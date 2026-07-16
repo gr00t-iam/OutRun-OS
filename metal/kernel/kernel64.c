@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.33.0-metal"
+#define KERNEL_VERSION "0.34.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -928,11 +928,16 @@ struct sevent { int32_t type, x, y, code; };   /* 1=click 2=key, x/y surface-loc
  * blocks until the compositor consumes the flip at a frame boundary — so a
  * blit can never observe a half-drawn frame. Apps that never flip keep the
  * v0.31 single-buffer behavior (front stays 0).                              */
+/* v0.34: flip consumption is tracked PER SLOT. A consumer (the compositor for
+ * the slots it composites, or a suite standing in) sets `consumer`; only then
+ * does SYS_SURFACE_FLIP block for a frame boundary. A flip on a slot nobody
+ * consumes completes immediately — a producer can never be parked by a pass
+ * that doesn't display it.                                                   */
 struct surface { uint64_t phys; int w, h, used, owner;
                  int bufpages, front; volatile int flip_pending;
+                 volatile int consumer;
                  struct sevent q[16]; volatile uint32_t qw, qr; };
 static struct surface g_surf[8];
-static volatile int g_canvas_live = 0;   /* a compositor pass is consuming flips */
 static inline uint64_t surf_front_phys(struct surface *S) {
     return S->front ? S->phys + (uint64_t)S->bufpages * 0x1000 : S->phys;
 }
@@ -958,7 +963,7 @@ static void surfaces_reclaim(int proc_idx) {
         }
         g_surf_last_reclaim = g_surf[i].phys;
         g_surf[i].used = 0; g_surf[i].owner = -1; g_surf[i].qw = g_surf[i].qr = 0;
-        g_surf[i].front = 0; g_surf[i].flip_pending = 0;
+        g_surf[i].front = 0; g_surf[i].flip_pending = 0; g_surf[i].consumer = 0;
         kprintf("[surface] slot %d reclaimed on owner exit — %u pages (phys %X) back on the free list\n",
                 (uint64_t)i, pages, g_surf_last_reclaim);
     }
@@ -3084,9 +3089,9 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (g_surf[slot].owner != (int)current_proc_idx) return (uint64_t)-13;   /* owner only */
         struct surface *S = &g_surf[slot];
         S->flip_pending = 1;
-        while (S->flip_pending && g_canvas_live) sched_yield();
-        if (S->flip_pending) {                         /* no compositor live:   */
-            S->front ^= 1; S->flip_pending = 0;        /* consume immediately,  */
+        while (S->flip_pending && S->consumer) sched_yield();   /* v0.34: per-slot */
+        if (S->flip_pending) {                         /* nobody consumes this  */
+            S->front ^= 1; S->flip_pending = 0;        /* slot: consume at once,*/
             sched_yield();                             /* but a flip is still a */
         }                                              /* frame boundary — it   */
                                                        /* must ALWAYS schedule  */
@@ -3509,6 +3514,7 @@ static void draw_str(int x, int y, const char *s, uint32_t c) {
 #define FX 16
 #define FXI(v) ((int64_t)(v) << FX)
 #define FXMUL(a,b) (((int64_t)(a) * (int64_t)(b)) >> FX)
+#define FX_HALF 32768   /* one PIT tick advances a per-frame velocity by v/2   */
 struct win { int64_t x, y, vx, vy, tx, ty; int w, h; uint32_t edge; };
 
 static void fb_flip(void) {
@@ -3517,14 +3523,27 @@ static void fb_flip(void) {
             g_fb[y * g_stride + x] = g_bb[y * g_stride + x];
 }
 
-/* one physics step (spring toward target + mass-weighted collision push)       */
-static void physics_step(struct win *wn, int n) {
-    int64_t k = FXI(1) / 6;
-    int64_t damp = (int64_t)(0.82 * (1 << FX));
+/* v0.34: window-spring physics on the same PIT-tick clock as the camera.
+ * Per-tick constants derived from the tuned per-frame pair (k=1/6, damp=0.82,
+ * frame = 2 ticks): damp_t = sqrt(damp) in 16.16 (59345; its FXMUL square is
+ * 53738 vs 53739 — within 1/65536), and the spring impulse rescaled so two
+ * ticks impart the per-frame velocity gain: k_t = k*damp_t/(1+damp_t) = 5190.
+ * Verified step response matches the old tuning (same overshoot, same settle).
+ * Velocities stay in world-units-per-frame; position integrates v/2 per tick.
+ * Collision separation runs per tick with the unchanged rule — it is
+ * state-proportional and convergent, so it simply settles in half the wall
+ * time. ALL mutation is per tick: grouping ticks into frames of any size
+ * cannot change the trajectory.                                              */
+#define SPRING_K_T    5190
+#define SPRING_DAMP_T 59345
+
+static void physics_tick(struct win *wn, int n) {
     for (int i = 0; i < n; i++) {
-        int64_t ax = FXMUL(k, wn[i].tx - wn[i].x), ay = FXMUL(k, wn[i].ty - wn[i].y);
-        wn[i].vx = FXMUL(wn[i].vx + ax, damp); wn[i].vy = FXMUL(wn[i].vy + ay, damp);
-        wn[i].x += wn[i].vx; wn[i].y += wn[i].vy;
+        int64_t ax = FXMUL(SPRING_K_T, wn[i].tx - wn[i].x);
+        int64_t ay = FXMUL(SPRING_K_T, wn[i].ty - wn[i].y);
+        wn[i].vx = FXMUL(wn[i].vx + ax, SPRING_DAMP_T);
+        wn[i].vy = FXMUL(wn[i].vy + ay, SPRING_DAMP_T);
+        wn[i].x += FXMUL(wn[i].vx, FX_HALF); wn[i].y += FXMUL(wn[i].vy, FX_HALF);
     }
     for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
         int ax = (int)(wn[i].x >> FX), ay = (int)(wn[i].y >> FX);
@@ -3541,6 +3560,16 @@ static void physics_step(struct win *wn, int n) {
         }
     }
 }
+
+/* Advance by a measured number of ticks (a variable-length frame).           */
+static void physics_step_dt(struct win *wn, int n, int ticks) {
+    if (ticks < 1) ticks = 1;
+    if (ticks > 32) ticks = 32;
+    while (ticks--) physics_tick(wn, n);
+}
+
+/* Legacy fixed frame (cmd_gfx's compositor loop steps by this).              */
+static void physics_step(struct win *wn, int n) { physics_step_dt(wn, n, 2); }
 
 static struct win g_wins[5];
 static const char *g_labels[5] = { "TIME-STREAM", "COMM-DECK", "SYS.TELEMETRY", "TIME-NODE", "VIDEO-EDITOR" };
@@ -3659,7 +3688,6 @@ static void canvas_zoom_at(int sx, int sy, int64_t factor) {
 #define CAM_FRICTION_T 61478   /* sqrt(0.88):   FXMUL(t,t) == FXI(1)*88/100 exactly   */
 #define CAM_EASE_T      7656   /* 1 - sqrt(0.78): per-frame ease 0.22 (±1/65536)      */
 #define ZOOM_EASE_T     8780   /* 1 - sqrt(0.75): per-frame ease 0.25 exactly         */
-#define FX_HALF        32768   /* one tick advances position by v/2 (v is per-frame)  */
 #define CAM_FRAME_TICKS 2      /* the legacy frame the suites step by                 */
 static int64_t g_cam_vx = 0, g_cam_vy = 0;    /* camera velocity (world/frame) */
 static int64_t g_cam_tx = 0, g_cam_ty = 0;    /* camera glide target           */
@@ -4077,7 +4105,9 @@ static void canvas_frame(void) {
     int W = g_fb_width, H = g_fb_height;
     /* v0.32: consume pending page flips at the frame boundary — the ONLY point */
     /* front/back swap while a pass is live, so no blit ever straddles a flip.  */
-    for (int i = 0; i < 8; i++)
+    /* v0.34: only for the slots THIS compositor composites (it registered as   */
+    /* their consumer); flips on other slots complete on their own.             */
+    for (int i = 0; i < NWIN; i++)
         if (g_surf[i].used && g_surf[i].flip_pending) {
             g_surf[i].front ^= 1;
             g_surf[i].flip_pending = 0;        /* unblocks the app's SYS_SURFACE_FLIP */
@@ -4159,7 +4189,9 @@ static void canvas_pass(int frames, const char *script,
     if (!g_gfx_ready) { kputs("[canvas ] no framebuffer\n"); return; }
     if (reinit) canvas_init();
     preempt_enable();
-    g_canvas_live = 1;                /* SYS_SURFACE_FLIP now blocks until a frame */
+    for (int i = 0; i < NWIN; i++) g_surf[i].consumer = 1;   /* we consume the  */
+                                      /* composited slots' flips (even a slot   */
+                                      /* bound mid-pass is covered)             */
     uint64_t tprev = g_ticks;
     int f = 0, ci = 0;
     for (; f < frames; f++) {
@@ -4178,14 +4210,16 @@ static void canvas_pass(int frames, const char *script,
         /* MEASURED elapsed PIT ticks, not by an assumed frame.                 */
         uint64_t tnow = g_ticks;
         int dt = (int)(tnow - tprev); tprev = tnow;
-        camera_step_dt(dt < 1 ? 1 : dt);
-        physics_step(g_wins, NWIN);
+        if (dt < 1) dt = 1;
+        camera_step_dt(dt);
+        physics_step_dt(g_wins, NWIN, dt);   /* v0.34: springs on the same clock */
         canvas_frame();
         fb_flip();
         uint64_t t = g_ticks;
         while (g_ticks - t < 2) sched_yield();     /* frame pacing = app run time */
     }
-    g_canvas_live = 0;                /* parked flips self-consume from here on  */
+    for (int i = 0; i < NWIN; i++) g_surf[i].consumer = 0;   /* deregister:     */
+                                      /* parked flips self-consume from here on */
     preempt_disable();
     kprintf("[canvas ] %d frames | camera world (%d,%d) zoom %d%% | focus '%s' | hud %s\n",
             (uint64_t)f, (uint64_t)(g_cam_x >> FX), (uint64_t)(g_cam_y >> FX),
@@ -4302,6 +4336,34 @@ static void cmd_kinetic(void) {
         for (int j = 0; j < 8; j++) camera_step_dt(jitter[j]);
     kcheck("irregular frame times (1..5 ticks) land on the identical camera state",
            xa == g_cam_x && ya == g_cam_y && za == g_zoom && va == g_cam_vx);
+
+    /* (8) v0.34: the WINDOW SPRINGS share the tick clock — same exactness bar. */
+    /* Perturb every target, run the full spring+collision system, and demand   */
+    /* the bit-identical endpoint under different tick groupings.               */
+    static struct win wa[NWIN], wb[NWIN];
+    canvas_init();
+    for (int i = 0; i < NWIN; i++) { g_wins[i].tx += FXI(137 + 41 * i); g_wins[i].ty -= FXI(53 + 29 * i); }
+    for (int i = 0; i < NWIN; i++) wa[i] = g_wins[i];
+    for (int s = 0; s < 60; s++) physics_step_dt(wa, NWIN, 2);      /* 120 ticks */
+    for (int i = 0; i < NWIN; i++) wb[i] = g_wins[i];
+    for (int s = 0; s < 120; s++) physics_step_dt(wb, NWIN, 1);     /* 120 ticks */
+    int spring_ok = 1;
+    for (int i = 0; i < NWIN; i++)
+        if (wa[i].x != wb[i].x || wa[i].y != wb[i].y ||
+            wa[i].vx != wb[i].vx || wa[i].vy != wb[i].vy) spring_ok = 0;
+    kcheck("window-spring dt grouping is EXACT (60 frames @ dt=2 == 120 @ dt=1)", spring_ok);
+
+    /* (9) irregular groupings, same 120 ticks, same endpoint — springs AND the */
+    /* pairwise collision resolution are tick-pure.                             */
+    for (int i = 0; i < NWIN; i++) wb[i] = g_wins[i];
+    static const int sjit[6] = { 1, 4, 2, 5, 3, 5 };                /* 20/cycle  */
+    for (int c = 0; c < 6; c++)
+        for (int j = 0; j < 6; j++) physics_step_dt(wb, NWIN, sjit[j]);
+    spring_ok = 1;
+    for (int i = 0; i < NWIN; i++)
+        if (wa[i].x != wb[i].x || wa[i].y != wb[i].y ||
+            wa[i].vx != wb[i].vx || wa[i].vy != wb[i].vy) spring_ok = 0;
+    kcheck("window springs under irregular frame times land on the identical state", spring_ok);
 
     canvas_init();
     kprintf("[kinetic] RESULT: %d passed, %d failed\n", (uint64_t)g_kpass, (uint64_t)g_kfail);
@@ -5410,9 +5472,29 @@ static void cmd_flip(void) {
             !access_ok(kprocs[pt].cr3, SURF_USER_V + (uint64_t)2 * S->bufpages * 0x1000, 0x1000, 1));
     uint64_t phys0 = S->phys;
 
-    /* play compositor: consume 200 flips, scanning every published frame      */
-    g_canvas_live = 1;                 /* the app's flips now wait for us       */
-    preempt_enable();                  /* and it gets preempted mid-draw        */
+    /* v0.34: with NO consumer registered, flips must complete immediately —   */
+    /* the producer keeps publishing frames instead of parking.                 */
+    uint32_t cA = 0, cB = 0;
+    for (int y = 0; y < 40 && !(cA && cB); y++) {
+        sched_yield();
+        uint32_t c0 = *(volatile uint32_t *)surf_front_phys(S) & 0xFFFFFF;
+        if (c0 == TEAR_COLOR_A) cA = 1;
+        if (c0 == TEAR_COLOR_B) cB = 1;
+    }
+    flcheck("flips on a slot with NO consumer complete immediately (producer never parks)",
+            cA && cB);
+
+    /* the sibling slot-4 app must KEEP RUNNING while we consume slot 5 — the  */
+    /* v0.33 gap. Watch its liveness bar move across our consume loop.         */
+    int bar0 = -1, bar1 = -1;
+    if (g_surf[4].used) {
+        uint32_t *s4 = (uint32_t *)surf_front_phys(&g_surf[4]);
+        for (int x = 0; x < 200; x++) if ((s4[106 * 200 + x] & 0xFFFFFF) == 0x9B4DFF) { bar0 = x; break; }
+    }
+
+    /* play compositor FOR SLOT 5 ONLY: consume 200 flips, scan each frame     */
+    S->consumer = 1;                   /* per-slot registration (v0.34)         */
+    preempt_enable();                  /* the app gets preempted mid-draw       */
     int consumed = 0, torn = 0, alt_ok = 1, seenA = 0, seenB = 0;
     uint32_t last = 0;
     while (consumed < 200) {
@@ -5434,7 +5516,21 @@ static void cmd_flip(void) {
         consumed++;
     }
     preempt_disable();
-    g_canvas_live = 0;
+    S->consumer = 0;                   /* deregister                            */
+    if (g_surf[4].used) {
+        uint32_t *s4 = (uint32_t *)surf_front_phys(&g_surf[4]);
+        for (int x = 0; x < 200; x++)              /* sample NOW, before any    */
+            if ((s4[106 * 200 + x] & 0xFFFFFF) == 0x9B4DFF) { bar1 = x; break; } /* more yields */
+        for (int tries = 0; tries < 2 && bar1 == bar0; tries++) {   /* 184-wrap fallback */
+            for (int y = 0; y < 20; y++) sched_yield();
+            s4 = (uint32_t *)surf_front_phys(&g_surf[4]);
+            bar1 = -1;
+            for (int x = 0; x < 200; x++)
+                if ((s4[106 * 200 + x] & 0xFFFFFF) == 0x9B4DFF) { bar1 = x; break; }
+        }
+        flcheck("sibling surface thread kept running while another slot was consumed",
+                bar0 >= 0 && bar1 >= 0 && bar1 != bar0);
+    }
     kprintf("[flip   ] consumed %d published frames: %d torn, %d/%d color A/B\n",
             (uint64_t)consumed, (uint64_t)torn, (uint64_t)seenA, (uint64_t)seenB);
     flcheck("200 frames published through SYS_SURFACE_FLIP under preemption", consumed == 200);
