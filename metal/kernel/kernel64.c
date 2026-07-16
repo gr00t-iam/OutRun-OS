@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.32.0-metal"
+#define KERNEL_VERSION "0.33.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -3873,10 +3873,33 @@ static void ccmd_exec(int id) {
     }
 }
 
+/* v0.33: keyboard routing to surfaces — the reserved type=2 event goes live.
+ * Modal, like a real WM: Enter arms "type-to-app" when the focused window has
+ * a bound surface; from then on EVERY key belongs to the app (it owns the
+ * keyboard) except Esc, which returns it to camera navigation. Keys travel
+ * the same 16-deep per-surface queue as clicks; the app's SYS_SURFACE_POLL
+ * loop dispatches on sevent.type.                                            */
+static int      g_key_to_app = 0;
+static uint64_t g_keys_routed = 0;             /* test hook: keys delivered    */
+
+static void key_route(int slot, int code) {
+    struct surface *S = &g_surf[slot];
+    struct sevent e;
+    e.type = 2; e.x = -1; e.y = -1; e.code = code;   /* keys have no position  */
+    if ((S->qw - S->qr) < 16) { S->q[S->qw++ % 16] = e; g_keys_routed++; }
+}
+
 /* Drain the keyboard. Returns 0 when the user asks to leave the canvas.        */
 static int canvas_input(void) {
     int c;
     while ((c = kbd_getc_nonblock()) >= 0) {
+        if (g_key_to_app) {                    /* the focused app owns the keys */
+            if (c == 27) { g_key_to_app = 0; continue; }         /* Esc: back  */
+            if (!g_surf[g_focus].used) { g_key_to_app = 0; continue; }
+            if (c == '\b' || c == '\n' || (c >= 32 && c < 127))
+                key_route(g_focus, c);
+            continue;
+        }
         if (g_hud) {
             if (c == 27) { g_hud = 0; g_hud_len = 0; g_hud_buf[0] = 0; }
             else if (c == '\n') {
@@ -3899,6 +3922,9 @@ static int canvas_input(void) {
             case '\t': canvas_focus_on((g_focus + 1) % NWIN); break;
             case '/':  g_hud = 1; g_hud_len = 0; g_hud_buf[0] = 0; break;
             case 'f': case 'F': canvas_zoom_fit(); break;
+            case '\n': if (g_focus < 8 && g_surf[g_focus].used)  /* arm type-to-app */
+                           g_key_to_app = 1;
+                       break;
             case 27: case 'x': case 'X': return 0;
         }
     }
@@ -4089,8 +4115,9 @@ static void canvas_frame(void) {
 
     /* context ribbon: tells you what the current input mode can do */
     rect(0, H - 20, W, 20, C_OBS1); hline(0, H - 20, W, C_HAIR);
-    draw_str(8, H - 14, g_hud ? "TYPE FILTER  ENTER RUN  ESC CLOSE"
-                              : "DRAG WINDOW / PAN  WHEEL ZOOM@CURSOR  WASD  Q/E  TAB  F FIT  / HUD  X EXIT", C_MUTE);
+    draw_str(8, H - 14, g_key_to_app ? "KEYBOARD -> RING-3 APP  (ESC RETURNS TO CANVAS)"
+                      : g_hud       ? "TYPE FILTER  ENTER RUN  ESC CLOSE"
+                      : "DRAG WINDOW / PAN  WHEEL ZOOM@CURSOR  WASD  Q/E  TAB  F FIT  ENTER TYPE-TO-APP  / HUD  X EXIT", C_MUTE);
     char z[24]; int zp = (int)((g_zoom * 100) >> FX);
     int n = 0; z[n++] = 'Z'; z[n++] = ':';
     if (zp >= 100) z[n++] = (char)('0' + (zp / 100) % 10);
@@ -5474,6 +5501,75 @@ static void cmd_surfin(void) {
     kputs("-- done --\n");
 }
 
+/* ===========================================================================
+ * KEYBOARD ROUTING TO RING-3 SURFACES  (v0.33 — the type=2 event goes live)
+ * ===========================================================================
+ * End-to-end, both ends verified: keystrokes are injected into the REAL PS/2
+ * ring buffer inside a live canvas pass; the modal router delivers them to
+ * the focused app's event queue; the app (a first-class thread) drains them,
+ * paints each char as a block whose COLOR ENCODES THE ASCII CODE, and
+ * publishes via SYS_SURFACE_FLIP. The suite then decodes the published front
+ * buffer back into the typed string. Negative checks prove navigation-mode
+ * keys never route and Esc returns the keyboard to the camera.
+ * =========================================================================== */
+#define KEYBLOCK_BASE 0x00A00030u   /* app block color: 0xA0..30 | (ascii<<8)  */
+static int g_kbpass, g_kbfail;
+static void kbcheck(const char *n, int c) {
+    if (c) { g_kbpass++; kprintf("[keys   ]  PASS  %s\n", n); }
+    else   { g_kbfail++; kprintf("[keys   ]  FAIL  %s\n", n); }
+}
+
+static void cmd_keys(void) {
+    kputs("-- KEYBOARD ROUTING TO RING-3 SURFACES (type=2) --\n");
+    g_kbpass = g_kbfail = 0;
+    if (!g_surf[4].used) { kputs("[keys   ] no surface bound\n-- done --\n"); return; }
+
+    /* (1) navigation mode: keys steer the camera and must NOT reach the app   */
+    uint64_t r0 = g_keys_routed;
+    int64_t x0 = g_cam_x;
+    canvas_pass(30, "dd", 0, 0, 0, 0, 0);          /* two 'd' impulses          */
+    kbcheck("navigation-mode keys steer the camera, none leak to the app",
+            g_keys_routed == r0 && g_cam_x != x0);
+
+    /* (2)(3)(4) Enter arms type-to-app; "HI R3" routes; Esc disarms — all      */
+    /* through the real PS/2 ring inside one live pass                          */
+    canvas_pass(90, "\nHI R3\x1b", 0, 0, 0, 0, 0);
+    kbcheck("Enter armed type-to-app and 5 keys were routed to the focused surface",
+            g_keys_routed == r0 + 5);
+    kbcheck("Esc returned the keyboard to canvas navigation", g_key_to_app == 0);
+
+    /* decode the app's published frame: block i encodes typed char i           */
+    static const char *want = "HI R3";
+    struct surface *S = &g_surf[4];
+    char got[8]; int ok = 1;
+    int tries = 0; uint32_t *fp = 0;
+    for (tries = 0; tries < 50; tries++) {         /* let the app publish       */
+        sched_yield();
+        fp = (uint32_t *)surf_front_phys(S);
+        ok = 1;
+        for (int i = 0; i < 5; i++) {
+            uint32_t px = fp[92 * 200 + (6 + 8 * i + 3)] & 0xFFFFFF;
+            got[i] = ((px & 0xFF00FF) == KEYBLOCK_BASE) ? (char)((px >> 8) & 0xFF) : '?';
+            if (got[i] != want[i]) ok = 0;
+        }
+        if (ok) break;
+    }
+    got[5] = 0;
+    kprintf("[keys   ] pixel-decoded from the published front buffer: \"%s\"\n", got);
+    kbcheck("app painted the typed text — pixels decode back to \"HI R3\"", ok);
+
+    /* (5) after Esc, keys are navigation again: camera moves, count frozen     */
+    uint64_t r1 = g_keys_routed; x0 = g_cam_x;
+    canvas_pass(30, "dd", 0, 0, 0, 0, 0);
+    kbcheck("post-Esc keys move the camera again and the app receives none",
+            g_keys_routed == r1 && g_cam_x != x0);
+
+    kprintf("[keys   ] RESULT: %d passed, %d failed\n", (uint64_t)g_kbpass, (uint64_t)g_kbfail);
+    if (!g_kbfail) kputs("[keys   ] KEYBOARD ROUTING VERIFIED — the focused app owns the keys, end to end\n");
+    else          kputs("[keys   ] KEY ROUTING DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 /* ---- Shell ------------------------------------------------------------------------------------ */
 static uint64_t g_mb_info = 0;
 
@@ -5508,6 +5604,7 @@ static void cmd_help(void) {
       "  nicdrv          hand the NIC to a ring-3 userspace driver\n"
       "  threads         first-class ring-3 scheduler threads suite\n"
       "  flip            double-buffered surface page-flip / tearing suite\n"
+      "  keys            keyboard-to-surface routing suite (type=2 events)\n"
       "  surface         spawn the ring-3 surface app as a live thread\n"
       "  surfin          route clicks to the live app in one canvas pass\n"
       "  canvas          Metropolis-Terminal spatial canvas (WASD/QE/TAB//)\n"
@@ -5581,6 +5678,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "surfin")) cmd_surfin();
     else if (!kstrcmp(argv[0], "threads")) cmd_threads();
     else if (!kstrcmp(argv[0], "flip")) cmd_flip();
+    else if (!kstrcmp(argv[0], "keys")) cmd_keys();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -5725,6 +5823,7 @@ void kernel_main(uint64_t mb_info) {
     cmd_kinetic();
     cmd_canvas(300, "/zoom fit\n");
     cmd_surfin();         /* clicks routed + app reacts INSIDE this single pass */
+    cmd_keys();           /* v0.33: keyboard routed to the focused app          */
     cmd_canvas(120, 0);   /* recomposite — the hit markers persist              */
     cmd_usermode();
 

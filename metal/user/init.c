@@ -107,10 +107,20 @@ static void surface_app(void) {
     print(" — drawing back buffers, publishing via SYS_SURFACE_FLIP\n");
     struct { int type, x, y, code; } ev;
     int hx[8], hy[8], nh = 0;
+    char typed[24]; int nt = 0;
     u64 frame = 0;
     for (;;) {
-        /* drain routed input: the compositor delivers clicks in OUR pixel space */
+        /* drain routed input: clicks arrive in OUR pixel space, keys (type=2) */
+        /* arrive as ASCII codes — same queue, dispatched on sevent.type       */
         while (sysc(SYS_SURFACE_POLL, 4, (u64)&ev, 0) == 1) {
+            if (ev.type == 2) {                            /* v0.33: keyboard  */
+                print("  [app:r3] key event code ");
+                hex((u64)(unsigned)ev.code); print(" — echoing into our pixels\n");
+                if (ev.code == 8) { if (nt) nt--; }        /* backspace        */
+                else if (ev.code >= 32 && ev.code < 127 && nt < 24)
+                    typed[nt++] = (char)ev.code;
+                continue;
+            }
             print("  [app:r3] click at surface-local (");
             hex((u64)(unsigned)ev.x); print(","); hex((u64)(unsigned)ev.y);
             print(") — repainting NOW, mid-pass\n");
@@ -139,6 +149,14 @@ static void surface_app(void) {
                     if (X < 0 || X >= 200 || Y < 0 || Y >= 120) continue;
                     if (dx * dx + dy * dy <= 49) p[Y * 200 + X] = 0xF06A18u;
                 }
+        /* typed text: each char is a block whose COLOR encodes its ASCII code */
+        /* (0xA0..30 | code<<8) so the kernel can decode our pixels verbatim   */
+        for (int i = 0; i < nt; i++) {
+            unsigned int c = 0x00A00030u | ((unsigned int)(u8)typed[i] << 8);
+            for (int y = 88; y < 96; y++)
+                for (int x = 6 + 8 * i; x < 6 + 8 * i + 7 && x < 200; x++)
+                    p[y * 200 + x] = c;
+        }
         frame++;
         /* publish: blocks until the compositor's next frame boundary, then     */
         /* hands us the buffer it just retired — vsync for free                 */
