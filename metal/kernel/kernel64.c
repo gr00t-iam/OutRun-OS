@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.31.0-metal"
+#define KERNEL_VERSION "0.32.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -867,7 +867,7 @@ struct kproc {
     uint64_t cr3;       /* physical address of this process's PML4             */
     bool     used;
     uint64_t role;      /* 0=demo 1=userspace driver 2=surface app             */
-                        /* 3=surface-exit test 4=identity prober               */
+                        /* 3=surface-exit test 4=identity prober 5=tear-test   */
     uint64_t dma_next;  /* bump pointer into this process's DMA window         */
     uint64_t exit_code; /* SYS_EXIT code (uthreads; 0x8000+vector on a fault)  */
     int      exited;    /* set when the process's thread has been reaped       */
@@ -922,9 +922,20 @@ static struct kdev *kdev_find(uint64_t io_addr) {
  * process, composited by the kernel. The compositor never draws this content —
  * it only places it. */
 struct sevent { int32_t type, x, y, code; };   /* 1=click 2=key, x/y surface-local */
+/* v0.32: DOUBLE-BUFFERED. phys is buffer 0 of a contiguous 2*bufpages chunk;
+ * buffer 1 sits at phys + bufpages*4K. The compositor reads only buf[front];
+ * the app draws only buf[front^1] and publishes with SYS_SURFACE_FLIP, which
+ * blocks until the compositor consumes the flip at a frame boundary — so a
+ * blit can never observe a half-drawn frame. Apps that never flip keep the
+ * v0.31 single-buffer behavior (front stays 0).                              */
 struct surface { uint64_t phys; int w, h, used, owner;
+                 int bufpages, front; volatile int flip_pending;
                  struct sevent q[16]; volatile uint32_t qw, qr; };
 static struct surface g_surf[8];
+static volatile int g_canvas_live = 0;   /* a compositor pass is consuming flips */
+static inline uint64_t surf_front_phys(struct surface *S) {
+    return S->front ? S->phys + (uint64_t)S->bufpages * 0x1000 : S->phys;
+}
 static int  iommu_attach_proc_domain(uint16_t bdf, int proc_idx);  /* fwd: IOMMU DMA domain */
 static void iommu_domain_add_page(int proc_idx, uint64_t pa);      /* fwd: live domain add */
 
@@ -939,7 +950,7 @@ static uint64_t g_surf_last_reclaim = 0;   /* phys of the most recent reclaim (t
 static void surfaces_reclaim(int proc_idx) {
     for (int i = 0; i < 8; i++) {
         if (!g_surf[i].used || g_surf[i].owner != proc_idx) continue;
-        uint64_t pages = ((uint64_t)g_surf[i].w * g_surf[i].h * 4 + 0xFFF) / 0x1000;
+        uint64_t pages = 2ull * g_surf[i].bufpages;        /* both halves of the pair */
         if (g_surf_nfree < 8) {
             g_surf_free[g_surf_nfree].phys  = g_surf[i].phys;
             g_surf_free[g_surf_nfree].pages = pages;
@@ -947,6 +958,7 @@ static void surfaces_reclaim(int proc_idx) {
         }
         g_surf_last_reclaim = g_surf[i].phys;
         g_surf[i].used = 0; g_surf[i].owner = -1; g_surf[i].qw = g_surf[i].qr = 0;
+        g_surf[i].front = 0; g_surf[i].flip_pending = 0;
         kprintf("[surface] slot %d reclaimed on owner exit — %u pages (phys %X) back on the free list\n",
                 (uint64_t)i, pages, g_surf_last_reclaim);
     }
@@ -3034,9 +3046,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int sw = (int)(a0 >> 16), sh = (int)(a0 & 0xFFFF), slot = (int)a1;
         if (sw < 8 || sw > 512 || sh < 8 || sh > 512) return (uint64_t)-1;
         if (slot < 0 || slot >= 8) return (uint64_t)-1;
-        uint64_t pages = ((uint64_t)sw * sh * 4 + 0xFFF) / 0x1000;
+        uint64_t bufpages = ((uint64_t)sw * sh * 4 + 0xFFF) / 0x1000;
+        uint64_t pages = 2 * bufpages;                     /* v0.32: front+back pair */
         uint64_t phys = 0; int recycled = 0;
-        for (int fi = 0; fi < g_surf_nfree; fi++)          /* reuse a reclaimed buffer */
+        for (int fi = 0; fi < g_surf_nfree; fi++)          /* reuse a reclaimed pair  */
             if (g_surf_free[fi].pages >= pages) {
                 phys = g_surf_free[fi].phys;
                 g_surf_free[fi] = g_surf_free[--g_surf_nfree];
@@ -3045,17 +3058,40 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             }
         if (!phys) phys = alloc_frames(pages);
         struct kproc *p = &kprocs[current_proc_idx];
-        for (uint64_t i = 0; i < pages; i++) {
+        for (uint64_t i = 0; i < pages; i++) {             /* both buffers user-mapped */
             for (int z = 0; z < 512; z++) ((uint64_t *)(phys + i * 0x1000))[z] = 0;
             map_page(p->cr3, SURF_USER_V + i * 0x1000, phys + i * 0x1000, PTE_USER | PTE_WRITE | PTE_NX);
         }
         g_surf[slot].phys = phys; g_surf[slot].w = sw; g_surf[slot].h = sh;
         g_surf[slot].used = 1;    g_surf[slot].owner = (int)current_proc_idx;
+        g_surf[slot].bufpages = (int)bufpages; g_surf[slot].front = 0;
+        g_surf[slot].flip_pending = 0;
         g_surf[slot].qw = g_surf[slot].qr = 0;
-        kprintf("[surface] pid %u owns surface %d (%ux%u) at user vaddr %X — kernel will composite it%s\n",
+        kprintf("[surface] pid %u owns surface %d (%ux%u) DOUBLE-BUFFERED at user vaddr %X (+%u pages back)%s\n",
                 p->pid, (uint64_t)slot, (uint64_t)sw, (uint64_t)sh, SURF_USER_V,
-                recycled ? " (recycled pixel buffer)" : "");
+                bufpages, recycled ? " (recycled pixel buffers)" : "");
         return SURF_USER_V;
+    }
+
+    case 17: {   /* SYS_SURFACE_FLIP(slot) — publish the back buffer.            */
+        /* Vsync semantics: mark the flip pending and BLOCK until a compositor  */
+        /* frame boundary consumes it (canvas_frame), so the compositor can     */
+        /* never blit a half-drawn frame and the app can never draw into a      */
+        /* buffer being blitted. With no compositor pass live, consume at once. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FRAMEBUFFER)) return (uint64_t)-13;
+        int slot = (int)a0;
+        if (slot < 0 || slot >= 8 || !g_surf[slot].used) return (uint64_t)-1;
+        if (g_surf[slot].owner != (int)current_proc_idx) return (uint64_t)-13;   /* owner only */
+        struct surface *S = &g_surf[slot];
+        S->flip_pending = 1;
+        while (S->flip_pending && g_canvas_live) sched_yield();
+        if (S->flip_pending) {                         /* no compositor live:   */
+            S->front ^= 1; S->flip_pending = 0;        /* consume immediately,  */
+            sched_yield();                             /* but a flip is still a */
+        }                                              /* frame boundary — it   */
+                                                       /* must ALWAYS schedule  */
+        /* return the NEW back buffer's user vaddr — where the app draws next   */
+        return SURF_USER_V + (uint64_t)(S->front ^ 1) * S->bufpages * 0x1000;
     }
     }
     return (uint64_t)-1;
@@ -3613,9 +3649,18 @@ static void canvas_zoom_at(int sx, int sy, int64_t factor) {
  * world point under the anchor stays pinned for EVERY frame of the transition,
  * not just the endpoints. Commands glide the camera to a target instead of
  * teleporting. All fixed-point: no FPU anywhere. */
-#define CAM_FRICTION (FXI(1) * 88 / 100)      /* per-frame velocity decay      */
-#define CAM_EASE     (FXI(1) * 22 / 100)      /* glide-to-target easing        */
-#define ZOOM_EASE    (FXI(1) * 25 / 100)      /* zoom easing                   */
+/* v0.32: the physics clock is the PIT tick (10 ms), not the frame. The classic
+ * frame was 2 ticks (~50 fps), so each per-frame decay constant is replaced by
+ * its 16.16 square root applied once per tick — two ticks reproduce the tuned
+ * v0.31 feel bit-for-bit (friction and zoom roots are exact under FXMUL
+ * truncation; glide retention lands within 1/65536). Because ALL state
+ * mutation happens per tick, camera_step_dt(a);camera_step_dt(b) is exactly
+ * camera_step_dt(a+b): frame rate cannot change the trajectory.              */
+#define CAM_FRICTION_T 61478   /* sqrt(0.88):   FXMUL(t,t) == FXI(1)*88/100 exactly   */
+#define CAM_EASE_T      7656   /* 1 - sqrt(0.78): per-frame ease 0.22 (±1/65536)      */
+#define ZOOM_EASE_T     8780   /* 1 - sqrt(0.75): per-frame ease 0.25 exactly         */
+#define FX_HALF        32768   /* one tick advances position by v/2 (v is per-frame)  */
+#define CAM_FRAME_TICKS 2      /* the legacy frame the suites step by                 */
 static int64_t g_cam_vx = 0, g_cam_vy = 0;    /* camera velocity (world/frame) */
 static int64_t g_cam_tx = 0, g_cam_ty = 0;    /* camera glide target           */
 static int64_t g_zoom_t = 0;                  /* zoom target                   */
@@ -3634,39 +3679,51 @@ static void canvas_zoom_to(int sx, int sy, int64_t factor) {
     g_cam_glide = 0;                          /* a manual zoom cancels a glide */
 }
 
-/* Advance the camera one frame. */
-static void camera_step(void) {
+/* Advance the camera by exactly ONE PIT tick. Everything that mutates state —
+ * decay, easing, snap thresholds, zoom clamp, anchor re-pin — happens here,
+ * per tick, so tick grouping cannot alter the trajectory.                    */
+static void camera_tick(void) {
     int W = g_fb_width, H = g_fb_height;
     if (g_cam_glide) {                        /* eased move to a commanded spot */
         int64_t dx = g_cam_tx - g_cam_x, dy = g_cam_ty - g_cam_y;
-        g_cam_x += FXMUL(dx, CAM_EASE);
-        g_cam_y += FXMUL(dy, CAM_EASE);
+        g_cam_x += FXMUL(dx, CAM_EASE_T);
+        g_cam_y += FXMUL(dy, CAM_EASE_T);
         g_cam_vx = g_cam_vy = 0;
         int64_t dz = g_zoom_t - g_zoom;
-        g_zoom += FXMUL(dz, ZOOM_EASE);
+        g_zoom += FXMUL(dz, ZOOM_EASE_T);
         canvas_clampz();
         if (kabs(dx) < FXI(1) && kabs(dy) < FXI(1) && kabs(dz) < FXI(1) / 256) {
             g_cam_x = g_cam_tx; g_cam_y = g_cam_ty; g_zoom = g_zoom_t; g_cam_glide = 0;
         }
         return;
     }
-    /* momentum */
-    g_cam_x += g_cam_vx; g_cam_y += g_cam_vy;
-    g_cam_vx = FXMUL(g_cam_vx, CAM_FRICTION);
-    g_cam_vy = FXMUL(g_cam_vy, CAM_FRICTION);
+    /* momentum: v is world-units-per-frame; one tick is half a classic frame  */
+    g_cam_x += FXMUL(g_cam_vx, FX_HALF); g_cam_y += FXMUL(g_cam_vy, FX_HALF);
+    g_cam_vx = FXMUL(g_cam_vx, CAM_FRICTION_T);
+    g_cam_vy = FXMUL(g_cam_vy, CAM_FRICTION_T);
     if (kabs(g_cam_vx) < FXI(1) / 32) g_cam_vx = 0;
     if (kabs(g_cam_vy) < FXI(1) / 32) g_cam_vy = 0;
-    /* eased zoom, re-pinned to the anchor every frame */
+    /* eased zoom, re-pinned to the anchor every TICK (drift bound tightens)   */
     if (g_zoom != g_zoom_t) {
         int64_t wx = s2wx(g_anchor_sx), wy = s2wy(g_anchor_sy);   /* before step */
         int64_t dz = g_zoom_t - g_zoom;
         if (kabs(dz) < FXI(1) / 256) g_zoom = g_zoom_t;
-        else g_zoom += FXMUL(dz, ZOOM_EASE);
+        else g_zoom += FXMUL(dz, ZOOM_EASE_T);
         canvas_clampz();
         g_cam_x = wx - FXDIV(FXI(g_anchor_sx - W / 2), g_zoom);   /* re-pin      */
         g_cam_y = wy - FXDIV(FXI(g_anchor_sy - H / 2), g_zoom);
     }
 }
+
+/* Advance by a measured number of ticks (a variable-length frame).           */
+static void camera_step_dt(int ticks) {
+    if (ticks < 1) ticks = 1;
+    if (ticks > 32) ticks = 32;               /* a stall is not a teleport      */
+    while (ticks--) camera_tick();
+}
+
+/* Legacy fixed frame (the kinetic/cursor suites step by this).               */
+static void camera_step(void) { camera_step_dt(CAM_FRAME_TICKS); }
 
 /* Topmost window under a screen point (focused window is on top), else -1. */
 static int canvas_pick(int sx, int sy) {
@@ -3954,7 +4011,7 @@ static void canvas_window(int i, int focused) {
         if (i < 8 && g_surf[i].used) {          /* ring-3 app owns these pixels    */
             struct surface *S = &g_surf[i];
             int cw = w - 16, ch = h - 30;
-            uint32_t *sp = (uint32_t *)S->phys;
+            uint32_t *sp = (uint32_t *)surf_front_phys(S);   /* only ever the FRONT */
             for (int sy = 0; sy < ch; sy++) {
                 int v = sy * S->h / ch;
                 for (int sx = 0; sx < cw; sx++)
@@ -3992,6 +4049,13 @@ static void canvas_hud(void) {
 
 static void canvas_frame(void) {
     int W = g_fb_width, H = g_fb_height;
+    /* v0.32: consume pending page flips at the frame boundary — the ONLY point */
+    /* front/back swap while a pass is live, so no blit ever straddles a flip.  */
+    for (int i = 0; i < 8; i++)
+        if (g_surf[i].used && g_surf[i].flip_pending) {
+            g_surf[i].front ^= 1;
+            g_surf[i].flip_pending = 0;        /* unblocks the app's SYS_SURFACE_FLIP */
+        }
     fill(C_OBS0);
 
     /* infinite grid: world-anchored, spacing follows the zoom */
@@ -4068,6 +4132,8 @@ static void canvas_pass(int frames, const char *script,
     if (!g_gfx_ready) { kputs("[canvas ] no framebuffer\n"); return; }
     if (reinit) canvas_init();
     preempt_enable();
+    g_canvas_live = 1;                /* SYS_SURFACE_FLIP now blocks until a frame */
+    uint64_t tprev = g_ticks;
     int f = 0, ci = 0;
     for (; f < frames; f++) {
         /* feed the scripted demo one keystroke at a time, at human typing pace, */
@@ -4081,13 +4147,18 @@ static void canvas_pass(int frames, const char *script,
         if (ci < nclk && f == clkf[ci] + 3) { g_mouse_btn = 0; ci++; }  /* release */
         canvas_mouse();
         if (!canvas_input()) break;
-        camera_step();
+        /* v0.32: frame-rate-independent physics — advance the camera by the    */
+        /* MEASURED elapsed PIT ticks, not by an assumed frame.                 */
+        uint64_t tnow = g_ticks;
+        int dt = (int)(tnow - tprev); tprev = tnow;
+        camera_step_dt(dt < 1 ? 1 : dt);
         physics_step(g_wins, NWIN);
         canvas_frame();
         fb_flip();
         uint64_t t = g_ticks;
         while (g_ticks - t < 2) sched_yield();     /* frame pacing = app run time */
     }
+    g_canvas_live = 0;                /* parked flips self-consume from here on  */
     preempt_disable();
     kprintf("[canvas ] %d frames | camera world (%d,%d) zoom %d%% | focus '%s' | hud %s\n",
             (uint64_t)f, (uint64_t)(g_cam_x >> FX), (uint64_t)(g_cam_y >> FX),
@@ -4180,6 +4251,30 @@ static void cmd_kinetic(void) {
     for (int i = 0; i < 40; i++) { canvas_zoom_to(512, 384, FXI(1) / 2); for (int j = 0; j < 8; j++) camera_step(); }
     kcheck("zoom stays clamped to 12.5%..400% under repeated impulses",
            hi_ok && g_zoom >= FXI(1) / 8);
+
+    /* (6) v0.32: THE frame-rate-independence invariant, checked EXACTLY.       */
+    /* The physics clock is the tick; frames merely group ticks. So the same    */
+    /* total tick count must land on the bit-identical camera state no matter   */
+    /* how it is chopped into frames.                                           */
+    canvas_init();
+    g_cam_vx = FXI(30); g_cam_vy = FXI(-12); canvas_zoom_to(400, 300, FXI(2));
+    for (int i = 0; i < 100; i++) camera_step_dt(2);         /* 100 frames @ 20ms */
+    int64_t xa = g_cam_x, ya = g_cam_y, za = g_zoom, va = g_cam_vx;
+    canvas_init();
+    g_cam_vx = FXI(30); g_cam_vy = FXI(-12); canvas_zoom_to(400, 300, FXI(2));
+    for (int i = 0; i < 200; i++) camera_step_dt(1);         /* 200 frames @ 10ms */
+    kcheck("dt grouping is EXACT: 100 frames @ dt=2 == 200 frames @ dt=1 (bit-identical)",
+           xa == g_cam_x && ya == g_cam_y && za == g_zoom && va == g_cam_vx);
+
+    /* (7) irregular frame times — a stuttering compositor (1..5 ticks/frame)   */
+    /* still lands on the identical state after the same 200 ticks.             */
+    canvas_init();
+    g_cam_vx = FXI(30); g_cam_vy = FXI(-12); canvas_zoom_to(400, 300, FXI(2));
+    static const int jitter[8] = { 1, 3, 2, 4, 1, 5, 2, 2 };   /* 20 ticks/cycle */
+    for (int c = 0; c < 10; c++)
+        for (int j = 0; j < 8; j++) camera_step_dt(jitter[j]);
+    kcheck("irregular frame times (1..5 ticks) land on the identical camera state",
+           xa == g_cam_x && ya == g_cam_y && za == g_zoom && va == g_cam_vx);
 
     canvas_init();
     kprintf("[kinetic] RESULT: %d passed, %d failed\n", (uint64_t)g_kpass, (uint64_t)g_kfail);
@@ -4911,10 +5006,11 @@ static void cmd_fuzz(void) {
     int N = 20000, calls = 0, rejected = 0, okc = 0;
     g_quiet = 1;                                                    /* silence SYS_WRITE spam  */
     for (int i = 0; i < N; i++) {
-        uint64_t num = rng_next() % 15;                            /* 0..12 + YIELD/GETPID via remap */
+        uint64_t num = rng_next() % 16;                            /* 0..12 + 15/16/17 via remap */
         if (num == 13) num = 15;                                   /* SYS_YIELD: exercises the per- */
         if (num == 14) num = 16;                                   /* thread switch under fuzz      */
-        if (num == 2)  num = 3;                                    /* never SYS_EXIT          */
+        if (num == 15) num = 17;                                   /* SYS_SURFACE_FLIP: owner-gated,*/
+        if (num == 2)  num = 3;                                    /* denied before any state change */
         kprocs[fp].caps = cpool[rng_next() % ncp];
         if (num == 9 && (kprocs[fp].caps & PCAP_NETWORK)) kprocs[fp].caps &= ~PCAP_NETWORK; /* no block */
         uint64_t a0 = pool[rng_next() % np], a1 = pool[rng_next() % np], a2 = pool[rng_next() % np];
@@ -5252,6 +5348,85 @@ static void cmd_threads(void) {
     kputs("-- done --\n");
 }
 
+/* ===========================================================================
+ * DOUBLE-BUFFERED SURFACES  (v0.32 — SYS_SURFACE_FLIP, tear-free by design)
+ * ===========================================================================
+ * The tear detector: a ring-3 thread fills WHOLE frames in strictly
+ * alternating app-unique colors and flips; this suite plays compositor
+ * (consuming flips at its own "frame boundaries", with timer preemption ON so
+ * the app is interrupted mid-draw arbitrarily) and scans every consumed front
+ * buffer. One non-uniform scan = one torn frame. Under v0.31's in-place
+ * repaint this scan catches partial frames; with the flip protocol the front
+ * buffer is a completed frame by construction.
+ * =========================================================================== */
+#define TEAR_COLOR_A 0x004682EAu    /* app-unique: not in the kernel palette   */
+#define TEAR_COLOR_B 0x001FBF6Eu
+static int g_flpass, g_flfail;
+static void flcheck(const char *n, int c) {
+    if (c) { g_flpass++; kprintf("[flip   ]  PASS  %s\n", n); }
+    else   { g_flfail++; kprintf("[flip   ]  FAIL  %s\n", n); }
+}
+
+static void cmd_flip(void) {
+    kputs("-- DOUBLE-BUFFERED SURFACES: page flip vs tearing --\n");
+    g_flpass = g_flfail = 0;
+    int tt = -1;
+    int pt = uthread_spawn_elf("tear-test", PCAP_FRAMEBUFFER, 5, &tt);
+    if (pt < 0) { kputs("[flip   ] spawn failed\n-- done --\n"); return; }
+    uint64_t t0 = g_ticks;
+    while (!g_surf[5].used && g_ticks - t0 < 500) sched_yield();
+    struct surface *S = &g_surf[5];
+    flcheck("ring-3 thread created a double-buffered surface (front+back pair)",
+            S->used && S->bufpages == 4 && S->owner == pt);
+    flcheck("both buffers are user-mapped in the owner (and only 2*bufpages of them)",
+            access_ok(kprocs[pt].cr3, SURF_USER_V, (uint64_t)2 * S->bufpages * 0x1000, 1) &&
+            !access_ok(kprocs[pt].cr3, SURF_USER_V + (uint64_t)2 * S->bufpages * 0x1000, 0x1000, 1));
+    uint64_t phys0 = S->phys;
+
+    /* play compositor: consume 200 flips, scanning every published frame      */
+    g_canvas_live = 1;                 /* the app's flips now wait for us       */
+    preempt_enable();                  /* and it gets preempted mid-draw        */
+    int consumed = 0, torn = 0, alt_ok = 1, seenA = 0, seenB = 0;
+    uint32_t last = 0;
+    while (consumed < 200) {
+        t0 = g_ticks;
+        while (!S->flip_pending && g_ticks - t0 < 300) sched_yield();
+        if (!S->flip_pending) break;                   /* app died / stalled    */
+        S->front ^= 1; S->flip_pending = 0;            /* frame boundary        */
+        volatile uint32_t *fp = (volatile uint32_t *)surf_front_phys(S);
+        uint32_t c0 = fp[0] & 0xFFFFFF;
+        int mix = 0;
+        for (int i = 1; i < S->w * S->h; i++)
+            if ((fp[i] & 0xFFFFFF) != c0) { mix = 1; break; }
+        if (mix) torn++;
+        if (c0 == TEAR_COLOR_A) seenA++;
+        else if (c0 == TEAR_COLOR_B) seenB++;
+        else alt_ok = 0;                               /* junk frame            */
+        if (consumed > 0 && c0 == last) alt_ok = 0;    /* must strictly alternate */
+        last = c0;
+        consumed++;
+    }
+    preempt_disable();
+    g_canvas_live = 0;
+    kprintf("[flip   ] consumed %d published frames: %d torn, %d/%d color A/B\n",
+            (uint64_t)consumed, (uint64_t)torn, (uint64_t)seenA, (uint64_t)seenB);
+    flcheck("200 frames published through SYS_SURFACE_FLIP under preemption", consumed == 200);
+    flcheck("ZERO torn frames: every published front buffer is a COMPLETE frame", torn == 0);
+    flcheck("frames alternate strictly (each flip is exactly one finished frame)",
+            alt_ok && seenA + seenB == consumed && seenA >= 99);
+
+    /* lifecycle: the tear app exits after its 400 frames; the PAIR is reclaimed */
+    t0 = g_ticks;
+    while (!kprocs[pt].exited && g_ticks - t0 < 800) sched_yield();
+    flcheck("double buffer reclaimed as one chunk when the owner exits",
+            kprocs[pt].exited && !g_surf[5].used && g_surf_last_reclaim == phys0);
+
+    kprintf("[flip   ] RESULT: %d passed, %d failed\n", (uint64_t)g_flpass, (uint64_t)g_flfail);
+    if (!g_flfail) kputs("[flip   ] PAGE FLIP VERIFIED — the compositor can no longer observe a half-drawn frame\n");
+    else          kputs("[flip   ] FLIP DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 /* Hand a canvas window to an unprivileged process that renders its own pixels.
  * v0.31: the app is a FIRST-CLASS THREAD — spawned, not entered. It creates
  * its surface and then loops (poll events -> render -> yield) forever,
@@ -5288,10 +5463,11 @@ static void cmd_surfin(void) {
     struct surface *S = &g_surf[4];
     int hits = 0;
     for (int tries = 0; tries < 50 && !hits; tries++) {
-        sched_yield();
+        sched_yield();                     /* app self-consumes its parked flip  */
         hits = 0;
+        uint32_t *fp = (uint32_t *)surf_front_phys(S);   /* the PUBLISHED frame  */
         for (int i = 0; i < S->w * S->h; i++)
-            if ((((uint32_t *)S->phys)[i] & 0xFFFFFF) == APP_HIT_MARKER) hits++;
+            if ((fp[i] & 0xFFFFFF) == APP_HIT_MARKER) hits++;
     }
     kprintf("[surfin ] app repainted DURING the pass: %d hit-marker pixels (%X) in its surface\n",
             (uint64_t)hits, (uint64_t)APP_HIT_MARKER);
@@ -5331,6 +5507,7 @@ static void cmd_help(void) {
       "  capdma          capability-bound per-process DMA domains\n"
       "  nicdrv          hand the NIC to a ring-3 userspace driver\n"
       "  threads         first-class ring-3 scheduler threads suite\n"
+      "  flip            double-buffered surface page-flip / tearing suite\n"
       "  surface         spawn the ring-3 surface app as a live thread\n"
       "  surfin          route clicks to the live app in one canvas pass\n"
       "  canvas          Metropolis-Terminal spatial canvas (WASD/QE/TAB//)\n"
@@ -5403,6 +5580,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "surface")) cmd_surface();
     else if (!kstrcmp(argv[0], "surfin")) cmd_surfin();
     else if (!kstrcmp(argv[0], "threads")) cmd_threads();
+    else if (!kstrcmp(argv[0], "flip")) cmd_flip();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -5542,6 +5720,7 @@ void kernel_main(uint64_t mb_info) {
     cmd_gfx();
     cmd_surface();        /* spawns the surface app as a first-class thread     */
     cmd_threads();        /* v0.31: thread model verification suite             */
+    cmd_flip();           /* v0.32: double-buffer page-flip / tearing suite     */
     cmd_cursor();
     cmd_kinetic();
     cmd_canvas(300, "/zoom fit\n");
