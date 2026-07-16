@@ -1,0 +1,3 @@
+metal/build/
+metal/iso/boot/outrun-kernel.elf
+metal/iso/boot/user_init.elf
