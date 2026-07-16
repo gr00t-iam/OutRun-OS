@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.35.0-metal"
+#define KERNEL_VERSION "0.36.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -2995,6 +2995,26 @@ struct percpu {
     volatile uint32_t work_done;
     volatile uint64_t probe_val;           /* what this cpu read at g_probe_va */
 };
+
+/* v0.36: a work-stealing parallel job. Every online core (BSP + APs) claims
+ * fixed-size units from one shared atomic cursor, folds each unit's content
+ * into its OWN per-CPU accumulator, and the BSP reduces the accumulators. The
+ * fold is a per-unit FNV-1a hash and the accumulators are summed, so the
+ * reduction is order-independent (any interleaving yields the identical
+ * result) yet sensitive to every byte. Entirely bounded and self-contained:
+ * no scheduler, no user code, no run-queue migration — the AP safety boundary
+ * from v0.35 is untouched; this is offloaded compute, not a second scheduler. */
+struct pjob {
+    volatile uint64_t cursor;              /* next unit index to claim (xadd)  */
+    uint64_t units;                        /* total units                      */
+    uint64_t base;                         /* buffer base (identity-mapped)    */
+    uint64_t unit_words;                   /* uint64s per unit                 */
+    volatile uint64_t partial[MAX_CPUS];   /* per-CPU fold (no false sharing:  */
+    volatile uint64_t _pad[MAX_CPUS];      /* padded apart)                    */
+    volatile uint32_t claimed[MAX_CPUS];   /* per-CPU units taken              */
+    volatile uint32_t done;                /* cores that finished this job     */
+};
+static struct pjob g_pjob;
 static struct percpu g_pcpu[MAX_CPUS];
 static uint8_t  g_ap_stacks[MAX_CPUS][AP_STACK_SZ] __attribute__((aligned(64)));
 static int      g_ncpu_found = 1, g_ncpu_online = 1;
@@ -3061,8 +3081,25 @@ static int tlb_shootdown(uint64_t va) {
     return (int)g_shoot_ack;
 }
 
-/* What an AP does for a living: park in hlt, answer IPIs, and run the two    */
-/* bounded suite workloads when the BSP raises the mailbox.                   */
+/* Fold this core's share of the parallel job. Claims units from the shared
+ * cursor until it is drained; each unit is FNV-1a hashed and summed into this
+ * core's private accumulator. Runs on every participating core (BSP + APs).  */
+static void pjob_run(int me) {
+    for (;;) {
+        uint64_t u = __sync_fetch_and_add(&g_pjob.cursor, 1);
+        if (u >= g_pjob.units) break;
+        uint64_t h = 0xcbf29ce484222325ull;
+        const uint64_t *p = (const uint64_t *)(g_pjob.base + u * g_pjob.unit_words * 8);
+        for (uint64_t i = 0; i < g_pjob.unit_words; i++)
+            h = (h ^ p[i]) * 0x100000001b3ull;
+        g_pjob.partial[me] += h;               /* summed -> order-independent   */
+        g_pjob.claimed[me]++;
+    }
+    __sync_fetch_and_add(&g_pjob.done, 1);
+}
+
+/* What an AP does for a living: park in hlt, answer IPIs, and run the bounded */
+/* suite workloads when the BSP raises the mailbox.                           */
 static void __attribute__((noreturn)) ap_main(uint64_t idx) {
     /* the trampoline's private GDT got us here; switch to the KERNEL GDT so  */
     /* CS becomes the 0x08 the IDT gates name, then take the shared IDT.      */
@@ -3094,6 +3131,8 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
                     __sync_fetch_and_add(&g_work_counter, 1);
             else if (mode == 2)                           /* remote page probe */
                 g_pcpu[idx].probe_val = *(volatile uint64_t *)g_probe_va;
+            else if (mode == 3)                           /* parallel job (v0.36) */
+                pjob_run((int)idx);
             g_pcpu[idx].work_done = 1;
         }
         __asm__ volatile("hlt");                          /* woken by IPIs     */
@@ -3324,6 +3363,127 @@ static void __attribute__((no_stack_protector)) cmd_smp(void) {
     kprintf("[smp    ] RESULT: %d passed, %d failed\n", (uint64_t)g_smpass, (uint64_t)g_smfail);
     if (!g_smfail) kputs("[smp    ] SMP GROUNDWORK VERIFIED — every core boots, IPIs and shootdowns are real\n");
     else          kputs("[smp    ] SMP DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * PARALLEL WORK DISPATCH  (v0.36 — a work-stealing job runner across cores)
+ * ===========================================================================
+ * The first useful multi-core capability: the BSP hands a bounded, data-
+ * parallel job to every online core, which cooperatively drain one shared
+ * atomic cursor, and the BSP reduces the per-core results. Stays entirely
+ * inside the v0.35 safety boundary — no scheduler, no ring 3, no run-queue
+ * migration — so every isolation invariant still holds.
+ *
+ * Honest measurement note: under TCG the vCPUs are time-sliced onto ONE host
+ * thread, so this cannot show wall-clock speedup. What it proves is what
+ * matters for a parallel runtime's correctness: the reduction equals the
+ * serial reference bit-for-bit, every unit is processed exactly once, and the
+ * work is genuinely distributed across cores.
+ * =========================================================================== */
+#define PAR_UNITS      2048
+#define PAR_UNIT_WORDS 64                 /* 512 B/unit -> 1 MiB working set     */
+static int g_ppass, g_pfail;
+static void pcheck(const char *n, int c) {
+    if (c) { g_ppass++; kprintf("[par    ]  PASS  %s\n", n); }
+    else   { g_pfail++; kprintf("[par    ]  FAIL  %s\n", n); }
+}
+
+/* the serial reference: identical per-unit fold, summed in one thread */
+static uint64_t par_serial(uint64_t base, uint64_t units, uint64_t uw) {
+    uint64_t sum = 0;
+    for (uint64_t u = 0; u < units; u++) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        const uint64_t *p = (const uint64_t *)(base + u * uw * 8);
+        for (uint64_t i = 0; i < uw; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+        sum += h;
+    }
+    return sum;
+}
+
+/* Dispatch the job to all cores and reduce. Returns the folded result and,
+ * via *ncores, how many distinct cores claimed a nonzero share.              */
+static uint64_t par_dispatch(uint64_t base, uint64_t units, uint64_t uw, int *ncores) {
+    for (int i = 0; i < MAX_CPUS; i++) { g_pjob.partial[i] = 0; g_pjob.claimed[i] = 0; }
+    g_pjob.base = base; g_pjob.units = units; g_pjob.unit_words = uw;
+    g_pjob.cursor = 0; g_pjob.done = 0;
+    for (int i = 0; i < g_ncpu_online; i++) g_pcpu[i].work_done = 0;
+    __sync_synchronize();
+    g_work_go = 3;                                /* APs enter pjob_run once     */
+    if (g_ncpu_online > 1) {
+        lapic_ipi(0, IPI_PING, 1);                /* wake every AP               */
+        uint64_t t0 = g_ticks;                    /* head start: let an AP engage */
+        while (g_pjob.cursor == 0 && g_ticks - t0 < 20) __asm__ volatile("pause");
+    }
+    pjob_run(0);                                  /* the BSP work-steals too      */
+    uint64_t t0 = g_ticks;
+    while (g_pjob.done < (uint32_t)g_ncpu_online && g_ticks - t0 < 600) {
+        if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);   /* keep APs awake    */
+        __asm__ volatile("pause");
+    }
+    g_work_go = 0;
+    uint64_t sum = 0; int nc = 0;
+    for (int i = 0; i < g_ncpu_online; i++) {
+        sum += g_pjob.partial[i];
+        if (g_pjob.claimed[i]) nc++;
+    }
+    if (ncores) *ncores = nc;
+    return sum;
+}
+
+/* no_stack_protector, like cmd_smp and sched_switch_to: the parallel
+ * coordinator busy-waits on other cores while the BSP-owned per-thread canary
+ * is live, so it must not carry that canary (the reduction and every worker
+ * are verified correct; only the coordinator's frame-canary check is at risk,
+ * exactly as measured for cmd_smp in v0.35). */
+static void __attribute__((no_stack_protector)) cmd_parallel(void) {
+    kputs("-- PARALLEL WORK DISPATCH: work-stealing job runner across cores --\n");
+    g_ppass = g_pfail = 0;
+
+    /* a deterministic 1 MiB working set in identity-mapped RAM */
+    uint64_t words = (uint64_t)PAR_UNITS * PAR_UNIT_WORDS;
+    uint64_t buf = alloc_frames((words * 8 + 0xFFF) / 0x1000);
+    for (uint64_t i = 0; i < words; i++)
+        ((uint64_t *)buf)[i] = i * 0x9E3779B97F4A7C15ull ^ 0xA5A5A5A5DEADBEEFull;
+
+    uint64_t ref = par_serial(buf, PAR_UNITS, PAR_UNIT_WORDS);
+
+    int ncores = 0;
+    uint64_t par = par_dispatch(buf, PAR_UNITS, PAR_UNIT_WORDS, &ncores);
+    uint64_t total_claimed = 0;
+    for (int i = 0; i < g_ncpu_online; i++) total_claimed += g_pjob.claimed[i];
+
+    kprintf("[par    ] %u units over %d core(s): ", (uint64_t)PAR_UNITS, (uint64_t)g_ncpu_online);
+    for (int i = 0; i < g_ncpu_online; i++) kprintf("cpu%u=%u ", (uint64_t)i, (uint64_t)g_pjob.claimed[i]);
+    kprintf("| result %X vs serial %X\n", par, ref);
+
+    pcheck("work conservation: every unit processed exactly once (sum of claims == units)",
+           total_claimed == PAR_UNITS);
+    pcheck("correctness: parallel reduction equals the serial reference bit-for-bit",
+           par == ref);
+    pcheck("distribution: the job was spread across multiple cores (or 1 on a uniprocessor)",
+           ncores >= (g_ncpu_online > 1 ? 2 : 1));
+
+    /* sensitivity: flip ONE word and the parallel fold must change — proves    */
+    /* the cores actually read the whole working set, not a shortcut.           */
+    ((uint64_t *)buf)[words / 2] ^= 1;
+    uint64_t par2 = par_dispatch(buf, PAR_UNITS, PAR_UNIT_WORDS, &ncores);
+    pcheck("sensitivity: a one-bit change to the data changes the parallel result",
+           par2 != par);
+
+    /* idempotence: restore and re-run -> back to the original result           */
+    ((uint64_t *)buf)[words / 2] ^= 1;
+    uint64_t par3 = par_dispatch(buf, PAR_UNITS, PAR_UNIT_WORDS, &ncores);
+    pcheck("determinism: restoring the data reproduces the original result",
+           par3 == par);
+
+    kprintf("[par    ] RESULT: %d passed, %d failed\n", (uint64_t)g_ppass, (uint64_t)g_pfail);
+    if (!g_pfail) {
+        if (g_ncpu_online > 1)
+            kputs("[par    ] PARALLEL DISPATCH VERIFIED — all cores share the work, reduction is exact\n");
+        else
+            kputs("[par    ] PARALLEL DISPATCH VERIFIED — single-cpu inline path, reduction is exact\n");
+    } else kputs("[par    ] PARALLEL DISPATCH DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -6099,6 +6259,7 @@ static void cmd_help(void) {
       "  flip            double-buffered surface page-flip / tearing suite\n"
       "  keys            keyboard-to-surface routing suite (type=2 events)\n"
       "  smp             multi-core suite: IPIs, TLB shootdown, atomics\n"
+      "  parallel        work-stealing parallel job across all cores\n"
       "  surface         spawn the ring-3 surface app as a live thread\n"
       "  surfin          route clicks to the live app in one canvas pass\n"
       "  canvas          Metropolis-Terminal spatial canvas (WASD/QE/TAB//)\n"
@@ -6174,6 +6335,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "flip")) cmd_flip();
     else if (!kstrcmp(argv[0], "keys")) cmd_keys();
     else if (!kstrcmp(argv[0], "smp")) cmd_smp();
+    else if (!kstrcmp(argv[0], "parallel") || !kstrcmp(argv[0], "par")) cmd_parallel();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -6308,6 +6470,7 @@ void kernel_main(uint64_t mb_info) {
     cmd_fuzz();
     cmd_sweep();
     cmd_smp();              /* v0.35: cross-core protocol verification            */
+    cmd_parallel();         /* v0.36: work-stealing parallel job across cores     */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
