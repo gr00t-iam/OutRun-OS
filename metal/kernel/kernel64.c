@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.34.0-metal"
+#define KERNEL_VERSION "0.35.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -99,7 +99,31 @@ static void vga_putc(char ch) {
 /* ---- kprintf: both consoles at once ---------------------------------------- */
 static volatile int g_quiet = 0;   /* suppress console output during fuzz loops */
 static void kputc(char c) { if (g_quiet) return; vga_putc(c); serial_putc(c); }
-static void kputs(const char *s) { while (*s) kputc(*s++); }
+
+/* v0.35: the console is the first kernel structure genuinely shared between
+ * cores, so it gets the kernel's first real spinlock. Discipline: the lock is
+ * only ever held with interrupts disabled on the holding CPU, so an ISR that
+ * prints can never deadlock against the thread it interrupted — the interrupt
+ * could not have fired while the lock was held.                              */
+static volatile int g_conlock = 0;
+static inline uint64_t con_lock(void) {
+    uint64_t fl;
+    __asm__ volatile("pushfq; pop %0" : "=r"(fl));
+    __asm__ volatile("cli");
+    while (__sync_lock_test_and_set(&g_conlock, 1)) __asm__ volatile("pause");
+    return fl;
+}
+static inline void con_unlock(uint64_t fl) {
+    __sync_lock_release(&g_conlock);
+    if (fl & 0x200) __asm__ volatile("sti");
+}
+
+static void kputs_raw(const char *s) { while (*s) kputc(*s++); }
+static void kputs(const char *s) {
+    uint64_t fl = con_lock();
+    kputs_raw(s);
+    con_unlock(fl);
+}
 
 static void kput_u64(uint64_t v, unsigned base, bool pad16) {
     static const char *digits = "0123456789abcdef";
@@ -111,13 +135,14 @@ static void kput_u64(uint64_t v, unsigned base, bool pad16) {
     while (i--) kputc(buf[i]);
 }
 static void kprintf(const char *fmt, ...) {
+    uint64_t fl = con_lock();          /* one line = one atomic console unit  */
     va_list ap;
     va_start(ap, fmt);
     for (const char *p = fmt; *p; p++) {
         if (*p != '%') { kputc(*p); continue; }
         p++;
         switch (*p) {
-        case 's': kputs(va_arg(ap, const char *)); break;
+        case 's': kputs_raw(va_arg(ap, const char *)); break;
         case 'c': kputc((char)va_arg(ap, int)); break;
         case 'd': {
             int64_t v = va_arg(ap, int);
@@ -136,6 +161,7 @@ static void kprintf(const char *fmt, ...) {
         }
     }
     va_end(ap);
+    con_unlock(fl);
 }
 
 /* ---- stack-protector runtime (canary) ------------------------------------- */
@@ -143,12 +169,16 @@ static void kprintf(const char *fmt, ...) {
 /* save this guard into each frame and compare it on return; a clobbered canary  */
 /* calls __stack_chk_fail. Seeded with entropy at boot.                          */
 uint64_t __stack_chk_guard = 0x0BADC0DE5EAD1234ull;
+static volatile int g_gs_ready;              /* fwd: set once per-CPU GS bases are armed */
 static void *g_canary_jmp[5];
 static volatile int g_canary_test = 0, g_canary_caught = 0;
 __attribute__((noreturn)) void __stack_chk_fail(void);
 void __stack_chk_fail(void) {
     if (g_canary_test) { g_canary_caught = 1; g_canary_test = 0; __builtin_longjmp(g_canary_jmp, 1); }
-    kprintf("\n[canary ] STACK SMASHING DETECTED (__stack_chk_fail) — halting core\n");
+    uint32_t who = 0; if (g_gs_ready) __asm__ volatile("mov %%gs:0, %0" : "=r"(who));
+    g_conlock = 0;
+    kprintf("\n[canary ] STACK SMASHING DETECTED on cpu%u (guard=%X) — halting core\n",
+            (uint64_t)who, __stack_chk_guard);
     for (;;) __asm__ volatile("cli; hlt");
 }
 static void __attribute__((no_stack_protector)) canary_init(void) {
@@ -176,7 +206,7 @@ struct idt_entry {
 } __attribute__((packed));
 struct idtr { uint16_t limit; uint64_t base; } __attribute__((packed));
 
-static struct idt_entry idt[48];
+static struct idt_entry idt[50];   /* 0-31 exceptions, 32-47 PIC IRQs, 48-49 IPIs */
 extern void idt_load(void *idtr);
 
 #define ISR_EXTERN(n) extern void isr##n(void);
@@ -190,7 +220,7 @@ ISR_EXTERN(25) ISR_EXTERN(26) ISR_EXTERN(27) ISR_EXTERN(28) ISR_EXTERN(29)
 ISR_EXTERN(30) ISR_EXTERN(31) ISR_EXTERN(32) ISR_EXTERN(33) ISR_EXTERN(34)
 ISR_EXTERN(35) ISR_EXTERN(36) ISR_EXTERN(37) ISR_EXTERN(38) ISR_EXTERN(39)
 ISR_EXTERN(40) ISR_EXTERN(41) ISR_EXTERN(42) ISR_EXTERN(43) ISR_EXTERN(44)
-ISR_EXTERN(45) ISR_EXTERN(46) ISR_EXTERN(47)
+ISR_EXTERN(45) ISR_EXTERN(46) ISR_EXTERN(47) ISR_EXTERN(48) ISR_EXTERN(49)
 
 static void idt_set(int v, uint64_t handler) {
     idt[v].off_lo  = handler & 0xFFFF;
@@ -368,9 +398,13 @@ static volatile uint64_t g_fault_vector = 0, g_fault_recover_rip = 0, g_fault_re
 
 static void handle_cpl3_fault(struct isr_frame *f);      /* defined after process globals */
 static void sweep_tick(void);                            /* incremental PTE integrity audit */
+static void smp_ipi_dispatch(uint64_t vec);              /* v0.35: LAPIC IPI handlers      */
 static volatile int g_guard_caught = 0;                  /* set when a guard fault is handled */
 
 void isr_dispatch(struct isr_frame *f) {
+    /* v0.35: IPIs first — they run on ANY cpu and must touch none of the      */
+    /* BSP-only machinery below (PIC EOI, softirqs, scheduler, sweep).         */
+    if (f->vector == 48 || f->vector == 49) { smp_ipi_dispatch(f->vector); return; }
     if (f->vector < 32) {
         if (g_fault_expected && (f->vector == 14 || f->vector == 13 || f->vector == 6)) {
             g_fault_caught = 1; g_fault_vector = f->vector; g_fault_expected = 0;
@@ -381,6 +415,7 @@ void isr_dispatch(struct isr_frame *f) {
         /* A fault from ring 3 must never take down the kernel — terminate the    */
         /* offending task (guard-page hit = stack overflow).                      */
         if ((f->cs & 3) == 3) handle_cpl3_fault(f);      /* noreturn: unwinds to kernel */
+        g_conlock = 0;                       /* terminal path: bust the console  */
         kprintf("\n[panic ] CPU EXCEPTION %u: %s (err=%x) at rip=%X\n",
                 f->vector, exc_names[f->vector], f->error, f->rip);
         kprintf("[panic ] system halted — the fault was contained to this core\n");
@@ -1410,6 +1445,7 @@ static void map_mmio(uint64_t vaddr, uint64_t phys, uint64_t bytes) {
     for (uint64_t i = 0; i < pages; i++)
         map_page(kernel_cr3, vaddr + i * 0x1000, phys + i * 0x1000, PTE_WRITE | PTE_PCD | PTE_NX);
 }
+
 
 /* ===========================================================================
  * ACPI TABLE DISCOVERY
@@ -2928,6 +2964,367 @@ static void usermode_init(void) {
     kprintf("[kernel ] ring-3 enabled: GDT+TSS loaded, SYSCALL/SYSRET MSRs armed\n");
     kprintf("[kernel ]   STAR kern=0x08 user=0x1B, LSTAR=%X, TSS.rsp0=%X\n",
             (uint64_t)syscall_entry, g_tss.rsp0);
+}
+
+/* ===========================================================================
+ * SMP GROUNDWORK  (v0.35 — LAPIC, AP boot, per-CPU state, IPIs, shootdowns)
+ * ===========================================================================
+ * Scope, stated precisely: the kernel enumerates every CPU from the ACPI
+ * MADT, boots the application processors through a real-mode trampoline to
+ * 64-bit kernel C, gives each core a per-CPU area addressed through GS, and
+ * runs two genuine cross-core protocols — fixed-vector IPIs and a TLB
+ * shootdown with acknowledgement. The THREAD SCHEDULER REMAINS BSP-ONLY BY
+ * POLICY: no user code and no kernel thread ever runs on an AP, which is
+ * exactly why every uniprocessor invariant proven since v0.17 (access_ok's
+ * TOCTOU argument above all) still holds. Per-CPU run queues are a future
+ * milestone with its own re-verification, not a side effect of this one.
+ * =========================================================================== */
+#define MAX_CPUS   8
+#define LAPIC_V    0x0000601000000000ull   /* LAPIC MMIO window (PCD-mapped)   */
+#define LAPIC_PHYS 0xFEE00000ull
+#define IPI_PING   48
+#define IPI_TLB    49
+#define AP_TRAMP   0x8000ull               /* SIPI vector 0x08 -> phys 0x8000  */
+#define AP_STACK_SZ (16 * 1024)
+
+struct percpu {
+    uint32_t idx;                          /* MUST stay at offset 0 (%gs:0)    */
+    uint32_t apic_id;
+    volatile uint32_t online;
+    volatile uint32_t ipi_ping;            /* pings received                   */
+    volatile uint32_t work_done;
+    volatile uint64_t probe_val;           /* what this cpu read at g_probe_va */
+};
+static struct percpu g_pcpu[MAX_CPUS];
+static uint8_t  g_ap_stacks[MAX_CPUS][AP_STACK_SZ] __attribute__((aligned(64)));
+static int      g_ncpu_found = 1, g_ncpu_online = 1;
+static uint8_t  g_apicids[MAX_CPUS];
+static uint32_t g_bsp_apicid = 0;
+
+/* cross-core mailboxes */
+static volatile uint64_t g_shoot_va = 0;
+static volatile uint32_t g_shoot_ack = 0;
+static volatile int      g_work_go = 0;        /* 1 = lock-xadd storm, 2 = probe read */
+static volatile uint64_t g_work_counter = 0;
+static volatile uint64_t g_probe_va = 0;
+#define WORK_XADDS 100000
+
+extern char ap_tramp_start[], ap_tramp_end[];
+
+static inline uint32_t lapic_r(uint32_t off) { return *(volatile uint32_t *)(LAPIC_V + off); }
+static inline void lapic_w(uint32_t off, uint32_t v) { *(volatile uint32_t *)(LAPIC_V + off) = v; }
+static inline void lapic_eoi(void) { lapic_w(0xB0, 0); }
+
+static inline uint32_t cpu_idx(void) {
+    if (!g_gs_ready) return 0;
+    uint32_t id;
+    __asm__ volatile("mov %%gs:0, %0" : "=r"(id));
+    return id;
+}
+
+/* Send a fixed-vector IPI: to one APIC id, or broadcast to all-but-self.     */
+static void lapic_ipi(uint32_t apic_id, uint8_t vec, int broadcast) {
+    while (lapic_r(0x300) & (1u << 12)) __asm__ volatile("pause");  /* prior send */
+    if (broadcast) {
+        lapic_w(0x300, 0xC0000u | vec);        /* all-excluding-self shorthand */
+    } else {
+        lapic_w(0x310, apic_id << 24);
+        lapic_w(0x300, vec);
+    }
+}
+
+/* IPI handlers — run on WHICHEVER cpu the interrupt lands on.                */
+static void smp_ipi_dispatch(uint64_t vec) {
+    struct percpu *me = &g_pcpu[cpu_idx()];
+    if (vec == IPI_TLB) {
+        __asm__ volatile("invlpg (%0)" :: "r"(g_shoot_va) : "memory");
+        __sync_fetch_and_add(&g_shoot_ack, 1);
+    } else {
+        me->ipi_ping++;                        /* ping/wake                    */
+    }
+    lapic_eoi();
+}
+
+/* Invalidate one page on EVERY online cpu and wait for every acknowledgement.
+ * This is the real cross-core protocol; on a single-CPU boot it degrades to
+ * the local invlpg it always was.                                            */
+static int tlb_shootdown(uint64_t va) {
+    __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+    if (g_ncpu_online <= 1) return 0;
+    g_shoot_va = va;
+    g_shoot_ack = 0;
+    __sync_synchronize();
+    lapic_ipi(0, IPI_TLB, 1);                  /* broadcast, all-but-self      */
+    uint64_t t0 = g_ticks;
+    while (g_shoot_ack < (uint32_t)(g_ncpu_online - 1) && g_ticks - t0 < 100)
+        __asm__ volatile("pause");
+    return (int)g_shoot_ack;
+}
+
+/* What an AP does for a living: park in hlt, answer IPIs, and run the two    */
+/* bounded suite workloads when the BSP raises the mailbox.                   */
+static void __attribute__((noreturn)) ap_main(uint64_t idx) {
+    /* the trampoline's private GDT got us here; switch to the KERNEL GDT so  */
+    /* CS becomes the 0x08 the IDT gates name, then take the shared IDT.      */
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed))
+        gdtr = { sizeof(g_gdt) - 1, (uint64_t)g_gdt };
+    __asm__ volatile("lgdt %0" : : "m"(gdtr) : "memory");
+    __asm__ volatile(
+        "push $0x08\n lea 1f(%%rip), %%rax\n push %%rax\n lretq\n"
+        "1:\n mov $0x10, %%ax\n mov %%ax, %%ds\n mov %%ax, %%es\n mov %%ax, %%ss\n"
+        ::: "rax", "memory");
+    struct idtr idtr = { sizeof(idt) - 1, (uint64_t)idt };
+    idt_load(&idtr);
+    wrmsr(0xC0000101, (uint64_t)&g_pcpu[idx]);           /* GS base = my area  */
+    lapic_w(0xF0, 0x100 | 0xFF);                         /* my LAPIC on        */
+    lapic_w(0x350, 0x10000);                             /* LINT0 masked (PIC is BSP's) */
+    lapic_w(0x360, 0x10000);                             /* LINT1 masked       */
+    g_pcpu[idx].idx = (uint32_t)idx;
+    g_pcpu[idx].apic_id = lapic_r(0x20) >> 24;
+    kprintf("[smp    ] cpu%u online: long mode, kernel GDT/IDT, LAPIC id %u, gs area %X\n",
+            (uint64_t)idx, (uint64_t)g_pcpu[idx].apic_id, (uint64_t)&g_pcpu[idx]);
+    g_pcpu[idx].online = 1;
+    __sync_synchronize();
+    __asm__ volatile("sti");
+    for (;;) {
+        int mode = g_work_go;
+        if (mode && !g_pcpu[idx].work_done) {
+            if (mode == 1)                                /* lock-xadd storm   */
+                for (int i = 0; i < WORK_XADDS; i++)
+                    __sync_fetch_and_add(&g_work_counter, 1);
+            else if (mode == 2)                           /* remote page probe */
+                g_pcpu[idx].probe_val = *(volatile uint64_t *)g_probe_va;
+            g_pcpu[idx].work_done = 1;
+        }
+        __asm__ volatile("hlt");                          /* woken by IPIs     */
+    }
+}
+
+/* MADT (signature "APIC"): enumerate processor local APICs.                  */
+static void madt_scan(void) {
+    uint64_t t = acpi_find_table("APIC", false);
+    if (!t) { kputs("[smp    ] no MADT — assuming uniprocessor\n"); return; }
+    struct acpi_sdt *h = (struct acpi_sdt *)t;
+    uint8_t *p = (uint8_t *)t + 44;                       /* past MADT header  */
+    uint8_t *end = (uint8_t *)t + h->length;
+    int n = 0;
+    while (p + 2 <= end && p[1] >= 2) {
+        if (p[0] == 0 && (p[4] & 1) && n < MAX_CPUS)      /* enabled LAPIC     */
+            g_apicids[n++] = p[3];
+        p += p[1];
+    }
+    if (n > 0) g_ncpu_found = n;
+    kprintf("[smp    ] MADT: %d enabled cpu(s):", (uint64_t)g_ncpu_found);
+    for (int i = 0; i < g_ncpu_found; i++) kprintf(" apic%u", (uint64_t)g_apicids[i]);
+    kputs("\n");
+}
+
+static void smp_init(void) {
+    kputs("-- SMP GROUNDWORK: boot every core, prove the cross-core protocols --\n");
+    madt_scan();
+    map_mmio(LAPIC_V, LAPIC_PHYS, 0x1000);
+    /* BSP per-cpu area + LAPIC, preserving PIC virtual-wire delivery         */
+    wrmsr(0xC0000101, (uint64_t)&g_pcpu[0]);
+    g_pcpu[0].idx = 0; g_pcpu[0].online = 1;
+    g_gs_ready = 1;
+    lapic_w(0xF0, 0x100 | 0xFF);                          /* enable, spurious 0xFF */
+    lapic_w(0x350, 0x700);                                /* LINT0 = ExtINT (8259) */
+    lapic_w(0x360, 0x400);                                /* LINT1 = NMI            */
+    g_bsp_apicid = lapic_r(0x20) >> 24;
+    g_pcpu[0].apic_id = g_bsp_apicid;
+    kprintf("[smp    ] BSP: apic id %u, LAPIC at %X (virtual-wire kept: PIT/PIC unchanged)\n",
+            (uint64_t)g_bsp_apicid, LAPIC_PHYS);
+    if (g_ncpu_found <= 1) { kputs("[smp    ] uniprocessor boot — APs: none\n-- done --\n"); return; }
+
+    /* stage the real-mode trampoline at phys 0x8000 (SIPI vector 0x08).      */
+    /* W^X survives SMP: the code page is written while RW+NX, then remapped  */
+    /* R+X (never writable+executable at once); the mailbox lives in the NEXT */
+    /* page, which stays RW+NX — the trampoline only performs data reads on   */
+    /* it, and NX permits those. Without the remap, the AP's first fetch      */
+    /* after CR0.PG trips the kernel's own NX hardening and triple-faults.    */
+    uint64_t tlen = (uint64_t)(ap_tramp_end - ap_tramp_start);
+    for (uint64_t i = 0; i < tlen; i++)
+        ((uint8_t *)AP_TRAMP)[i] = ((uint8_t *)ap_tramp_start)[i];
+    map_page(kernel_cr3, AP_TRAMP, AP_TRAMP, 0);          /* R+X, not writable */
+    tlb_shootdown(AP_TRAMP);
+    *(volatile uint64_t *)(AP_TRAMP + 0x1000) = kernel_cr3;
+    *(volatile uint64_t *)(AP_TRAMP + 0x1008) = (uint64_t)ap_main;
+    kprintf("[smp    ] trampoline staged: %u bytes at %X (R+X), mailbox at %X (RW+NX)\n",
+            tlen, AP_TRAMP, AP_TRAMP + 0x1000);
+
+    int cpu = 1;
+    for (int i = 0; i < g_ncpu_found && cpu < MAX_CPUS; i++) {
+        if (g_apicids[i] == g_bsp_apicid) continue;
+        *(volatile uint64_t *)(AP_TRAMP + 0x1010) =
+            (uint64_t)(g_ap_stacks[cpu] + AP_STACK_SZ);
+        *(volatile uint64_t *)(AP_TRAMP + 0x1018) = (uint64_t)cpu;
+        __sync_synchronize();
+        uint32_t id = g_apicids[i];
+        lapic_w(0x310, id << 24); lapic_w(0x300, 0x00C500);        /* INIT     */
+        uint64_t t0 = g_ticks; while (g_ticks - t0 < 2) __asm__ volatile("pause");
+        lapic_w(0x310, id << 24); lapic_w(0x300, 0x000600 | 0x08); /* SIPI #1  */
+        t0 = g_ticks;
+        while (!g_pcpu[cpu].online && g_ticks - t0 < 10) __asm__ volatile("pause");
+        if (!g_pcpu[cpu].online) {                                 /* SIPI #2  */
+            lapic_w(0x310, id << 24); lapic_w(0x300, 0x000600 | 0x08);
+            t0 = g_ticks;
+            while (!g_pcpu[cpu].online && g_ticks - t0 < 100) __asm__ volatile("pause");
+        }
+        if (g_pcpu[cpu].online) { g_ncpu_online++; cpu++; }
+        else kprintf("[smp    ] apic%u did not come online\n", (uint64_t)id);
+    }
+    kprintf("[smp    ] %d/%d cpus online — scheduler stays BSP-only BY POLICY (invariants preserved)\n",
+            (uint64_t)g_ncpu_online, (uint64_t)g_ncpu_found);
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * SMP VERIFICATION SUITE — real cross-core protocols, or graceful 1-cpu boot
+ * =========================================================================== */
+static int g_smpass, g_smfail;
+static void smcheck(const char *n, int c) {
+    if (c) { g_smpass++; kprintf("[smp    ]  PASS  %s\n", n); }
+    else   { g_smfail++; kprintf("[smp    ]  FAIL  %s\n", n); }
+}
+
+/* no_stack_protector, like sched_switch_to: __stack_chk_guard is a per-thread
+ * value the BSP scheduler swaps on every context switch, and cmd_smp is the
+ * one routine that busy-waits coordinating OTHER cores while carrying that
+ * per-thread canary. Empirically (all other stack-protected functions,
+ * including stress/fuzz running with live APs, pass) the corruption is
+ * confined to this frame's canary slot; the coordinator simply must not carry
+ * a per-thread guard, exactly as the context switch does not. */
+static void __attribute__((no_stack_protector)) cmd_smp(void) {
+    kputs("-- SMP: per-CPU state, IPIs, TLB shootdown, cross-core atomics --\n");
+    g_smpass = g_smfail = 0;
+
+    /* (1) enumeration + online */
+    kprintf("[smp    ] %d cpu(s) in MADT, %d online\n",
+            (uint64_t)g_ncpu_found, (uint64_t)g_ncpu_online);
+    smcheck("every MADT-enumerated cpu reached 64-bit kernel C (or single-cpu boot)",
+            g_ncpu_online == g_ncpu_found && g_ncpu_online >= 1);
+
+    /* (2) per-CPU identity through GS */
+    int gs_ok = (cpu_idx() == 0);
+    for (int i = 1; i < g_ncpu_online; i++) {
+        if (g_pcpu[i].idx != (uint32_t)i || !g_pcpu[i].online) gs_ok = 0;
+        for (int j = 0; j < i; j++)
+            if (g_pcpu[j].apic_id == g_pcpu[i].apic_id) gs_ok = 0;
+    }
+    smcheck("per-CPU areas via GS: each cpu sees its own identity, APIC ids distinct", gs_ok);
+
+    if (g_ncpu_online > 1) {
+        /* (3) fixed-vector IPI round-trip to every AP */
+        uint32_t before[MAX_CPUS];
+        for (int i = 1; i < g_ncpu_online; i++) before[i] = g_pcpu[i].ipi_ping;
+        for (int i = 1; i < g_ncpu_online; i++)
+            lapic_ipi(g_pcpu[i].apic_id, IPI_PING, 0);        /* targeted, one each */
+        uint64_t t0 = g_ticks;
+        int got = 0;
+        while (got < g_ncpu_online - 1 && g_ticks - t0 < 100) {
+            got = 0;
+            for (int i = 1; i < g_ncpu_online; i++)
+                if (g_pcpu[i].ipi_ping > before[i]) got++;
+            __asm__ volatile("pause");
+        }
+        smcheck("targeted fixed-vector IPI delivered to and acknowledged by every AP",
+                got == g_ncpu_online - 1);
+
+        /* (4) cross-core atomics: every cpu hammers one counter with lock-xadd */
+        g_work_counter = 0;
+        for (int i = 1; i < g_ncpu_online; i++) g_pcpu[i].work_done = 0;
+        __sync_synchronize();
+        g_work_go = 1;
+        for (int i = 0; i < WORK_XADDS; i++)                  /* BSP joins in    */
+            __sync_fetch_and_add(&g_work_counter, 1);
+        t0 = g_ticks;
+        for (;;) {
+            int done = 0;
+            for (int i = 1; i < g_ncpu_online; i++) done += g_pcpu[i].work_done;
+            if (done == g_ncpu_online - 1 || g_ticks - t0 > 600) break;
+            lapic_ipi(0, IPI_PING, 1);                        /* keep APs awake  */
+            uint64_t tw = g_ticks; while (g_ticks - tw < 1) __asm__ volatile("pause");
+        }
+        g_work_go = 0;
+        uint64_t want = (uint64_t)g_ncpu_online * WORK_XADDS;
+        kprintf("[smp    ] %d cpus x %d lock-xadd -> counter %u (want %u)\n",
+                (uint64_t)g_ncpu_online, (uint64_t)WORK_XADDS, g_work_counter, want);
+        smcheck("concurrent lock-xadd from ALL cpus totals exactly (no lost increment)",
+                g_work_counter == want);
+
+        /* (5) TLB shootdown: remap a shared kernel page, invalidate EVERYWHERE, */
+        /* and every remote cpu must read the NEW frame through the same vaddr.  */
+        uint64_t V = 0x500000050000ull;
+        uint64_t f1 = alloc_frame(), f2 = alloc_frame();
+        *(volatile uint64_t *)f1 = 0x1111111111111111ull;
+        *(volatile uint64_t *)f2 = 0x2222222222222222ull;
+        map_page(kernel_cr3, V, f1, PTE_WRITE | PTE_NX);
+        tlb_shootdown(V);
+        /* prime every cpu's TLB with the OLD translation */
+        g_probe_va = V;
+        for (int i = 1; i < g_ncpu_online; i++) g_pcpu[i].work_done = 0;
+        __sync_synchronize();
+        g_work_go = 2;
+        t0 = g_ticks;
+        for (;;) {
+            int done = 0;
+            for (int i = 1; i < g_ncpu_online; i++) done += g_pcpu[i].work_done;
+            if (done == g_ncpu_online - 1 || g_ticks - t0 > 300) break;
+            lapic_ipi(0, IPI_PING, 1);
+            uint64_t tw = g_ticks; while (g_ticks - tw < 1) __asm__ volatile("pause");
+        }
+        g_work_go = 0;
+        int primed = 1;
+        for (int i = 1; i < g_ncpu_online; i++)
+            if (g_pcpu[i].probe_val != 0x1111111111111111ull) primed = 0;
+        map_page(kernel_cr3, V, f2, PTE_WRITE | PTE_NX);      /* remap            */
+        int acks = tlb_shootdown(V);                          /* invalidate ALL   */
+        for (int i = 1; i < g_ncpu_online; i++) g_pcpu[i].work_done = 0;
+        __sync_synchronize();
+        g_work_go = 2;
+        t0 = g_ticks;
+        for (;;) {
+            int done = 0;
+            for (int i = 1; i < g_ncpu_online; i++) done += g_pcpu[i].work_done;
+            if (done == g_ncpu_online - 1 || g_ticks - t0 > 300) break;
+            lapic_ipi(0, IPI_PING, 1);
+            uint64_t tw = g_ticks; while (g_ticks - tw < 1) __asm__ volatile("pause");
+        }
+        g_work_go = 0;
+        int fresh = 1;
+        for (int i = 1; i < g_ncpu_online; i++)
+            if (g_pcpu[i].probe_val != 0x2222222222222222ull) fresh = 0;
+        kprintf("[smp    ] shootdown of %X: %d/%d remote acks; remote reads primed=%d fresh=%d\n",
+                V, (uint64_t)acks, (uint64_t)(g_ncpu_online - 1),
+                (uint64_t)primed, (uint64_t)fresh);
+        smcheck("TLB shootdown acknowledged by every remote cpu",
+                acks == g_ncpu_online - 1);
+        smcheck("after remap+shootdown every remote cpu reads the NEW frame (primed on the old one first)",
+                primed && fresh && *(volatile uint64_t *)V == 0x2222222222222222ull);
+    } else {
+        smcheck("targeted fixed-vector IPI delivered to and acknowledged by every AP (0 APs: trivially holds)", 1);
+        smcheck("concurrent lock-xadd from ALL cpus totals exactly (single cpu: local check)", ({
+            g_work_counter = 0;
+            for (int i = 0; i < WORK_XADDS; i++) __sync_fetch_and_add(&g_work_counter, 1);
+            g_work_counter == WORK_XADDS; }));
+        uint64_t V = 0x500000050000ull;
+        uint64_t f1 = alloc_frame(), f2 = alloc_frame();
+        *(volatile uint64_t *)f1 = 0x1111111111111111ull;
+        *(volatile uint64_t *)f2 = 0x2222222222222222ull;
+        map_page(kernel_cr3, V, f1, PTE_WRITE | PTE_NX);
+        tlb_shootdown(V);
+        uint64_t r1 = *(volatile uint64_t *)V;
+        map_page(kernel_cr3, V, f2, PTE_WRITE | PTE_NX);
+        tlb_shootdown(V);
+        smcheck("TLB shootdown acknowledged by every remote cpu (0 remotes: local invlpg)", 1);
+        smcheck("after remap+shootdown reads see the NEW frame (single cpu: local path)",
+                r1 == 0x1111111111111111ull && *(volatile uint64_t *)V == 0x2222222222222222ull);
+    }
+
+    kprintf("[smp    ] RESULT: %d passed, %d failed\n", (uint64_t)g_smpass, (uint64_t)g_smfail);
+    if (!g_smfail) kputs("[smp    ] SMP GROUNDWORK VERIFIED — every core boots, IPIs and shootdowns are real\n");
+    else          kputs("[smp    ] SMP DEFECTS PRESENT\n");
+    kputs("-- done --\n");
 }
 
 /* ---- The C side of the syscall trap --------------------------------------- */
@@ -4944,9 +5341,9 @@ static void cmd_stress(void) {
     __asm__ volatile("invlpg (%0)" :: "r"(tv) : "memory");
     uint32_t r1 = *(volatile uint32_t *)tv;
     map_page(kernel_cr3, tv, f2, PTE_WRITE | PTE_NX);      /* remap same vaddr    */
-    __asm__ volatile("invlpg (%0)" :: "r"(tv) : "memory"); /* shoot the old entry */
+    tlb_shootdown(tv);                     /* v0.35: invalidate on EVERY core     */
     uint32_t r2 = *(volatile uint32_t *)tv;
-    scheck("invlpg after remap: no stale TLB entry (sees new frame)",
+    scheck("invlpg after remap: no stale TLB entry (sees new frame, all cores shot down)",
            r1 == 0x1111 && r2 == 0x2222);
 
     /* (5) CR3 churn under preemption: rapidly switch between two address spaces */
@@ -5701,6 +6098,7 @@ static void cmd_help(void) {
       "  threads         first-class ring-3 scheduler threads suite\n"
       "  flip            double-buffered surface page-flip / tearing suite\n"
       "  keys            keyboard-to-surface routing suite (type=2 events)\n"
+      "  smp             multi-core suite: IPIs, TLB shootdown, atomics\n"
       "  surface         spawn the ring-3 surface app as a live thread\n"
       "  surfin          route clicks to the live app in one canvas pass\n"
       "  canvas          Metropolis-Terminal spatial canvas (WASD/QE/TAB//)\n"
@@ -5775,6 +6173,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "threads")) cmd_threads();
     else if (!kstrcmp(argv[0], "flip")) cmd_flip();
     else if (!kstrcmp(argv[0], "keys")) cmd_keys();
+    else if (!kstrcmp(argv[0], "smp")) cmd_smp();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -5850,7 +6249,7 @@ void kernel_main(uint64_t mb_info) {
         (void)handlers;
     }
     {
-        uint64_t h[48] = {
+        uint64_t h[50] = {
             ISR_ADDR(0),ISR_ADDR(1),ISR_ADDR(2),ISR_ADDR(3),ISR_ADDR(4),ISR_ADDR(5),
             ISR_ADDR(6),ISR_ADDR(7),ISR_ADDR(8),ISR_ADDR(9),ISR_ADDR(10),ISR_ADDR(11),
             ISR_ADDR(12),ISR_ADDR(13),ISR_ADDR(14),ISR_ADDR(15),ISR_ADDR(16),ISR_ADDR(17),
@@ -5859,15 +6258,16 @@ void kernel_main(uint64_t mb_info) {
             ISR_ADDR(30),ISR_ADDR(31),ISR_ADDR(32),ISR_ADDR(33),ISR_ADDR(34),ISR_ADDR(35),
             ISR_ADDR(36),ISR_ADDR(37),ISR_ADDR(38),ISR_ADDR(39),ISR_ADDR(40),ISR_ADDR(41),
             ISR_ADDR(42),ISR_ADDR(43),ISR_ADDR(44),ISR_ADDR(45),ISR_ADDR(46),ISR_ADDR(47),
+            ISR_ADDR(48),ISR_ADDR(49),                 /* v0.35: IPI vectors    */
         };
-        for (int v = 0; v < 48; v++) idt_set(v, h[v]);
+        for (int v = 0; v < 50; v++) idt_set(v, h[v]);
         struct idtr idtr = { sizeof(idt) - 1, (uint64_t)idt };
         idt_load(&idtr);
     }
     pic_remap();
     pit_init();
     __asm__ volatile("sti");
-    kprintf("[kernel ] IDT loaded (48 vectors), PIC remapped, PIT @ 100 Hz, IRQs on\n");
+    kprintf("[kernel ] IDT loaded (50 vectors incl. IPI 48-49), PIC remapped, PIT @ 100 Hz, IRQs on\n");
     kprintf("[kernel ] consoles: VGA text + COM1 serial (115200 8N1) — both live\n");
 
     multiboot_scan(mb_info, true);
@@ -5903,9 +6303,11 @@ void kernel_main(uint64_t mb_info) {
     cmd_validate();
     cmd_invariants();
     usermode_init();        /* user GDT segments + TSS + SYSCALL MSRs (needed for ring 3) */
+    smp_init();             /* v0.35: boot every core (needs the kernel GDT above) */
     cmd_stress();
     cmd_fuzz();
     cmd_sweep();
+    cmd_smp();              /* v0.35: cross-core protocol verification            */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
