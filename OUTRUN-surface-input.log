@@ -1,0 +1,9 @@
+[surface] handing canvas window 4 to unprivileged pid 17
+[surface] pid 17 owns surface 4 (200x120) at user vaddr 0000530000000000 — kernel will composite it
+[surface] slot 4 bound=1 owner=pid 17 — compositor will place its pixels
+[surfin ] routed 3 clicks into surface 4's queue (surface-local coords)
+[surface] pid 17 owns surface 4 (200x120) at user vaddr 0000530000000000 — kernel will composite it
+  [app:r3] event type 0000000000000001 at surface-local 000000000000001f0000000000000014
+  [app:r3] event type 0000000000000001 at surface-local 000000000000005b0000000000000040
+  [app:r3] event type 0000000000000001 at surface-local 000000000000009d0000000000000061
+  [app:r3] handled 0000000000000003 routed events and redrew itself
