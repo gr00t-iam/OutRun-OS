@@ -40,6 +40,7 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_MAP_FRAMEBUFFER 10
 #define SYS_YIELD          15
 #define SYS_GETPID         16
+#define SYS_SURFACE_FLIP   17
 
 #define DEV_DEFAULT 0xFFFF
 
@@ -97,21 +98,35 @@ static void surface_app(void) {
     print("  [app:r3] ==== RING-3 SURFACE THREAD: live event/render loop ====\n");
     i64 va = (i64)sysc(SYS_SURFACE, (200u << 16) | 120u, 4, 0);   /* slot 4 */
     if (va <= 0) { print("  [app:r3] surface denied (needs CAP_FRAMEBUFFER)\n"); return; }
-    print("  [app:r3] got surface at "); hex((u64)va);
-    print(" — thread stays alive, repainting every frame\n");
-    volatile unsigned int *p = (volatile unsigned int *)va;
+    /* v0.32: DOUBLE-BUFFERED. The kernel maps buf0 then buf1 contiguously; we
+     * always draw into the back buffer and publish with SYS_SURFACE_FLIP,
+     * which returns the next back buffer once the compositor took the frame. */
+    u64 bufbytes = ((200u * 120u * 4u) + 0xFFFu) & ~0xFFFull;
+    volatile unsigned int *p = (volatile unsigned int *)((u64)va + bufbytes); /* back = buf1 */
+    print("  [app:r3] got double-buffered surface at "); hex((u64)va);
+    print(" — drawing back buffers, publishing via SYS_SURFACE_FLIP\n");
     struct { int type, x, y, code; } ev;
     int hx[8], hy[8], nh = 0;
+    char typed[24]; int nt = 0;
     u64 frame = 0;
     for (;;) {
-        /* drain routed input: the compositor delivers clicks in OUR pixel space */
+        /* drain routed input: clicks arrive in OUR pixel space, keys (type=2) */
+        /* arrive as ASCII codes — same queue, dispatched on sevent.type       */
         while (sysc(SYS_SURFACE_POLL, 4, (u64)&ev, 0) == 1) {
+            if (ev.type == 2) {                            /* v0.33: keyboard  */
+                print("  [app:r3] key event code ");
+                hex((u64)(unsigned)ev.code); print(" — echoing into our pixels\n");
+                if (ev.code == 8) { if (nt) nt--; }        /* backspace        */
+                else if (ev.code >= 32 && ev.code < 127 && nt < 24)
+                    typed[nt++] = (char)ev.code;
+                continue;
+            }
             print("  [app:r3] click at surface-local (");
             hex((u64)(unsigned)ev.x); print(","); hex((u64)(unsigned)ev.y);
             print(") — repainting NOW, mid-pass\n");
             if (nh < 8) { hx[nh] = ev.x; hy[nh] = ev.y; nh++; }
         }
-        /* full repaint: base scene + liveness bar + every click hit so far */
+        /* full repaint into the BACK buffer: scene + liveness bar + hits       */
         for (int y = 0; y < 120; y++) {
             for (int x = 0; x < 200; x++) {
                 unsigned int c;
@@ -134,9 +149,35 @@ static void surface_app(void) {
                     if (X < 0 || X >= 200 || Y < 0 || Y >= 120) continue;
                     if (dx * dx + dy * dy <= 49) p[Y * 200 + X] = 0xF06A18u;
                 }
+        /* typed text: each char is a block whose COLOR encodes its ASCII code */
+        /* (0xA0..30 | code<<8) so the kernel can decode our pixels verbatim   */
+        for (int i = 0; i < nt; i++) {
+            unsigned int c = 0x00A00030u | ((unsigned int)(u8)typed[i] << 8);
+            for (int y = 88; y < 96; y++)
+                for (int x = 6 + 8 * i; x < 6 + 8 * i + 7 && x < 200; x++)
+                    p[y * 200 + x] = c;
+        }
         frame++;
-        sysc(SYS_YIELD, 0, 0, 0);          /* give the compositor its frame time */
+        /* publish: blocks until the compositor's next frame boundary, then     */
+        /* hands us the buffer it just retired — vsync for free                 */
+        p = (volatile unsigned int *)sysc(SYS_SURFACE_FLIP, 4, 0, 0);
     }
+}
+
+/* role 5: the tear detector's producer. Fills WHOLE frames in strictly
+ * alternating unique colors and flips each one; if the kernel's flip protocol
+ * is sound, no observer can ever scan a front buffer mixing the two.         */
+static void tear_test(void) {
+    i64 va = (i64)sysc(SYS_SURFACE, (64u << 16) | 64u, 5, 0);
+    if (va <= 0) { print("  [tt :r3] surface denied\n"); sysc(SYS_EXIT, 1, 0, 0); }
+    volatile unsigned int *back = (volatile unsigned int *)((u64)va + 64 * 64 * 4);
+    print("  [tt :r3] tear-test live: 400 alternating full frames via SYS_SURFACE_FLIP\n");
+    for (int f = 0; f < 400; f++) {
+        unsigned int c = (f & 1) ? 0x1FBF6Eu : 0x4682EAu;
+        for (int i = 0; i < 64 * 64; i++) back[i] = c;
+        back = (volatile unsigned int *)sysc(SYS_SURFACE_FLIP, 5, 0, 0);
+    }
+    sysc(SYS_EXIT, 0, 0, 0);
 }
 
 /* role 3: surface-lifecycle probe. Creates a small surface in slot 3, lets the
@@ -278,6 +319,7 @@ void _start(void) {
     if (role == 2) { surface_app(); sysc(SYS_EXIT, 0, 0, 0); }
     if (role == 3) { surface_exit_test(); }             /* exits itself         */
     if (role == 4) { ident_probe(); }                   /* exits itself         */
+    if (role == 5) { tear_test(); }                     /* exits itself         */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");

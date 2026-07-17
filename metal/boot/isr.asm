@@ -10,6 +10,14 @@
 bits 64
 extern isr_dispatch
 global idt_load
+global ap_tramp_start
+global ap_tramp_end
+
+; v0.35: the 16->64-bit AP boot trampoline, carried as data and copied to
+; physical 0x8000 by smp_init before the INIT-SIPI-SIPI sequence.
+section .rodata
+ap_tramp_start: incbin "build/apboot.bin"
+ap_tramp_end:
 
 %macro ISR_NOERR 1
 global isr%1
@@ -68,6 +76,10 @@ ISR_NOERR 31
 ISR_NOERR v
 %assign v v+1
 %endrep
+
+; v0.35: inter-processor interrupts (LAPIC fixed vectors)
+ISR_NOERR 48                         ; IPI: ping / wake
+ISR_NOERR 49                         ; IPI: TLB shootdown
 
 isr_common:
     push rax

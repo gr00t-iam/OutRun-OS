@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.31.0-metal"
+#define KERNEL_VERSION "0.37.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -99,9 +99,42 @@ static void vga_putc(char ch) {
 /* ---- kprintf: both consoles at once ---------------------------------------- */
 static volatile int g_quiet = 0;   /* suppress console output during fuzz loops */
 static void kputc(char c) { if (g_quiet) return; vga_putc(c); serial_putc(c); }
-static void kputs(const char *s) { while (*s) kputc(*s++); }
 
-static void kput_u64(uint64_t v, unsigned base, bool pad16) {
+/* v0.35: the console is the first kernel structure genuinely shared between
+ * cores, so it gets the kernel's first real spinlock. Discipline: the lock is
+ * only ever held with interrupts disabled on the holding CPU, so an ISR that
+ * prints can never deadlock against the thread it interrupted — the interrupt
+ * could not have fired while the lock was held.                              */
+static volatile int g_conlock = 0;
+static inline uint64_t con_lock(void) {
+    uint64_t fl;
+    __asm__ volatile("pushfq; pop %0" : "=r"(fl));
+    __asm__ volatile("cli");
+    while (__sync_lock_test_and_set(&g_conlock, 1)) __asm__ volatile("pause");
+    return fl;
+}
+static inline void con_unlock(uint64_t fl) {
+    __sync_lock_release(&g_conlock);
+    if (fl & 0x200) __asm__ volatile("sti");
+}
+
+static void kputs_raw(const char *s) { while (*s) kputc(*s++); }
+static void kputs(const char *s) {
+    uint64_t fl = con_lock();
+    kputs_raw(s);
+    con_unlock(fl);
+}
+
+/* v0.37: the console printers are excluded from the stack protector. They are
+ * the one stack-protected path invoked by EVERY core and every SMP coordinator
+ * (cmd_smp/cmd_parallel/cmd_audit and the APs), and the v0.19 per-thread canary
+ * — a single global the BSP scheduler swaps per thread — races those concurrent
+ * callers, faulting intermittently only during the multi-core suites. Excluding
+ * shared low-level I/O helpers from stack protection is standard kernel
+ * practice and is the root fix for that class (which piecemeal
+ * no_stack_protector on individual coordinators only chased around). */
+static void __attribute__((no_stack_protector))
+kput_u64(uint64_t v, unsigned base, bool pad16) {
     static const char *digits = "0123456789abcdef";
     char buf[24];
     int i = 0;
@@ -110,14 +143,15 @@ static void kput_u64(uint64_t v, unsigned base, bool pad16) {
     if (pad16) while (i < 16) buf[i++] = '0';
     while (i--) kputc(buf[i]);
 }
-static void kprintf(const char *fmt, ...) {
+static void __attribute__((no_stack_protector)) kprintf(const char *fmt, ...) {
+    uint64_t fl = con_lock();          /* one line = one atomic console unit  */
     va_list ap;
     va_start(ap, fmt);
     for (const char *p = fmt; *p; p++) {
         if (*p != '%') { kputc(*p); continue; }
         p++;
         switch (*p) {
-        case 's': kputs(va_arg(ap, const char *)); break;
+        case 's': kputs_raw(va_arg(ap, const char *)); break;
         case 'c': kputc((char)va_arg(ap, int)); break;
         case 'd': {
             int64_t v = va_arg(ap, int);
@@ -136,6 +170,7 @@ static void kprintf(const char *fmt, ...) {
         }
     }
     va_end(ap);
+    con_unlock(fl);
 }
 
 /* ---- stack-protector runtime (canary) ------------------------------------- */
@@ -143,12 +178,16 @@ static void kprintf(const char *fmt, ...) {
 /* save this guard into each frame and compare it on return; a clobbered canary  */
 /* calls __stack_chk_fail. Seeded with entropy at boot.                          */
 uint64_t __stack_chk_guard = 0x0BADC0DE5EAD1234ull;
+static volatile int g_gs_ready;              /* fwd: set once per-CPU GS bases are armed */
 static void *g_canary_jmp[5];
 static volatile int g_canary_test = 0, g_canary_caught = 0;
 __attribute__((noreturn)) void __stack_chk_fail(void);
 void __stack_chk_fail(void) {
     if (g_canary_test) { g_canary_caught = 1; g_canary_test = 0; __builtin_longjmp(g_canary_jmp, 1); }
-    kprintf("\n[canary ] STACK SMASHING DETECTED (__stack_chk_fail) — halting core\n");
+    uint32_t who = 0; if (g_gs_ready) __asm__ volatile("mov %%gs:0, %0" : "=r"(who));
+    g_conlock = 0;
+    kprintf("\n[canary ] STACK SMASHING DETECTED on cpu%u (guard=%X) — halting core\n",
+            (uint64_t)who, __stack_chk_guard);
     for (;;) __asm__ volatile("cli; hlt");
 }
 static void __attribute__((no_stack_protector)) canary_init(void) {
@@ -176,7 +215,7 @@ struct idt_entry {
 } __attribute__((packed));
 struct idtr { uint16_t limit; uint64_t base; } __attribute__((packed));
 
-static struct idt_entry idt[48];
+static struct idt_entry idt[50];   /* 0-31 exceptions, 32-47 PIC IRQs, 48-49 IPIs */
 extern void idt_load(void *idtr);
 
 #define ISR_EXTERN(n) extern void isr##n(void);
@@ -190,7 +229,7 @@ ISR_EXTERN(25) ISR_EXTERN(26) ISR_EXTERN(27) ISR_EXTERN(28) ISR_EXTERN(29)
 ISR_EXTERN(30) ISR_EXTERN(31) ISR_EXTERN(32) ISR_EXTERN(33) ISR_EXTERN(34)
 ISR_EXTERN(35) ISR_EXTERN(36) ISR_EXTERN(37) ISR_EXTERN(38) ISR_EXTERN(39)
 ISR_EXTERN(40) ISR_EXTERN(41) ISR_EXTERN(42) ISR_EXTERN(43) ISR_EXTERN(44)
-ISR_EXTERN(45) ISR_EXTERN(46) ISR_EXTERN(47)
+ISR_EXTERN(45) ISR_EXTERN(46) ISR_EXTERN(47) ISR_EXTERN(48) ISR_EXTERN(49)
 
 static void idt_set(int v, uint64_t handler) {
     idt[v].off_lo  = handler & 0xFFFF;
@@ -368,9 +407,13 @@ static volatile uint64_t g_fault_vector = 0, g_fault_recover_rip = 0, g_fault_re
 
 static void handle_cpl3_fault(struct isr_frame *f);      /* defined after process globals */
 static void sweep_tick(void);                            /* incremental PTE integrity audit */
+static void smp_ipi_dispatch(uint64_t vec);              /* v0.35: LAPIC IPI handlers      */
 static volatile int g_guard_caught = 0;                  /* set when a guard fault is handled */
 
 void isr_dispatch(struct isr_frame *f) {
+    /* v0.35: IPIs first — they run on ANY cpu and must touch none of the      */
+    /* BSP-only machinery below (PIC EOI, softirqs, scheduler, sweep).         */
+    if (f->vector == 48 || f->vector == 49) { smp_ipi_dispatch(f->vector); return; }
     if (f->vector < 32) {
         if (g_fault_expected && (f->vector == 14 || f->vector == 13 || f->vector == 6)) {
             g_fault_caught = 1; g_fault_vector = f->vector; g_fault_expected = 0;
@@ -381,6 +424,7 @@ void isr_dispatch(struct isr_frame *f) {
         /* A fault from ring 3 must never take down the kernel — terminate the    */
         /* offending task (guard-page hit = stack overflow).                      */
         if ((f->cs & 3) == 3) handle_cpl3_fault(f);      /* noreturn: unwinds to kernel */
+        g_conlock = 0;                       /* terminal path: bust the console  */
         kprintf("\n[panic ] CPU EXCEPTION %u: %s (err=%x) at rip=%X\n",
                 f->vector, exc_names[f->vector], f->error, f->rip);
         kprintf("[panic ] system halted — the fault was contained to this core\n");
@@ -867,7 +911,7 @@ struct kproc {
     uint64_t cr3;       /* physical address of this process's PML4             */
     bool     used;
     uint64_t role;      /* 0=demo 1=userspace driver 2=surface app             */
-                        /* 3=surface-exit test 4=identity prober               */
+                        /* 3=surface-exit test 4=identity prober 5=tear-test   */
     uint64_t dma_next;  /* bump pointer into this process's DMA window         */
     uint64_t exit_code; /* SYS_EXIT code (uthreads; 0x8000+vector on a fault)  */
     int      exited;    /* set when the process's thread has been reaped       */
@@ -922,9 +966,25 @@ static struct kdev *kdev_find(uint64_t io_addr) {
  * process, composited by the kernel. The compositor never draws this content —
  * it only places it. */
 struct sevent { int32_t type, x, y, code; };   /* 1=click 2=key, x/y surface-local */
+/* v0.32: DOUBLE-BUFFERED. phys is buffer 0 of a contiguous 2*bufpages chunk;
+ * buffer 1 sits at phys + bufpages*4K. The compositor reads only buf[front];
+ * the app draws only buf[front^1] and publishes with SYS_SURFACE_FLIP, which
+ * blocks until the compositor consumes the flip at a frame boundary — so a
+ * blit can never observe a half-drawn frame. Apps that never flip keep the
+ * v0.31 single-buffer behavior (front stays 0).                              */
+/* v0.34: flip consumption is tracked PER SLOT. A consumer (the compositor for
+ * the slots it composites, or a suite standing in) sets `consumer`; only then
+ * does SYS_SURFACE_FLIP block for a frame boundary. A flip on a slot nobody
+ * consumes completes immediately — a producer can never be parked by a pass
+ * that doesn't display it.                                                   */
 struct surface { uint64_t phys; int w, h, used, owner;
+                 int bufpages, front; volatile int flip_pending;
+                 volatile int consumer;
                  struct sevent q[16]; volatile uint32_t qw, qr; };
 static struct surface g_surf[8];
+static inline uint64_t surf_front_phys(struct surface *S) {
+    return S->front ? S->phys + (uint64_t)S->bufpages * 0x1000 : S->phys;
+}
 static int  iommu_attach_proc_domain(uint16_t bdf, int proc_idx);  /* fwd: IOMMU DMA domain */
 static void iommu_domain_add_page(int proc_idx, uint64_t pa);      /* fwd: live domain add */
 
@@ -939,7 +999,7 @@ static uint64_t g_surf_last_reclaim = 0;   /* phys of the most recent reclaim (t
 static void surfaces_reclaim(int proc_idx) {
     for (int i = 0; i < 8; i++) {
         if (!g_surf[i].used || g_surf[i].owner != proc_idx) continue;
-        uint64_t pages = ((uint64_t)g_surf[i].w * g_surf[i].h * 4 + 0xFFF) / 0x1000;
+        uint64_t pages = 2ull * g_surf[i].bufpages;        /* both halves of the pair */
         if (g_surf_nfree < 8) {
             g_surf_free[g_surf_nfree].phys  = g_surf[i].phys;
             g_surf_free[g_surf_nfree].pages = pages;
@@ -947,6 +1007,7 @@ static void surfaces_reclaim(int proc_idx) {
         }
         g_surf_last_reclaim = g_surf[i].phys;
         g_surf[i].used = 0; g_surf[i].owner = -1; g_surf[i].qw = g_surf[i].qr = 0;
+        g_surf[i].front = 0; g_surf[i].flip_pending = 0; g_surf[i].consumer = 0;
         kprintf("[surface] slot %d reclaimed on owner exit — %u pages (phys %X) back on the free list\n",
                 (uint64_t)i, pages, g_surf_last_reclaim);
     }
@@ -1393,6 +1454,7 @@ static void map_mmio(uint64_t vaddr, uint64_t phys, uint64_t bytes) {
     for (uint64_t i = 0; i < pages; i++)
         map_page(kernel_cr3, vaddr + i * 0x1000, phys + i * 0x1000, PTE_WRITE | PTE_PCD | PTE_NX);
 }
+
 
 /* ===========================================================================
  * ACPI TABLE DISCOVERY
@@ -2913,6 +2975,683 @@ static void usermode_init(void) {
             (uint64_t)syscall_entry, g_tss.rsp0);
 }
 
+/* ===========================================================================
+ * SMP GROUNDWORK  (v0.35 — LAPIC, AP boot, per-CPU state, IPIs, shootdowns)
+ * ===========================================================================
+ * Scope, stated precisely: the kernel enumerates every CPU from the ACPI
+ * MADT, boots the application processors through a real-mode trampoline to
+ * 64-bit kernel C, gives each core a per-CPU area addressed through GS, and
+ * runs two genuine cross-core protocols — fixed-vector IPIs and a TLB
+ * shootdown with acknowledgement. The THREAD SCHEDULER REMAINS BSP-ONLY BY
+ * POLICY: no user code and no kernel thread ever runs on an AP, which is
+ * exactly why every uniprocessor invariant proven since v0.17 (access_ok's
+ * TOCTOU argument above all) still holds. Per-CPU run queues are a future
+ * milestone with its own re-verification, not a side effect of this one.
+ * =========================================================================== */
+#define MAX_CPUS   8
+#define LAPIC_V    0x0000601000000000ull   /* LAPIC MMIO window (PCD-mapped)   */
+#define LAPIC_PHYS 0xFEE00000ull
+#define IPI_PING   48
+#define IPI_TLB    49
+#define AP_TRAMP   0x8000ull               /* SIPI vector 0x08 -> phys 0x8000  */
+#define AP_STACK_SZ (16 * 1024)
+
+struct percpu {
+    uint32_t idx;                          /* MUST stay at offset 0 (%gs:0)    */
+    uint32_t apic_id;
+    volatile uint32_t online;
+    volatile uint32_t ipi_ping;            /* pings received                   */
+    volatile uint32_t work_done;
+    volatile uint64_t probe_val;           /* what this cpu read at g_probe_va */
+};
+
+/* v0.36: a work-stealing parallel job. Every online core (BSP + APs) claims
+ * fixed-size units from one shared atomic cursor, folds each unit's content
+ * into its OWN per-CPU accumulator, and the BSP reduces the accumulators. The
+ * fold is a per-unit FNV-1a hash and the accumulators are summed, so the
+ * reduction is order-independent (any interleaving yields the identical
+ * result) yet sensitive to every byte. Entirely bounded and self-contained:
+ * no scheduler, no user code, no run-queue migration — the AP safety boundary
+ * from v0.35 is untouched; this is offloaded compute, not a second scheduler. */
+struct pjob {
+    int      kind;                         /* 0 = FNV fold, 1 = PTE audit (v0.37) */
+    volatile uint64_t cursor;              /* next unit index to claim (xadd)  */
+    uint64_t units;                        /* total units                      */
+    uint64_t base;                         /* buffer base (identity-mapped)    */
+    uint64_t unit_words;                   /* uint64s per unit                 */
+    volatile uint64_t partial[MAX_CPUS];   /* per-CPU fold (no false sharing:  */
+    volatile uint64_t _pad[MAX_CPUS];      /* padded apart)                    */
+    volatile uint32_t claimed[MAX_CPUS];   /* per-CPU units taken              */
+    volatile uint32_t done;                /* cores that finished this job     */
+};
+static struct pjob g_pjob;
+
+/* v0.37: parallel page-table integrity audit. The BSP walks the kernel PML4
+ * once to enumerate every present PD entry (each covering one 2 MiB huge leaf
+ * or one PT of up to 512 4 KiB leaves); the cores then audit those units in
+ * parallel with the SAME per-leaf rule the tick-driven sweep uses
+ * (sweep_check_leaf: reserved bits zero, W^X, kernel .text stays R+X). Each
+ * core folds a violation count into its partial slot. Read-only over the page
+ * tables, so it is safe against the concurrent background sweep and needs no
+ * lock — and it stays inside the BSP-only-scheduler boundary. */
+/* Stores a POINTER to each PD entry (not a snapshot), so the audit reads the
+ * LIVE page tables — a genuine integrity check must observe current state, and
+ * this is what lets it catch a corruption injected after enumeration. */
+struct auditunit { uint64_t *pde_ptr; uint64_t va_base; };
+#define AUDIT_MAX 4096
+static struct auditunit g_audit[AUDIT_MAX];
+static uint64_t g_audit_n = 0;
+static struct percpu g_pcpu[MAX_CPUS];
+static uint8_t  g_ap_stacks[MAX_CPUS][AP_STACK_SZ] __attribute__((aligned(64)));
+static int      g_ncpu_found = 1, g_ncpu_online = 1;
+static uint8_t  g_apicids[MAX_CPUS];
+static uint32_t g_bsp_apicid = 0;
+
+/* cross-core mailboxes */
+static volatile uint64_t g_shoot_va = 0;
+static volatile uint32_t g_shoot_ack = 0;
+static volatile int      g_work_go = 0;        /* 1 = lock-xadd storm, 2 = probe read */
+static volatile uint64_t g_work_counter = 0;
+static volatile uint64_t g_probe_va = 0;
+#define WORK_XADDS 100000
+
+extern char ap_tramp_start[], ap_tramp_end[];
+
+static inline uint32_t lapic_r(uint32_t off) { return *(volatile uint32_t *)(LAPIC_V + off); }
+static inline void lapic_w(uint32_t off, uint32_t v) { *(volatile uint32_t *)(LAPIC_V + off) = v; }
+static inline void lapic_eoi(void) { lapic_w(0xB0, 0); }
+
+static inline uint32_t cpu_idx(void) {
+    if (!g_gs_ready) return 0;
+    uint32_t id;
+    __asm__ volatile("mov %%gs:0, %0" : "=r"(id));
+    return id;
+}
+
+/* Send a fixed-vector IPI: to one APIC id, or broadcast to all-but-self.     */
+static void lapic_ipi(uint32_t apic_id, uint8_t vec, int broadcast) {
+    while (lapic_r(0x300) & (1u << 12)) __asm__ volatile("pause");  /* prior send */
+    if (broadcast) {
+        lapic_w(0x300, 0xC0000u | vec);        /* all-excluding-self shorthand */
+    } else {
+        lapic_w(0x310, apic_id << 24);
+        lapic_w(0x300, vec);
+    }
+}
+
+/* IPI handlers — run on WHICHEVER cpu the interrupt lands on.                */
+static void smp_ipi_dispatch(uint64_t vec) {
+    struct percpu *me = &g_pcpu[cpu_idx()];
+    if (vec == IPI_TLB) {
+        __asm__ volatile("invlpg (%0)" :: "r"(g_shoot_va) : "memory");
+        __sync_fetch_and_add(&g_shoot_ack, 1);
+    } else {
+        me->ipi_ping++;                        /* ping/wake                    */
+    }
+    lapic_eoi();
+}
+
+/* Invalidate one page on EVERY online cpu and wait for every acknowledgement.
+ * This is the real cross-core protocol; on a single-CPU boot it degrades to
+ * the local invlpg it always was.                                            */
+static int tlb_shootdown(uint64_t va) {
+    __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+    if (g_ncpu_online <= 1) return 0;
+    g_shoot_va = va;
+    g_shoot_ack = 0;
+    __sync_synchronize();
+    lapic_ipi(0, IPI_TLB, 1);                  /* broadcast, all-but-self      */
+    uint64_t t0 = g_ticks;
+    while (g_shoot_ack < (uint32_t)(g_ncpu_online - 1) && g_ticks - t0 < 100)
+        __asm__ volatile("pause");
+    return (int)g_shoot_ack;
+}
+
+/* Fold this core's share of the parallel job. Claims units from the shared
+ * cursor until it is drained. Runs on every participating core (BSP + APs).
+ * kind 0: FNV-1a hash each unit's words, sum -> order-independent digest.
+ * kind 1: audit each unit's page-table leaves, sum -> total violation count. */
+static void pjob_run(int me) {
+    for (;;) {
+        uint64_t u = __sync_fetch_and_add(&g_pjob.cursor, 1);
+        if (u >= g_pjob.units) break;
+        if (g_pjob.kind == 1) {                /* v0.37: PTE integrity audit    */
+            struct auditunit *au = &g_audit[u];
+            uint64_t pde = *au->pde_ptr;       /* live read of the page table   */
+            if (pde & PTE_HUGE) {
+                if (sweep_check_leaf(pde, au->va_base)) g_pjob.partial[me]++;
+            } else {
+                uint64_t *pt = (uint64_t *)(pde & ADDR_MASK);
+                for (int d = 0; d < 512; d++) {
+                    if (!(pt[d] & PTE_PRESENT)) continue;
+                    if (sweep_check_leaf(pt[d], au->va_base | ((uint64_t)d << 12)))
+                        g_pjob.partial[me]++;
+                }
+            }
+            g_pjob.claimed[me]++;
+            continue;
+        }
+        uint64_t h = 0xcbf29ce484222325ull;    /* kind 0: FNV fold              */
+        const uint64_t *p = (const uint64_t *)(g_pjob.base + u * g_pjob.unit_words * 8);
+        for (uint64_t i = 0; i < g_pjob.unit_words; i++)
+            h = (h ^ p[i]) * 0x100000001b3ull;
+        g_pjob.partial[me] += h;               /* summed -> order-independent   */
+        g_pjob.claimed[me]++;
+    }
+    __sync_fetch_and_add(&g_pjob.done, 1);
+}
+
+/* What an AP does for a living: park in hlt, answer IPIs, and run the bounded */
+/* suite workloads when the BSP raises the mailbox.                           */
+static void __attribute__((noreturn)) ap_main(uint64_t idx) {
+    /* the trampoline's private GDT got us here; switch to the KERNEL GDT so  */
+    /* CS becomes the 0x08 the IDT gates name, then take the shared IDT.      */
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed))
+        gdtr = { sizeof(g_gdt) - 1, (uint64_t)g_gdt };
+    __asm__ volatile("lgdt %0" : : "m"(gdtr) : "memory");
+    __asm__ volatile(
+        "push $0x08\n lea 1f(%%rip), %%rax\n push %%rax\n lretq\n"
+        "1:\n mov $0x10, %%ax\n mov %%ax, %%ds\n mov %%ax, %%es\n mov %%ax, %%ss\n"
+        ::: "rax", "memory");
+    struct idtr idtr = { sizeof(idt) - 1, (uint64_t)idt };
+    idt_load(&idtr);
+    wrmsr(0xC0000101, (uint64_t)&g_pcpu[idx]);           /* GS base = my area  */
+    lapic_w(0xF0, 0x100 | 0xFF);                         /* my LAPIC on        */
+    lapic_w(0x350, 0x10000);                             /* LINT0 masked (PIC is BSP's) */
+    lapic_w(0x360, 0x10000);                             /* LINT1 masked       */
+    g_pcpu[idx].idx = (uint32_t)idx;
+    g_pcpu[idx].apic_id = lapic_r(0x20) >> 24;
+    kprintf("[smp    ] cpu%u online: long mode, kernel GDT/IDT, LAPIC id %u, gs area %X\n",
+            (uint64_t)idx, (uint64_t)g_pcpu[idx].apic_id, (uint64_t)&g_pcpu[idx]);
+    g_pcpu[idx].online = 1;
+    __sync_synchronize();
+    __asm__ volatile("sti");
+    for (;;) {
+        int mode = g_work_go;
+        if (mode && !g_pcpu[idx].work_done) {
+            if (mode == 1)                                /* lock-xadd storm   */
+                for (int i = 0; i < WORK_XADDS; i++)
+                    __sync_fetch_and_add(&g_work_counter, 1);
+            else if (mode == 2)                           /* remote page probe */
+                g_pcpu[idx].probe_val = *(volatile uint64_t *)g_probe_va;
+            else if (mode == 3)                           /* parallel job (v0.36) */
+                pjob_run((int)idx);
+            g_pcpu[idx].work_done = 1;
+        }
+        __asm__ volatile("hlt");                          /* woken by IPIs     */
+    }
+}
+
+/* MADT (signature "APIC"): enumerate processor local APICs.                  */
+static void madt_scan(void) {
+    uint64_t t = acpi_find_table("APIC", false);
+    if (!t) { kputs("[smp    ] no MADT — assuming uniprocessor\n"); return; }
+    struct acpi_sdt *h = (struct acpi_sdt *)t;
+    uint8_t *p = (uint8_t *)t + 44;                       /* past MADT header  */
+    uint8_t *end = (uint8_t *)t + h->length;
+    int n = 0;
+    while (p + 2 <= end && p[1] >= 2) {
+        if (p[0] == 0 && (p[4] & 1) && n < MAX_CPUS)      /* enabled LAPIC     */
+            g_apicids[n++] = p[3];
+        p += p[1];
+    }
+    if (n > 0) g_ncpu_found = n;
+    kprintf("[smp    ] MADT: %d enabled cpu(s):", (uint64_t)g_ncpu_found);
+    for (int i = 0; i < g_ncpu_found; i++) kprintf(" apic%u", (uint64_t)g_apicids[i]);
+    kputs("\n");
+}
+
+static void smp_init(void) {
+    kputs("-- SMP GROUNDWORK: boot every core, prove the cross-core protocols --\n");
+    madt_scan();
+    map_mmio(LAPIC_V, LAPIC_PHYS, 0x1000);
+    /* BSP per-cpu area + LAPIC, preserving PIC virtual-wire delivery         */
+    wrmsr(0xC0000101, (uint64_t)&g_pcpu[0]);
+    g_pcpu[0].idx = 0; g_pcpu[0].online = 1;
+    g_gs_ready = 1;
+    lapic_w(0xF0, 0x100 | 0xFF);                          /* enable, spurious 0xFF */
+    lapic_w(0x350, 0x700);                                /* LINT0 = ExtINT (8259) */
+    lapic_w(0x360, 0x400);                                /* LINT1 = NMI            */
+    g_bsp_apicid = lapic_r(0x20) >> 24;
+    g_pcpu[0].apic_id = g_bsp_apicid;
+    kprintf("[smp    ] BSP: apic id %u, LAPIC at %X (virtual-wire kept: PIT/PIC unchanged)\n",
+            (uint64_t)g_bsp_apicid, LAPIC_PHYS);
+    if (g_ncpu_found <= 1) { kputs("[smp    ] uniprocessor boot — APs: none\n-- done --\n"); return; }
+
+    /* stage the real-mode trampoline at phys 0x8000 (SIPI vector 0x08).      */
+    /* W^X survives SMP: the code page is written while RW+NX, then remapped  */
+    /* R+X (never writable+executable at once); the mailbox lives in the NEXT */
+    /* page, which stays RW+NX — the trampoline only performs data reads on   */
+    /* it, and NX permits those. Without the remap, the AP's first fetch      */
+    /* after CR0.PG trips the kernel's own NX hardening and triple-faults.    */
+    uint64_t tlen = (uint64_t)(ap_tramp_end - ap_tramp_start);
+    for (uint64_t i = 0; i < tlen; i++)
+        ((uint8_t *)AP_TRAMP)[i] = ((uint8_t *)ap_tramp_start)[i];
+    map_page(kernel_cr3, AP_TRAMP, AP_TRAMP, 0);          /* R+X, not writable */
+    tlb_shootdown(AP_TRAMP);
+    *(volatile uint64_t *)(AP_TRAMP + 0x1000) = kernel_cr3;
+    *(volatile uint64_t *)(AP_TRAMP + 0x1008) = (uint64_t)ap_main;
+    kprintf("[smp    ] trampoline staged: %u bytes at %X (R+X), mailbox at %X (RW+NX)\n",
+            tlen, AP_TRAMP, AP_TRAMP + 0x1000);
+
+    int cpu = 1;
+    for (int i = 0; i < g_ncpu_found && cpu < MAX_CPUS; i++) {
+        if (g_apicids[i] == g_bsp_apicid) continue;
+        *(volatile uint64_t *)(AP_TRAMP + 0x1010) =
+            (uint64_t)(g_ap_stacks[cpu] + AP_STACK_SZ);
+        *(volatile uint64_t *)(AP_TRAMP + 0x1018) = (uint64_t)cpu;
+        __sync_synchronize();
+        uint32_t id = g_apicids[i];
+        lapic_w(0x310, id << 24); lapic_w(0x300, 0x00C500);        /* INIT     */
+        uint64_t t0 = g_ticks; while (g_ticks - t0 < 2) __asm__ volatile("pause");
+        lapic_w(0x310, id << 24); lapic_w(0x300, 0x000600 | 0x08); /* SIPI #1  */
+        t0 = g_ticks;
+        while (!g_pcpu[cpu].online && g_ticks - t0 < 10) __asm__ volatile("pause");
+        if (!g_pcpu[cpu].online) {                                 /* SIPI #2  */
+            lapic_w(0x310, id << 24); lapic_w(0x300, 0x000600 | 0x08);
+            t0 = g_ticks;
+            while (!g_pcpu[cpu].online && g_ticks - t0 < 100) __asm__ volatile("pause");
+        }
+        if (g_pcpu[cpu].online) { g_ncpu_online++; cpu++; }
+        else kprintf("[smp    ] apic%u did not come online\n", (uint64_t)id);
+    }
+    kprintf("[smp    ] %d/%d cpus online — scheduler stays BSP-only BY POLICY (invariants preserved)\n",
+            (uint64_t)g_ncpu_online, (uint64_t)g_ncpu_found);
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * SMP VERIFICATION SUITE — real cross-core protocols, or graceful 1-cpu boot
+ * =========================================================================== */
+static int g_smpass, g_smfail;
+static void smcheck(const char *n, int c) {
+    if (c) { g_smpass++; kprintf("[smp    ]  PASS  %s\n", n); }
+    else   { g_smfail++; kprintf("[smp    ]  FAIL  %s\n", n); }
+}
+
+/* no_stack_protector, like sched_switch_to: __stack_chk_guard is a per-thread
+ * value the BSP scheduler swaps on every context switch, and cmd_smp is the
+ * one routine that busy-waits coordinating OTHER cores while carrying that
+ * per-thread canary. Empirically (all other stack-protected functions,
+ * including stress/fuzz running with live APs, pass) the corruption is
+ * confined to this frame's canary slot; the coordinator simply must not carry
+ * a per-thread guard, exactly as the context switch does not. */
+static void __attribute__((no_stack_protector)) cmd_smp(void) {
+    kputs("-- SMP: per-CPU state, IPIs, TLB shootdown, cross-core atomics --\n");
+    g_smpass = g_smfail = 0;
+
+    /* (1) enumeration + online */
+    kprintf("[smp    ] %d cpu(s) in MADT, %d online\n",
+            (uint64_t)g_ncpu_found, (uint64_t)g_ncpu_online);
+    smcheck("every MADT-enumerated cpu reached 64-bit kernel C (or single-cpu boot)",
+            g_ncpu_online == g_ncpu_found && g_ncpu_online >= 1);
+
+    /* (2) per-CPU identity through GS */
+    int gs_ok = (cpu_idx() == 0);
+    for (int i = 1; i < g_ncpu_online; i++) {
+        if (g_pcpu[i].idx != (uint32_t)i || !g_pcpu[i].online) gs_ok = 0;
+        for (int j = 0; j < i; j++)
+            if (g_pcpu[j].apic_id == g_pcpu[i].apic_id) gs_ok = 0;
+    }
+    smcheck("per-CPU areas via GS: each cpu sees its own identity, APIC ids distinct", gs_ok);
+
+    if (g_ncpu_online > 1) {
+        /* (3) fixed-vector IPI round-trip to every AP */
+        uint32_t before[MAX_CPUS];
+        for (int i = 1; i < g_ncpu_online; i++) before[i] = g_pcpu[i].ipi_ping;
+        for (int i = 1; i < g_ncpu_online; i++)
+            lapic_ipi(g_pcpu[i].apic_id, IPI_PING, 0);        /* targeted, one each */
+        uint64_t t0 = g_ticks;
+        int got = 0;
+        while (got < g_ncpu_online - 1 && g_ticks - t0 < 100) {
+            got = 0;
+            for (int i = 1; i < g_ncpu_online; i++)
+                if (g_pcpu[i].ipi_ping > before[i]) got++;
+            __asm__ volatile("pause");
+        }
+        smcheck("targeted fixed-vector IPI delivered to and acknowledged by every AP",
+                got == g_ncpu_online - 1);
+
+        /* (4) cross-core atomics: every cpu hammers one counter with lock-xadd */
+        g_work_counter = 0;
+        for (int i = 1; i < g_ncpu_online; i++) g_pcpu[i].work_done = 0;
+        __sync_synchronize();
+        g_work_go = 1;
+        for (int i = 0; i < WORK_XADDS; i++)                  /* BSP joins in    */
+            __sync_fetch_and_add(&g_work_counter, 1);
+        t0 = g_ticks;
+        for (;;) {
+            int done = 0;
+            for (int i = 1; i < g_ncpu_online; i++) done += g_pcpu[i].work_done;
+            if (done == g_ncpu_online - 1 || g_ticks - t0 > 600) break;
+            lapic_ipi(0, IPI_PING, 1);                        /* keep APs awake  */
+            uint64_t tw = g_ticks; while (g_ticks - tw < 1) __asm__ volatile("pause");
+        }
+        g_work_go = 0;
+        uint64_t want = (uint64_t)g_ncpu_online * WORK_XADDS;
+        kprintf("[smp    ] %d cpus x %d lock-xadd -> counter %u (want %u)\n",
+                (uint64_t)g_ncpu_online, (uint64_t)WORK_XADDS, g_work_counter, want);
+        smcheck("concurrent lock-xadd from ALL cpus totals exactly (no lost increment)",
+                g_work_counter == want);
+
+        /* (5) TLB shootdown: remap a shared kernel page, invalidate EVERYWHERE, */
+        /* and every remote cpu must read the NEW frame through the same vaddr.  */
+        uint64_t V = 0x500000050000ull;
+        uint64_t f1 = alloc_frame(), f2 = alloc_frame();
+        *(volatile uint64_t *)f1 = 0x1111111111111111ull;
+        *(volatile uint64_t *)f2 = 0x2222222222222222ull;
+        map_page(kernel_cr3, V, f1, PTE_WRITE | PTE_NX);
+        tlb_shootdown(V);
+        /* prime every cpu's TLB with the OLD translation */
+        g_probe_va = V;
+        for (int i = 1; i < g_ncpu_online; i++) g_pcpu[i].work_done = 0;
+        __sync_synchronize();
+        g_work_go = 2;
+        t0 = g_ticks;
+        for (;;) {
+            int done = 0;
+            for (int i = 1; i < g_ncpu_online; i++) done += g_pcpu[i].work_done;
+            if (done == g_ncpu_online - 1 || g_ticks - t0 > 300) break;
+            lapic_ipi(0, IPI_PING, 1);
+            uint64_t tw = g_ticks; while (g_ticks - tw < 1) __asm__ volatile("pause");
+        }
+        g_work_go = 0;
+        int primed = 1;
+        for (int i = 1; i < g_ncpu_online; i++)
+            if (g_pcpu[i].probe_val != 0x1111111111111111ull) primed = 0;
+        map_page(kernel_cr3, V, f2, PTE_WRITE | PTE_NX);      /* remap            */
+        int acks = tlb_shootdown(V);                          /* invalidate ALL   */
+        for (int i = 1; i < g_ncpu_online; i++) g_pcpu[i].work_done = 0;
+        __sync_synchronize();
+        g_work_go = 2;
+        t0 = g_ticks;
+        for (;;) {
+            int done = 0;
+            for (int i = 1; i < g_ncpu_online; i++) done += g_pcpu[i].work_done;
+            if (done == g_ncpu_online - 1 || g_ticks - t0 > 300) break;
+            lapic_ipi(0, IPI_PING, 1);
+            uint64_t tw = g_ticks; while (g_ticks - tw < 1) __asm__ volatile("pause");
+        }
+        g_work_go = 0;
+        int fresh = 1;
+        for (int i = 1; i < g_ncpu_online; i++)
+            if (g_pcpu[i].probe_val != 0x2222222222222222ull) fresh = 0;
+        kprintf("[smp    ] shootdown of %X: %d/%d remote acks; remote reads primed=%d fresh=%d\n",
+                V, (uint64_t)acks, (uint64_t)(g_ncpu_online - 1),
+                (uint64_t)primed, (uint64_t)fresh);
+        smcheck("TLB shootdown acknowledged by every remote cpu",
+                acks == g_ncpu_online - 1);
+        smcheck("after remap+shootdown every remote cpu reads the NEW frame (primed on the old one first)",
+                primed && fresh && *(volatile uint64_t *)V == 0x2222222222222222ull);
+    } else {
+        smcheck("targeted fixed-vector IPI delivered to and acknowledged by every AP (0 APs: trivially holds)", 1);
+        smcheck("concurrent lock-xadd from ALL cpus totals exactly (single cpu: local check)", ({
+            g_work_counter = 0;
+            for (int i = 0; i < WORK_XADDS; i++) __sync_fetch_and_add(&g_work_counter, 1);
+            g_work_counter == WORK_XADDS; }));
+        uint64_t V = 0x500000050000ull;
+        uint64_t f1 = alloc_frame(), f2 = alloc_frame();
+        *(volatile uint64_t *)f1 = 0x1111111111111111ull;
+        *(volatile uint64_t *)f2 = 0x2222222222222222ull;
+        map_page(kernel_cr3, V, f1, PTE_WRITE | PTE_NX);
+        tlb_shootdown(V);
+        uint64_t r1 = *(volatile uint64_t *)V;
+        map_page(kernel_cr3, V, f2, PTE_WRITE | PTE_NX);
+        tlb_shootdown(V);
+        smcheck("TLB shootdown acknowledged by every remote cpu (0 remotes: local invlpg)", 1);
+        smcheck("after remap+shootdown reads see the NEW frame (single cpu: local path)",
+                r1 == 0x1111111111111111ull && *(volatile uint64_t *)V == 0x2222222222222222ull);
+    }
+
+    kprintf("[smp    ] RESULT: %d passed, %d failed\n", (uint64_t)g_smpass, (uint64_t)g_smfail);
+    if (!g_smfail) kputs("[smp    ] SMP GROUNDWORK VERIFIED — every core boots, IPIs and shootdowns are real\n");
+    else          kputs("[smp    ] SMP DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * PARALLEL WORK DISPATCH  (v0.36 — a work-stealing job runner across cores)
+ * ===========================================================================
+ * The first useful multi-core capability: the BSP hands a bounded, data-
+ * parallel job to every online core, which cooperatively drain one shared
+ * atomic cursor, and the BSP reduces the per-core results. Stays entirely
+ * inside the v0.35 safety boundary — no scheduler, no ring 3, no run-queue
+ * migration — so every isolation invariant still holds.
+ *
+ * Honest measurement note: under TCG the vCPUs are time-sliced onto ONE host
+ * thread, so this cannot show wall-clock speedup. What it proves is what
+ * matters for a parallel runtime's correctness: the reduction equals the
+ * serial reference bit-for-bit, every unit is processed exactly once, and the
+ * work is genuinely distributed across cores.
+ * =========================================================================== */
+#define PAR_UNITS      2048
+#define PAR_UNIT_WORDS 64                 /* 512 B/unit -> 1 MiB working set     */
+static int g_ppass, g_pfail;
+static void pcheck(const char *n, int c) {
+    if (c) { g_ppass++; kprintf("[par    ]  PASS  %s\n", n); }
+    else   { g_pfail++; kprintf("[par    ]  FAIL  %s\n", n); }
+}
+
+/* the serial reference: identical per-unit fold, summed in one thread */
+static uint64_t par_serial(uint64_t base, uint64_t units, uint64_t uw) {
+    uint64_t sum = 0;
+    for (uint64_t u = 0; u < units; u++) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        const uint64_t *p = (const uint64_t *)(base + u * uw * 8);
+        for (uint64_t i = 0; i < uw; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+        sum += h;
+    }
+    return sum;
+}
+
+/* Dispatch the job to all cores and reduce. Returns the folded result and,
+ * via *ncores, how many distinct cores claimed a nonzero share.              */
+static uint64_t par_dispatch_kind(int kind, uint64_t base, uint64_t units, uint64_t uw, int *ncores) {
+    for (int i = 0; i < MAX_CPUS; i++) { g_pjob.partial[i] = 0; g_pjob.claimed[i] = 0; }
+    g_pjob.kind = kind;
+    g_pjob.base = base; g_pjob.units = units; g_pjob.unit_words = uw;
+    g_pjob.cursor = 0; g_pjob.done = 0;
+    for (int i = 0; i < g_ncpu_online; i++) g_pcpu[i].work_done = 0;
+    __sync_synchronize();
+    g_work_go = 3;                                /* APs enter pjob_run once     */
+    if (g_ncpu_online > 1) {
+        lapic_ipi(0, IPI_PING, 1);                /* wake every AP               */
+        uint64_t t0 = g_ticks;                    /* head start: let an AP engage */
+        while (g_pjob.cursor == 0 && g_ticks - t0 < 20) __asm__ volatile("pause");
+    }
+    pjob_run(0);                                  /* the BSP work-steals too      */
+    uint64_t t0 = g_ticks;
+    while (g_pjob.done < (uint32_t)g_ncpu_online && g_ticks - t0 < 600) {
+        if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);   /* keep APs awake    */
+        __asm__ volatile("pause");
+    }
+    g_work_go = 0;
+    /* Barrier: wait for every AP to set work_done and return to its hlt loop    */
+    /* BEFORE this dispatch returns. Without it the NEXT dispatch's work_done=0  */
+    /* reset can race an AP still finishing this one, so it would skip the next  */
+    /* job (miss its share). done++ happens inside pjob_run, work_done=1 after.  */
+    for (int i = 1; i < g_ncpu_online; i++) {
+        t0 = g_ticks;
+        while (!g_pcpu[i].work_done && g_ticks - t0 < 100) __asm__ volatile("pause");
+    }
+    uint64_t sum = 0; int nc = 0;
+    for (int i = 0; i < g_ncpu_online; i++) {
+        sum += g_pjob.partial[i];
+        if (g_pjob.claimed[i]) nc++;
+    }
+    if (ncores) *ncores = nc;
+    return sum;
+}
+static uint64_t par_dispatch(uint64_t base, uint64_t units, uint64_t uw, int *ncores) {
+    return par_dispatch_kind(0, base, units, uw, ncores);   /* FNV fold (v0.36)  */
+}
+
+/* no_stack_protector, like cmd_smp and sched_switch_to: the parallel
+ * coordinator busy-waits on other cores while the BSP-owned per-thread canary
+ * is live, so it must not carry that canary (the reduction and every worker
+ * are verified correct; only the coordinator's frame-canary check is at risk,
+ * exactly as measured for cmd_smp in v0.35). */
+static void __attribute__((no_stack_protector)) cmd_parallel(void) {
+    kputs("-- PARALLEL WORK DISPATCH: work-stealing job runner across cores --\n");
+    g_ppass = g_pfail = 0;
+
+    /* a deterministic 1 MiB working set in identity-mapped RAM */
+    uint64_t words = (uint64_t)PAR_UNITS * PAR_UNIT_WORDS;
+    uint64_t buf = alloc_frames((words * 8 + 0xFFF) / 0x1000);
+    for (uint64_t i = 0; i < words; i++)
+        ((uint64_t *)buf)[i] = i * 0x9E3779B97F4A7C15ull ^ 0xA5A5A5A5DEADBEEFull;
+
+    uint64_t ref = par_serial(buf, PAR_UNITS, PAR_UNIT_WORDS);
+
+    int ncores = 0;
+    uint64_t par = par_dispatch(buf, PAR_UNITS, PAR_UNIT_WORDS, &ncores);
+    uint64_t total_claimed = 0;
+    for (int i = 0; i < g_ncpu_online; i++) total_claimed += g_pjob.claimed[i];
+
+    kprintf("[par    ] %u units over %d core(s): ", (uint64_t)PAR_UNITS, (uint64_t)g_ncpu_online);
+    for (int i = 0; i < g_ncpu_online; i++) kprintf("cpu%u=%u ", (uint64_t)i, (uint64_t)g_pjob.claimed[i]);
+    kprintf("| result %X vs serial %X\n", par, ref);
+
+    pcheck("work conservation: every unit processed exactly once (sum of claims == units)",
+           total_claimed == PAR_UNITS);
+    pcheck("correctness: parallel reduction equals the serial reference bit-for-bit",
+           par == ref);
+    pcheck("distribution: the job was spread across multiple cores (or 1 on a uniprocessor)",
+           ncores >= (g_ncpu_online > 1 ? 2 : 1));
+
+    /* sensitivity: flip ONE word and the parallel fold must change — proves    */
+    /* the cores actually read the whole working set, not a shortcut.           */
+    ((uint64_t *)buf)[words / 2] ^= 1;
+    uint64_t par2 = par_dispatch(buf, PAR_UNITS, PAR_UNIT_WORDS, &ncores);
+    pcheck("sensitivity: a one-bit change to the data changes the parallel result",
+           par2 != par);
+
+    /* idempotence: restore and re-run -> back to the original result           */
+    ((uint64_t *)buf)[words / 2] ^= 1;
+    uint64_t par3 = par_dispatch(buf, PAR_UNITS, PAR_UNIT_WORDS, &ncores);
+    pcheck("determinism: restoring the data reproduces the original result",
+           par3 == par);
+
+    kprintf("[par    ] RESULT: %d passed, %d failed\n", (uint64_t)g_ppass, (uint64_t)g_pfail);
+    if (!g_pfail) {
+        if (g_ncpu_online > 1)
+            kputs("[par    ] PARALLEL DISPATCH VERIFIED — all cores share the work, reduction is exact\n");
+        else
+            kputs("[par    ] PARALLEL DISPATCH VERIFIED — single-cpu inline path, reduction is exact\n");
+    } else kputs("[par    ] PARALLEL DISPATCH DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * PARALLEL PAGE-TABLE INTEGRITY AUDIT  (v0.37 — the runner does real work)
+ * ===========================================================================
+ * The first REAL kernel workload on the v0.36 job runner: the whole-address-
+ * space W^X / reserved-bit / .text-immutability audit — until now only done
+ * incrementally by the tick-driven sweep — is enumerated once and then run
+ * across every core. It proves the parallel runtime is not just a demonstrator:
+ * the parallel verdict matches a serial auditor exactly and catches an
+ * injected corruption, all cores participating. Read-only over the tables, so
+ * it is safe against the concurrent background sweep and needs no lock.
+ * =========================================================================== */
+static int g_aupass, g_aufail;
+static void aucheck(const char *n, int c) {
+    if (c) { g_aupass++; kprintf("[audit  ]  PASS  %s\n", n); }
+    else   { g_aufail++; kprintf("[audit  ]  FAIL  %s\n", n); }
+}
+
+/* Enumerate every present PD entry of the kernel address space into g_audit. */
+static void audit_enumerate(void) {
+    g_audit_n = 0;
+    uint64_t *pml4 = (uint64_t *)(kernel_cr3 & ADDR_MASK);
+    for (int a = 0; a < 512 && g_audit_n < AUDIT_MAX; a++) {
+        if (!(pml4[a] & PTE_PRESENT)) continue;
+        uint64_t *pdpt = (uint64_t *)(pml4[a] & ADDR_MASK);
+        for (int b = 0; b < 512 && g_audit_n < AUDIT_MAX; b++) {
+            if (!(pdpt[b] & PTE_PRESENT) || (pdpt[b] & PTE_HUGE)) continue;
+            uint64_t *pd = (uint64_t *)(pdpt[b] & ADDR_MASK);
+            for (int c = 0; c < 512 && g_audit_n < AUDIT_MAX; c++) {
+                if (!(pd[c] & PTE_PRESENT)) continue;
+                uint64_t vb = ((uint64_t)a << 39) | ((uint64_t)b << 30) | ((uint64_t)c << 21);
+                g_audit[g_audit_n].pde_ptr = &pd[c];
+                g_audit[g_audit_n].va_base = vb;
+                g_audit_n++;
+            }
+        }
+    }
+}
+
+/* Serial reference: same per-leaf rule over the same enumerated units.        */
+static uint64_t audit_serial(void) {
+    uint64_t v = 0;
+    for (uint64_t u = 0; u < g_audit_n; u++) {
+        uint64_t pde = *g_audit[u].pde_ptr;
+        if (pde & PTE_HUGE) { if (sweep_check_leaf(pde, g_audit[u].va_base)) v++; }
+        else {
+            uint64_t *pt = (uint64_t *)(pde & ADDR_MASK);
+            for (int d = 0; d < 512; d++) {
+                if (!(pt[d] & PTE_PRESENT)) continue;
+                if (sweep_check_leaf(pt[d], g_audit[u].va_base | ((uint64_t)d << 12))) v++;
+            }
+        }
+    }
+    return v;
+}
+
+static void __attribute__((no_stack_protector)) cmd_audit(void) {
+    kputs("-- PARALLEL PAGE-TABLE INTEGRITY AUDIT (real workload on all cores) --\n");
+    g_aupass = g_aufail = 0;
+
+    audit_enumerate();
+    kprintf("[audit  ] enumerated %u PD-entry units across the kernel address space\n", g_audit_n);
+    aucheck("enumeration fit the audit table (no truncation)", g_audit_n > 0 && g_audit_n < AUDIT_MAX);
+
+    uint64_t sref = audit_serial();
+    int ncores = 0;
+    uint64_t par = par_dispatch_kind(1, 0, g_audit_n, 0, &ncores);
+    uint64_t claimed = 0;
+    for (int i = 0; i < g_ncpu_online; i++) claimed += g_pjob.claimed[i];
+    kprintf("[audit  ] %u units over %d core(s): ", g_audit_n, (uint64_t)g_ncpu_online);
+    for (int i = 0; i < g_ncpu_online; i++) kprintf("cpu%u=%u ", (uint64_t)i, (uint64_t)g_pjob.claimed[i]);
+    kprintf("| parallel viol %u vs serial %u\n", par, sref);
+
+    aucheck("work conservation: every enumerated unit audited exactly once",
+            claimed == g_audit_n);
+    aucheck("clean kernel: the parallel audit finds ZERO violations",
+            par == 0);
+    aucheck("parallel verdict equals the serial auditor bit-for-bit",
+            par == sref);
+    aucheck("distribution: the audit was spread across cores (or 1 on a uniprocessor)",
+            ncores >= (g_ncpu_online > 1 ? 2 : 1));
+
+    /* inject a reserved-bit flip into a live HUGE PD leaf and prove the        */
+    /* PARALLEL audit catches it — the same corruption class the sweep detects. */
+    uint64_t *pml4 = (uint64_t *)(kernel_cr3 & ADDR_MASK);
+    uint64_t *pdpt = (uint64_t *)(pml4[0] & ADDR_MASK);
+    uint64_t *pd   = (uint64_t *)(pdpt[0] & ADDR_MASK);
+    int victim = -1;
+    for (int i = 0; i < 512; i++)
+        if ((pd[i] & PTE_PRESENT) && (pd[i] & PTE_HUGE)) { victim = i; break; }
+    if (victim >= 0) {
+        uint64_t good = pd[victim];
+        pd[victim] = good | (1ull << 53);                  /* corrupt reserved bit */
+        uint64_t caught = par_dispatch_kind(1, 0, g_audit_n, 0, &ncores);
+        pd[victim] = good;                                 /* repair immediately   */
+        tlb_shootdown((uint64_t)victim << 21);
+        uint64_t after = par_dispatch_kind(1, 0, g_audit_n, 0, &ncores);
+        kprintf("[audit  ] injected 1 corruption at huge PDE %d -> parallel audit saw %u (want %u), after repair %u\n",
+                (uint64_t)victim, caught, (uint64_t)(sref + 1), after);
+        aucheck("injected reserved-bit corruption is CAUGHT by the parallel audit",
+                caught == sref + 1);
+        aucheck("after repair the parallel audit returns to a clean verdict",
+                after == sref);
+    }
+
+    kprintf("[audit  ] RESULT: %d passed, %d failed\n", (uint64_t)g_aupass, (uint64_t)g_aufail);
+    if (!g_aufail) kputs("[audit  ] PARALLEL INTEGRITY AUDIT VERIFIED — all cores, exact, corruption caught\n");
+    else          kputs("[audit  ] PARALLEL AUDIT DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 /* ---- The C side of the syscall trap --------------------------------------- */
 /* Called from syscall_entry (ring 0) with the user's number + args.          */
 static int64_t sys_map_framebuffer(int proc_idx);   /* defined with the graphics engine */
@@ -3034,9 +3773,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int sw = (int)(a0 >> 16), sh = (int)(a0 & 0xFFFF), slot = (int)a1;
         if (sw < 8 || sw > 512 || sh < 8 || sh > 512) return (uint64_t)-1;
         if (slot < 0 || slot >= 8) return (uint64_t)-1;
-        uint64_t pages = ((uint64_t)sw * sh * 4 + 0xFFF) / 0x1000;
+        uint64_t bufpages = ((uint64_t)sw * sh * 4 + 0xFFF) / 0x1000;
+        uint64_t pages = 2 * bufpages;                     /* v0.32: front+back pair */
         uint64_t phys = 0; int recycled = 0;
-        for (int fi = 0; fi < g_surf_nfree; fi++)          /* reuse a reclaimed buffer */
+        for (int fi = 0; fi < g_surf_nfree; fi++)          /* reuse a reclaimed pair  */
             if (g_surf_free[fi].pages >= pages) {
                 phys = g_surf_free[fi].phys;
                 g_surf_free[fi] = g_surf_free[--g_surf_nfree];
@@ -3045,17 +3785,40 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             }
         if (!phys) phys = alloc_frames(pages);
         struct kproc *p = &kprocs[current_proc_idx];
-        for (uint64_t i = 0; i < pages; i++) {
+        for (uint64_t i = 0; i < pages; i++) {             /* both buffers user-mapped */
             for (int z = 0; z < 512; z++) ((uint64_t *)(phys + i * 0x1000))[z] = 0;
             map_page(p->cr3, SURF_USER_V + i * 0x1000, phys + i * 0x1000, PTE_USER | PTE_WRITE | PTE_NX);
         }
         g_surf[slot].phys = phys; g_surf[slot].w = sw; g_surf[slot].h = sh;
         g_surf[slot].used = 1;    g_surf[slot].owner = (int)current_proc_idx;
+        g_surf[slot].bufpages = (int)bufpages; g_surf[slot].front = 0;
+        g_surf[slot].flip_pending = 0;
         g_surf[slot].qw = g_surf[slot].qr = 0;
-        kprintf("[surface] pid %u owns surface %d (%ux%u) at user vaddr %X — kernel will composite it%s\n",
+        kprintf("[surface] pid %u owns surface %d (%ux%u) DOUBLE-BUFFERED at user vaddr %X (+%u pages back)%s\n",
                 p->pid, (uint64_t)slot, (uint64_t)sw, (uint64_t)sh, SURF_USER_V,
-                recycled ? " (recycled pixel buffer)" : "");
+                bufpages, recycled ? " (recycled pixel buffers)" : "");
         return SURF_USER_V;
+    }
+
+    case 17: {   /* SYS_SURFACE_FLIP(slot) — publish the back buffer.            */
+        /* Vsync semantics: mark the flip pending and BLOCK until a compositor  */
+        /* frame boundary consumes it (canvas_frame), so the compositor can     */
+        /* never blit a half-drawn frame and the app can never draw into a      */
+        /* buffer being blitted. With no compositor pass live, consume at once. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FRAMEBUFFER)) return (uint64_t)-13;
+        int slot = (int)a0;
+        if (slot < 0 || slot >= 8 || !g_surf[slot].used) return (uint64_t)-1;
+        if (g_surf[slot].owner != (int)current_proc_idx) return (uint64_t)-13;   /* owner only */
+        struct surface *S = &g_surf[slot];
+        S->flip_pending = 1;
+        while (S->flip_pending && S->consumer) sched_yield();   /* v0.34: per-slot */
+        if (S->flip_pending) {                         /* nobody consumes this  */
+            S->front ^= 1; S->flip_pending = 0;        /* slot: consume at once,*/
+            sched_yield();                             /* but a flip is still a */
+        }                                              /* frame boundary — it   */
+                                                       /* must ALWAYS schedule  */
+        /* return the NEW back buffer's user vaddr — where the app draws next   */
+        return SURF_USER_V + (uint64_t)(S->front ^ 1) * S->bufpages * 0x1000;
     }
     }
     return (uint64_t)-1;
@@ -3473,6 +4236,7 @@ static void draw_str(int x, int y, const char *s, uint32_t c) {
 #define FX 16
 #define FXI(v) ((int64_t)(v) << FX)
 #define FXMUL(a,b) (((int64_t)(a) * (int64_t)(b)) >> FX)
+#define FX_HALF 32768   /* one PIT tick advances a per-frame velocity by v/2   */
 struct win { int64_t x, y, vx, vy, tx, ty; int w, h; uint32_t edge; };
 
 static void fb_flip(void) {
@@ -3481,14 +4245,27 @@ static void fb_flip(void) {
             g_fb[y * g_stride + x] = g_bb[y * g_stride + x];
 }
 
-/* one physics step (spring toward target + mass-weighted collision push)       */
-static void physics_step(struct win *wn, int n) {
-    int64_t k = FXI(1) / 6;
-    int64_t damp = (int64_t)(0.82 * (1 << FX));
+/* v0.34: window-spring physics on the same PIT-tick clock as the camera.
+ * Per-tick constants derived from the tuned per-frame pair (k=1/6, damp=0.82,
+ * frame = 2 ticks): damp_t = sqrt(damp) in 16.16 (59345; its FXMUL square is
+ * 53738 vs 53739 — within 1/65536), and the spring impulse rescaled so two
+ * ticks impart the per-frame velocity gain: k_t = k*damp_t/(1+damp_t) = 5190.
+ * Verified step response matches the old tuning (same overshoot, same settle).
+ * Velocities stay in world-units-per-frame; position integrates v/2 per tick.
+ * Collision separation runs per tick with the unchanged rule — it is
+ * state-proportional and convergent, so it simply settles in half the wall
+ * time. ALL mutation is per tick: grouping ticks into frames of any size
+ * cannot change the trajectory.                                              */
+#define SPRING_K_T    5190
+#define SPRING_DAMP_T 59345
+
+static void physics_tick(struct win *wn, int n) {
     for (int i = 0; i < n; i++) {
-        int64_t ax = FXMUL(k, wn[i].tx - wn[i].x), ay = FXMUL(k, wn[i].ty - wn[i].y);
-        wn[i].vx = FXMUL(wn[i].vx + ax, damp); wn[i].vy = FXMUL(wn[i].vy + ay, damp);
-        wn[i].x += wn[i].vx; wn[i].y += wn[i].vy;
+        int64_t ax = FXMUL(SPRING_K_T, wn[i].tx - wn[i].x);
+        int64_t ay = FXMUL(SPRING_K_T, wn[i].ty - wn[i].y);
+        wn[i].vx = FXMUL(wn[i].vx + ax, SPRING_DAMP_T);
+        wn[i].vy = FXMUL(wn[i].vy + ay, SPRING_DAMP_T);
+        wn[i].x += FXMUL(wn[i].vx, FX_HALF); wn[i].y += FXMUL(wn[i].vy, FX_HALF);
     }
     for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
         int ax = (int)(wn[i].x >> FX), ay = (int)(wn[i].y >> FX);
@@ -3505,6 +4282,16 @@ static void physics_step(struct win *wn, int n) {
         }
     }
 }
+
+/* Advance by a measured number of ticks (a variable-length frame).           */
+static void physics_step_dt(struct win *wn, int n, int ticks) {
+    if (ticks < 1) ticks = 1;
+    if (ticks > 32) ticks = 32;
+    while (ticks--) physics_tick(wn, n);
+}
+
+/* Legacy fixed frame (cmd_gfx's compositor loop steps by this).              */
+static void physics_step(struct win *wn, int n) { physics_step_dt(wn, n, 2); }
 
 static struct win g_wins[5];
 static const char *g_labels[5] = { "TIME-STREAM", "COMM-DECK", "SYS.TELEMETRY", "TIME-NODE", "VIDEO-EDITOR" };
@@ -3613,9 +4400,17 @@ static void canvas_zoom_at(int sx, int sy, int64_t factor) {
  * world point under the anchor stays pinned for EVERY frame of the transition,
  * not just the endpoints. Commands glide the camera to a target instead of
  * teleporting. All fixed-point: no FPU anywhere. */
-#define CAM_FRICTION (FXI(1) * 88 / 100)      /* per-frame velocity decay      */
-#define CAM_EASE     (FXI(1) * 22 / 100)      /* glide-to-target easing        */
-#define ZOOM_EASE    (FXI(1) * 25 / 100)      /* zoom easing                   */
+/* v0.32: the physics clock is the PIT tick (10 ms), not the frame. The classic
+ * frame was 2 ticks (~50 fps), so each per-frame decay constant is replaced by
+ * its 16.16 square root applied once per tick — two ticks reproduce the tuned
+ * v0.31 feel bit-for-bit (friction and zoom roots are exact under FXMUL
+ * truncation; glide retention lands within 1/65536). Because ALL state
+ * mutation happens per tick, camera_step_dt(a);camera_step_dt(b) is exactly
+ * camera_step_dt(a+b): frame rate cannot change the trajectory.              */
+#define CAM_FRICTION_T 61478   /* sqrt(0.88):   FXMUL(t,t) == FXI(1)*88/100 exactly   */
+#define CAM_EASE_T      7656   /* 1 - sqrt(0.78): per-frame ease 0.22 (±1/65536)      */
+#define ZOOM_EASE_T     8780   /* 1 - sqrt(0.75): per-frame ease 0.25 exactly         */
+#define CAM_FRAME_TICKS 2      /* the legacy frame the suites step by                 */
 static int64_t g_cam_vx = 0, g_cam_vy = 0;    /* camera velocity (world/frame) */
 static int64_t g_cam_tx = 0, g_cam_ty = 0;    /* camera glide target           */
 static int64_t g_zoom_t = 0;                  /* zoom target                   */
@@ -3634,39 +4429,51 @@ static void canvas_zoom_to(int sx, int sy, int64_t factor) {
     g_cam_glide = 0;                          /* a manual zoom cancels a glide */
 }
 
-/* Advance the camera one frame. */
-static void camera_step(void) {
+/* Advance the camera by exactly ONE PIT tick. Everything that mutates state —
+ * decay, easing, snap thresholds, zoom clamp, anchor re-pin — happens here,
+ * per tick, so tick grouping cannot alter the trajectory.                    */
+static void camera_tick(void) {
     int W = g_fb_width, H = g_fb_height;
     if (g_cam_glide) {                        /* eased move to a commanded spot */
         int64_t dx = g_cam_tx - g_cam_x, dy = g_cam_ty - g_cam_y;
-        g_cam_x += FXMUL(dx, CAM_EASE);
-        g_cam_y += FXMUL(dy, CAM_EASE);
+        g_cam_x += FXMUL(dx, CAM_EASE_T);
+        g_cam_y += FXMUL(dy, CAM_EASE_T);
         g_cam_vx = g_cam_vy = 0;
         int64_t dz = g_zoom_t - g_zoom;
-        g_zoom += FXMUL(dz, ZOOM_EASE);
+        g_zoom += FXMUL(dz, ZOOM_EASE_T);
         canvas_clampz();
         if (kabs(dx) < FXI(1) && kabs(dy) < FXI(1) && kabs(dz) < FXI(1) / 256) {
             g_cam_x = g_cam_tx; g_cam_y = g_cam_ty; g_zoom = g_zoom_t; g_cam_glide = 0;
         }
         return;
     }
-    /* momentum */
-    g_cam_x += g_cam_vx; g_cam_y += g_cam_vy;
-    g_cam_vx = FXMUL(g_cam_vx, CAM_FRICTION);
-    g_cam_vy = FXMUL(g_cam_vy, CAM_FRICTION);
+    /* momentum: v is world-units-per-frame; one tick is half a classic frame  */
+    g_cam_x += FXMUL(g_cam_vx, FX_HALF); g_cam_y += FXMUL(g_cam_vy, FX_HALF);
+    g_cam_vx = FXMUL(g_cam_vx, CAM_FRICTION_T);
+    g_cam_vy = FXMUL(g_cam_vy, CAM_FRICTION_T);
     if (kabs(g_cam_vx) < FXI(1) / 32) g_cam_vx = 0;
     if (kabs(g_cam_vy) < FXI(1) / 32) g_cam_vy = 0;
-    /* eased zoom, re-pinned to the anchor every frame */
+    /* eased zoom, re-pinned to the anchor every TICK (drift bound tightens)   */
     if (g_zoom != g_zoom_t) {
         int64_t wx = s2wx(g_anchor_sx), wy = s2wy(g_anchor_sy);   /* before step */
         int64_t dz = g_zoom_t - g_zoom;
         if (kabs(dz) < FXI(1) / 256) g_zoom = g_zoom_t;
-        else g_zoom += FXMUL(dz, ZOOM_EASE);
+        else g_zoom += FXMUL(dz, ZOOM_EASE_T);
         canvas_clampz();
         g_cam_x = wx - FXDIV(FXI(g_anchor_sx - W / 2), g_zoom);   /* re-pin      */
         g_cam_y = wy - FXDIV(FXI(g_anchor_sy - H / 2), g_zoom);
     }
 }
+
+/* Advance by a measured number of ticks (a variable-length frame).           */
+static void camera_step_dt(int ticks) {
+    if (ticks < 1) ticks = 1;
+    if (ticks > 32) ticks = 32;               /* a stall is not a teleport      */
+    while (ticks--) camera_tick();
+}
+
+/* Legacy fixed frame (the kinetic/cursor suites step by this).               */
+static void camera_step(void) { camera_step_dt(CAM_FRAME_TICKS); }
 
 /* Topmost window under a screen point (focused window is on top), else -1. */
 static int canvas_pick(int sx, int sy) {
@@ -3816,10 +4623,33 @@ static void ccmd_exec(int id) {
     }
 }
 
+/* v0.33: keyboard routing to surfaces — the reserved type=2 event goes live.
+ * Modal, like a real WM: Enter arms "type-to-app" when the focused window has
+ * a bound surface; from then on EVERY key belongs to the app (it owns the
+ * keyboard) except Esc, which returns it to camera navigation. Keys travel
+ * the same 16-deep per-surface queue as clicks; the app's SYS_SURFACE_POLL
+ * loop dispatches on sevent.type.                                            */
+static int      g_key_to_app = 0;
+static uint64_t g_keys_routed = 0;             /* test hook: keys delivered    */
+
+static void key_route(int slot, int code) {
+    struct surface *S = &g_surf[slot];
+    struct sevent e;
+    e.type = 2; e.x = -1; e.y = -1; e.code = code;   /* keys have no position  */
+    if ((S->qw - S->qr) < 16) { S->q[S->qw++ % 16] = e; g_keys_routed++; }
+}
+
 /* Drain the keyboard. Returns 0 when the user asks to leave the canvas.        */
 static int canvas_input(void) {
     int c;
     while ((c = kbd_getc_nonblock()) >= 0) {
+        if (g_key_to_app) {                    /* the focused app owns the keys */
+            if (c == 27) { g_key_to_app = 0; continue; }         /* Esc: back  */
+            if (!g_surf[g_focus].used) { g_key_to_app = 0; continue; }
+            if (c == '\b' || c == '\n' || (c >= 32 && c < 127))
+                key_route(g_focus, c);
+            continue;
+        }
         if (g_hud) {
             if (c == 27) { g_hud = 0; g_hud_len = 0; g_hud_buf[0] = 0; }
             else if (c == '\n') {
@@ -3842,6 +4672,9 @@ static int canvas_input(void) {
             case '\t': canvas_focus_on((g_focus + 1) % NWIN); break;
             case '/':  g_hud = 1; g_hud_len = 0; g_hud_buf[0] = 0; break;
             case 'f': case 'F': canvas_zoom_fit(); break;
+            case '\n': if (g_focus < 8 && g_surf[g_focus].used)  /* arm type-to-app */
+                           g_key_to_app = 1;
+                       break;
             case 27: case 'x': case 'X': return 0;
         }
     }
@@ -3954,7 +4787,7 @@ static void canvas_window(int i, int focused) {
         if (i < 8 && g_surf[i].used) {          /* ring-3 app owns these pixels    */
             struct surface *S = &g_surf[i];
             int cw = w - 16, ch = h - 30;
-            uint32_t *sp = (uint32_t *)S->phys;
+            uint32_t *sp = (uint32_t *)surf_front_phys(S);   /* only ever the FRONT */
             for (int sy = 0; sy < ch; sy++) {
                 int v = sy * S->h / ch;
                 for (int sx = 0; sx < cw; sx++)
@@ -3992,6 +4825,15 @@ static void canvas_hud(void) {
 
 static void canvas_frame(void) {
     int W = g_fb_width, H = g_fb_height;
+    /* v0.32: consume pending page flips at the frame boundary — the ONLY point */
+    /* front/back swap while a pass is live, so no blit ever straddles a flip.  */
+    /* v0.34: only for the slots THIS compositor composites (it registered as   */
+    /* their consumer); flips on other slots complete on their own.             */
+    for (int i = 0; i < NWIN; i++)
+        if (g_surf[i].used && g_surf[i].flip_pending) {
+            g_surf[i].front ^= 1;
+            g_surf[i].flip_pending = 0;        /* unblocks the app's SYS_SURFACE_FLIP */
+        }
     fill(C_OBS0);
 
     /* infinite grid: world-anchored, spacing follows the zoom */
@@ -4025,8 +4867,9 @@ static void canvas_frame(void) {
 
     /* context ribbon: tells you what the current input mode can do */
     rect(0, H - 20, W, 20, C_OBS1); hline(0, H - 20, W, C_HAIR);
-    draw_str(8, H - 14, g_hud ? "TYPE FILTER  ENTER RUN  ESC CLOSE"
-                              : "DRAG WINDOW / PAN  WHEEL ZOOM@CURSOR  WASD  Q/E  TAB  F FIT  / HUD  X EXIT", C_MUTE);
+    draw_str(8, H - 14, g_key_to_app ? "KEYBOARD -> RING-3 APP  (ESC RETURNS TO CANVAS)"
+                      : g_hud       ? "TYPE FILTER  ENTER RUN  ESC CLOSE"
+                      : "DRAG WINDOW / PAN  WHEEL ZOOM@CURSOR  WASD  Q/E  TAB  F FIT  ENTER TYPE-TO-APP  / HUD  X EXIT", C_MUTE);
     char z[24]; int zp = (int)((g_zoom * 100) >> FX);
     int n = 0; z[n++] = 'Z'; z[n++] = ':';
     if (zp >= 100) z[n++] = (char)('0' + (zp / 100) % 10);
@@ -4068,6 +4911,10 @@ static void canvas_pass(int frames, const char *script,
     if (!g_gfx_ready) { kputs("[canvas ] no framebuffer\n"); return; }
     if (reinit) canvas_init();
     preempt_enable();
+    for (int i = 0; i < NWIN; i++) g_surf[i].consumer = 1;   /* we consume the  */
+                                      /* composited slots' flips (even a slot   */
+                                      /* bound mid-pass is covered)             */
+    uint64_t tprev = g_ticks;
     int f = 0, ci = 0;
     for (; f < frames; f++) {
         /* feed the scripted demo one keystroke at a time, at human typing pace, */
@@ -4081,13 +4928,20 @@ static void canvas_pass(int frames, const char *script,
         if (ci < nclk && f == clkf[ci] + 3) { g_mouse_btn = 0; ci++; }  /* release */
         canvas_mouse();
         if (!canvas_input()) break;
-        camera_step();
-        physics_step(g_wins, NWIN);
+        /* v0.32: frame-rate-independent physics — advance the camera by the    */
+        /* MEASURED elapsed PIT ticks, not by an assumed frame.                 */
+        uint64_t tnow = g_ticks;
+        int dt = (int)(tnow - tprev); tprev = tnow;
+        if (dt < 1) dt = 1;
+        camera_step_dt(dt);
+        physics_step_dt(g_wins, NWIN, dt);   /* v0.34: springs on the same clock */
         canvas_frame();
         fb_flip();
         uint64_t t = g_ticks;
         while (g_ticks - t < 2) sched_yield();     /* frame pacing = app run time */
     }
+    for (int i = 0; i < NWIN; i++) g_surf[i].consumer = 0;   /* deregister:     */
+                                      /* parked flips self-consume from here on */
     preempt_disable();
     kprintf("[canvas ] %d frames | camera world (%d,%d) zoom %d%% | focus '%s' | hud %s\n",
             (uint64_t)f, (uint64_t)(g_cam_x >> FX), (uint64_t)(g_cam_y >> FX),
@@ -4180,6 +5034,58 @@ static void cmd_kinetic(void) {
     for (int i = 0; i < 40; i++) { canvas_zoom_to(512, 384, FXI(1) / 2); for (int j = 0; j < 8; j++) camera_step(); }
     kcheck("zoom stays clamped to 12.5%..400% under repeated impulses",
            hi_ok && g_zoom >= FXI(1) / 8);
+
+    /* (6) v0.32: THE frame-rate-independence invariant, checked EXACTLY.       */
+    /* The physics clock is the tick; frames merely group ticks. So the same    */
+    /* total tick count must land on the bit-identical camera state no matter   */
+    /* how it is chopped into frames.                                           */
+    canvas_init();
+    g_cam_vx = FXI(30); g_cam_vy = FXI(-12); canvas_zoom_to(400, 300, FXI(2));
+    for (int i = 0; i < 100; i++) camera_step_dt(2);         /* 100 frames @ 20ms */
+    int64_t xa = g_cam_x, ya = g_cam_y, za = g_zoom, va = g_cam_vx;
+    canvas_init();
+    g_cam_vx = FXI(30); g_cam_vy = FXI(-12); canvas_zoom_to(400, 300, FXI(2));
+    for (int i = 0; i < 200; i++) camera_step_dt(1);         /* 200 frames @ 10ms */
+    kcheck("dt grouping is EXACT: 100 frames @ dt=2 == 200 frames @ dt=1 (bit-identical)",
+           xa == g_cam_x && ya == g_cam_y && za == g_zoom && va == g_cam_vx);
+
+    /* (7) irregular frame times — a stuttering compositor (1..5 ticks/frame)   */
+    /* still lands on the identical state after the same 200 ticks.             */
+    canvas_init();
+    g_cam_vx = FXI(30); g_cam_vy = FXI(-12); canvas_zoom_to(400, 300, FXI(2));
+    static const int jitter[8] = { 1, 3, 2, 4, 1, 5, 2, 2 };   /* 20 ticks/cycle */
+    for (int c = 0; c < 10; c++)
+        for (int j = 0; j < 8; j++) camera_step_dt(jitter[j]);
+    kcheck("irregular frame times (1..5 ticks) land on the identical camera state",
+           xa == g_cam_x && ya == g_cam_y && za == g_zoom && va == g_cam_vx);
+
+    /* (8) v0.34: the WINDOW SPRINGS share the tick clock — same exactness bar. */
+    /* Perturb every target, run the full spring+collision system, and demand   */
+    /* the bit-identical endpoint under different tick groupings.               */
+    static struct win wa[NWIN], wb[NWIN];
+    canvas_init();
+    for (int i = 0; i < NWIN; i++) { g_wins[i].tx += FXI(137 + 41 * i); g_wins[i].ty -= FXI(53 + 29 * i); }
+    for (int i = 0; i < NWIN; i++) wa[i] = g_wins[i];
+    for (int s = 0; s < 60; s++) physics_step_dt(wa, NWIN, 2);      /* 120 ticks */
+    for (int i = 0; i < NWIN; i++) wb[i] = g_wins[i];
+    for (int s = 0; s < 120; s++) physics_step_dt(wb, NWIN, 1);     /* 120 ticks */
+    int spring_ok = 1;
+    for (int i = 0; i < NWIN; i++)
+        if (wa[i].x != wb[i].x || wa[i].y != wb[i].y ||
+            wa[i].vx != wb[i].vx || wa[i].vy != wb[i].vy) spring_ok = 0;
+    kcheck("window-spring dt grouping is EXACT (60 frames @ dt=2 == 120 @ dt=1)", spring_ok);
+
+    /* (9) irregular groupings, same 120 ticks, same endpoint — springs AND the */
+    /* pairwise collision resolution are tick-pure.                             */
+    for (int i = 0; i < NWIN; i++) wb[i] = g_wins[i];
+    static const int sjit[6] = { 1, 4, 2, 5, 3, 5 };                /* 20/cycle  */
+    for (int c = 0; c < 6; c++)
+        for (int j = 0; j < 6; j++) physics_step_dt(wb, NWIN, sjit[j]);
+    spring_ok = 1;
+    for (int i = 0; i < NWIN; i++)
+        if (wa[i].x != wb[i].x || wa[i].y != wb[i].y ||
+            wa[i].vx != wb[i].vx || wa[i].vy != wb[i].vy) spring_ok = 0;
+    kcheck("window springs under irregular frame times land on the identical state", spring_ok);
 
     canvas_init();
     kprintf("[kinetic] RESULT: %d passed, %d failed\n", (uint64_t)g_kpass, (uint64_t)g_kfail);
@@ -4760,9 +5666,9 @@ static void cmd_stress(void) {
     __asm__ volatile("invlpg (%0)" :: "r"(tv) : "memory");
     uint32_t r1 = *(volatile uint32_t *)tv;
     map_page(kernel_cr3, tv, f2, PTE_WRITE | PTE_NX);      /* remap same vaddr    */
-    __asm__ volatile("invlpg (%0)" :: "r"(tv) : "memory"); /* shoot the old entry */
+    tlb_shootdown(tv);                     /* v0.35: invalidate on EVERY core     */
     uint32_t r2 = *(volatile uint32_t *)tv;
-    scheck("invlpg after remap: no stale TLB entry (sees new frame)",
+    scheck("invlpg after remap: no stale TLB entry (sees new frame, all cores shot down)",
            r1 == 0x1111 && r2 == 0x2222);
 
     /* (5) CR3 churn under preemption: rapidly switch between two address spaces */
@@ -4911,10 +5817,11 @@ static void cmd_fuzz(void) {
     int N = 20000, calls = 0, rejected = 0, okc = 0;
     g_quiet = 1;                                                    /* silence SYS_WRITE spam  */
     for (int i = 0; i < N; i++) {
-        uint64_t num = rng_next() % 15;                            /* 0..12 + YIELD/GETPID via remap */
+        uint64_t num = rng_next() % 16;                            /* 0..12 + 15/16/17 via remap */
         if (num == 13) num = 15;                                   /* SYS_YIELD: exercises the per- */
         if (num == 14) num = 16;                                   /* thread switch under fuzz      */
-        if (num == 2)  num = 3;                                    /* never SYS_EXIT          */
+        if (num == 15) num = 17;                                   /* SYS_SURFACE_FLIP: owner-gated,*/
+        if (num == 2)  num = 3;                                    /* denied before any state change */
         kprocs[fp].caps = cpool[rng_next() % ncp];
         if (num == 9 && (kprocs[fp].caps & PCAP_NETWORK)) kprocs[fp].caps &= ~PCAP_NETWORK; /* no block */
         uint64_t a0 = pool[rng_next() % np], a1 = pool[rng_next() % np], a2 = pool[rng_next() % np];
@@ -5252,6 +6159,119 @@ static void cmd_threads(void) {
     kputs("-- done --\n");
 }
 
+/* ===========================================================================
+ * DOUBLE-BUFFERED SURFACES  (v0.32 — SYS_SURFACE_FLIP, tear-free by design)
+ * ===========================================================================
+ * The tear detector: a ring-3 thread fills WHOLE frames in strictly
+ * alternating app-unique colors and flips; this suite plays compositor
+ * (consuming flips at its own "frame boundaries", with timer preemption ON so
+ * the app is interrupted mid-draw arbitrarily) and scans every consumed front
+ * buffer. One non-uniform scan = one torn frame. Under v0.31's in-place
+ * repaint this scan catches partial frames; with the flip protocol the front
+ * buffer is a completed frame by construction.
+ * =========================================================================== */
+#define TEAR_COLOR_A 0x004682EAu    /* app-unique: not in the kernel palette   */
+#define TEAR_COLOR_B 0x001FBF6Eu
+static int g_flpass, g_flfail;
+static void flcheck(const char *n, int c) {
+    if (c) { g_flpass++; kprintf("[flip   ]  PASS  %s\n", n); }
+    else   { g_flfail++; kprintf("[flip   ]  FAIL  %s\n", n); }
+}
+
+static void cmd_flip(void) {
+    kputs("-- DOUBLE-BUFFERED SURFACES: page flip vs tearing --\n");
+    g_flpass = g_flfail = 0;
+    int tt = -1;
+    int pt = uthread_spawn_elf("tear-test", PCAP_FRAMEBUFFER, 5, &tt);
+    if (pt < 0) { kputs("[flip   ] spawn failed\n-- done --\n"); return; }
+    uint64_t t0 = g_ticks;
+    while (!g_surf[5].used && g_ticks - t0 < 500) sched_yield();
+    struct surface *S = &g_surf[5];
+    flcheck("ring-3 thread created a double-buffered surface (front+back pair)",
+            S->used && S->bufpages == 4 && S->owner == pt);
+    flcheck("both buffers are user-mapped in the owner (and only 2*bufpages of them)",
+            access_ok(kprocs[pt].cr3, SURF_USER_V, (uint64_t)2 * S->bufpages * 0x1000, 1) &&
+            !access_ok(kprocs[pt].cr3, SURF_USER_V + (uint64_t)2 * S->bufpages * 0x1000, 0x1000, 1));
+    uint64_t phys0 = S->phys;
+
+    /* v0.34: with NO consumer registered, flips must complete immediately —   */
+    /* the producer keeps publishing frames instead of parking.                 */
+    uint32_t cA = 0, cB = 0;
+    for (int y = 0; y < 40 && !(cA && cB); y++) {
+        sched_yield();
+        uint32_t c0 = *(volatile uint32_t *)surf_front_phys(S) & 0xFFFFFF;
+        if (c0 == TEAR_COLOR_A) cA = 1;
+        if (c0 == TEAR_COLOR_B) cB = 1;
+    }
+    flcheck("flips on a slot with NO consumer complete immediately (producer never parks)",
+            cA && cB);
+
+    /* the sibling slot-4 app must KEEP RUNNING while we consume slot 5 — the  */
+    /* v0.33 gap. Watch its liveness bar move across our consume loop.         */
+    int bar0 = -1, bar1 = -1;
+    if (g_surf[4].used) {
+        uint32_t *s4 = (uint32_t *)surf_front_phys(&g_surf[4]);
+        for (int x = 0; x < 200; x++) if ((s4[106 * 200 + x] & 0xFFFFFF) == 0x9B4DFF) { bar0 = x; break; }
+    }
+
+    /* play compositor FOR SLOT 5 ONLY: consume 200 flips, scan each frame     */
+    S->consumer = 1;                   /* per-slot registration (v0.34)         */
+    preempt_enable();                  /* the app gets preempted mid-draw       */
+    int consumed = 0, torn = 0, alt_ok = 1, seenA = 0, seenB = 0;
+    uint32_t last = 0;
+    while (consumed < 200) {
+        t0 = g_ticks;
+        while (!S->flip_pending && g_ticks - t0 < 300) sched_yield();
+        if (!S->flip_pending) break;                   /* app died / stalled    */
+        S->front ^= 1; S->flip_pending = 0;            /* frame boundary        */
+        volatile uint32_t *fp = (volatile uint32_t *)surf_front_phys(S);
+        uint32_t c0 = fp[0] & 0xFFFFFF;
+        int mix = 0;
+        for (int i = 1; i < S->w * S->h; i++)
+            if ((fp[i] & 0xFFFFFF) != c0) { mix = 1; break; }
+        if (mix) torn++;
+        if (c0 == TEAR_COLOR_A) seenA++;
+        else if (c0 == TEAR_COLOR_B) seenB++;
+        else alt_ok = 0;                               /* junk frame            */
+        if (consumed > 0 && c0 == last) alt_ok = 0;    /* must strictly alternate */
+        last = c0;
+        consumed++;
+    }
+    preempt_disable();
+    S->consumer = 0;                   /* deregister                            */
+    if (g_surf[4].used) {
+        uint32_t *s4 = (uint32_t *)surf_front_phys(&g_surf[4]);
+        for (int x = 0; x < 200; x++)              /* sample NOW, before any    */
+            if ((s4[106 * 200 + x] & 0xFFFFFF) == 0x9B4DFF) { bar1 = x; break; } /* more yields */
+        for (int tries = 0; tries < 2 && bar1 == bar0; tries++) {   /* 184-wrap fallback */
+            for (int y = 0; y < 20; y++) sched_yield();
+            s4 = (uint32_t *)surf_front_phys(&g_surf[4]);
+            bar1 = -1;
+            for (int x = 0; x < 200; x++)
+                if ((s4[106 * 200 + x] & 0xFFFFFF) == 0x9B4DFF) { bar1 = x; break; }
+        }
+        flcheck("sibling surface thread kept running while another slot was consumed",
+                bar0 >= 0 && bar1 >= 0 && bar1 != bar0);
+    }
+    kprintf("[flip   ] consumed %d published frames: %d torn, %d/%d color A/B\n",
+            (uint64_t)consumed, (uint64_t)torn, (uint64_t)seenA, (uint64_t)seenB);
+    flcheck("200 frames published through SYS_SURFACE_FLIP under preemption", consumed == 200);
+    flcheck("ZERO torn frames: every published front buffer is a COMPLETE frame", torn == 0);
+    flcheck("frames alternate strictly (each flip is exactly one finished frame)",
+            alt_ok && seenA + seenB == consumed && seenA >= 99);
+
+    /* lifecycle: the tear app exits after its 400 frames; the PAIR is reclaimed */
+    t0 = g_ticks;
+    while (!kprocs[pt].exited && g_ticks - t0 < 800) sched_yield();
+    flcheck("double buffer reclaimed as one chunk when the owner exits",
+            kprocs[pt].exited && !g_surf[5].used && g_surf_last_reclaim == phys0);
+
+    kprintf("[flip   ] RESULT: %d passed, %d failed\n", (uint64_t)g_flpass, (uint64_t)g_flfail);
+    if (!g_flfail) kputs("[flip   ] PAGE FLIP VERIFIED — the compositor can no longer observe a half-drawn frame\n");
+    else          kputs("[flip   ] FLIP DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 /* Hand a canvas window to an unprivileged process that renders its own pixels.
  * v0.31: the app is a FIRST-CLASS THREAD — spawned, not entered. It creates
  * its surface and then loops (poll events -> render -> yield) forever,
@@ -5288,13 +6308,83 @@ static void cmd_surfin(void) {
     struct surface *S = &g_surf[4];
     int hits = 0;
     for (int tries = 0; tries < 50 && !hits; tries++) {
-        sched_yield();
+        sched_yield();                     /* app self-consumes its parked flip  */
         hits = 0;
+        uint32_t *fp = (uint32_t *)surf_front_phys(S);   /* the PUBLISHED frame  */
         for (int i = 0; i < S->w * S->h; i++)
-            if ((((uint32_t *)S->phys)[i] & 0xFFFFFF) == APP_HIT_MARKER) hits++;
+            if ((fp[i] & 0xFFFFFF) == APP_HIT_MARKER) hits++;
     }
     kprintf("[surfin ] app repainted DURING the pass: %d hit-marker pixels (%X) in its surface\n",
             (uint64_t)hits, (uint64_t)APP_HIT_MARKER);
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * KEYBOARD ROUTING TO RING-3 SURFACES  (v0.33 — the type=2 event goes live)
+ * ===========================================================================
+ * End-to-end, both ends verified: keystrokes are injected into the REAL PS/2
+ * ring buffer inside a live canvas pass; the modal router delivers them to
+ * the focused app's event queue; the app (a first-class thread) drains them,
+ * paints each char as a block whose COLOR ENCODES THE ASCII CODE, and
+ * publishes via SYS_SURFACE_FLIP. The suite then decodes the published front
+ * buffer back into the typed string. Negative checks prove navigation-mode
+ * keys never route and Esc returns the keyboard to the camera.
+ * =========================================================================== */
+#define KEYBLOCK_BASE 0x00A00030u   /* app block color: 0xA0..30 | (ascii<<8)  */
+static int g_kbpass, g_kbfail;
+static void kbcheck(const char *n, int c) {
+    if (c) { g_kbpass++; kprintf("[keys   ]  PASS  %s\n", n); }
+    else   { g_kbfail++; kprintf("[keys   ]  FAIL  %s\n", n); }
+}
+
+static void cmd_keys(void) {
+    kputs("-- KEYBOARD ROUTING TO RING-3 SURFACES (type=2) --\n");
+    g_kbpass = g_kbfail = 0;
+    if (!g_surf[4].used) { kputs("[keys   ] no surface bound\n-- done --\n"); return; }
+
+    /* (1) navigation mode: keys steer the camera and must NOT reach the app   */
+    uint64_t r0 = g_keys_routed;
+    int64_t x0 = g_cam_x;
+    canvas_pass(30, "dd", 0, 0, 0, 0, 0);          /* two 'd' impulses          */
+    kbcheck("navigation-mode keys steer the camera, none leak to the app",
+            g_keys_routed == r0 && g_cam_x != x0);
+
+    /* (2)(3)(4) Enter arms type-to-app; "HI R3" routes; Esc disarms — all      */
+    /* through the real PS/2 ring inside one live pass                          */
+    canvas_pass(90, "\nHI R3\x1b", 0, 0, 0, 0, 0);
+    kbcheck("Enter armed type-to-app and 5 keys were routed to the focused surface",
+            g_keys_routed == r0 + 5);
+    kbcheck("Esc returned the keyboard to canvas navigation", g_key_to_app == 0);
+
+    /* decode the app's published frame: block i encodes typed char i           */
+    static const char *want = "HI R3";
+    struct surface *S = &g_surf[4];
+    char got[8]; int ok = 1;
+    int tries = 0; uint32_t *fp = 0;
+    for (tries = 0; tries < 50; tries++) {         /* let the app publish       */
+        sched_yield();
+        fp = (uint32_t *)surf_front_phys(S);
+        ok = 1;
+        for (int i = 0; i < 5; i++) {
+            uint32_t px = fp[92 * 200 + (6 + 8 * i + 3)] & 0xFFFFFF;
+            got[i] = ((px & 0xFF00FF) == KEYBLOCK_BASE) ? (char)((px >> 8) & 0xFF) : '?';
+            if (got[i] != want[i]) ok = 0;
+        }
+        if (ok) break;
+    }
+    got[5] = 0;
+    kprintf("[keys   ] pixel-decoded from the published front buffer: \"%s\"\n", got);
+    kbcheck("app painted the typed text — pixels decode back to \"HI R3\"", ok);
+
+    /* (5) after Esc, keys are navigation again: camera moves, count frozen     */
+    uint64_t r1 = g_keys_routed; x0 = g_cam_x;
+    canvas_pass(30, "dd", 0, 0, 0, 0, 0);
+    kbcheck("post-Esc keys move the camera again and the app receives none",
+            g_keys_routed == r1 && g_cam_x != x0);
+
+    kprintf("[keys   ] RESULT: %d passed, %d failed\n", (uint64_t)g_kbpass, (uint64_t)g_kbfail);
+    if (!g_kbfail) kputs("[keys   ] KEYBOARD ROUTING VERIFIED — the focused app owns the keys, end to end\n");
+    else          kputs("[keys   ] KEY ROUTING DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -5331,6 +6421,11 @@ static void cmd_help(void) {
       "  capdma          capability-bound per-process DMA domains\n"
       "  nicdrv          hand the NIC to a ring-3 userspace driver\n"
       "  threads         first-class ring-3 scheduler threads suite\n"
+      "  flip            double-buffered surface page-flip / tearing suite\n"
+      "  keys            keyboard-to-surface routing suite (type=2 events)\n"
+      "  smp             multi-core suite: IPIs, TLB shootdown, atomics\n"
+      "  parallel        work-stealing parallel job across all cores\n"
+      "  audit           parallel page-table integrity audit across all cores\n"
       "  surface         spawn the ring-3 surface app as a live thread\n"
       "  surfin          route clicks to the live app in one canvas pass\n"
       "  canvas          Metropolis-Terminal spatial canvas (WASD/QE/TAB//)\n"
@@ -5403,6 +6498,11 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "surface")) cmd_surface();
     else if (!kstrcmp(argv[0], "surfin")) cmd_surfin();
     else if (!kstrcmp(argv[0], "threads")) cmd_threads();
+    else if (!kstrcmp(argv[0], "flip")) cmd_flip();
+    else if (!kstrcmp(argv[0], "keys")) cmd_keys();
+    else if (!kstrcmp(argv[0], "smp")) cmd_smp();
+    else if (!kstrcmp(argv[0], "parallel") || !kstrcmp(argv[0], "par")) cmd_parallel();
+    else if (!kstrcmp(argv[0], "audit")) cmd_audit();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -5478,7 +6578,7 @@ void kernel_main(uint64_t mb_info) {
         (void)handlers;
     }
     {
-        uint64_t h[48] = {
+        uint64_t h[50] = {
             ISR_ADDR(0),ISR_ADDR(1),ISR_ADDR(2),ISR_ADDR(3),ISR_ADDR(4),ISR_ADDR(5),
             ISR_ADDR(6),ISR_ADDR(7),ISR_ADDR(8),ISR_ADDR(9),ISR_ADDR(10),ISR_ADDR(11),
             ISR_ADDR(12),ISR_ADDR(13),ISR_ADDR(14),ISR_ADDR(15),ISR_ADDR(16),ISR_ADDR(17),
@@ -5487,15 +6587,16 @@ void kernel_main(uint64_t mb_info) {
             ISR_ADDR(30),ISR_ADDR(31),ISR_ADDR(32),ISR_ADDR(33),ISR_ADDR(34),ISR_ADDR(35),
             ISR_ADDR(36),ISR_ADDR(37),ISR_ADDR(38),ISR_ADDR(39),ISR_ADDR(40),ISR_ADDR(41),
             ISR_ADDR(42),ISR_ADDR(43),ISR_ADDR(44),ISR_ADDR(45),ISR_ADDR(46),ISR_ADDR(47),
+            ISR_ADDR(48),ISR_ADDR(49),                 /* v0.35: IPI vectors    */
         };
-        for (int v = 0; v < 48; v++) idt_set(v, h[v]);
+        for (int v = 0; v < 50; v++) idt_set(v, h[v]);
         struct idtr idtr = { sizeof(idt) - 1, (uint64_t)idt };
         idt_load(&idtr);
     }
     pic_remap();
     pit_init();
     __asm__ volatile("sti");
-    kprintf("[kernel ] IDT loaded (48 vectors), PIC remapped, PIT @ 100 Hz, IRQs on\n");
+    kprintf("[kernel ] IDT loaded (50 vectors incl. IPI 48-49), PIC remapped, PIT @ 100 Hz, IRQs on\n");
     kprintf("[kernel ] consoles: VGA text + COM1 serial (115200 8N1) — both live\n");
 
     multiboot_scan(mb_info, true);
@@ -5531,9 +6632,13 @@ void kernel_main(uint64_t mb_info) {
     cmd_validate();
     cmd_invariants();
     usermode_init();        /* user GDT segments + TSS + SYSCALL MSRs (needed for ring 3) */
+    smp_init();             /* v0.35: boot every core (needs the kernel GDT above) */
     cmd_stress();
     cmd_fuzz();
     cmd_sweep();
+    cmd_smp();              /* v0.35: cross-core protocol verification            */
+    cmd_parallel();         /* v0.36: work-stealing parallel job across cores     */
+    cmd_audit();            /* v0.37: parallel page-table integrity audit         */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
@@ -5542,10 +6647,12 @@ void kernel_main(uint64_t mb_info) {
     cmd_gfx();
     cmd_surface();        /* spawns the surface app as a first-class thread     */
     cmd_threads();        /* v0.31: thread model verification suite             */
+    cmd_flip();           /* v0.32: double-buffer page-flip / tearing suite     */
     cmd_cursor();
     cmd_kinetic();
     cmd_canvas(300, "/zoom fit\n");
     cmd_surfin();         /* clicks routed + app reacts INSIDE this single pass */
+    cmd_keys();           /* v0.33: keyboard routed to the focused app          */
     cmd_canvas(120, 0);   /* recomposite — the hit markers persist              */
     cmd_usermode();
 

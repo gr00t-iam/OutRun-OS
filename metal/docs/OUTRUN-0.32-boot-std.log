@@ -1,0 +1,499 @@
+
+  ....................................................................
+  :   OUTRUN OS  --  bare-metal kernel 0.32.0-metal                   :
+  :   Assembly bootstrap -> x86_64 long mode -> freestanding C core  :
+  ....................................................................
+
+[kernel ] long mode active, kernel at 1 MiB, first GiB identity-mapped
+[kernel ] IDT loaded (48 vectors), PIC remapped, PIT @ 100 Hz, IRQs on
+[kernel ] consoles: VGA text + COM1 serial (115200 8N1) — both live
+[kernel ] booted by: GRUB 2.12-1ubuntu7.3
+[kernel ] boot module 'user_init.elf' at phys 0000000000196000..0000000000197bb0 (user ELF)
+[kernel ] physical memory map (Multiboot2):
+           0000000000000000 + 000000000009fc00  USABLE RAM
+           000000000009fc00 + 0000000000000400  reserved
+           00000000000f0000 + 0000000000010000  reserved
+           0000000000100000 + 000000001fedd000  USABLE RAM
+           000000001ffdd000 + 0000000000023000  reserved
+           00000000fffc0000 + 0000000000040000  reserved
+           000000fd00000000 + 0000000300000000  reserved
+           total usable: 511 MiB
+[kernel ] framebuffer: 1024x768 x32 bpp, pitch 4096, phys 00000000fd000000
+[acpi   ] RSDP (ACPI 1.0) provided by bootloader
+[kernel ] capability table initialized (16 slots, kernel-owned)
+[kernel ] paging: boot PML4 @ phys 0000000000121000; process frame pool from 16 MiB
+[kernel ] W^X enforced: kernel .text R+X, all other pages RW+NX
+[sweep  ] descriptor-table integrity sweep armed: 64 entries/tick @ 100 Hz
+
+-- real 4-level page-table hardware passthrough --
+[hw     ] device 'sensor0' registers at phys 0000000001001000, sentinel 0x00000000cafebabe, requires CAMERA
+[kernel ] spawned pid 1 'stream-app' caps 0000000000000003 — private PML4 @ phys 0000000001002000
+[kernel ] spawned pid 2 'sketchy-app' caps 0000000000000020 — private PML4 @ phys 0000000001003000
+
+[test   ] authorized process maps the device:
+[hw     ] GRANT  pid 1 'stream-app' -> 'sensor0': phys 0000000001001000 mapped at vaddr 0000400040000000 (1 pages)
+[paging ] 'stream-app' PTE: vaddr 0000400040000000 -> phys 0000000001001000
+[paging ] 'stream-app' read through its OWN address space: 0x00000000cafebabe  == sentinel (REAL mapping resolves)
+
+[test   ] unauthorized process attempts the same device:
+[hw     ] DENIED pid 2 'sketchy-app' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[paging ] 'sketchy-app' passthrough returned -2; device vaddr present in its space? NO (sandboxed, nothing mapped)
+-- done: authorized app holds a real MMIO mapping; unauthorized was dropped --
+[iommu  ] no DMAR table — platform has no VT-d remapping hardware
+
+[pci    ] enumerating bus 0 (config mechanism #1, ports 0xCF8/0xCFC):
+[pci    ]   0:00.0  vendor 8086 device 1237 class 600
+[pci    ]   1:00.0  vendor 8086 device 7000 class 601
+[pci    ]   2:00.0  vendor 1234 device 1111 class 300
+[pci    ]   3:00.0  vendor 1af4 device 1042 class 100
+[vblk   ] virtio-blk at 0:3.0 — bringing up modern driver
+[vblk   ] device features: hi 101 lo 30006e54 (VERSION_1=1)
+[vblk   ] capacity: 8192 sectors (4 MiB)
+[vblk   ] DRIVER_OK — queue0 size 64, notify_off 0, mult 4 — READY
+[vblk   ] interrupt-driven: INTx on IRQ 11 (vector 43), ISR reg mapped
+[pci    ]   4:00.0  vendor 1af4 device 1041 class 200
+[vnet   ] virtio-net at 0:4.0 — bringing up modern driver
+[vnet   ] MAC 52:54:0:ab:cd:ef
+[vnet   ] DRIVER_OK — rxq 16 txq 16, INTx IRQ 11 — READY
+[sched  ] round-robin up: main=tid0, idle=tid1 (PIT preemption on demand)
+[poly   ] C++ SPSC ring: pushed 12, popped 12 -> "polyglot-ipc" (depth 0)
+-- content-addressable storage on virtio-blk (Rust-hashed) --
+[cas    ] no volume signature; formatting a fresh CAS volume
+[cas    ] formatted 8192 blocks: bitmap@1(2) index@3(16) dir@19(8) data@27
+[cas    ] put len 46 hash 155c834afdff66eb -> block 27 (stored)
+[cas    ] put len 47 hash bc6c7bd024077f72 -> block 28 (stored)
+[cas    ] put len 46 hash 155c834afdff66eb -> DEDUP to block 27 (no write)
+[cas    ] get 155c834afdff66eb -> "Hello, Outrun CAS! The content is the address." (46 bytes read from disk)
+[cas    ] dedup: hash(a)==hash(a')? YES ; blocks used this run +2
+[vblk   ] I/O completions delivered by INTERRUPT: 48
+-- done (state persisted to disk) --
+-- VFS: named files over CAS (multi-block, dedup, copy-on-write) --
+[cas    ] put len 70 hash 84244543d2d93a3d -> block 29 (stored)
+[cas    ] put len 512 hash aea49363f1ef848d -> block 30 (stored)
+[cas    ] put len 512 hash fb04efdab6d2ed4d -> block 31 (stored)
+[cas    ] put len 376 hash 7f4fe244e98a0963 -> block 32 (stored)
+[vfs    ] directory:
+[vfs    ]   motd  (70 bytes, 1 chunks, hash 84244543d2d93a3d)
+[vfs    ]   readme  (1400 bytes, 3 chunks, hash 0abbc20b3944d403)
+[vfs    ] read 'readme' (1400 bytes, spans 3 blocks): content verified
+[cas    ] put len 32 hash 50fc444c0771b178 -> block 33 (stored)
+[vfs    ] copy-on-write 'motd': hash 84244543d2d93a3d -> 50fc444c0771b178 (immutable blocks, name repointed)
+[cas    ] put len 512 hash aea49363f1ef848d -> DEDUP to block 30 (no write)
+[cas    ] put len 512 hash fb04efdab6d2ed4d -> DEDUP to block 31 (no write)
+[cas    ] put len 376 hash 7f4fe244e98a0963 -> DEDUP to block 32 (no write)
+[vfs    ] 'readme_copy' identical to 'readme' -> blocks used +0 (CAS dedup)
+-- done --
+-- preemptive scheduler + multiple outstanding I/O --
+[sched  ] submitted 8 reads without blocking; in-flight now 8
+[sched  ] all 8 done; PEAK concurrent in-flight tags = 8
+[worker ] tid3 did 4 write+read cycles: verified
+[worker ] tid2 did 4 write+read cycles: verified
+[worker ] tid4 did 4 write+read cycles: verified
+[worker ] tid5 did 4 write+read cycles: verified
+[sched  ] 4 worker threads completed; wakes routed to specific TIDs
+[sched  ] preemption proof: non-yielding spinner advanced to 40468717 while main
+[sched  ]   also ran (0 would mean no time-slicing occurred)
+[vblk   ] lifetime interrupt completions: 173
+-- done --
+-- async IRQ routing: NIC interrupt wakes a parked thread --
+[netd   ] tid2 holds CAP_NETWORK; TX ARP who-has 10.0.2.2
+[netd   ] sys_wait_event(NET_RX): parking until the NIC interrupts...
+[netd   ] woken by IRQ; RX 76 bytes, ethertype 806
+[netd   ] ARP reply: 10.0.2.2 is-at 52:55:a:0:2:2 (parsed in place)
+[net    ] zero-copy IP/UDP router: DHCP round-trip through a port filter
+[dhcpd  ] tid2 bound UDP port 68 -> execution slot 0
+[dhcpd  ] TX DHCPDISCOVER (291 bytes), waiting on port-68 slot...
+[dhcpd  ] router delivered 548-byte UDP payload (zero-copy pointer)
+[dhcpd  ] DHCP OFFER: offered IP 10.0.2.15, server 10.0.2.2
+-- done --
+-- Time-Stream Engine: chronological index + local vector query --
+[stream ] chronological timeline (9 events, all vector-indexed):
+[stream ]  #0  t=14  FILE  vfs: wrote file motd
+[stream ]  #1  t=17  FILE  vfs: wrote file readme
+[stream ]  #2  t=19  FILE  vfs: wrote file motd
+[stream ]  #3  t=21  FILE  vfs: wrote file readme_copy
+[stream ]  #4  t=44  COMM  Sarah: shared the Q3 revenue chart deck
+[stream ]  #5  t=44  COMM  DevTeam: merged the microkernel scheduler patch
+[stream ]  #6  t=44  COMM  Ops: flagged a network gateway DHCP change
+[stream ]  #7  t=44  SYS   netd: received DHCP offer 10.0.2.15 from gateway
+[stream ]  #8  t=44  SYS   sched: ran four concurrent worker threads
+[stream ] query "the Q3 chart Sarah sent":
+[stream ]   -> COMM Sarah: shared the Q3 revenue chart deck  (score 4)
+[stream ]   -> COMM DevTeam: merged the microkernel scheduler patch  (score 1)
+[stream ] query "scheduler patch":
+[stream ]   -> COMM DevTeam: merged the microkernel scheduler patch  (score 2)
+[stream ] query "dhcp gateway address":
+[stream ]   -> COMM Ops: flagged a network gateway DHCP change  (score 2)
+[stream ]   -> SYS  netd: received DHCP offer 10.0.2.15 from gateway  (score 2)
+-- done --
+-- PRODUCTION VALIDATION MATRIX --
+[valid  ] capability audit:
+[kernel ] spawned pid 3 'audit-none' caps 0000000000000000 — private PML4 @ phys 0000000001014000
+[kernel ] spawned pid 4 'audit-fs' caps 0000000000000020 — private PML4 @ phys 0000000001015000
+[valid  ]  PASS  sys_open  denied w/o CAP_FILESYSTEM
+[valid  ]  PASS  sys_read  denied w/o CAP_FILESYSTEM
+[valid  ]  PASS  sys_write denied w/o CAP_FILESYSTEM
+[valid  ]  PASS  sys_wait_event denied w/o CAP_NETWORK
+[valid  ]  PASS  sys_map_fb denied w/o CAP_FRAMEBUFFER
+[valid  ]  PASS  sys_open  passes cap gate w/ CAP_FILESYSTEM
+[valid  ] ELF loader bounds-checking:
+[elf    ] PT_LOAD vaddr 0000500000000000 filesz 0000000000000000 memsz 0000000000001000 (ro) -> mapped USER (bounds ok)
+[valid  ]  PASS  valid minimal ELF accepted
+[elf    ] reject: image smaller than ELF header
+[valid  ]  PASS  reject: image smaller than header
+[elf    ] reject: program header table out of bounds
+[valid  ]  PASS  reject: phdr table out of bounds
+[elf    ] reject: segment file range out of bounds
+[valid  ]  PASS  reject: segment file range out of bounds
+[elf    ] reject: segment vaddr 0000000000001000 outside user range
+[valid  ]  PASS  reject: segment vaddr outside user range
+[elf    ] reject: entry 0000000000001000 outside user range
+[valid  ]  PASS  reject: entry outside user range
+[elf    ] reject: memsz < filesz
+[valid  ]  PASS  reject: memsz < filesz
+[valid  ] CAS/VFS round-trip integrity:
+[cas    ] put len 512 hash 6404ff35e8dec725 -> block 34 (stored)
+[valid  ]  PASS  CAS put/get byte-exact round-trip
+[cas    ] put len 512 hash 6404ff35e8dec725 -> DEDUP to block 34 (no write)
+[valid  ]  PASS  CAS dedup: identical put -> same hash
+[valid  ]  PASS  CAS dedup: identical put -> no new block
+[valid  ]  PASS  CAS get of unknown hash -> not found
+[cas    ] put len 512 hash 510b231af2415325 -> block 35 (stored)
+[cas    ] put len 512 hash 510b231af2415325 -> DEDUP to block 35 (no write)
+[cas    ] put len 276 hash ab06722f02efa055 -> block 36 (stored)
+[valid  ]  PASS  VFS multi-block write/read round-trip
+[cas    ] put len 512 hash 510b231af2415325 -> DEDUP to block 35 (no write)
+[cas    ] put len 388 hash 668072e4108a11d5 -> block 37 (stored)
+[valid  ]  PASS  VFS copy-on-write changes file hash
+[valid  ] RESULT: 19 passed, 0 failed
+[valid  ] ALL CHECKS PASSED — image is production-verified
+-- done --
+-- EXHAUSTIVE ISOLATION & HARDENING INVARIANTS --
+[kernel ] spawned pid 5 'inv-cap' caps 0000000000000000 — private PML4 @ phys 000000000101f000
+[invar  ]  PASS  no cap-mask escalates sys_open
+[invar  ]  PASS  no cap-mask escalates sys_read
+[invar  ]  PASS  no cap-mask escalates sys_write_file
+[invar  ]  PASS  no cap-mask escalates sys_wait_event
+[invar  ]  PASS  no cap-mask escalates sys_map_framebuffer
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[invar  ]  PASS  no cap-mask escalates sys_hw_passthrough
+[invar  ] capability space swept: 192/192 denial checks held
+[kernel ] spawned pid 6 'inv-A' caps 0000000000000000 — private PML4 @ phys 0000000001020000
+[kernel ] spawned pid 7 'inv-B' caps 0000000000000000 — private PML4 @ phys 0000000001021000
+[invar  ]  PASS  same vaddr resolves to A's own frame in A
+[invar  ]  PASS  same vaddr resolves to B's own frame in B
+[invar  ]  PASS  processes get physically distinct frames
+[invar  ]  PASS  A-private page is NOT visible in B
+[invar  ]  PASS  user page PTE present + USER + WRITE
+[invar  ]  PASS  kernel page reachable via shared identity
+[invar  ]  PASS  kernel page is SUPERVISOR-only (ring3 blocked)
+[invar  ]  PASS  processes SHARE identity PML4[0]
+[invar  ]  PASS  processes SHARE device-MMIO PML4[0xC0]
+[invar  ]  PASS  processes have PRIVATE user PML4[0xA0]
+[kernel ] spawned pid 8 'inv-hw' caps 0000000000000003 — private PML4 @ phys 000000000102e000
+[kernel ] spawned pid 9 'inv-hw2' caps 0000000000000001 — private PML4 @ phys 000000000102f000
+[invar  ]  PASS  passthrough rejects invalid device handle
+[hw     ] GRANT  pid 8 'inv-hw' -> 'sensor0': phys 0000000001001000 mapped at vaddr 0000400200000000 (1 pages)
+[invar  ]  PASS  passthrough grants valid device w/ HW+device cap
+[hw     ] DENIED pid 9 'inv-hw2' -> 'sensor0': missing device capability
+[invar  ]  PASS  passthrough denies device w/o its device-cap (2-level gate)
+[invar  ]  PASS  granted device page is USER + cache-disabled
+[invar  ]  PASS  device mapping absent from an unrelated space
+[invar  ] RESULT: 21 passed, 0 failed
+[invar  ] CORE SECURITY BOUNDARY VERIFIED — isolation is airtight
+-- done --
+[kernel ] ring-3 enabled: GDT+TSS loaded, SYSCALL/SYSRET MSRs armed
+[kernel ]   STAR kern=0x08 user=0x1B, LSTAR=00000000001012c0, TSS.rsp0=000000000013dbf0
+-- STRESS & ENFORCEMENT (fault injection + TLB/CR3 + W^X/NX) --
+[stress ]  PASS  kernel address space has ZERO writable+executable pages
+[stress ] scanned 1031 kernel leaf pages, 0 W+X
+[kernel ] spawned pid 10 'stress-wx' caps 0000000000000020 — private PML4 @ phys 0000000001033000
+[stress ]  PASS  user address space has ZERO writable+executable pages
+[stress ]  PASS  executing a data page traps (#PF, NX enforced)
+[stress ]  PASS  writing to R+X kernel code traps (#PF, code immutable)
+[stress ]  PASS  invlpg after remap: no stale TLB entry (sees new frame)
+[kernel ] spawned pid 11 'churn-A' caps 0000000000000000 — private PML4 @ phys 000000000103e000
+[kernel ] spawned pid 12 'churn-B' caps 0000000000000000 — private PML4 @ phys 000000000103f000
+[stress ]  PASS  20000 CR3 switches under preemption keep spaces isolated
+[stress ]  PASS  page-table auditor detects a flipped reserved bit
+[kernel ] spawned pid 13 'oom' caps 0000000000000020 — private PML4 @ phys 0000000001048000
+[stress ]  PASS  allocator exhaustion returns failure cleanly (no panic)
+[kernel ] spawned pid 14 'stack-bomb' caps 0000000000000000 — private PML4 @ phys 000000000104d000
+
+[kernel ] --> RING 3 as pid 14 'stack-bomb' (entry 0000500000000000, caps 0000000000000000, cr3 000000000104d000)
+
+[guard  ] STACK OVERFLOW: ring-3 pid 14 hit guard page @ 0000500000fefff8 — task terminated
+[kernel ] <-- RING 0: 'stack-bomb' returned via SYS_EXIT
+[stress ]  PASS  ring-3 stack overflow trapped by guard page
+[stress ]  PASS  stack canary detects local buffer overflow
+[stress ] RESULT: 10 passed, 0 failed
+[stress ] STRESS & ENFORCEMENT CLEAN — no races, W^X/NX hold
+-- done --
+-- SYSCALL ARGUMENT FUZZING --
+[kernel ] spawned pid 15 'fuzz' caps 0000000000000000 — private PML4 @ phys 0000000001057000
+[fuzz   ]  PASS  SYS_OPEN valid user name pointer succeeds
+[fuzz   ]  PASS  SYS_OPEN kernel-address name rejected (EFAULT)
+[fuzz   ]  PASS  SYS_WRITE kernel-address string rejected (no kernel leak)
+[fuzz   ]  PASS  SYS_WRITE unmapped user pointer rejected
+[fuzz   ]  PASS  SYS_READ into kernel memory rejected (no kernel write)
+[fuzz   ]  PASS  SYS_READ into valid user buffer succeeds
+[fuzz   ] 20000 randomized calls: 12347 rejected, 7653 ok — kernel never faulted
+[fuzz   ]  PASS  post-fuzz: kernel still has ZERO writable+executable pages
+[fuzz   ]  PASS  post-fuzz: fuzz process isolation intact (private user PML4)
+[fuzz   ] RESULT: 8 passed, 0 failed
+[fuzz   ] SYSCALL BOUNDARY HARDENED — all adversarial pointers rejected
+-- done --
+-- DESCRIPTOR-TABLE INTEGRITY SWEEP (background, tick-driven) --
+[sweep  ] armed=1  batch=64 entries/tick @ 100 Hz
+[sweep  ] full passes completed: 4
+[sweep  ] leaf entries audited:  4893
+[sweep  ] violations found:      0
+[sweep  ] injecting reserved-bit flip into live PD entry 1 ...
+[sweep  ]  PASS  background sweep caught corruption at va 0000000000200000 after 14 ticks
+[sweep  ] entry repaired; violations counter now 1
+-- done --
+-- IOMMU (INTEL VT-d) STATUS + DMA ISOLATION --
+[virt   ] CPUID.1:ECX.VMX = 0 (no VT-x — TCG emulation, guest execution unavailable)
+[iommu  ] no remapping hardware on this platform (run QEMU with -device intel-iommu)
+-- done --
+-- CAPABILITY-BOUND DMA DOMAINS --
+[capdma ] no IOMMU on this platform — run with -device intel-iommu
+-- done --
+-- RING-3 USERSPACE DEVICE DRIVER --
+[kernel ] spawned pid 16 'nic-driver' caps 0000000000000011 — private PML4 @ phys 00000000010bd000
+[drv    ] handing 'virtio-net' to unprivileged pid 16 (kernel leaves the data path)
+[elf    ] loading 'nic-driver' from ISO module image at phys 0000000000196000 (0000000000001bb0 bytes)
+[elf    ] PT_LOAD vaddr 0000500000000000 filesz 0000000000001778 memsz 0000000000001778 (ro) -> mapped USER (bounds ok)
+
+[kernel ] --> RING 3 as pid 16 'nic-driver' (entry 0000500000000000, caps 0000000000000011, cr3 00000000010bd000)
+  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====
+[hw     ] GRANT  pid 16 'nic-driver' -> 'virtio-net': phys 00000000fe004000 mapped at vaddr 0000400400000000 (4 pages)
+  [drv:r3] NIC registers mapped into this process at vaddr 0000400400000000
+  [drv:r3] own DMA memory: vaddr 0000520000000000 -> phys 00000000010cb000
+  [drv:r3] negotiated features, FEATURES_OK accepted by device
+  [drv:r3] TX virtqueue live in our own pages; DRIVER_OK set
+  [drv:r3] *** TX COMPLETED BY HARDWARE *** used.idx=0000000000000001
+  [drv:r3] the NIC read the descriptor and frame from THIS PROCESS's
+  [drv:r3] memory via DMA, inside its capability-bound IOMMU domain.
+[kernel ] <-- RING 0: 'nic-driver' returned via SYS_EXIT
+-- done --
+[mouse  ] PS/2 mouse online: id 3, 4-byte packets (wheel), IRQ 12
+[gfx    ] framebuffer 1024x768 mapped; backbuffer @ 00000000010d6000 (double-buffered)
+-- Metropolis-Terminal compositor: animated physics loop --
+[gfx    ] animated 150 frames (glitch-in + spring + collision), settled. center=00000000000b0f16
+-- done (screendump to view) --
+-- RING-3 APPLICATION SURFACE (first-class scheduler thread) --
+[kernel ] spawned pid 17 'surface-app' caps 0000000000000040 — private PML4 @ phys 00000000013d6000
+[elf    ] PT_LOAD vaddr 0000500000000000 filesz 0000000000001778 memsz 0000000000001778 (ro) -> mapped USER (bounds ok)
+[uthread] spawned 'surface-app': pid 17 = tid 2 (role 2) — scheduled, not entered
+[surface] handing canvas window 4 to unprivileged pid 17
+[uthread] tid 2 --> RING 3 as pid 17 'surface-app' (entry 0000500000000000, cr3 00000000013d6000)
+  [app:r3] ==== RING-3 SURFACE THREAD: live event/render loop ====
+[surface] pid 17 owns surface 4 (200x120) DOUBLE-BUFFERED at user vaddr 0000530000000000 (+24 pages back)
+  [app:r3] got double-buffered surface at 0000530000000000 — drawing back buffers, publishing via SYS_SURFACE_FLIP
+[surface] slot 4 bound=1 owner=pid 17 — compositor will place its pixels; the app KEEPS RUNNING
+-- done --
+-- RING-3 PROCESSES AS FIRST-CLASS SCHEDULER THREADS --
+[kernel ] spawned pid 18 'ident-A' caps 0000000000000020 — private PML4 @ phys 0000000001414000
+[elf    ] PT_LOAD vaddr 0000500000000000 filesz 0000000000001778 memsz 0000000000001778 (ro) -> mapped USER (bounds ok)
+[uthread] spawned 'ident-A': pid 18 = tid 3 (role 4) — scheduled, not entered
+[kernel ] spawned pid 19 'ident-B' caps 0000000000000000 — private PML4 @ phys 000000000141f000
+[elf    ] PT_LOAD vaddr 0000500000000000 filesz 0000000000001778 memsz 0000000000001778 (ro) -> mapped USER (bounds ok)
+[uthread] spawned 'ident-B': pid 19 = tid 4 (role 4) — scheduled, not entered
+[uthread] tid 3 --> RING 3 as pid 18 'ident-A' (entry 0000500000000000, cr3 0000000001414000)
+[uthread] tid 4 --> RING 3 as pid 19 'ident-B' (entry 0000500000000000, cr3 000000000141f000)
+[uthread] tid 3 pid 18 'ident-A' exited (code 0) — thread reaped
+[uthread] tid 4 pid 19 'ident-B' exited (code 0) — thread reaped
+[threads]  PASS  two ring-3 threads ran to completion CONCURRENTLY with the kernel main thread
+[threads]  PASS  per-thread process identity survived every context switch (both probers exit 0)
+[threads]  PASS  SYS_EXIT reaps the thread (PCB slots returned to the scheduler)
+[kernel ] spawned pid 20 'surf-exit' caps 0000000000000040 — private PML4 @ phys 000000000142a000
+[elf    ] PT_LOAD vaddr 0000500000000000 filesz 0000000000001778 memsz 0000000000001778 (ro) -> mapped USER (bounds ok)
+[uthread] spawned 'surf-exit': pid 20 = tid 3 (role 3) — scheduled, not entered
+[uthread] tid 3 --> RING 3 as pid 20 'surf-exit' (entry 0000500000000000, cr3 000000000142a000)
+[surface] pid 20 owns surface 3 (64x64) DOUBLE-BUFFERED at user vaddr 0000530000000000 (+4 pages back)
+  [x3 :r3] surface slot 3 live; exiting so the kernel reclaims it
+[surface] slot 3 reclaimed on owner exit — 8 pages (phys 0000000001435000) back on the free list
+[uthread] tid 3 pid 20 'surf-exit' exited (code 0) — thread reaped
+[threads]  PASS  surface reclaimed when its owner exits (slot unbound, buffer on free list)
+[kernel ] spawned pid 21 'surf-exit2' caps 0000000000000040 — private PML4 @ phys 0000000001440000
+[elf    ] PT_LOAD vaddr 0000500000000000 filesz 0000000000001778 memsz 0000000000001778 (ro) -> mapped USER (bounds ok)
+[uthread] spawned 'surf-exit2': pid 21 = tid 3 (role 3) — scheduled, not entered
+[uthread] tid 3 --> RING 3 as pid 21 'surf-exit2' (entry 0000500000000000, cr3 0000000001440000)
+[surface] pid 21 owns surface 3 (64x64) DOUBLE-BUFFERED at user vaddr 0000530000000000 (+4 pages back) (recycled pixel buffers)
+  [x3 :r3] surface slot 3 live; exiting so the kernel reclaims it
+[surface] slot 3 reclaimed on owner exit — 8 pages (phys 0000000001435000) back on the free list
+[uthread] tid 3 pid 21 'surf-exit2' exited (code 0) — thread reaped
+[threads]  PASS  reclaimed pixel buffer is RECYCLED by the next surface create (same phys)
+[kernel ] spawned pid 22 'stack-bomb-t' caps 0000000000000000 — private PML4 @ phys 000000000144e000
+[uthread] tid 3 --> RING 3 as pid 22 'stack-bomb-t' (entry 0000500000000000, cr3 000000000144e000)
+
+[guard  ] STACK OVERFLOW: ring-3 pid 22 hit guard page @ 0000500000fefff8 — task terminated
+[uthread] faulting tid 3 terminated — siblings and kernel unaffected
+[threads]  PASS  faulting ring-3 thread hit the guard page and was terminated (not unwound)
+[threads]  PASS  kernel and sibling threads survive the fault (surface app still bound)
+[threads] RESULT: 7 passed, 0 failed
+[threads] FIRST-CLASS RING-3 THREADS VERIFIED — concurrent, isolated, reaped
+-- done --
+-- DOUBLE-BUFFERED SURFACES: page flip vs tearing --
+[kernel ] spawned pid 23 'tear-test' caps 0000000000000040 — private PML4 @ phys 0000000001458000
+[elf    ] PT_LOAD vaddr 0000500000000000 filesz 0000000000001778 memsz 0000000000001778 (ro) -> mapped USER (bounds ok)
+[uthread] spawned 'tear-test': pid 23 = tid 3 (role 5) — scheduled, not entered
+[uthread] tid 3 --> RING 3 as pid 23 'tear-test' (entry 0000500000000000, cr3 0000000001458000)
+[surface] pid 23 owns surface 5 (64x64) DOUBLE-BUFFERED at user vaddr 0000530000000000 (+4 pages back) (recycled pixel buffers)
+  [tt :r3] tear-test live: 400 alternating full frames via SYS_SURFACE_FLIP
+[flip   ]  PASS  ring-3 thread created a double-buffered surface (front+back pair)
+[flip   ]  PASS  both buffers are user-mapped in the owner (and only 2*bufpages of them)
+[flip   ] consumed 200 published frames: 0 torn, 100/100 color A/B
+[flip   ]  PASS  200 frames published through SYS_SURFACE_FLIP under preemption
+[flip   ]  PASS  ZERO torn frames: every published front buffer is a COMPLETE frame
+[flip   ]  PASS  frames alternate strictly (each flip is exactly one finished frame)
+[surface] slot 5 reclaimed on owner exit — 8 pages (phys 0000000001435000) back on the free list
+[uthread] tid 3 pid 23 'tear-test' exited (code 0) — thread reaped
+[flip   ]  PASS  double buffer reclaimed as one chunk when the owner exits
+[flip   ] RESULT: 6 passed, 0 failed
+[flip   ] PAGE FLIP VERIFIED — the compositor can no longer observe a half-drawn frame
+-- done --
+-- CURSOR COORDINATE TRANSLATION INVARIANTS --
+[cursor ]  PASS  screen->world->screen round-trip exact at all zooms (<=1 px)
+[cursor ] worst round-trip error across 150 samples: 1 px
+[cursor ]  PASS  world->screen->world round-trip stable
+[cursor ]  PASS  zoom-at-cursor keeps the world point pinned under the pointer
+[cursor ] worst anchor drift across 150 zoom ops: 0 world units
+[cursor ]  PASS  panning preserves projected size (no drift)
+[cursor ]  PASS  2x zoom doubles projected size
+[cursor ]  PASS  hit-testing matches rendering (centre of each window picks it)
+[cursor ] RESULT: 6 passed, 0 failed
+[cursor ] COORDINATE TRANSLATION LOCKED DOWN
+-- done --
+-- KINETIC CAMERA INVARIANTS --
+[kinetic]  PASS  a flick imparts momentum (camera keeps moving after input stops)
+[kinetic]  PASS  friction brings the camera to a complete rest
+[kinetic] flick settled in 48 frames; glide distance 193 world units
+[kinetic]  PASS  glide distance is bounded (no runaway)
+[kinetic]  PASS  eased zoom converges to its target
+[kinetic]  PASS  anchor stays pinned on EVERY frame of the eased zoom
+[kinetic] worst mid-transition anchor drift over 4 zooms: 0 world units
+[kinetic]  PASS  commanded glide converges exactly on its target
+[kinetic] glide-to-focus converged in 25 frames
+[kinetic]  PASS  eased zoom does not overshoot its target
+[kinetic]  PASS  zoom stays clamped to 12.5%..400% under repeated impulses
+[kinetic]  PASS  dt grouping is EXACT: 100 frames @ dt=2 == 200 frames @ dt=1 (bit-identical)
+[kinetic]  PASS  irregular frame times (1..5 ticks) land on the identical camera state
+[kinetic] RESULT: 10 passed, 0 failed
+[kinetic] KINETIC CAMERA VERIFIED — momentum settles, anchor never slips
+-- done --
+-- METROPOLIS-TERMINAL: spatial canvas (interactive) --
+[canvas ] 300 frames | camera world (-30,0) zoom 88% | focus 'TIME-STREAM' | hud closed
+-- done --
+-- INPUT ROUTING TO A LIVE RING-3 THREAD (single canvas pass) --
+[canvas ] frame 30: click synthesized at screen (470,400)
+  [app:r3] click at surface-local (000000000000001f,0000000000000014) — repainting NOW, mid-pass
+[canvas ] frame 60: click synthesized at screen (560,440)
+  [app:r3] click at surface-local (000000000000005b,0000000000000040) — repainting NOW, mid-pass
+[canvas ] frame 90: click synthesized at screen (660,470)
+  [app:r3] click at surface-local (000000000000009d,0000000000000061) — repainting NOW, mid-pass
+[canvas ] 150 frames | camera world (-30,0) zoom 88% | focus 'VIDEO-EDITOR' | hud closed
+[surfin ] app repainted DURING the pass: 447 hit-marker pixels (0000000000f06a18) in its surface
+-- done --
+-- METROPOLIS-TERMINAL: spatial canvas (interactive) --
+[canvas ] 120 frames | camera world (0,0) zoom 100% | focus 'TIME-STREAM' | hud closed
+-- done --
+-- genuine ring-3 user mode: capability passthrough via SYSCALL trap --
+[kernel ] demo device: REAL 'virtio-net' (virtio MMIO @ phys 00000000fe004000)
+[kernel ] spawned pid 24 'stream-app' caps 0000000000000011 — private PML4 @ phys 0000000001466000
+[kernel ] spawned pid 25 'sketchy-app' caps 0000000000000020 — private PML4 @ phys 0000000001467000
+[kernel ] user program source: ELF module loaded from ISO
+[elf    ] loading 'stream-app' from ISO module image at phys 0000000000196000 (0000000000001bb0 bytes)
+[elf    ] PT_LOAD vaddr 0000500000000000 filesz 0000000000001778 memsz 0000000000001778 (ro) -> mapped USER (bounds ok)
+
+[kernel ] --> RING 3 as pid 24 'stream-app' (entry 0000500000000000, caps 0000000000000011, cr3 0000000001466000)
+  [elf:r3] user_init.elf alive at ring 3
+00000000005ec0de  [elf:r3] callee-saved regs survive SYSCALL: PASS
+  [elf:r3] requesting virtio MMIO window via SYSCALL...
+[hw     ] GRANT  pid 24 'stream-app' -> 'virtio-net': phys 00000000fe004000 mapped at vaddr 0000400600000000 (4 pages)
+  [elf:r3] virtio-net MAC read from device registers: 0000525400abcdef
+  [elf:r3] opening "motd" via sys_open...
+  [elf:r3] file access DENIED (this process lacks CAP_FILESYSTEM)
+  [elf:r3] framebuffer access DENIED (no CAP_FRAMEBUFFER)
+[kernel ] <-- RING 0: 'stream-app' returned via SYS_EXIT
+[elf    ] loading 'sketchy-app' from ISO module image at phys 0000000000196000 (0000000000001bb0 bytes)
+[elf    ] PT_LOAD vaddr 0000500000000000 filesz 0000000000001778 memsz 0000000000001778 (ro) -> mapped USER (bounds ok)
+
+[kernel ] --> RING 3 as pid 25 'sketchy-app' (entry 0000500000000000, caps 0000000000000020, cr3 0000000001467000)
+  [elf:r3] user_init.elf alive at ring 3
+00000000005ec0de  [elf:r3] callee-saved regs survive SYSCALL: PASS
+  [elf:r3] requesting virtio MMIO window via SYSCALL...
+[hw     ] DENIED pid 25 'sketchy-app' -> 'virtio-net': lacks CAP_HW_PASSTHROUGH
+  [elf:r3] passthrough DENIED, code fffffffffffffffe
+  [elf:r3] opening "motd" via sys_open...
+  [elf:r3] read from VFS -> motd v2 - overwritten content.
+  [elf:r3] framebuffer access DENIED (no CAP_FRAMEBUFFER)
+[kernel ] <-- RING 0: 'sketchy-app' returned via SYS_EXIT
+[cas    ] put len 512 hash 6e48d16d3b56cd00 -> block 38 (stored)
+[cas    ] put len 512 hash 7bb6aa6d9f78e020 -> block 39 (stored)
+[cas    ] put len 512 hash 8042bbe4b08e322f -> block 40 (stored)
+[cas    ] put len 512 hash 240028b0fcf42d46 -> block 41 (stored)
+[cas    ] put len 512 hash f9cd0cfd0870029f -> block 42 (stored)
+[cas    ] put len 512 hash 6862900b58c66b17 -> block 43 (stored)
+[cas    ] put len 512 hash 1bbc33b67d16e8c3 -> block 44 (stored)
+[cas    ] put len 512 hash 7da144b97d054b25 -> block 45 (stored)
+[cas    ] put len 512 hash 1f76412c62264f89 -> block 46 (stored)
+[cas    ] put len 512 hash d45a068cfc36f5a7 -> block 47 (stored)
+[cas    ] put len 512 hash 419bacca3ecaef9a -> block 48 (stored)
+[cas    ] put len 512 hash bc320ad32c408b48 -> block 49 (stored)
+[cas    ] put len 512 hash 6714f0d888449e9b -> block 50 (stored)
+[cas    ] put len 432 hash caaf81493595b33e -> block 51 (stored)
+[kernel ] spawned pid 26 'cas-exec' caps 0000000000000071 — private PML4 @ phys 000000000147f000
+
+[kernel ] exec-from-storage: running 'init' loaded from CAS (not GRUB)
+[exec   ] read 7088 ELF bytes from CAS (file_hash 4330322ed22ded67) — not a GRUB module
+[elf    ] PT_LOAD vaddr 0000500000000000 filesz 0000000000001778 memsz 0000000000001778 (ro) -> mapped USER (bounds ok)
+
+[kernel ] --> RING 3 as pid 26 'init' (entry 0000500000000000, caps 0000000000000071, cr3 000000000147f000)
+  [elf:r3] user_init.elf alive at ring 3
+00000000005ec0de  [elf:r3] callee-saved regs survive SYSCALL: PASS
+  [elf:r3] requesting virtio MMIO window via SYSCALL...
+[hw     ] GRANT  pid 26 'cas-exec' -> 'virtio-net': phys 00000000fe004000 mapped at vaddr 0000400680000000 (4 pages)
+  [elf:r3] virtio-net MAC read from device registers: 0000525400abcdef
+  [elf:r3] opening "motd" via sys_open...
+  [elf:r3] read from VFS -> motd v2 - overwritten content.
+[gfx    ] sys_map_framebuffer: mapped 3072 KiB of FB into pid 26 at user vaddr 0000550000000000
+  [elf:r3] mapped framebuffer; drawing a ring-3 marker
+[kernel ] <-- RING 0: 'init' returned via SYS_EXIT
+-- done: capabilities decided per-process — hardware for one, files
+   for another, both for the CAS-loaded process. --
+
+Type 'help' for commands, 'demo' for the capability walk-through.
+outrun> 

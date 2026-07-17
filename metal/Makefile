@@ -18,7 +18,7 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-ISO  := $(BUILD)/outrun-os-0.31.0.iso
+ISO  := $(BUILD)/outrun-os-0.37.0.iso
 
 .PHONY: all qemu qemu-vga clean
 all: $(ISO)
@@ -29,7 +29,11 @@ $(BUILD):
 $(BUILD)/boot.o: boot/boot.asm | $(BUILD)
 	$(NASM) $< -o $@
 
-$(BUILD)/isr.o: boot/isr.asm | $(BUILD)
+$(BUILD)/apboot.bin: boot/apboot.asm | $(BUILD)
+	nasm -f bin $< -o $@
+	@echo "  AP trampoline: $@ (flat binary, org 0x8000)"
+
+$(BUILD)/isr.o: boot/isr.asm $(BUILD)/apboot.bin | $(BUILD)
 	$(NASM) $< -o $@
 
 $(BUILD)/usermode.o: boot/usermode.asm | $(BUILD)
