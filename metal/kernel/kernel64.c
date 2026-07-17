@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.37.0-metal"
+#define KERNEL_VERSION "0.38.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -2854,13 +2854,21 @@ struct tss64 {
     uint16_t iomap_base;
 } __attribute__((packed));
 
-static struct tss64 g_tss;
-static uint64_t g_gdt[8];                                  /* null,kcode,kdata,ucode32,udata,ucode64,tss.lo,tss.hi */
-static uint8_t  g_syscall_stack[8192] __attribute__((aligned(16)));
-static uint8_t  g_int_stack[8192]     __attribute__((aligned(16)));
+/* v0.38: per-CPU TSS + trap stacks. The GDT keeps its 6 base entries
+ * (null,kcode,kdata,ucode32,udata,ucode64) and then carries one 16-byte TSS
+ * descriptor PER CPU, so every core can `ltr` its own TSS and thus take a
+ * CPL3->CPL0 trap onto its own rsp0. TSS_SEL(i) is that CPU's TR selector.    */
+#define SMP_MAX_CPUS 8                                     /* == MAX_CPUS; used pre-decl */
+static struct tss64 g_tss[SMP_MAX_CPUS];
+static uint64_t g_gdt[6 + 2 * SMP_MAX_CPUS];
+#define TSS_SEL(i) (uint16_t)((6 + 2 * (i)) << 3)
+static uint8_t  g_syscall_stack[SMP_MAX_CPUS][8192] __attribute__((aligned(16)));
+static uint8_t  g_int_stack[SMP_MAX_CPUS][8192]     __attribute__((aligned(16)));
 
 extern void syscall_entry(void);
-extern void enter_user_mode(uint64_t entry, uint64_t ustack);
+/* Returns the SYS_EXIT code: enter_user_mode only ever "returns" via
+ * resume_kernel, which places the exit code in RAX. Legacy callers ignore it. */
+extern uint64_t enter_user_mode(uint64_t entry, uint64_t ustack);
 extern void enter_user_thread(uint64_t entry, uint64_t ustack);   /* no resume point */
 extern void resume_kernel(uint64_t retval);
 extern void set_syscall_stack(uint64_t top);
@@ -2871,11 +2879,14 @@ extern char user_blob_start[], user_blob_end[];
  * top — the two can never be live at once on one thread, because a thread at
  * CPL3 has no syscall in flight and a thread in a syscall is not at CPL3).
  * Kernel threads and the boot thread keep the original shared stacks.        */
+static uint32_t cpu_idx(void);   /* fwd: returns 0 until per-CPU GS is armed */
+
 static void uthread_ctx_load(struct pcb *next) {
-    g_tss.rsp0 = next->rsp0 ? next->rsp0
-                            : (uint64_t)(g_int_stack + sizeof g_int_stack);
+    uint32_t c = cpu_idx();                          /* the CPU doing the switch */
+    g_tss[c].rsp0 = next->rsp0 ? next->rsp0
+                               : (uint64_t)(g_int_stack[c] + sizeof g_int_stack[c]);
     set_syscall_stack(next->ksrsp ? next->ksrsp
-                                  : (uint64_t)(g_syscall_stack + sizeof g_syscall_stack));
+                                  : (uint64_t)(g_syscall_stack[c] + sizeof g_syscall_stack[c]));
 }
 
 static void gdt_set_tss(int slot, uint64_t base, uint32_t limit) {
@@ -2939,6 +2950,28 @@ static int uthread_create(const char *name, int proc_idx, uint64_t entry) {
     return tid;
 }
 
+/* v0.38: install CPU `idx`'s own TSS into the (shared) GDT and load its TR.
+ * The GDT's 6 base entries are built once by the BSP; this fills the per-CPU
+ * TSS descriptor at TSS_SEL(idx) and points rsp0 at that CPU's interrupt stack.
+ * Runs on the CPU it configures (ltr affects the running core).               */
+static void cpu_tss_setup(int idx) {
+    struct tss64 *t = &g_tss[idx];
+    for (unsigned i = 0; i < sizeof *t; i++) ((uint8_t *)t)[i] = 0;
+    t->rsp0 = (uint64_t)(g_int_stack[idx] + sizeof g_int_stack[idx]);
+    t->iomap_base = sizeof(struct tss64);
+    gdt_set_tss(6 + 2 * idx, (uint64_t)t, sizeof(struct tss64) - 1);
+    __asm__ volatile("ltr %0" : : "r"(TSS_SEL(idx)));
+}
+
+/* v0.38: arm this CPU's SYSCALL/SYSRET path. STAR/LSTAR/SFMASK are the same on
+ * every core; each CPU must still execute the wrmsrs (MSRs are per-core).      */
+static void cpu_syscall_arm(void) {
+    wrmsr(0xC0000080, rdmsr(0xC0000080) | 1);              /* EFER.SCE = enable SYSCALL  */
+    wrmsr(0xC0000081, ((uint64_t)0x1B << 48) | ((uint64_t)0x08 << 32)); /* STAR       */
+    wrmsr(0xC0000082, (uint64_t)syscall_entry);            /* LSTAR = entry RIP          */
+    wrmsr(0xC0000084, 0x200);                              /* SFMASK: clear IF on entry  */
+}
+
 static void usermode_init(void) {
     __asm__ volatile("cli");
 
@@ -2949,30 +2982,22 @@ static void usermode_init(void) {
     g_gdt[4] = 0x00CFF2000000FFFFull;                      /* 0x20 user data  (DPL3)     */
     g_gdt[5] = 0x00AFFA000000FFFFull;                      /* 0x28 user code64 (DPL3)    */
 
-    for (unsigned i = 0; i < sizeof g_tss; i++) ((uint8_t *)&g_tss)[i] = 0;
-    g_tss.rsp0 = (uint64_t)(g_int_stack + sizeof g_int_stack); /* ring-0 stack on trap from ring 3 */
-    g_tss.iomap_base = sizeof(struct tss64);
-    gdt_set_tss(6, (uint64_t)&g_tss, sizeof(struct tss64) - 1);
-
     struct { uint16_t limit; uint64_t base; } __attribute__((packed))
         gdtr = { sizeof(g_gdt) - 1, (uint64_t)g_gdt };
     __asm__ volatile("lgdt %0" : : "m"(gdtr) : "memory");
     __asm__ volatile(
         "mov $0x10, %%ax\n mov %%ax, %%ds\n mov %%ax, %%es\n"
         "mov %%ax, %%ss\n mov %%ax, %%fs\n mov %%ax, %%gs\n" ::: "rax");
-    __asm__ volatile("ltr %%ax" : : "a"(0x30));            /* load task register -> TSS  */
 
-    set_syscall_stack((uint64_t)(g_syscall_stack + sizeof g_syscall_stack));
-
-    wrmsr(0xC0000080, rdmsr(0xC0000080) | 1);              /* EFER.SCE = enable SYSCALL  */
-    wrmsr(0xC0000081, ((uint64_t)0x1B << 48) | ((uint64_t)0x08 << 32)); /* STAR: kern 0x08 / user 0x1B */
-    wrmsr(0xC0000082, (uint64_t)syscall_entry);            /* LSTAR = entry RIP          */
-    wrmsr(0xC0000084, 0x200);                              /* SFMASK: clear IF on entry  */
+    cpu_tss_setup(0);                                      /* BSP is CPU 0               */
+    set_syscall_stack((uint64_t)(g_syscall_stack[0] + sizeof g_syscall_stack[0]));
+    cpu_syscall_arm();
 
     __asm__ volatile("sti");
-    kprintf("[kernel ] ring-3 enabled: GDT+TSS loaded, SYSCALL/SYSRET MSRs armed\n");
-    kprintf("[kernel ]   STAR kern=0x08 user=0x1B, LSTAR=%X, TSS.rsp0=%X\n",
-            (uint64_t)syscall_entry, g_tss.rsp0);
+    kprintf("[kernel ] ring-3 enabled: GDT (%d TSS slots) + BSP TSS loaded, SYSCALL/SYSRET armed\n",
+            (uint64_t)SMP_MAX_CPUS);
+    kprintf("[kernel ]   STAR kern=0x08 user=0x1B, LSTAR=%X, TSS0.rsp0=%X\n",
+            (uint64_t)syscall_entry, g_tss[0].rsp0);
 }
 
 /* ===========================================================================
@@ -2996,14 +3021,32 @@ static void usermode_init(void) {
 #define AP_TRAMP   0x8000ull               /* SIPI vector 0x08 -> phys 0x8000  */
 #define AP_STACK_SZ (16 * 1024)
 
-struct percpu {
-    uint32_t idx;                          /* MUST stay at offset 0 (%gs:0)    */
-    uint32_t apic_id;
+/* v0.38: the per-CPU block. GS_BASE points at this in BOTH rings (ring-3 cannot
+ * change GS_BASE — no wrgsbase, CR4.FSGSBASE off), so syscall_entry reaches its
+ * kernel stack GS-relative with no swapgs. Offset 0 stays `idx` (the cpu_idx()
+ * contract). The two syscall-scratch fields have FIXED offsets the asm knows.  */
+struct cpu_local {
+    uint32_t idx;                          /* %gs:0   MUST stay offset 0        */
+    uint32_t apic_id;                      /* %gs:4                             */
+    uint64_t syscall_rsp;                  /* %gs:8   SYSCALL kernel stack top  */
+    uint64_t user_rsp;                     /* %gs:16  scratch: parked user RSP  */
+    struct pcb *cur;                       /* %gs:24  thread this CPU runs      */
+    uint64_t cur_proc;                     /* the capability gate reads this    */
+    struct tss64 *tss;                     /* this CPU's own TSS (its rsp0)     */
     volatile uint32_t online;
-    volatile uint32_t ipi_ping;            /* pings received                   */
+    volatile uint32_t resched;             /* IPI asked this CPU to reschedule  */
+    volatile uint32_t ipi_ping;            /* pings received                    */
     volatile uint32_t work_done;
-    volatile uint64_t probe_val;           /* what this cpu read at g_probe_va */
+    volatile uint64_t probe_val;           /* what this cpu read at g_probe_va  */
+    /* v0.38 Stage 2: mailbox for the BSP to hand a ring-3 thread to this AP.   */
+    volatile int      run_req;             /* BSP set: run the thread below      */
+    volatile int      run_done;            /* AP set: the thread returned        */
+    volatile int      run_proc;            /* kproc index to run                 */
+    volatile uint64_t run_entry;           /* ring-3 entry point                 */
+    volatile uint64_t run_exit_code;       /* SYS_EXIT code the thread returned   */
 };
+#define CPUL_SYSCALL_RSP 8                 /* struct offsets the asm relies on  */
+#define CPUL_USER_RSP    16
 
 /* v0.36: a work-stealing parallel job. Every online core (BSP + APs) claims
  * fixed-size units from one shared atomic cursor, folds each unit's content
@@ -3041,7 +3084,7 @@ struct auditunit { uint64_t *pde_ptr; uint64_t va_base; };
 #define AUDIT_MAX 4096
 static struct auditunit g_audit[AUDIT_MAX];
 static uint64_t g_audit_n = 0;
-static struct percpu g_pcpu[MAX_CPUS];
+static struct cpu_local g_cpu[MAX_CPUS];
 static uint8_t  g_ap_stacks[MAX_CPUS][AP_STACK_SZ] __attribute__((aligned(64)));
 static int      g_ncpu_found = 1, g_ncpu_online = 1;
 static uint8_t  g_apicids[MAX_CPUS];
@@ -3061,7 +3104,7 @@ static inline uint32_t lapic_r(uint32_t off) { return *(volatile uint32_t *)(LAP
 static inline void lapic_w(uint32_t off, uint32_t v) { *(volatile uint32_t *)(LAPIC_V + off) = v; }
 static inline void lapic_eoi(void) { lapic_w(0xB0, 0); }
 
-static inline uint32_t cpu_idx(void) {
+static uint32_t cpu_idx(void) {
     if (!g_gs_ready) return 0;
     uint32_t id;
     __asm__ volatile("mov %%gs:0, %0" : "=r"(id));
@@ -3081,7 +3124,7 @@ static void lapic_ipi(uint32_t apic_id, uint8_t vec, int broadcast) {
 
 /* IPI handlers — run on WHICHEVER cpu the interrupt lands on.                */
 static void smp_ipi_dispatch(uint64_t vec) {
-    struct percpu *me = &g_pcpu[cpu_idx()];
+    struct cpu_local *me = &g_cpu[cpu_idx()];
     if (vec == IPI_TLB) {
         __asm__ volatile("invlpg (%0)" :: "r"(g_shoot_va) : "memory");
         __sync_fetch_and_add(&g_shoot_ack, 1);
@@ -3141,6 +3184,34 @@ static void pjob_run(int me) {
     __sync_fetch_and_add(&g_pjob.done, 1);
 }
 
+/* v0.38 Stage 2: an application processor runs a ring-3 thread the BSP handed
+ * it via its per-CPU mailbox. This first demonstration is SERIALIZED — the BSP
+ * is quiesced (spin-waiting) while the AP runs, so the still-global syscall
+ * entry stack (g_ksrsp), user-RSP scratch, resume context and current_proc_idx
+ * are exercised by exactly ONE core and stay race-free. It proves an AP can
+ * enter ring 3 on its own TSS/SYSCALL path, have the capability gate resolve
+ * ITS thread's identity, and return cleanly. Concurrent per-CPU scheduling
+ * (BSP + APs in ring 3 at once) is v0.39 and needs the per-CPU syscall path. */
+static void ap_run_uthread(uint32_t idx) {
+    struct cpu_local *me = &g_cpu[idx];
+    int p = me->run_proc;
+    __asm__ volatile("cli");
+    current_proc_idx = (uint64_t)p;          /* global identity (BSP quiesced)  */
+    me->cur_proc = (uint64_t)p;
+    g_tss[idx].rsp0 = (uint64_t)(g_int_stack[idx] + sizeof g_int_stack[idx]);
+    set_syscall_stack((uint64_t)(g_syscall_stack[idx] + sizeof g_syscall_stack[idx]));
+    kprintf("[mcsched] cpu%u adopting ring-3 pid %u (entry %X) on its own TSS/SYSCALL\n",
+            (uint64_t)idx, kprocs[p].pid, me->run_entry);
+    write_cr3(kprocs[p].cr3);
+    uint64_t code = enter_user_mode(me->run_entry, USTK_TOP);  /* returns via SYS_EXIT */
+    write_cr3(kernel_cr3);
+    __asm__ volatile("sti");
+    me->run_exit_code = code;
+    __sync_synchronize();
+    me->run_req = 0;
+    me->run_done = 1;
+}
+
 /* What an AP does for a living: park in hlt, answer IPIs, and run the bounded */
 /* suite workloads when the BSP raises the mailbox.                           */
 static void __attribute__((noreturn)) ap_main(uint64_t idx) {
@@ -3155,28 +3226,33 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
         ::: "rax", "memory");
     struct idtr idtr = { sizeof(idt) - 1, (uint64_t)idt };
     idt_load(&idtr);
-    wrmsr(0xC0000101, (uint64_t)&g_pcpu[idx]);           /* GS base = my area  */
+    wrmsr(0xC0000101, (uint64_t)&g_cpu[idx]);           /* GS base = my area  */
+    g_cpu[idx].idx = (uint32_t)idx;                      /* %gs:0 valid now    */
+    cpu_tss_setup((int)idx);                             /* v0.38: my own TSS + ltr  */
+    g_cpu[idx].tss = &g_tss[idx];
+    g_cpu[idx].syscall_rsp = (uint64_t)(g_syscall_stack[idx] + sizeof g_syscall_stack[idx]);
+    cpu_syscall_arm();                                   /* v0.38: SYSCALL on this core */
     lapic_w(0xF0, 0x100 | 0xFF);                         /* my LAPIC on        */
     lapic_w(0x350, 0x10000);                             /* LINT0 masked (PIC is BSP's) */
     lapic_w(0x360, 0x10000);                             /* LINT1 masked       */
-    g_pcpu[idx].idx = (uint32_t)idx;
-    g_pcpu[idx].apic_id = lapic_r(0x20) >> 24;
-    kprintf("[smp    ] cpu%u online: long mode, kernel GDT/IDT, LAPIC id %u, gs area %X\n",
-            (uint64_t)idx, (uint64_t)g_pcpu[idx].apic_id, (uint64_t)&g_pcpu[idx]);
-    g_pcpu[idx].online = 1;
+    g_cpu[idx].apic_id = lapic_r(0x20) >> 24;
+    kprintf("[smp    ] cpu%u online: long mode, own TSS (sel %X)+SYSCALL, LAPIC id %u, gs %X\n",
+            (uint64_t)idx, (uint64_t)TSS_SEL(idx), (uint64_t)g_cpu[idx].apic_id, (uint64_t)&g_cpu[idx]);
+    g_cpu[idx].online = 1;
     __sync_synchronize();
     __asm__ volatile("sti");
     for (;;) {
+        if (g_cpu[idx].run_req) ap_run_uthread((uint32_t)idx);   /* v0.38: ring-3 on this AP */
         int mode = g_work_go;
-        if (mode && !g_pcpu[idx].work_done) {
+        if (mode && !g_cpu[idx].work_done) {
             if (mode == 1)                                /* lock-xadd storm   */
                 for (int i = 0; i < WORK_XADDS; i++)
                     __sync_fetch_and_add(&g_work_counter, 1);
             else if (mode == 2)                           /* remote page probe */
-                g_pcpu[idx].probe_val = *(volatile uint64_t *)g_probe_va;
+                g_cpu[idx].probe_val = *(volatile uint64_t *)g_probe_va;
             else if (mode == 3)                           /* parallel job (v0.36) */
                 pjob_run((int)idx);
-            g_pcpu[idx].work_done = 1;
+            g_cpu[idx].work_done = 1;
         }
         __asm__ volatile("hlt");                          /* woken by IPIs     */
     }
@@ -3206,14 +3282,16 @@ static void smp_init(void) {
     madt_scan();
     map_mmio(LAPIC_V, LAPIC_PHYS, 0x1000);
     /* BSP per-cpu area + LAPIC, preserving PIC virtual-wire delivery         */
-    wrmsr(0xC0000101, (uint64_t)&g_pcpu[0]);
-    g_pcpu[0].idx = 0; g_pcpu[0].online = 1;
+    wrmsr(0xC0000101, (uint64_t)&g_cpu[0]);
+    g_cpu[0].idx = 0; g_cpu[0].online = 1;
+    g_cpu[0].tss = &g_tss[0];                             /* BSP's TSS (set in usermode_init) */
+    g_cpu[0].syscall_rsp = (uint64_t)(g_syscall_stack[0] + sizeof g_syscall_stack[0]);
     g_gs_ready = 1;
     lapic_w(0xF0, 0x100 | 0xFF);                          /* enable, spurious 0xFF */
     lapic_w(0x350, 0x700);                                /* LINT0 = ExtINT (8259) */
     lapic_w(0x360, 0x400);                                /* LINT1 = NMI            */
     g_bsp_apicid = lapic_r(0x20) >> 24;
-    g_pcpu[0].apic_id = g_bsp_apicid;
+    g_cpu[0].apic_id = g_bsp_apicid;
     kprintf("[smp    ] BSP: apic id %u, LAPIC at %X (virtual-wire kept: PIT/PIC unchanged)\n",
             (uint64_t)g_bsp_apicid, LAPIC_PHYS);
     if (g_ncpu_found <= 1) { kputs("[smp    ] uniprocessor boot — APs: none\n-- done --\n"); return; }
@@ -3246,13 +3324,13 @@ static void smp_init(void) {
         uint64_t t0 = g_ticks; while (g_ticks - t0 < 2) __asm__ volatile("pause");
         lapic_w(0x310, id << 24); lapic_w(0x300, 0x000600 | 0x08); /* SIPI #1  */
         t0 = g_ticks;
-        while (!g_pcpu[cpu].online && g_ticks - t0 < 10) __asm__ volatile("pause");
-        if (!g_pcpu[cpu].online) {                                 /* SIPI #2  */
+        while (!g_cpu[cpu].online && g_ticks - t0 < 10) __asm__ volatile("pause");
+        if (!g_cpu[cpu].online) {                                 /* SIPI #2  */
             lapic_w(0x310, id << 24); lapic_w(0x300, 0x000600 | 0x08);
             t0 = g_ticks;
-            while (!g_pcpu[cpu].online && g_ticks - t0 < 100) __asm__ volatile("pause");
+            while (!g_cpu[cpu].online && g_ticks - t0 < 100) __asm__ volatile("pause");
         }
-        if (g_pcpu[cpu].online) { g_ncpu_online++; cpu++; }
+        if (g_cpu[cpu].online) { g_ncpu_online++; cpu++; }
         else kprintf("[smp    ] apic%u did not come online\n", (uint64_t)id);
     }
     kprintf("[smp    ] %d/%d cpus online — scheduler stays BSP-only BY POLICY (invariants preserved)\n",
@@ -3289,24 +3367,24 @@ static void __attribute__((no_stack_protector)) cmd_smp(void) {
     /* (2) per-CPU identity through GS */
     int gs_ok = (cpu_idx() == 0);
     for (int i = 1; i < g_ncpu_online; i++) {
-        if (g_pcpu[i].idx != (uint32_t)i || !g_pcpu[i].online) gs_ok = 0;
+        if (g_cpu[i].idx != (uint32_t)i || !g_cpu[i].online) gs_ok = 0;
         for (int j = 0; j < i; j++)
-            if (g_pcpu[j].apic_id == g_pcpu[i].apic_id) gs_ok = 0;
+            if (g_cpu[j].apic_id == g_cpu[i].apic_id) gs_ok = 0;
     }
     smcheck("per-CPU areas via GS: each cpu sees its own identity, APIC ids distinct", gs_ok);
 
     if (g_ncpu_online > 1) {
         /* (3) fixed-vector IPI round-trip to every AP */
         uint32_t before[MAX_CPUS];
-        for (int i = 1; i < g_ncpu_online; i++) before[i] = g_pcpu[i].ipi_ping;
+        for (int i = 1; i < g_ncpu_online; i++) before[i] = g_cpu[i].ipi_ping;
         for (int i = 1; i < g_ncpu_online; i++)
-            lapic_ipi(g_pcpu[i].apic_id, IPI_PING, 0);        /* targeted, one each */
+            lapic_ipi(g_cpu[i].apic_id, IPI_PING, 0);        /* targeted, one each */
         uint64_t t0 = g_ticks;
         int got = 0;
         while (got < g_ncpu_online - 1 && g_ticks - t0 < 100) {
             got = 0;
             for (int i = 1; i < g_ncpu_online; i++)
-                if (g_pcpu[i].ipi_ping > before[i]) got++;
+                if (g_cpu[i].ipi_ping > before[i]) got++;
             __asm__ volatile("pause");
         }
         smcheck("targeted fixed-vector IPI delivered to and acknowledged by every AP",
@@ -3314,7 +3392,7 @@ static void __attribute__((no_stack_protector)) cmd_smp(void) {
 
         /* (4) cross-core atomics: every cpu hammers one counter with lock-xadd */
         g_work_counter = 0;
-        for (int i = 1; i < g_ncpu_online; i++) g_pcpu[i].work_done = 0;
+        for (int i = 1; i < g_ncpu_online; i++) g_cpu[i].work_done = 0;
         __sync_synchronize();
         g_work_go = 1;
         for (int i = 0; i < WORK_XADDS; i++)                  /* BSP joins in    */
@@ -3322,7 +3400,7 @@ static void __attribute__((no_stack_protector)) cmd_smp(void) {
         t0 = g_ticks;
         for (;;) {
             int done = 0;
-            for (int i = 1; i < g_ncpu_online; i++) done += g_pcpu[i].work_done;
+            for (int i = 1; i < g_ncpu_online; i++) done += g_cpu[i].work_done;
             if (done == g_ncpu_online - 1 || g_ticks - t0 > 600) break;
             lapic_ipi(0, IPI_PING, 1);                        /* keep APs awake  */
             uint64_t tw = g_ticks; while (g_ticks - tw < 1) __asm__ volatile("pause");
@@ -3344,13 +3422,13 @@ static void __attribute__((no_stack_protector)) cmd_smp(void) {
         tlb_shootdown(V);
         /* prime every cpu's TLB with the OLD translation */
         g_probe_va = V;
-        for (int i = 1; i < g_ncpu_online; i++) g_pcpu[i].work_done = 0;
+        for (int i = 1; i < g_ncpu_online; i++) g_cpu[i].work_done = 0;
         __sync_synchronize();
         g_work_go = 2;
         t0 = g_ticks;
         for (;;) {
             int done = 0;
-            for (int i = 1; i < g_ncpu_online; i++) done += g_pcpu[i].work_done;
+            for (int i = 1; i < g_ncpu_online; i++) done += g_cpu[i].work_done;
             if (done == g_ncpu_online - 1 || g_ticks - t0 > 300) break;
             lapic_ipi(0, IPI_PING, 1);
             uint64_t tw = g_ticks; while (g_ticks - tw < 1) __asm__ volatile("pause");
@@ -3358,16 +3436,16 @@ static void __attribute__((no_stack_protector)) cmd_smp(void) {
         g_work_go = 0;
         int primed = 1;
         for (int i = 1; i < g_ncpu_online; i++)
-            if (g_pcpu[i].probe_val != 0x1111111111111111ull) primed = 0;
+            if (g_cpu[i].probe_val != 0x1111111111111111ull) primed = 0;
         map_page(kernel_cr3, V, f2, PTE_WRITE | PTE_NX);      /* remap            */
         int acks = tlb_shootdown(V);                          /* invalidate ALL   */
-        for (int i = 1; i < g_ncpu_online; i++) g_pcpu[i].work_done = 0;
+        for (int i = 1; i < g_ncpu_online; i++) g_cpu[i].work_done = 0;
         __sync_synchronize();
         g_work_go = 2;
         t0 = g_ticks;
         for (;;) {
             int done = 0;
-            for (int i = 1; i < g_ncpu_online; i++) done += g_pcpu[i].work_done;
+            for (int i = 1; i < g_ncpu_online; i++) done += g_cpu[i].work_done;
             if (done == g_ncpu_online - 1 || g_ticks - t0 > 300) break;
             lapic_ipi(0, IPI_PING, 1);
             uint64_t tw = g_ticks; while (g_ticks - tw < 1) __asm__ volatile("pause");
@@ -3375,7 +3453,7 @@ static void __attribute__((no_stack_protector)) cmd_smp(void) {
         g_work_go = 0;
         int fresh = 1;
         for (int i = 1; i < g_ncpu_online; i++)
-            if (g_pcpu[i].probe_val != 0x2222222222222222ull) fresh = 0;
+            if (g_cpu[i].probe_val != 0x2222222222222222ull) fresh = 0;
         kprintf("[smp    ] shootdown of %X: %d/%d remote acks; remote reads primed=%d fresh=%d\n",
                 V, (uint64_t)acks, (uint64_t)(g_ncpu_online - 1),
                 (uint64_t)primed, (uint64_t)fresh);
@@ -3451,7 +3529,7 @@ static uint64_t par_dispatch_kind(int kind, uint64_t base, uint64_t units, uint6
     g_pjob.kind = kind;
     g_pjob.base = base; g_pjob.units = units; g_pjob.unit_words = uw;
     g_pjob.cursor = 0; g_pjob.done = 0;
-    for (int i = 0; i < g_ncpu_online; i++) g_pcpu[i].work_done = 0;
+    for (int i = 0; i < g_ncpu_online; i++) g_cpu[i].work_done = 0;
     __sync_synchronize();
     g_work_go = 3;                                /* APs enter pjob_run once     */
     if (g_ncpu_online > 1) {
@@ -3472,7 +3550,7 @@ static uint64_t par_dispatch_kind(int kind, uint64_t base, uint64_t units, uint6
     /* job (miss its share). done++ happens inside pjob_run, work_done=1 after.  */
     for (int i = 1; i < g_ncpu_online; i++) {
         t0 = g_ticks;
-        while (!g_pcpu[i].work_done && g_ticks - t0 < 100) __asm__ volatile("pause");
+        while (!g_cpu[i].work_done && g_ticks - t0 < 100) __asm__ volatile("pause");
     }
     uint64_t sum = 0; int nc = 0;
     for (int i = 0; i < g_ncpu_online; i++) {
@@ -3652,6 +3730,84 @@ static void __attribute__((no_stack_protector)) cmd_audit(void) {
     kputs("-- done --\n");
 }
 
+/* ===========================================================================
+ * MULTI-CORE SCHEDULING  (v0.38 Stage 2 — an AP autonomously runs a ring-3 thread)
+ * ===========================================================================
+ * The BSP loads a ring-3 program into a process, hands it to an application
+ * processor via that AP's per-CPU mailbox + a wake IPI, then QUIESCES (spin-
+ * waits). The AP adopts the thread on its OWN TSS/SYSCALL path, drops to ring
+ * 3, the thread reads its identity through the capability gate and exits with
+ * code == its pid, and the AP returns cleanly to its scheduler loop. This
+ * proves the headline — an AP executes a first-class ring-3 application thread
+ * — with the still-global syscall/resume state exercised by exactly one core
+ * (serialized). Concurrent BSP+AP ring-3 is v0.39 (per-CPU syscall path).     */
+static uint64_t elf_load(int proc_idx, uint64_t img, uint64_t img_size);   /* fwd (defined below) */
+static int g_mcpass, g_mcfail;
+static void mccheck(const char *n, int c) {
+    if (c) { g_mcpass++; kprintf("[mcsched]  PASS  %s\n", n); }
+    else   { g_mcfail++; kprintf("[mcsched]  FAIL  %s\n", n); }
+}
+
+static void cmd_mcsched(void) {
+    kputs("-- MULTI-CORE SCHEDULING: an AP autonomously runs a ring-3 thread --\n");
+    g_mcpass = g_mcfail = 0;
+    uint64_t save = current_proc_idx;
+
+    int p = kproc_spawn("mc-thread", 0);
+    if (p < 0) { kputs("[mcsched] spawn failed\n-- done --\n"); return; }
+    kprocs[p].role = 6;
+    uint64_t entry = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!entry) { kputs("[mcsched] ELF load failed\n-- done --\n"); return; }
+    uint64_t want = kprocs[p].pid;
+
+    if (g_ncpu_online < 2) {                              /* uniprocessor degrade  */
+        kputs("[mcsched] uniprocessor boot — running the thread on the BSP (no AP available)\n");
+        __asm__ volatile("cli");
+        current_proc_idx = (uint64_t)p;
+        g_tss[0].rsp0 = (uint64_t)(g_int_stack[0] + sizeof g_int_stack[0]);
+        set_syscall_stack((uint64_t)(g_syscall_stack[0] + sizeof g_syscall_stack[0]));
+        write_cr3(kprocs[p].cr3);
+        uint64_t code = enter_user_mode(entry, USTK_TOP);
+        write_cr3(kernel_cr3);
+        __asm__ volatile("sti");
+        current_proc_idx = save;
+        mccheck("ring-3 thread ran and returned (single-cpu path)", 1);
+        mccheck("capability gate resolved the thread's identity (exit code == pid)", code == want);
+        kprintf("[mcsched] BSP ran pid %u -> exit code %u (want %u)\n", want, code, want);
+        goto done;
+    }
+
+    int ap = 1;                                          /* hand it to cpu 1      */
+    struct cpu_local *c = &g_cpu[ap];
+    c->run_proc = p; c->run_entry = entry; c->run_exit_code = 0; c->run_done = 0;
+    __sync_synchronize();
+    c->run_req = 1;
+    kprintf("[mcsched] handing pid %u to cpu%d (apic %u); BSP quiesces and waits\n",
+            want, (uint64_t)ap, (uint64_t)g_cpu[ap].apic_id);
+    lapic_ipi(g_cpu[ap].apic_id, IPI_PING, 0);           /* wake it from hlt      */
+    uint64_t t0 = g_ticks;
+    while (!c->run_done && g_ticks - t0 < 500) {
+        lapic_ipi(g_cpu[ap].apic_id, IPI_PING, 0);
+        uint64_t tw = g_ticks; while (g_ticks - tw < 1) __asm__ volatile("pause");
+    }
+    /* the AP mutated the shared syscall stack while it ran; restore the BSP's   */
+    set_syscall_stack((uint64_t)(g_syscall_stack[0] + sizeof g_syscall_stack[0]));
+    current_proc_idx = save;
+
+    mccheck("an application processor executed the ring-3 thread and it returned", c->run_done);
+    mccheck("the AP's capability gate resolved the thread's identity (exit code == pid)",
+            c->run_done && c->run_exit_code == want);
+    kprintf("[mcsched] cpu%d ran pid %u -> exit code %u (want %u)\n",
+            (uint64_t)ap, want, c->run_exit_code, want);
+
+done:
+    kprintf("[mcsched] RESULT: %d passed, %d failed\n", (uint64_t)g_mcpass, (uint64_t)g_mcfail);
+    if (!g_mcfail) kputs("[mcsched] MULTI-CORE SCHEDULING VERIFIED — a ring-3 thread ran on an application processor\n");
+    else          kputs("[mcsched] MULTI-CORE SCHEDULING DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 /* ---- The C side of the syscall trap --------------------------------------- */
 /* Called from syscall_entry (ring 0) with the user's number + args.          */
 static int64_t sys_map_framebuffer(int proc_idx);   /* defined with the graphics engine */
@@ -3674,9 +3830,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         return (uint64_t)r;
     }
     case 2:                                                /* SYS_EXIT(code)             */
-        if (curthr->uthread) uthread_exit(a0);             /* first-class thread: reap + reschedule */
+        /* On an AP (cpu != 0) this is a serialized ap_run_uthread excursion —   */
+        /* return through resume_kernel to the AP's C loop, never the BSP reaper. */
+        if (cpu_idx() == 0 && curthr->uthread) uthread_exit(a0);   /* BSP first-class thread */
         write_cr3(kernel_cr3);                             /* leave the process address space */
-        resume_kernel(a0);                                 /* legacy boot-thread excursion */
+        resume_kernel(a0);                                 /* AP excursion / BSP legacy excursion */
         return 0;                                          /* unreached                  */
     case 3:                                                /* SYS_WRITEHEX(value)        */
         kprintf("%X", a0);
@@ -6426,6 +6584,7 @@ static void cmd_help(void) {
       "  smp             multi-core suite: IPIs, TLB shootdown, atomics\n"
       "  parallel        work-stealing parallel job across all cores\n"
       "  audit           parallel page-table integrity audit across all cores\n"
+      "  mcsched         run a ring-3 thread on an application processor\n"
       "  surface         spawn the ring-3 surface app as a live thread\n"
       "  surfin          route clicks to the live app in one canvas pass\n"
       "  canvas          Metropolis-Terminal spatial canvas (WASD/QE/TAB//)\n"
@@ -6503,6 +6662,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "smp")) cmd_smp();
     else if (!kstrcmp(argv[0], "parallel") || !kstrcmp(argv[0], "par")) cmd_parallel();
     else if (!kstrcmp(argv[0], "audit")) cmd_audit();
+    else if (!kstrcmp(argv[0], "mcsched")) cmd_mcsched();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -6639,6 +6799,7 @@ void kernel_main(uint64_t mb_info) {
     cmd_smp();              /* v0.35: cross-core protocol verification            */
     cmd_parallel();         /* v0.36: work-stealing parallel job across cores     */
     cmd_audit();            /* v0.37: parallel page-table integrity audit         */
+    cmd_mcsched();          /* v0.38: an AP autonomously runs a ring-3 thread      */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();

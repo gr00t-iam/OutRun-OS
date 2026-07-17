@@ -206,6 +206,17 @@ static void ident_probe(void) {
     sysc(SYS_EXIT, 0, 0, 0);
 }
 
+/* role 6: v0.38 multi-core scheduling probe. This thread is entered by an
+ * APPLICATION PROCESSOR, not the BSP. It reads its own identity through the
+ * capability path and exits with code == its pid, so the kernel can confirm
+ * the AP resolved THIS thread's identity and got a clean return. */
+static void mcsched_probe(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    print("  [mc :r3] ring-3 thread executing on an APPLICATION PROCESSOR\n");
+    print("  [mc :r3] SYS_GETPID via the AP's own SYSCALL path -> pid "); hex(pid); print("\n");
+    sysc(SYS_EXIT, pid, 0, 0);              /* exit code == pid; the BSP verifies */
+}
+
 static void nic_driver(void) {
     print("  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====\n");
 
@@ -320,6 +331,7 @@ void _start(void) {
     if (role == 3) { surface_exit_test(); }             /* exits itself         */
     if (role == 4) { ident_probe(); }                   /* exits itself         */
     if (role == 5) { tear_test(); }                     /* exits itself         */
+    if (role == 6) { mcsched_probe(); }                 /* exits itself (on an AP) */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");
