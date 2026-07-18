@@ -81,6 +81,7 @@ ISR_NOERR v
 ISR_NOERR 48                         ; IPI: ping / wake
 ISR_NOERR 49                         ; IPI: TLB shootdown
 ISR_NOERR 50                         ; IPI: preempt (v0.39 — capture ring-3 ctx)
+ISR_NOERR 51                         ; LAPIC timer: AP-local slice tick (v0.40)
 
 isr_common:
     push rax

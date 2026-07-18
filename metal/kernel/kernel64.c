@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.39.0-metal"
+#define KERNEL_VERSION "0.40.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -213,6 +213,7 @@ struct cpu_local {
     volatile uint32_t rq_ran;                /* tasks this CPU ran to completion */
     volatile uint32_t rq_stolen;             /* tasks this CPU stole from siblings */
     volatile uint32_t preempt_count;         /* ring-3 contexts forced out (IPI 50) */
+    volatile uint32_t slice_count;           /* v0.40: contexts sliced out by MY timer */
 };
 #define CPUL_SYSCALL_RSP 8                   /* asm contract (boot/usermode.asm) */
 #define CPUL_USER_RSP    16
@@ -279,7 +280,7 @@ struct idt_entry {
 } __attribute__((packed));
 struct idtr { uint16_t limit; uint64_t base; } __attribute__((packed));
 
-static struct idt_entry idt[51];   /* 0-31 exceptions, 32-47 PIC IRQs, 48-50 IPIs */
+static struct idt_entry idt[52];   /* 0-31 exceptions, 32-47 PIC IRQs, 48-50 IPIs, 51 slice tick */
 extern void idt_load(void *idtr);
 
 #define ISR_EXTERN(n) extern void isr##n(void);
@@ -294,7 +295,7 @@ ISR_EXTERN(30) ISR_EXTERN(31) ISR_EXTERN(32) ISR_EXTERN(33) ISR_EXTERN(34)
 ISR_EXTERN(35) ISR_EXTERN(36) ISR_EXTERN(37) ISR_EXTERN(38) ISR_EXTERN(39)
 ISR_EXTERN(40) ISR_EXTERN(41) ISR_EXTERN(42) ISR_EXTERN(43) ISR_EXTERN(44)
 ISR_EXTERN(45) ISR_EXTERN(46) ISR_EXTERN(47) ISR_EXTERN(48) ISR_EXTERN(49)
-ISR_EXTERN(50)
+ISR_EXTERN(50) ISR_EXTERN(51)
 
 static void idt_set(int v, uint64_t handler) {
     idt[v].off_lo  = handler & 0xFFFF;
@@ -480,10 +481,11 @@ void isr_dispatch(struct isr_frame *f) {
     /* v0.35: IPIs first — they run on ANY cpu and must touch none of the      */
     /* BSP-only machinery below (PIC EOI, softirqs, scheduler, sweep).         */
     if (f->vector == 48 || f->vector == 49) { smp_ipi_dispatch(f->vector); return; }
-    /* v0.39: preempt IPI. If it caught ring 3, this call NEVER RETURNS — the  */
-    /* handler captures the user context from `f` and unwinds the whole        */
-    /* interrupt through this core's kernel resume point instead of iretq.     */
-    if (f->vector == 50) { smp_preempt_ipi(f); return; }
+    /* v0.39: preempt IPI (50); v0.40: this core's own LAPIC slice tick (51).  */
+    /* If either caught ring 3, this call NEVER RETURNS — the handler captures */
+    /* the user context from `f` and unwinds the whole interrupt through this  */
+    /* core's kernel resume point instead of iretq.                            */
+    if (f->vector == 50 || f->vector == 51) { smp_preempt_ipi(f); return; }
     if (f->vector < 32) {
         if (g_fault_expected && (f->vector == 14 || f->vector == 13 || f->vector == 6)) {
             g_fault_caught = 1; g_fault_vector = f->vector; g_fault_expected = 0;
@@ -1003,6 +1005,7 @@ struct kproc {
     struct uctx uctx;   /* captured context while preempted                    */
     volatile uint32_t ran_on;     /* bitmask: cpus that executed this task     */
     volatile uint32_t finish_seq; /* global completion order (1-based)         */
+    volatile uint32_t dispatches; /* v0.40: times an executor picked this up   */
 };
 #define MAX_KPROC 40
 static struct kproc kprocs[MAX_KPROC];
@@ -1030,6 +1033,7 @@ static int kproc_spawn(const char *name, uint64_t caps) {
     kprocs[i].migrate_to = -1;
     kprocs[i].ran_on = 0;
     kprocs[i].finish_seq = 0;
+    kprocs[i].dispatches = 0;
     kprintf("[kernel ] spawned pid %u '%s' caps %X — private PML4 @ phys %X\n",
             kprocs[i].pid, name, caps, kprocs[i].cr3);
     return i;
@@ -3314,6 +3318,14 @@ static int rq_steal(int thief) {                       /* balance: rob siblings 
 static volatile int g_inr3 = 0, g_inr3_max = 0;
 static volatile uint32_t g_finish_seq = 0;             /* global completion order */
 
+/* v0.40: the dispatch log — every time an executor picks a task up (fresh or
+ * resumed), the kproc index is appended. Round-robin slicing shows up here as
+ * the interleaved pattern A,B,C,A,B,C..., which the slice suite demands
+ * literally rather than trusting counters alone.                            */
+#define DLOG_LEN 128
+static volatile int g_dlog[DLOG_LEN];
+static volatile uint32_t g_dlog_n = 0;
+
 #define RET_PREEMPTED 0xFEED5EEDF00DFACEull  /* sentinel: "context captured, not exited" */
 
 /* THE executor, identical on every core: adopt the task's identity into this
@@ -3329,6 +3341,9 @@ static void cpu_exec_proc(int c, int p) {
     g_tss[c].rsp0 = (uint64_t)(g_int_stack[c] + sizeof g_int_stack[c]);
     set_syscall_stack((uint64_t)(g_syscall_stack[c] + sizeof g_syscall_stack[c]));
     __sync_fetch_and_or(&kprocs[p].ran_on, 1u << c);
+    __sync_fetch_and_add(&kprocs[p].dispatches, 1);
+    uint32_t dl = __sync_fetch_and_add(&g_dlog_n, 1);  /* v0.40: dispatch log  */
+    if (dl < DLOG_LEN) g_dlog[dl] = p;
     int now = __sync_add_and_fetch(&g_inr3, 1);
     for (;;) {                                         /* high-water mark (CAS) */
         int m = g_inr3_max;
@@ -3375,8 +3390,22 @@ static void cpu_exec_proc(int c, int p) {
  * is not safe — just flag resched and return; the sender retries until the
  * IPI lands in user code (statistically immediate: the probes spend >99% of
  * their time there).                                                        */
+/* v0.40: AP-local time-slicing. Each AP's LAPIC timer is armed periodic on
+ * vector 51 and gated by g_slice_on — the same "preemption on demand"
+ * discipline the BSP has used for its PIT since v0.19. When the gate is open
+ * and the tick catches ring 3, the tick IS a self-directed preemption: the
+ * same capture path runs, the context is requeued at the TAIL of this CPU's
+ * queue, and the executor pulls the next task — round-robin, involuntary,
+ * per-core. The counters stay separate (slice_count vs preempt_count) so the
+ * mcpre suite's cross-core IPI semantics remain exactly what they verify.   */
+static volatile int g_slice_on = 0;
+
 static void smp_preempt_ipi(struct isr_frame *f) {
     struct cpu_local *me = &g_cpu[cpu_idx()];
+    if (f->vector == 51 && !g_slice_on) {    /* slicing gated off: ignore tick   */
+        lapic_eoi();
+        return;
+    }
     if ((f->cs & 3) != 3) {
         me->resched = 1;                     /* in-kernel: defer, sender retries */
         lapic_eoi();
@@ -3389,7 +3418,7 @@ static void smp_preempt_ipi(struct isr_frame *f) {
     u->rbp = f->rbp; u->rdi = f->rdi; u->rsi = f->rsi; u->rdx = f->rdx;
     u->rcx = f->rcx; u->rbx = f->rbx; u->rax = f->rax;
     u->rip = f->rip; u->rsp = f->rsp; u->rflags = f->rflags;
-    me->preempt_count++;
+    if (f->vector == 51) me->slice_count++; else me->preempt_count++;
     lapic_eoi();
     write_cr3(kernel_cr3);
     resume_kernel(RET_PREEMPTED);            /* never returns                    */
@@ -3418,6 +3447,12 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
     lapic_w(0xF0, 0x100 | 0xFF);                         /* my LAPIC on        */
     lapic_w(0x350, 0x10000);                             /* LINT0 masked (PIC is BSP's) */
     lapic_w(0x360, 0x10000);                             /* LINT1 masked       */
+    /* v0.40: MY periodic slice timer (vector 51). Always armed, but the       */
+    /* handler ignores ticks while g_slice_on is 0 — preemption on demand,     */
+    /* the same discipline as the BSP's gated PIT preemption.                  */
+    lapic_w(0x3E0, 0x3);                                 /* timer divider: 16  */
+    lapic_w(0x320, 0x20000 | 51);                        /* LVT: periodic, vec 51 */
+    lapic_w(0x380, 3000000);                             /* initial count (~tens of ms) */
     g_cpu[idx].apic_id = lapic_r(0x20) >> 24;
     kprintf("[smp    ] cpu%u online: long mode, own TSS (sel %X)+SYSCALL, LAPIC id %u, gs %X\n",
             (uint64_t)idx, (uint64_t)TSS_SEL(idx), (uint64_t)g_cpu[idx].apic_id, (uint64_t)&g_cpu[idx]);
@@ -4182,6 +4217,114 @@ done:
     kprintf("[mcpre  ] RESULT: %d passed, %d failed\n", (uint64_t)g_prpass, (uint64_t)g_prfail);
     if (!g_prfail) kputs("[mcpre  ] IPI PREEMPTION VERIFIED — a ring-3 context was forced out, migrated, and resumed\n");
     else          kputs("[mcpre  ] IPI PREEMPTION DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ---- v0.40: AP-local TIME-SLICING -----------------------------------------
+ * Three long-running ring-3 threads are piled onto ONE core's queue and the
+ * slice gate is opened: cpu1's own LAPIC timer must now round-robin them —
+ * capture the running context on each tick, requeue it at the tail, dispatch
+ * the next — with no other core involved. The dispatch log is then read back
+ * LITERALLY: interleaving (A,B,C,A,...) is demanded as a sequence, each
+ * thread must have been set down and picked back up, and all three checksums
+ * must survive their many capture/rebuild cycles.                           */
+static int g_slpass, g_slfail;
+static void slcheck(const char *n, int c) {
+    if (c) { g_slpass++; kprintf("[slice  ]  PASS  %s\n", n); }
+    else   { g_slfail++; kprintf("[slice  ]  FAIL  %s\n", n); }
+}
+
+static void cmd_slice(void) {
+    kputs("-- TIME-SLICING: one AP round-robins several ring-3 threads off its own LAPIC timer --\n");
+    g_slpass = g_slfail = 0;
+    uint64_t save = current_proc_idx;
+    enum { NSL = 3 };
+    int procs[NSL];
+
+    for (int i = 0; i < NSL; i++) {
+        int p = kproc_spawn("slice-probe", 0);
+        if (p < 0) { kputs("[slice  ] spawn failed\n-- done --\n"); return; }
+        kprocs[p].role = 8;                                /* long checksum loop */
+        uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!e) { kputs("[slice  ] ELF load failed\n-- done --\n"); return; }
+        kprocs[p].entry = e;
+        procs[i] = p;
+    }
+
+    if (g_ncpu_online < 2) {
+        kputs("[slice  ] uniprocessor boot — no AP, no LAPIC slice timer; running the probes sequentially on the BSP\n");
+        for (int i = 0; i < NSL; i++) { cpu_exec_proc(0, procs[i]); current_proc_idx = save; }
+        int ok = 1;
+        for (int i = 0; i < NSL; i++)
+            if (!kprocs[procs[i]].exited || kprocs[procs[i]].exit_code != kprocs[procs[i]].pid) ok = 0;
+        slcheck("all probes ran to completion on the BSP (single-cpu degrade)", ok);
+        kputs("[slice  ]  SKIP  slicing/interleave checks (needs an AP with its own timer)\n");
+        goto done;
+    }
+
+    uint32_t sc0[MAX_CPUS];
+    for (int i = 0; i < MAX_CPUS; i++) sc0[i] = g_cpu[i].slice_count;
+    uint32_t d0  = g_dlog_n;
+    g_slice_on = 1;                                        /* open the gate FIRST */
+    __sync_synchronize();
+    for (int i = 0; i < NSL; i++) rq_push(1, procs[i]);    /* all three on cpu1  */
+    kprintf("[slice  ] %d threads on cpu1's queue, slice gate OPEN — its timer takes it from here\n",
+            (uint64_t)NSL);
+    lapic_ipi(g_cpu[1].apic_id, IPI_PING, 0);
+    uint64_t t0 = g_ticks;
+    for (;;) {
+        int done = 1;
+        for (int i = 0; i < NSL; i++) if (!kprocs[procs[i]].exited) done = 0;
+        if (done || g_ticks - t0 > 4000) break;
+        __asm__ volatile("pause");
+    }
+    g_slice_on = 0;                                        /* close the gate      */
+    __sync_synchronize();
+    current_proc_idx = save;
+
+    /* NB: the sliced-out contexts stay ordinary queue entries, so idle APs —
+     * woken by their OWN gated ticks — may STEAL them mid-suite: slicing and
+     * migration compose. The log below is the GLOBAL dispatch order.        */
+    uint32_t slices = 0;
+    for (int i = 0; i < MAX_CPUS; i++) {
+        uint32_t s = g_cpu[i].slice_count - sc0[i];
+        slices += s;
+        if (s) kprintf("[slice  ]   cpu%d's timer sliced %u context(s) out mid-loop\n",
+                       (uint64_t)i, (uint64_t)s);
+    }
+    uint32_t dn = g_dlog_n; if (dn > DLOG_LEN) dn = DLOG_LEN;
+    int transitions = 0, last = -1, mine;
+    kputs("[slice  ] dispatch order (all cores):");
+    for (uint32_t i = d0; i < dn; i++) {
+        mine = 0;
+        for (int j = 0; j < NSL; j++) if (g_dlog[i] == procs[j]) mine = 1;
+        if (!mine) continue;
+        kprintf(" %u", kprocs[g_dlog[i]].pid);
+        if (last >= 0 && g_dlog[i] != last) transitions++;
+        last = g_dlog[i];
+    }
+    kputs("\n");
+    int all_ok = 1, redispatched = 1;
+    for (int i = 0; i < NSL; i++) {
+        struct kproc *k = &kprocs[procs[i]];
+        if (!k->exited || k->exit_code != k->pid) all_ok = 0;
+        if (k->dispatches < 2) redispatched = 0;
+        kprintf("[slice  ]   pid %u: exit %u (want %u)  dispatched %u time(s)  ran_on %x\n",
+                k->pid, k->exit_code, k->pid, (uint64_t)k->dispatches, (uint64_t)k->ran_on);
+    }
+    slcheck("all three threads completed with intact checksums (exit == pid) despite slicing",
+            all_ok);
+    slcheck("AP timers forced context switches (total slice count >= 2)", slices >= 2);
+    slcheck("every thread was set down and picked back up (each dispatched >= 2 times)",
+            redispatched);
+    slcheck("the dispatch log shows ROUND-ROBIN interleaving (>= 4 alternations between threads)",
+            transitions >= 4);
+
+done:
+    kprintf("[slice  ] RESULT: %d passed, %d failed\n", (uint64_t)g_slpass, (uint64_t)g_slfail);
+    if (!g_slfail) kputs("[slice  ] TIME-SLICING VERIFIED — an AP preemptively multitasks ring-3 threads on its own clock\n");
+    else          kputs("[slice  ] TIME-SLICING DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -7044,6 +7187,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "mcsched")) cmd_mcsched();
     else if (!kstrcmp(argv[0], "mcq")) cmd_mcq();
     else if (!kstrcmp(argv[0], "mcpre")) cmd_mcpre();
+    else if (!kstrcmp(argv[0], "slice")) cmd_slice();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -7125,7 +7269,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
         (void)handlers;
     }
     {
-        uint64_t h[51] = {
+        uint64_t h[52] = {
             ISR_ADDR(0),ISR_ADDR(1),ISR_ADDR(2),ISR_ADDR(3),ISR_ADDR(4),ISR_ADDR(5),
             ISR_ADDR(6),ISR_ADDR(7),ISR_ADDR(8),ISR_ADDR(9),ISR_ADDR(10),ISR_ADDR(11),
             ISR_ADDR(12),ISR_ADDR(13),ISR_ADDR(14),ISR_ADDR(15),ISR_ADDR(16),ISR_ADDR(17),
@@ -7135,16 +7279,16 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
             ISR_ADDR(36),ISR_ADDR(37),ISR_ADDR(38),ISR_ADDR(39),ISR_ADDR(40),ISR_ADDR(41),
             ISR_ADDR(42),ISR_ADDR(43),ISR_ADDR(44),ISR_ADDR(45),ISR_ADDR(46),ISR_ADDR(47),
             ISR_ADDR(48),ISR_ADDR(49),                 /* v0.35: IPI vectors    */
-            ISR_ADDR(50),                              /* v0.39: preempt IPI    */
+            ISR_ADDR(50),ISR_ADDR(51),                 /* v0.39 preempt, v0.40 slice */
         };
-        for (int v = 0; v < 51; v++) idt_set(v, h[v]);
+        for (int v = 0; v < 52; v++) idt_set(v, h[v]);
         struct idtr idtr = { sizeof(idt) - 1, (uint64_t)idt };
         idt_load(&idtr);
     }
     pic_remap();
     pit_init();
     __asm__ volatile("sti");
-    kprintf("[kernel ] IDT loaded (51 vectors incl. IPI 48-50), PIC remapped, PIT @ 100 Hz, IRQs on\n");
+    kprintf("[kernel ] IDT loaded (52 vectors incl. IPI 48-50 + slice tick 51), PIC remapped, PIT @ 100 Hz, IRQs on\n");
     kprintf("[kernel ] consoles: VGA text + COM1 serial (115200 8N1) — both live\n");
 
     multiboot_scan(mb_info, true);
@@ -7190,6 +7334,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_mcsched();          /* v0.38: an AP autonomously runs a ring-3 thread      */
     cmd_mcq();              /* v0.39: per-CPU queues, stealing, concurrent ring 3  */
     cmd_mcpre();            /* v0.39: IPI preemption + cross-core context migration */
+    cmd_slice();            /* v0.40: AP-local LAPIC timer round-robin time-slicing */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
