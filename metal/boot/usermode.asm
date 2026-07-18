@@ -19,44 +19,48 @@
 ;   user_blob         — a self-contained, position-independent ring-3 program
 ;                       that talks to the kernel ONLY through syscalls.
 ;
+; v0.39: EVERY word of trap-path state below is PER-CPU, reached GS-relative
+; through this core's `struct cpu_local` (GS_BASE points at it in both rings:
+; ring 3 cannot change GS_BASE — no wrgsbase, CR4.FSGSBASE off — so no swapgs
+; is needed anywhere). This is what lets several cores sit in ring 3 and take
+; SYSCALLs *simultaneously*: no shared .bss scratch remains in the entry path.
+;
 ; SYSCALL clobbers RCX (=return RIP) and R11 (=RFLAGS); RDI/RSI/RDX survive.
 ; Our ABI: RAX = syscall number, RDI = arg0, RSI = arg1.
 ; =============================================================================
 bits 64
 
+; struct cpu_local offsets (kernel64.c keeps these in lockstep)
+CPUL_SYSCALL_RSP equ 8           ; this CPU's SYSCALL kernel stack top
+CPUL_USER_RSP    equ 16          ; scratch: parked user RSP (2 insns, IF masked)
+CPUL_KRSP        equ 24          ; kernel resume context (SYS_EXIT longjmp),
+CPUL_KRBX        equ 32          ;   one per CPU so concurrent synchronous
+CPUL_KRBP        equ 40          ;   ring-3 excursions on different cores
+CPUL_KR12        equ 48          ;   unwind independently
+CPUL_KR13        equ 56
+CPUL_KR14        equ 64
+CPUL_KR15        equ 72
+
 global syscall_entry
 global enter_user_mode
 global enter_user_thread
+global enter_user_resume
 global resume_kernel
 global set_syscall_stack
 global user_blob_start
 global user_blob_end
 extern syscall_dispatch
 
-section .bss
-align 16
-g_ksrsp: resq 1          ; kernel syscall stack top (per-thread, reloaded on switch)
-g_ursp:  resq 1          ; SCRATCH only: user RSP parks here for two instructions
-                         ; (IF is masked by SFMASK, uniprocessor) before moving
-                         ; onto the thread's own kernel stack, so a syscall that
-                         ; blocks can no longer have its user RSP clobbered by
-                         ; another thread's syscall
-; kernel resume context (for SYS_EXIT longjmp)
-g_krsp:  resq 1
-g_krbx:  resq 1
-g_krbp:  resq 1
-g_kr12:  resq 1
-g_kr13:  resq 1
-g_kr14:  resq 1
-g_kr15:  resq 1
-
 section .text
 
 ; ---- SYSCALL entry: RAX=num, RDI=a0, RSI=a1 --------------------------------
+; GS-relative on every core: N cores can be in here at once, each on its own
+; cpu_local and its own kernel stack. SFMASK keeps IF off across the two-insn
+; scratch window, and no other core can touch %gs-addressed state but ours.
 syscall_entry:
-    mov [g_ursp], rsp            ; SYSCALL does NOT switch RSP — park user RSP
-    mov rsp, [g_ksrsp]           ; switch to THIS THREAD's kernel syscall stack
-    push qword [g_ursp]          ; user RSP now lives on the thread's own stack:
+    mov [gs:CPUL_USER_RSP], rsp  ; SYSCALL does NOT switch RSP — park user RSP
+    mov rsp, [gs:CPUL_SYSCALL_RSP] ; switch to THIS CPU's/thread's kernel stack
+    push qword [gs:CPUL_USER_RSP] ; user RSP now lives on the thread's own stack:
                                  ; safe across a blocking syscall (yield/wait)
     ; The user-space ABI expects a syscall to clobber only RAX/RCX/R11. Our C
     ; dispatcher freely clobbers the caller-saved arg registers, so preserve
@@ -88,15 +92,15 @@ syscall_entry:
     pop rsp                      ; user RSP, from THIS thread's kernel stack
     o64 sysret                   ; SYSRETQ: RIP<-RCX, RFLAGS<-R11, CS/SS<-user
 
-; ---- void enter_user_mode(uint64_t entry /*rdi*/, uint64_t ustack /*rsi*/) --
+; ---- uint64_t enter_user_mode(uint64_t entry /*rdi*/, uint64_t ustack /*rsi*/)
 enter_user_mode:
-    mov [g_krbx], rbx            ; save callee-saved regs + RSP so SYS_EXIT can
-    mov [g_krbp], rbp            ; return us straight back into kernel_main
-    mov [g_kr12], r12
-    mov [g_kr13], r13
-    mov [g_kr14], r14
-    mov [g_kr15], r15
-    mov [g_krsp], rsp
+    mov [gs:CPUL_KRBX], rbx      ; save callee-saved regs + RSP (PER CPU) so
+    mov [gs:CPUL_KRBP], rbp      ; SYS_EXIT unwinds to THIS core's call site
+    mov [gs:CPUL_KR12], r12
+    mov [gs:CPUL_KR13], r13
+    mov [gs:CPUL_KR14], r14
+    mov [gs:CPUL_KR15], r15
+    mov [gs:CPUL_KRSP], rsp
     mov ax, 0x23                 ; user data selector (0x20 | RPL3)
     mov ds, ax
     mov es, ax
@@ -124,21 +128,66 @@ enter_user_thread:
     push rdi                     ; RIP = user entry
     iretq
 
+; ---- uint64_t enter_user_resume(struct uctx *u /*rdi*/) -------------------
+; v0.39: rebuild a PREEMPTED ring-3 context — possibly on a DIFFERENT core
+; than the one that captured it. Saves this core's kernel resume point exactly
+; like enter_user_mode (so the next SYS_EXIT / preemption unwinds HERE), then
+; restores every GPR plus RIP/RSP/RFLAGS from the capture and iretq's straight
+; back into the middle of the interrupted user code.
+; struct uctx offsets (mirrors isr_frame GPR order; kernel64.c is the master):
+;   r15 0  r14 8  r13 16  r12 24  r11 32  r10 40  r9 48  r8 56
+;   rbp 64 rdi 72 rsi 80  rdx 88  rcx 96  rbx 104 rax 112
+;   rip 120  rsp 128  rflags 136
+enter_user_resume:
+    mov [gs:CPUL_KRBX], rbx
+    mov [gs:CPUL_KRBP], rbp
+    mov [gs:CPUL_KR12], r12
+    mov [gs:CPUL_KR13], r13
+    mov [gs:CPUL_KR14], r14
+    mov [gs:CPUL_KR15], r15
+    mov [gs:CPUL_KRSP], rsp
+    mov ax, 0x23                 ; user data selectors (before rax is restored)
+    mov ds, ax
+    mov es, ax
+    push qword 0x23              ; SS     = user data
+    push qword [rdi+128]         ; RSP    = captured user stack pointer
+    push qword [rdi+136]         ; RFLAGS = captured flags (IF was live)
+    push qword 0x2B              ; CS     = user code64
+    push qword [rdi+120]         ; RIP    = the interrupted instruction
+    mov r15, [rdi+0]
+    mov r14, [rdi+8]
+    mov r13, [rdi+16]
+    mov r12, [rdi+24]
+    mov r11, [rdi+32]
+    mov r10, [rdi+40]
+    mov r9,  [rdi+48]
+    mov r8,  [rdi+56]
+    mov rbp, [rdi+64]
+    mov rsi, [rdi+80]
+    mov rdx, [rdi+88]
+    mov rcx, [rdi+96]
+    mov rbx, [rdi+104]
+    mov rax, [rdi+112]
+    mov rdi, [rdi+72]            ; rdi last — it was the pointer
+    iretq
+
 ; ---- void resume_kernel(uint64_t retval /*rdi*/) — noreturn ---------------
 resume_kernel:
     mov rax, rdi
-    mov rsp, [g_krsp]            ; restore the kernel stack captured above
-    mov rbx, [g_krbx]
-    mov rbp, [g_krbp]
-    mov r12, [g_kr12]
-    mov r13, [g_kr13]
-    mov r14, [g_kr14]
-    mov r15, [g_kr15]
+    mov rsp, [gs:CPUL_KRSP]      ; restore THIS core's kernel resume context
+    mov rbx, [gs:CPUL_KRBX]
+    mov rbp, [gs:CPUL_KRBP]
+    mov r12, [gs:CPUL_KR12]
+    mov r13, [gs:CPUL_KR13]
+    mov r14, [gs:CPUL_KR14]
+    mov r15, [gs:CPUL_KR15]
     ret                          ; returns as if enter_user_mode() returned
 
 ; ---- void set_syscall_stack(uint64_t top /*rdi*/) -------------------------
+; Writes the CALLING core's slot: the scheduler / exec wrappers always run on
+; the CPU whose stack they are installing.
 set_syscall_stack:
-    mov [g_ksrsp], rdi
+    mov [gs:CPUL_SYSCALL_RSP], rdi
     ret
 
 ; ===========================================================================

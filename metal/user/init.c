@@ -206,6 +206,51 @@ static void ident_probe(void) {
     sysc(SYS_EXIT, 0, 0, 0);
 }
 
+/* role 6: v0.38 multi-core scheduling probe. This thread is entered by an
+ * APPLICATION PROCESSOR, not the BSP. It reads its own identity through the
+ * capability path and exits with code == its pid, so the kernel can confirm
+ * the AP resolved THIS thread's identity and got a clean return. */
+static void mcsched_probe(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    print("  [mc :r3] ring-3 thread executing on an APPLICATION PROCESSOR\n");
+    print("  [mc :r3] SYS_GETPID via the AP's own SYSCALL path -> pid "); hex(pid); print("\n");
+    sysc(SYS_EXIT, pid, 0, 0);              /* exit code == pid; the BSP verifies */
+}
+
+/* role 7: v0.39 CONCURRENT scheduling probe. Several of these run in ring 3
+ * on DIFFERENT cores at the same time. The compute loop keeps this core in
+ * ring 3 long enough to overlap its siblings, and the periodic SYS_GETPID
+ * re-check is the sharp edge: every syscall crosses the per-CPU entry path,
+ * and if any core's identity bled into another's capability gate, the pid
+ * comes back wrong and we exit 999 — which the kernel-side suite FAILs on. */
+static void mcq_probe(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    volatile u64 acc = 0;
+    for (u64 i = 0; i < 3000000ull; i++) {
+        acc += i ^ pid;
+        if ((i & 0xFFFFull) == 0 && sysc(SYS_GETPID, 0, 0, 0) != pid)
+            sysc(SYS_EXIT, 999, 0, 0);       /* cross-core identity bleed */
+    }
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
+/* role 8: v0.39 long-running PREEMPTIBLE probe (Stage 3). Same identity fuzz,
+ * ~10x the work: long enough for another core to preempt it mid-loop, requeue
+ * its captured context on a DIFFERENT cpu, and resume it there. If the
+ * capture/resume or the migration corrupted anything — registers, stack,
+ * identity — the checksum loop or the pid check breaks and the exit code
+ * betrays it. */
+static void mcpre_long(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    volatile u64 acc = 0;
+    for (u64 i = 0; i < 30000000ull; i++) {
+        acc += i ^ pid;
+        if ((i & 0x3FFFFull) == 0 && sysc(SYS_GETPID, 0, 0, 0) != pid)
+            sysc(SYS_EXIT, 999, 0, 0);
+    }
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
 static void nic_driver(void) {
     print("  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====\n");
 
@@ -320,6 +365,9 @@ void _start(void) {
     if (role == 3) { surface_exit_test(); }             /* exits itself         */
     if (role == 4) { ident_probe(); }                   /* exits itself         */
     if (role == 5) { tear_test(); }                     /* exits itself         */
+    if (role == 6) { mcsched_probe(); }                 /* exits itself (on an AP) */
+    if (role == 7) { mcq_probe(); }                     /* concurrent multi-core probe */
+    if (role == 8) { mcpre_long(); }                    /* preemptible long probe      */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");

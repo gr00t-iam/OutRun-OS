@@ -12,13 +12,15 @@ CC      := gcc
 CXX     := g++
 CFLAGS  := -ffreestanding -O2 -Wall -Wextra -std=c11 \
            -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -msoft-float \
-           -mcmodel=kernel -fno-pic -fstack-protector-strong -fno-builtin
+           -mcmodel=kernel -fno-pic -fstack-protector-strong -fno-builtin \
+           -mstack-protector-guard=tls -mstack-protector-guard-reg=gs \
+           -mstack-protector-guard-offset=80
 LD      := ld
 LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-ISO  := $(BUILD)/outrun-os-0.37.0.iso
+ISO  := $(BUILD)/outrun-os-0.39.0.iso
 
 .PHONY: all qemu qemu-vga clean
 all: $(ISO)
