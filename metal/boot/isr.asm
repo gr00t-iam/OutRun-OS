@@ -80,6 +80,7 @@ ISR_NOERR v
 ; v0.35: inter-processor interrupts (LAPIC fixed vectors)
 ISR_NOERR 48                         ; IPI: ping / wake
 ISR_NOERR 49                         ; IPI: TLB shootdown
+ISR_NOERR 50                         ; IPI: preempt (v0.39 — capture ring-3 ctx)
 
 isr_common:
     push rax
