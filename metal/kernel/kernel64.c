@@ -469,6 +469,12 @@ static const char *exc_names[32] = {
 static volatile int      g_fault_expected = 0, g_fault_caught = 0;
 static volatile uint64_t g_fault_vector = 0, g_fault_recover_rip = 0, g_fault_recover_rsp = 0;
 
+/* Runtime-gated diagnostics for the syscall-exit / page-fault CR3 discipline.
+ * Both default OFF (one branch, no output) and are toggled at runtime, same
+ * discipline as g_fault_expected above. */
+static volatile int g_debug_pagefault    = 0;   /* DEBUG_PAGEFAULT: log every #PF        */
+static volatile int g_debug_syscall_exit = 0;   /* DEBUG_SYSCALL_EXIT: log every sysret   */
+
 /* user-stack layout (used by the guard-page fault check in isr_dispatch) */
 #define USTK_V     0x0000500000FF0000ull                  /* user stack bottom       */
 #define USTK_PAGES 4                                       /* 16 KiB ring-3 stack     */
@@ -480,6 +486,8 @@ static void sweep_tick(void);                            /* incremental PTE inte
 static void smp_ipi_dispatch(uint64_t vec);              /* v0.35: LAPIC IPI handlers      */
 static void smp_preempt_ipi(struct isr_frame *f);        /* v0.39: vector 50 (may not return) */
 static volatile int g_guard_caught = 0;                  /* set when a guard fault is handled */
+static inline uint64_t read_cr3(void);                   /* fwd: defined with paging helpers  */
+static uint64_t dbg_pid_of(uint64_t proc_idx);           /* fwd: defined after kprocs[]        */
 
 void isr_dispatch(struct isr_frame *f) {
     /* v0.35: IPIs first — they run on ANY cpu and must touch none of the      */
@@ -496,6 +504,12 @@ void isr_dispatch(struct isr_frame *f) {
             f->rip = g_fault_recover_rip;                /* resume at recovery point */
             f->rsp = g_fault_recover_rsp;
             return;                                      /* iretq back into the test */
+        }
+        if (g_debug_pagefault && f->vector == 14) {
+            uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+            kprintf("[dbgpf  ] pid %u cr3=%X fault_va=%X rip=%X rsp=%X err=%x cpl=%u\n",
+                    dbg_pid_of(current_proc_idx), read_cr3(), cr2, f->rip, f->rsp,
+                    f->error, (uint64_t)(f->cs & 3));
         }
         /* A fault from ring 3 must never take down the kernel — terminate the    */
         /* offending task (guard-page hit = stack overflow).                      */
@@ -1203,6 +1217,26 @@ struct kproc {
 #define MAX_KPROC 48                  /* v0.41: +6 cio workers in the autorun */
 static struct kproc kprocs[MAX_KPROC];
 static int n_kproc = 0;
+
+/* Diagnostic-only: kproc index -> pid, bounds-checked (proc_idx is untrusted
+ * at a fault: the very thing being debugged may be a stale/out-of-range
+ * identity). Returns 0 (never a real pid) if the index doesn't resolve. */
+static uint64_t dbg_pid_of(uint64_t proc_idx) {
+    if (proc_idx >= (uint64_t)n_kproc) return 0;
+    return kprocs[proc_idx].pid;
+}
+
+/* Called from syscall_entry's shared epilogue (boot/usermode.asm), for BOTH
+ * success and error returns alike — there is only one epilogue, so this fires
+ * on every syscall return when armed. Runs strictly before any of the saved
+ * registers are popped back and before RSP/RIP are handed to SYSRET, so it
+ * observes exactly the CR3/RSP/RIP the current thread is about to resume
+ * with. Non-static: called across the C/asm boundary. */
+void dbg_syscall_exit(uint64_t saved_rip, uint64_t saved_rsp) {
+    if (!g_debug_syscall_exit) return;
+    kprintf("[dbgsys ] pid %u cr3=%X user_rip=%X user_rsp=%X\n",
+            dbg_pid_of(current_proc_idx), read_cr3(), saved_rip, saved_rsp);
+}
 
 /* Who is 'running': since v0.39 `current_proc_idx` is the PER-CPU slot
  * g_cpu[cpu_idx()].cur_proc (macro at the top of the file) — each core carries
