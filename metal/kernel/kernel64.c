@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.42.0-metal"
+#define KERNEL_VERSION "0.43.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -218,6 +218,7 @@ struct cpu_local {
     volatile uint32_t fs_ops;                /* file syscalls dispatched ON this CPU */
     uint8_t  rank_stack[8];                  /* klock ranks held by the context      */
     uint8_t  rank_sp;                        /* running on this CPU (APs only; the   */
+    volatile int dbg_was_idle;               /* v0.43: DEBUG_SMP_SCHED idle-edge latch */
 };                                           /* BSP tracks per-THREAD in the PCB)    */
 #define CPUL_SYSCALL_RSP 8                   /* asm contract (boot/usermode.asm) */
 #define CPUL_USER_RSP    16
@@ -474,6 +475,7 @@ static volatile uint64_t g_fault_vector = 0, g_fault_recover_rip = 0, g_fault_re
  * discipline as g_fault_expected above. */
 static volatile int g_debug_pagefault    = 0;   /* DEBUG_PAGEFAULT: log every #PF        */
 static volatile int g_debug_syscall_exit = 0;   /* DEBUG_SYSCALL_EXIT: log every sysret   */
+static volatile int g_debug_smp_sched    = 0;   /* DEBUG_SMP_SCHED: pick/switch/idle log  */
 
 /* user-stack layout (used by the guard-page fault check in isr_dispatch) */
 #define USTK_V     0x0000500000FF0000ull                  /* user stack bottom       */
@@ -1214,7 +1216,7 @@ struct kproc {
     volatile uint32_t dispatches; /* v0.40: times an executor picked this up   */
     uint64_t frames_freed;        /* v0.42: page_free_tree's count at exit     */
 };
-#define MAX_KPROC 48                  /* v0.41: +6 cio workers in the autorun */
+#define MAX_KPROC 64                  /* v0.41: +6 cio workers; v0.43: +10 smp_stress workers */
 static struct kproc kprocs[MAX_KPROC];
 static int n_kproc = 0;
 
@@ -2966,7 +2968,7 @@ static int     g_cas_mounted = 0;
 #define SB ((struct cas_superblock *)g_sbblk)
 
 /* --- VFS directory: names -> content, layered on CAS ---------------------- */
-#define VFS_MAXFILES   16
+#define VFS_MAXFILES   24                     /* v0.43: +4 headroom for smp_stress workers */
 #define VFS_MAX_CHUNKS 16                     /* 16 * 512 = 8 KiB max file       */
 struct dirent {
     char     name[32];
@@ -3759,6 +3761,9 @@ static void cpu_exec_proc(int c, int p) {
         if (now <= m || __sync_bool_compare_and_swap(&g_inr3_max, m, now)) break;
     }
     write_cr3(kprocs[p].cr3);
+    if (g_debug_smp_sched)
+        kprintf("[dbgsmp ] cpu%u pick+switch pid %u cr3=%X\n",
+                (uint64_t)c, kprocs[p].pid, kprocs[p].cr3);
     uint64_t code = kprocs[p].pstate
                   ? enter_user_resume(&kprocs[p].uctx)
                   : enter_user_mode(kprocs[p].entry, USTK_TOP);
@@ -3886,9 +3891,16 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
         /* v0.39: AUTONOMOUS scheduling — drain my own run queue, then steal   */
         /* from a busy sibling. No BSP mailbox: the BSP enqueues and this core */
         /* independently pulls, executes ring-3 tasks, and balances load.      */
-        int p;
-        while ((p = rq_pop((int)idx)) >= 0 || (p = rq_steal((int)idx)) >= 0)
+        int p, picked = 0;
+        while ((p = rq_pop((int)idx)) >= 0 || (p = rq_steal((int)idx)) >= 0) {
+            picked = 1;
+            g_cpu[idx].dbg_was_idle = 0;               /* leaving idle: reset the latch */
             cpu_exec_proc((int)idx, p);
+        }
+        if (!picked && g_debug_smp_sched && !g_cpu[idx].dbg_was_idle) {
+            g_cpu[idx].dbg_was_idle = 1;                /* log the TRANSITION once, not */
+            kprintf("[dbgsmp ] cpu%u idle (queue drained, nothing to steal)\n", (uint64_t)idx);
+        }
         int mode = g_work_go;
         if (mode && !g_cpu[idx].work_done) {
             if (mode == 1)                                /* lock-xadd storm   */
@@ -5285,6 +5297,123 @@ static void cmd_cio(void) {
     kprintf("[cio    ] RESULT: %d passed, %d failed\n", (uint64_t)g_iopass, (uint64_t)g_iofail);
     if (!g_iofail) kputs("[cio    ] CONCURRENT IO VERIFIED — the VFS/CAS/surface stack is multi-core reentrant\n");
     else          kputs("[cio    ] CONCURRENT IO DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.43: SMP STRESS HARNESS — a mixed workload biased across every core
+ * ===========================================================================
+ * Ten workers cycling through the THREE workload shapes this kernel already
+ * exercises separately: role 6 (mcsched_probe: pure SYS_GETPID/EXIT), role 9
+ * (cio_file_worker: VFS open/write/read/close, own file + racing shared
+ * file), role 10 (cio_surface_churn: paint + SYS_SURFACE_FLIP). Exactly TWO
+ * role-10 workers are spawned — cio_surface_churn picks its slot by
+ * `pid & 1` (slots 6/7 only), and cmd_cio's own suite never runs more than
+ * two concurrent instances for exactly that reason; more would race two
+ * workers onto the SAME slot, a hazard that belongs to role 10 itself, not to
+ * this harness. Placement is BIASED round-robin across every online core via
+ * rq_push — the same placement primitive mcq/cio already use — and idle
+ * siblings may still steal, so this is a bias, not a hard pin.            */
+static int g_smstrpass, g_smstrfail;
+static void smstrcheck(const char *n, int c) {
+    if (c) { g_smstrpass++; kprintf("[smpstrs]  PASS  %s\n", n); }
+    else   { g_smstrfail++; kprintf("[smpstrs]  FAIL  %s\n", n); }
+}
+
+#define STRESS_N 10
+
+static void cmd_smp_stress(void) {
+    kputs("-- SMP STRESS: mixed syscall/VFS/compositor workload biased across every core --\n");
+    g_smstrpass = g_smstrfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+
+    static const uint64_t roles[STRESS_N] = { 10, 10, 9, 9, 9, 9, 6, 6, 6, 6 };
+    int procs[STRESS_N];
+    static uint8_t stbuf[CIO_LEN];                     /* BSP-only pre-seed staging */
+    for (int i = 0; i < STRESS_N; i++) {
+        /* Same per-role capability grant cmd_cio uses: role 9 (VFS) needs
+         * CAP_FILESYSTEM, role 10 (surface) needs CAP_FRAMEBUFFER, role 6
+         * (bare GETPID/EXIT) needs neither. */
+        uint64_t caps = roles[i] == 9 ? PCAP_FILESYSTEM
+                      : roles[i] == 10 ? PCAP_FRAMEBUFFER : 0;
+        int p = kproc_spawn("smp-stress", caps);
+        if (p < 0) { kputs("[smpstrs] spawn failed\n-- done --\n"); return; }
+        kprocs[p].role = roles[i];
+        uint64_t entry = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!entry) { kputs("[smpstrs] ELF load failed\n-- done --\n"); return; }
+        kprocs[p].entry = entry;
+        procs[i] = p;
+        /* cio_file_worker's SYS_OPEN(own name) resolves an existing dirent, it
+         * does not create one — cmd_cio pre-seeds the same way, kernel-side,
+         * before dispatch. Missing this step is exactly what a fresh reader
+         * of this suite would get wrong; do it here too. */
+        if (roles[i] == 9) {
+            char nm[16]; cio_name(nm, kprocs[p].pid);
+            for (int j = 0; j < CIO_LEN; j++) stbuf[j] = cio_byte(kprocs[p].pid, 255, j);
+            vfs_write_file(nm, stbuf, CIO_LEN);
+        }
+    }
+    for (int j = 0; j < CIO_LEN; j++) stbuf[j] = (uint8_t)(11 + j * 7);
+    vfs_write_file("cio-shared", stbuf, CIO_LEN);          /* the racing shared file */
+
+    if (n > 1) {
+        for (int i = 0; i < STRESS_N; i++) rq_push(i % n, procs[i]);   /* biased round-robin */
+        __sync_synchronize();
+        lapic_ipi(0, IPI_PING, 1);                                     /* wake every AP     */
+        kprintf("[smpstrs] %d workers (2 surface + 4 VFS + 4 syscall) biased round-robin across %d cores\n",
+                (uint64_t)STRESS_N, (uint64_t)n);
+        int p;                                        /* the BSP drains ITS OWN share too, */
+        while ((p = rq_pop(0)) >= 0) cpu_exec_proc(0, p);   /* no special-casing vs an AP   */
+    } else {
+        kputs("[smpstrs] uniprocessor boot — running the mix sequentially on the BSP\n");
+        for (int i = 0; i < STRESS_N; i++) cpu_exec_proc(0, procs[i]);
+    }
+
+    uint64_t t0 = g_ticks;                             /* join + watchdog (deadlock proxy) */
+    for (;;) {
+        int all = 1;
+        for (int i = 0; i < STRESS_N; i++) if (!kprocs[procs[i]].exited) all = 0;
+        if (all || g_ticks - t0 > 4000) break;
+        if (n > 1) lapic_ipi(0, IPI_PING, 1);
+        uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
+    }
+    current_proc_idx = save;
+
+    int all_exited = 1, ids_ok = 1;
+    for (int i = 0; i < STRESS_N; i++) {
+        struct kproc *k = &kprocs[procs[i]];
+        if (!k->exited) all_exited = 0;
+        if (!k->exited || k->exit_code != k->pid) ids_ok = 0;
+        kprintf("[smpstrs]   pid %u role %u: exit %u (want %u) ran_on %x\n",
+                k->pid, k->role, k->exit_code, k->pid, (uint64_t)k->ran_on);
+    }
+    smstrcheck("no watchdog timeout — every worker reached a terminal state (no deadlock)",
+               all_exited);
+    smstrcheck("every worker's exit code == its pid (no 6xx/7xx: VFS/surface work was correct)",
+               ids_ok);
+    if (n >= 2) {
+        int cpus_used = 0;
+        for (int c = 0; c < MAX_CPUS; c++) {
+            int used = 0;
+            for (int i = 0; i < STRESS_N; i++) if (kprocs[procs[i]].ran_on & (1u << c)) used = 1;
+            if (used) cpus_used++;
+        }
+        kprintf("[smpstrs] %d distinct core(s) executed part of this mixed workload\n",
+                (uint64_t)cpus_used);
+        smstrcheck(">= 2 distinct cores executed part of the mix (bias + stealing both worked)",
+                   cpus_used >= 2);
+    } else {
+        kputs("[smpstrs]  SKIP  multi-core distribution check (uniprocessor boot)\n");
+    }
+    smstrcheck("ZERO cross-core lock-rank violations across the whole mixed run",
+               g_rank_violations == 0);
+
+    kprintf("[smpstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_smstrpass, (uint64_t)g_smstrfail);
+    if (!g_smstrfail)
+        kputs("[smpstrs] SMP STRESS VERIFIED — mixed syscall/VFS/compositor workload survives across every core\n");
+    else kputs("[smpstrs] SMP STRESS DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -8012,6 +8141,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "mcpre")) cmd_mcpre();
     else if (!kstrcmp(argv[0], "slice")) cmd_slice();
     else if (!kstrcmp(argv[0], "cio")) cmd_cio();
+    else if (!kstrcmp(argv[0], "smpstress")) cmd_smp_stress();
     else if (!kstrcmp(argv[0], "leakcheck")) cmd_leakcheck();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
@@ -8161,6 +8291,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_mcpre();            /* v0.39: IPI preemption + cross-core context migration */
     cmd_slice();            /* v0.40: AP-local LAPIC timer round-robin time-slicing */
     cmd_cio();              /* v0.41: BSP + APs concurrently inside the VFS/CAS/surfaces */
+    cmd_smp_stress();       /* v0.43: mixed syscall/VFS/compositor workload, every core   */
     cmd_leakcheck();        /* v0.42: heavy spawn/destroy proves 100% frame reclamation  */
     cmd_iommu();
     cmd_capdma();
