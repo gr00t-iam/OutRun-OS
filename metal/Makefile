@@ -20,7 +20,7 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-VERSION := 0.41.0
+VERSION := 0.42.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga clean
