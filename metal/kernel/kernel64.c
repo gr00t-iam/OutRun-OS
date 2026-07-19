@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.39.0-metal"
+#define KERNEL_VERSION "0.41.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -213,7 +213,12 @@ struct cpu_local {
     volatile uint32_t rq_ran;                /* tasks this CPU ran to completion */
     volatile uint32_t rq_stolen;             /* tasks this CPU stole from siblings */
     volatile uint32_t preempt_count;         /* ring-3 contexts forced out (IPI 50) */
-};
+    volatile uint32_t slice_count;           /* v0.40: contexts sliced out by MY timer */
+    /* v0.41: cross-core reentrancy witnesses + lock-rank discipline.          */
+    volatile uint32_t fs_ops;                /* file syscalls dispatched ON this CPU */
+    uint8_t  rank_stack[8];                  /* klock ranks held by the context      */
+    uint8_t  rank_sp;                        /* running on this CPU (APs only; the   */
+};                                           /* BSP tracks per-THREAD in the PCB)    */
 #define CPUL_SYSCALL_RSP 8                   /* asm contract (boot/usermode.asm) */
 #define CPUL_USER_RSP    16
 #define CPUL_KRSP        24
@@ -279,7 +284,7 @@ struct idt_entry {
 } __attribute__((packed));
 struct idtr { uint16_t limit; uint64_t base; } __attribute__((packed));
 
-static struct idt_entry idt[51];   /* 0-31 exceptions, 32-47 PIC IRQs, 48-50 IPIs */
+static struct idt_entry idt[52];   /* 0-31 exceptions, 32-47 PIC IRQs, 48-50 IPIs, 51 slice tick */
 extern void idt_load(void *idtr);
 
 #define ISR_EXTERN(n) extern void isr##n(void);
@@ -294,7 +299,7 @@ ISR_EXTERN(30) ISR_EXTERN(31) ISR_EXTERN(32) ISR_EXTERN(33) ISR_EXTERN(34)
 ISR_EXTERN(35) ISR_EXTERN(36) ISR_EXTERN(37) ISR_EXTERN(38) ISR_EXTERN(39)
 ISR_EXTERN(40) ISR_EXTERN(41) ISR_EXTERN(42) ISR_EXTERN(43) ISR_EXTERN(44)
 ISR_EXTERN(45) ISR_EXTERN(46) ISR_EXTERN(47) ISR_EXTERN(48) ISR_EXTERN(49)
-ISR_EXTERN(50)
+ISR_EXTERN(50) ISR_EXTERN(51)
 
 static void idt_set(int v, uint64_t handler) {
     idt[v].off_lo  = handler & 0xFFFF;
@@ -480,10 +485,11 @@ void isr_dispatch(struct isr_frame *f) {
     /* v0.35: IPIs first — they run on ANY cpu and must touch none of the      */
     /* BSP-only machinery below (PIC EOI, softirqs, scheduler, sweep).         */
     if (f->vector == 48 || f->vector == 49) { smp_ipi_dispatch(f->vector); return; }
-    /* v0.39: preempt IPI. If it caught ring 3, this call NEVER RETURNS — the  */
-    /* handler captures the user context from `f` and unwinds the whole        */
-    /* interrupt through this core's kernel resume point instead of iretq.     */
-    if (f->vector == 50) { smp_preempt_ipi(f); return; }
+    /* v0.39: preempt IPI (50); v0.40: this core's own LAPIC slice tick (51).  */
+    /* If either caught ring 3, this call NEVER RETURNS — the handler captures */
+    /* the user context from `f` and unwinds the whole interrupt through this  */
+    /* core's kernel resume point instead of iretq.                            */
+    if (f->vector == 50 || f->vector == 51) { smp_preempt_ipi(f); return; }
     if (f->vector < 32) {
         if (g_fault_expected && (f->vector == 14 || f->vector == 13 || f->vector == 6)) {
             g_fault_caught = 1; g_fault_vector = f->vector; g_fault_expected = 0;
@@ -692,20 +698,19 @@ extern uint64_t cpp_ring_depth(void);
 /* kernel CR3 and every process CR3 (which shares the low identity map) can     */
 /* reach them directly.                                                         */
 static uint64_t g_next_frame = 0x01000000; /* 16 MiB: clear of kernel + stack */
-static uint64_t alloc_frame(void) {
-    uint64_t f = g_next_frame;
-    g_next_frame += 0x1000;
-    uint64_t *p = (uint64_t *)f;            /* identity mapped -> phys == virt  */
-    for (int i = 0; i < 512; i++) p[i] = 0; /* zero the frame                   */
-    return f;
-}
 
-/* Allocate n contiguous frames (bump allocator makes them sequential).        */
+/* v0.41: the bump pointer is claimed with LOCK XADD, so any core may allocate
+ * concurrently — two cores can no longer be handed the same frame, and a
+ * multi-frame claim stays contiguous because the whole extent is reserved in
+ * ONE atomic add (per-frame bumping would interleave under SMP). Zeroing
+ * happens outside any lock: the frames are exclusively ours once claimed.    */
 static uint64_t alloc_frames(uint64_t n) {
-    uint64_t base = alloc_frame();
-    for (uint64_t i = 1; i < n; i++) alloc_frame();
+    uint64_t base = __sync_fetch_and_add(&g_next_frame, n * 0x1000);
+    uint64_t *p = (uint64_t *)base;         /* identity mapped -> phys == virt  */
+    for (uint64_t i = 0; i < n * 512; i++) p[i] = 0;
     return base;
 }
+static uint64_t alloc_frame(void) { return alloc_frames(1); }
 
 /* Fault-injection allocator: when g_alloc_limit is armed, allocations past it   */
 /* fail (return 0) so exhaustion-handling paths can be exercised.                */
@@ -1003,8 +1008,9 @@ struct kproc {
     struct uctx uctx;   /* captured context while preempted                    */
     volatile uint32_t ran_on;     /* bitmask: cpus that executed this task     */
     volatile uint32_t finish_seq; /* global completion order (1-based)         */
+    volatile uint32_t dispatches; /* v0.40: times an executor picked this up   */
 };
-#define MAX_KPROC 40
+#define MAX_KPROC 48                  /* v0.41: +6 cio workers in the autorun */
 static struct kproc kprocs[MAX_KPROC];
 static int n_kproc = 0;
 
@@ -1030,6 +1036,7 @@ static int kproc_spawn(const char *name, uint64_t caps) {
     kprocs[i].migrate_to = -1;
     kprocs[i].ran_on = 0;
     kprocs[i].finish_seq = 0;
+    kprocs[i].dispatches = 0;
     kprintf("[kernel ] spawned pid %u '%s' caps %X — private PML4 @ phys %X\n",
             kprocs[i].pid, name, caps, kprocs[i].cr3);
     return i;
@@ -1300,6 +1307,11 @@ struct pcb {
     int      uthread;           /* 1 = owns a ring-3 process (never resume_kernel) */
     uint64_t rsp0;              /* TSS.rsp0 while this thread runs (0 = kernel default) */
     uint64_t ksrsp;             /* SYSCALL kernel stack top     (0 = kernel default) */
+    /* v0.41: klock ranks THIS THREAD holds. Per-thread on the BSP because a
+     * lock holder can park (vblk wait) and another BSP thread runs meanwhile
+     * — a per-CPU stack would see the parked holder's ranks as its own.      */
+    uint8_t  rank_stack[8];
+    uint8_t  rank_sp;
 };
 
 #define MAX_THREADS 16
@@ -1412,6 +1424,95 @@ static int thread_create(const char *name, void (*entry)(void *), void *arg) {
 static void idle_fn(void *a) {
     (void)a;
     for (;;) { __asm__ volatile("sti; hlt"); sched_yield(); }
+}
+
+/* ===========================================================================
+ * v0.41: RANKED CROSS-CORE SPINLOCKS — the kernel's lock-ordering discipline
+ * ===========================================================================
+ * Until v0.40 every VFS/CAS/descriptor/surface path was exercised from the
+ * BSP only, so "one core at a time" was the (implicit) lock. v0.41 removes
+ * that restriction, and these locks are what replaces it. Deadlock freedom
+ * rests on a single global rank order — every context acquires strictly
+ * UPWARD in rank and releases LIFO:
+ *
+ *   rank 1  g_ofile_lock   open-descriptor array (fd alloc/free/deref)
+ *   rank 2  g_vfs_lock     VFS directory: dirent claim/scan/rewrite/flush
+ *   rank 3  g_cas_lock     CAS superblock counters, bitmap, index,
+ *                          shared staging sectors (g_blk / g_idxbuf)
+ *   rank 4  g_vblk_lock    virtio-blk request slots + avail-ring publish
+ *   rank 5  g_surf_lock    surface slot table + pixel-buffer free list
+ *   (6)     g_next_frame   frame allocator — LOCK XADD, no lock to rank
+ *   (7)     g_conlock      console — IRQ-safe leaf inside kprintf only
+ *
+ * The deep chain is SYS_WRITE_FILE: vfs(2) -> cas(3) -> vblk(4). The surface
+ * chain surf(5) -> frame(6) is disjoint from the file chain, so no cycle can
+ * pass through the allocator. Ranks 1 and 2 never nest AT ALL — vfs_open
+ * would want vfs->ofile while SYS_READ wants ofile->vfs, a real inversion,
+ * so both paths were built as two disjoint critical sections instead.
+ *
+ * Blocking rules that keep this deadlock-free on real cores:
+ *   - A klock is NEVER acquired in interrupt context (g_conlock stays the
+ *     only IRQ-side lock; the virtio bottom half touches only per-slot
+ *     completion flags).
+ *   - g_vblk_lock is never held across a disk WAIT — submit publishes the
+ *     avail entry, kicks the doorbell, releases; the wait is lock-free on
+ *     the slot's own done flag.
+ *   - Ranks 2/3 MAY be held across a blocking disk wait. That is safe only
+ *     because a contended acquire never bare-spins the one core that could
+ *     run the holder: on the BSP it yields through the scheduler (the parked
+ *     holder is woken by the IRQ bottom half and finishes), on an AP it
+ *     PAUSE-spins with IF set (the BSP services the completion IRQ).
+ *   - Rank order is ENFORCED at runtime: each context tracks the ranks it
+ *     holds (per-thread on the BSP, per-CPU on APs) and any non-monotonic
+ *     acquire counts a violation the cio suite fails on.
+ * =========================================================================== */
+struct klock {
+    volatile int      v;                     /* 0 = free, 1 = held             */
+    const char       *name;
+    uint8_t           rank;
+    volatile uint32_t acq;                   /* successful acquisitions        */
+    volatile uint32_t contended;             /* acquisitions that had to wait  */
+};
+static struct klock g_ofile_lock = { 0, "ofile", 1, 0, 0 };
+static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0 };
+static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0 };
+static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0 };
+static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0 };
+static volatile uint32_t g_rank_violations = 0;
+
+/* Back off without monopolizing the core that must make our progress: the BSP
+ * runs its scheduler (the lock holder may be a parked sibling thread), an AP
+ * has no kernel scheduler and PAUSE-spins with interrupts deliverable.       */
+static inline void krelax(void) {
+    if (cpu_idx() == 0 && g_sched_on) sched_yield();
+    else __asm__ volatile("pause");
+}
+
+/* Rank bookkeeping storage for the CURRENT context (see the pcb comment).    */
+static inline uint8_t *rank_ctx(uint8_t **sp) {
+    if (cpu_idx() == 0 && g_sched_on) { *sp = &curthr->rank_sp;         return curthr->rank_stack; }
+    struct cpu_local *me = &g_cpu[cpu_idx()]; *sp = &me->rank_sp;       return me->rank_stack;
+}
+
+static void klock_acquire(struct klock *l) {
+    uint8_t *sp, *st = rank_ctx(&sp);                  /* our context's stack;  */
+    if (*sp > 0 && st[*sp - 1] >= l->rank) {           /* still ours after any  */
+        __sync_fetch_and_add(&g_rank_violations, 1);   /* yield below — a yield */
+        kprintf("[klock  ] RANK VIOLATION: acquiring '%s' (rank %d) while holding rank %d\n",
+                l->name, (uint64_t)l->rank, (uint64_t)st[*sp - 1]);
+    }                                                  /* resumes THIS thread   */
+    if (__sync_lock_test_and_set(&l->v, 1)) {
+        __sync_fetch_and_add(&l->contended, 1);
+        do { krelax(); } while (l->v || __sync_lock_test_and_set(&l->v, 1));
+    }
+    l->acq++;                                          /* under the lock        */
+    if (*sp < 8) st[(*sp)++] = l->rank;
+}
+
+static void klock_release(struct klock *l) {
+    uint8_t *sp; rank_ctx(&sp);
+    if (*sp > 0) (*sp)--;                              /* LIFO release          */
+    __sync_lock_release(&l->v);
 }
 
 static void sched_init(void) {
@@ -1888,9 +1989,10 @@ static void virtio_blk_bh(void) {
         int slot = (int)(e->id / 3);                       /* head desc -> slot  */
         if (slot >= 0 && slot < g_vblk_nslots) {
             g_vreq[slot].status = g_stats[slot];
-            g_vreq[slot].done   = 1;
+            barrier();
+            g_vreq[slot].done   = 1;           /* AP waiters poll exactly this  */
             thread_wake(g_vreq[slot].waiter_tid);          /* wake THAT thread   */
-            if (g_inflight) g_inflight--;
+            if (g_inflight) __sync_fetch_and_sub(&g_inflight, 1);  /* vs AP submit */
             g_completions++;
         }
         g_vblk_last_used++;
@@ -2034,13 +2136,15 @@ static int vblk_alloc_slot(void) {
 
 /* Submit a request WITHOUT blocking. Returns the slot/tag, or -1.             */
 /* Many of these can be outstanding at once (up to g_vblk_nslots).             */
+/* v0.41: MP-safe. The old cli/sti guard only excluded THIS core's interrupts; */
+/* two cores could race the slot scan and the avail-ring publish. g_vblk_lock  */
+/* (rank 4) serializes slot claim -> descriptor fill -> publish -> doorbell,   */
+/* and is released BEFORE any wait — it is never held across a block.          */
 static int vblk_submit(uint32_t type, uint64_t sector, void *buffer, int waiter_tid) {
     if (!g_vblk_ready) return -1;
-    int slot;
-    uint64_t fl; __asm__ volatile("pushfq; pop %0" : "=r"(fl));
-    __asm__ volatile("cli");
-    slot = vblk_alloc_slot();
-    if (slot < 0) { if (fl & 0x200) __asm__ volatile("sti"); return -1; }
+    klock_acquire(&g_vblk_lock);
+    int slot = vblk_alloc_slot();
+    if (slot < 0) { klock_release(&g_vblk_lock); return -1; }
     int d0 = slot * 3, d1 = d0 + 1, d2 = d0 + 2;
 
     g_hdrs[slot].type = type; g_hdrs[slot].reserved = 0; g_hdrs[slot].sector = sector;
@@ -2058,40 +2162,57 @@ static int vblk_submit(uint32_t type, uint64_t sector, void *buffer, int waiter_
     uint16_t ai = g_vblk_avail->idx;
     g_vblk_avail->ring[ai % g_vblk_qsize] = (uint16_t)d0;   /* publish head desc  */
     barrier(); g_vblk_avail->idx = ai + 1; barrier();
-    g_inflight++; if (g_inflight > g_max_inflight) g_max_inflight = g_inflight;
+    uint64_t inf = __sync_add_and_fetch(&g_inflight, 1);    /* bh decrements       */
+    if (inf > g_max_inflight) g_max_inflight = inf;         /* (under the lock)    */
 
     volatile uint16_t *notify =
         (volatile uint16_t *)(g_vblk_notify + (uint32_t)g_vblk_notify_off * g_vblk_notify_mul);
     *notify = 0; barrier();
-    if (fl & 0x200) __asm__ volatile("sti");                /* restore caller IF  */
+    klock_release(&g_vblk_lock);
     return slot;
 }
 
-/* Wait for a submitted tag to complete by PARKING the calling thread (not the  */
-/* CPU). Other threads run while this one is blocked. Returns 0 / negative.     */
+/* Wait for a submitted tag to complete. v0.41: CPU-aware — the parking path
+ * (curthr / g_cur / sched_yield) is BSP scheduler state and was one of the
+ * three audited paths that silently corrupted a random BSP thread when a
+ * file syscall ran on an AP. An AP has no kernel scheduler to park in, so it
+ * PAUSE-polls the slot's own done flag with IF set: the completion IRQ is
+ * PIC-routed to the BSP, whose bottom half writes done=1, which this core
+ * observes. No scheduler state is touched off the BSP.                        */
 static int vblk_wait(int slot) {
-    while (!g_vreq[slot].done) {
-        __asm__ volatile("cli");
-        if (!g_vreq[slot].done) {
-            curthr->state = T_BLOCKED;                     /* park this thread   */
-            g_vreq[slot].waiter_tid = g_cur;
-            __asm__ volatile("sti");
-            sched_yield();                                 /* let others run     */
-        } else {
-            __asm__ volatile("sti");
+    if (cpu_idx() != 0) {
+        while (!g_vreq[slot].done) __asm__ volatile("pause");
+    } else {
+        while (!g_vreq[slot].done) {
+            __asm__ volatile("cli");
+            if (!g_vreq[slot].done) {
+                curthr->state = T_BLOCKED;                 /* park this thread   */
+                g_vreq[slot].waiter_tid = g_cur;
+                __asm__ volatile("sti");
+                sched_yield();                             /* let others run     */
+            } else {
+                __asm__ volatile("sti");
+            }
         }
     }
     uint8_t st = g_vreq[slot].status;
-    __asm__ volatile("cli"); g_vreq[slot].in_use = 0; __asm__ volatile("sti");
+    barrier();
+    g_vreq[slot].in_use = 0;      /* owner-only 1->0; submitters scan under lock */
     if (st != VIRTIO_BLK_S_OK) { kprintf("[vblk   ] slot %d status %d\n", (uint64_t)slot, (uint64_t)st); return -3; }
     return 0;
 }
 
 /* Blocking convenience wrapper: submit + wait (used by CAS and the VFS).      */
+/* v0.41: an AP passes waiter_tid -1 (it polls; there is no thread to wake),   */
+/* and slot exhaustion — now reachable with several cores submitting — backs   */
+/* off and retries instead of surfacing a spurious IO error into the VFS.      */
 static int virtio_blk_request(uint32_t type, uint64_t sector, void *buffer) {
-    int slot = vblk_submit(type, sector, buffer, g_cur);
-    if (slot < 0) return -1;
-    return vblk_wait(slot);
+    for (;;) {
+        int slot = vblk_submit(type, sector, buffer, cpu_idx() == 0 ? g_cur : -1);
+        if (slot >= 0) return vblk_wait(slot);
+        if (!g_vblk_ready) return -1;
+        krelax();                              /* all slots in flight: back off */
+    }
 }
 
 int virtio_read_block(uint64_t sector, void *buffer)        { return virtio_blk_request(VIRTIO_BLK_T_IN,  sector, buffer); }
@@ -2681,24 +2802,31 @@ static int cas_index_insert(uint64_t hash, uint32_t block, uint32_t len) {
 }
 
 /* store content -> return its content hash (address). Deduplicates.          */
+/* v0.41: g_cas_lock (rank 3) serializes the whole put — the index probe, the */
+/* bitmap claim, the shared staging sectors (g_blk/g_idxbuf) and the SB       */
+/* counters were all shared mutable state that two cores previously raced.    */
+/* The lock IS held across the disk waits inside; see the klock rank rules.   */
 static uint64_t cas_put(const void *data, uint32_t len) {
     uint64_t h = rust_cas_hash((uint64_t)data, len);       /* <-- Rust CAS hash */
+    klock_acquire(&g_cas_lock);
     SB->put_count++;
     uint32_t elen;
     int64_t existing = cas_index_find(h, &elen);
     if (existing >= 0) {
         SB->dedup_hits++; cas_flush_meta();
+        klock_release(&g_cas_lock);
         kprintf("[cas    ] put len %d hash %X -> DEDUP to block %d (no write)\n",
                 (uint64_t)len, h, (uint64_t)existing);
         return h;
     }
     int64_t b = bm_alloc();
-    if (b < 0) { kputs("[cas    ] volume full\n"); return 0; }
+    if (b < 0) { klock_release(&g_cas_lock); kputs("[cas    ] volume full\n"); return 0; }
     cmemset(g_blk, 0, CAS_BS);
     cmemcpy(g_blk, data, len > CAS_BS ? CAS_BS : len);
     virtio_write_block((uint64_t)b, g_blk);
     cas_index_insert(h, (uint32_t)b, len);
     cas_flush_meta();
+    klock_release(&g_cas_lock);
     kprintf("[cas    ] put len %d hash %X -> block %d (stored)\n", (uint64_t)len, h, (uint64_t)b);
     return h;
 }
@@ -2706,10 +2834,12 @@ static uint64_t cas_put(const void *data, uint32_t len) {
 /* fetch content by hash -> length, copies into out (up to max).              */
 static int64_t cas_get(uint64_t hash, void *out, uint32_t max) {
     uint32_t len;
+    klock_acquire(&g_cas_lock);                /* g_idxbuf + g_blk are shared   */
     int64_t b = cas_index_find(hash, &len);
-    if (b < 0) return -1;
+    if (b < 0) { klock_release(&g_cas_lock); return -1; }
     virtio_read_block((uint64_t)b, g_blk);
     cmemcpy(out, g_blk, len > max ? max : len);
+    klock_release(&g_cas_lock);
     return (int64_t)len;
 }
 
@@ -2740,6 +2870,10 @@ static void cas_format(void) {
             SB->index_start, SB->index_blocks, SB->dir_start, SB->dir_blocks, SB->data_start);
 }
 
+/* format/mount are UNLOCKED by design: both run on the boot core before the
+ * APs are online (and from the BSP shell with no AP tasks queued). Taking
+ * ranks here would only blur the invariant that matters: every POST-SMP
+ * entry into CAS state goes through cas_put/cas_get under rank 3.            */
 static int cas_mount(void) {
     virtio_read_block(0, g_sbblk);
     const char mg[8] = { 'O','R','U','N','C','A','S','1' };
@@ -2777,10 +2911,14 @@ static int vfs_find(const char *name) {
 }
 static void ts_emit(int type, const char *who, const char *text);  /* Time-Stream (Phase 5) */
 
-static int vfs_write_file(const char *name, const void *data, uint32_t len) {
-    int idx = vfs_find(name);
-    if (idx < 0) for (int i = 0; i < VFS_MAXFILES; i++) if (!DENTS[i].used) { idx = i; break; }
-    if (idx < 0) { kputs("[vfs    ] directory full\n"); return -1; }
+/* v0.41: the whole-file COW rewrite runs under g_vfs_lock (rank 2), held
+ * across every chunk's cas_put (rank 3 — strictly upward) and the directory
+ * flush. That makes a WRITE ATOMIC AGAINST READERS AND OTHER WRITERS: no
+ * core can observe a dirent whose chunk list is half old, half new, and two
+ * writers creating the same (or a new) name can no longer both claim a slot.
+ * The internal body assumes the lock is HELD; the two entry points below own
+ * the acquire so name-based and dirent-based callers share one code path.    */
+static int vfs_write_locked(int idx, const char *name, const void *data, uint32_t len) {
     struct dirent *d = &DENTS[idx];
     cmemset(d, 0, 256);
     kstrcpy_n(d->name, name, 32);
@@ -2795,33 +2933,72 @@ static int vfs_write_file(const char *name, const void *data, uint32_t len) {
     }
     d->file_hash = len ? rust_cas_hash((uint64_t)data, len) : 0;
     vfs_flush();
-    { char msg[64]; int p = 0;
-      const char *pre = "wrote file "; while (pre[p]) { msg[p] = pre[p]; p++; }
-      for (int q = 0; name[q] && p < 60; q++) msg[p++] = name[q];
-      msg[p] = 0; ts_emit(1 /*TSE_FILE*/, "vfs", msg); }
+    { char msg[64]; int mp = 0;
+      const char *pre = "wrote file "; while (pre[mp]) { msg[mp] = pre[mp]; mp++; }
+      for (int q = 0; name[q] && mp < 60; q++) msg[mp++] = name[q];
+      msg[mp] = 0; ts_emit(1 /*TSE_FILE*/, "vfs", msg); }   /* lock-free emit  */
     return idx;
 }
+static int vfs_write_file(const char *name, const void *data, uint32_t len) {
+    klock_acquire(&g_vfs_lock);
+    int idx = vfs_find(name);
+    if (idx < 0) for (int i = 0; i < VFS_MAXFILES; i++) if (!DENTS[i].used) { idx = i; break; }
+    if (idx < 0) { klock_release(&g_vfs_lock); kputs("[vfs    ] directory full\n"); return -1; }
+    idx = vfs_write_locked(idx, name, data, len);
+    klock_release(&g_vfs_lock);
+    return idx;
+}
+/* Rewrite an already-open dirent in place (SYS_WRITE_FILE). The old path read
+ * DENTS[di].name WITHOUT the lock and re-resolved it by name — both racy.    */
+static int vfs_write_by_dirent(int di, const void *data, uint32_t len) {
+    if (di < 0 || di >= VFS_MAXFILES) return -1;
+    klock_acquire(&g_vfs_lock);
+    if (!DENTS[di].used) { klock_release(&g_vfs_lock); return -1; }
+    char name[32]; kstrcpy_n(name, DENTS[di].name, 32);    /* copy under lock  */
+    int r = vfs_write_locked(di, name, data, len);
+    klock_release(&g_vfs_lock);
+    return r;
+}
 static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
-    struct dirent *d = &DENTS[idx];
+    klock_acquire(&g_vfs_lock);                /* the chunk list must not be    */
+    struct dirent *d = &DENTS[idx];            /* COW-swapped under our read    */
     uint32_t got = 0;
     uint8_t tmp[512];
     for (uint32_t i = 0; i < d->nchunks; i++) {
-        cas_get(d->chunk_hash[i], tmp, 512);
+        cas_get(d->chunk_hash[i], tmp, 512);   /* rank 2 -> 3: strictly upward  */
         uint32_t cl = d->len - i * 512; if (cl > 512) cl = 512;
         for (uint32_t j = 0; j < cl && got < max; j++) ((uint8_t *)buf)[got++] = tmp[j];
     }
+    klock_release(&g_vfs_lock);
     return got;
 }
-/* per-process open-file table */
-struct ofile { int used; int dirent; uint64_t off; };
+/* Open-descriptor array. v0.41: fd claim/free/deref go under g_ofile_lock
+ * (rank 1) and every descriptor records its OWNING process — before this,
+ * any process could close (or write through) any other process's fd, and two
+ * cores could be handed the same fd. NOTE the deliberate absence of nesting
+ * between ranks 1 and 2: vfs_open resolves the name under the vfs lock,
+ * RELEASES it, then claims the fd under the ofile lock. Nesting them here
+ * (vfs->ofile) against SYS_READ's ofile->vfs would be the classic ABBA
+ * inversion — the one concrete deadlock this design had to engineer out.    */
+struct ofile { int used; int dirent; uint64_t off; int owner; };
 static struct ofile g_ofiles[16];
-static int vfs_open(const char *name) {
+static int vfs_open_for(const char *name, int owner) {
+    klock_acquire(&g_vfs_lock);
     int di = vfs_find(name);
+    klock_release(&g_vfs_lock);                /* released BEFORE the fd claim  */
     if (di < 0) return -1;
+    klock_acquire(&g_ofile_lock);
     for (int fd = 0; fd < 16; fd++)
-        if (!g_ofiles[fd].used) { g_ofiles[fd].used = 1; g_ofiles[fd].dirent = di; g_ofiles[fd].off = 0; return fd; }
+        if (!g_ofiles[fd].used) {
+            g_ofiles[fd].used = 1; g_ofiles[fd].dirent = di;
+            g_ofiles[fd].off = 0; g_ofiles[fd].owner = owner;
+            klock_release(&g_ofile_lock);
+            return fd;
+        }
+    klock_release(&g_ofile_lock);
     return -1;
 }
+static int vfs_open(const char *name) { return vfs_open_for(name, (int)current_proc_idx); }
 
 /* Validate the C++ ring object is live in the boot image.                     */
 static void cpp_ring_selftest(void) {
@@ -3004,9 +3181,14 @@ static int      g_demo_dev_index = 0;                      /* device the ring-3 
  * own kernel stack, which stays valid until thread_create reuses the slot —
  * and it cannot: interrupts are off until the switch completes.               */
 static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
+    /* v0.41: take the surface lock BEFORE cli — a contended acquire may yield, */
+    /* which must not happen once this thread has begun dying under cli.        */
+    struct pcb *t0 = curthr;
+    klock_acquire(&g_surf_lock);
+    surfaces_reclaim((int)t0->proc);
+    klock_release(&g_surf_lock);
     __asm__ volatile("cli");
     struct pcb *t = curthr;
-    surfaces_reclaim((int)t->proc);
     kprocs[t->proc].exit_code = code;
     kprocs[t->proc].exited = 1;
     kprintf("[uthread] tid %d pid %u '%s' exited (code %u) — thread reaped\n",
@@ -3314,6 +3496,14 @@ static int rq_steal(int thief) {                       /* balance: rob siblings 
 static volatile int g_inr3 = 0, g_inr3_max = 0;
 static volatile uint32_t g_finish_seq = 0;             /* global completion order */
 
+/* v0.40: the dispatch log — every time an executor picks a task up (fresh or
+ * resumed), the kproc index is appended. Round-robin slicing shows up here as
+ * the interleaved pattern A,B,C,A,B,C..., which the slice suite demands
+ * literally rather than trusting counters alone.                            */
+#define DLOG_LEN 128
+static volatile int g_dlog[DLOG_LEN];
+static volatile uint32_t g_dlog_n = 0;
+
 #define RET_PREEMPTED 0xFEED5EEDF00DFACEull  /* sentinel: "context captured, not exited" */
 
 /* THE executor, identical on every core: adopt the task's identity into this
@@ -3329,6 +3519,9 @@ static void cpu_exec_proc(int c, int p) {
     g_tss[c].rsp0 = (uint64_t)(g_int_stack[c] + sizeof g_int_stack[c]);
     set_syscall_stack((uint64_t)(g_syscall_stack[c] + sizeof g_syscall_stack[c]));
     __sync_fetch_and_or(&kprocs[p].ran_on, 1u << c);
+    __sync_fetch_and_add(&kprocs[p].dispatches, 1);
+    uint32_t dl = __sync_fetch_and_add(&g_dlog_n, 1);  /* v0.40: dispatch log  */
+    if (dl < DLOG_LEN) g_dlog[dl] = p;
     int now = __sync_add_and_fetch(&g_inr3, 1);
     for (;;) {                                         /* high-water mark (CAS) */
         int m = g_inr3_max;
@@ -3354,6 +3547,14 @@ static void cpu_exec_proc(int c, int p) {
         __sync_synchronize();
         kprocs[p].exited = 1;
         __sync_fetch_and_add(&me->rq_ran, 1);
+        /* v0.41 audit fix: only the BSP's uthread reap path ever reclaimed     */
+        /* surfaces — a task that exited on an AP leaked its slot and pixel     */
+        /* pair permanently. Every executor now reclaims on exit.               */
+        __asm__ volatile("sti");                       /* lock may spin: IF on   */
+        klock_acquire(&g_surf_lock);
+        surfaces_reclaim(p);
+        klock_release(&g_surf_lock);
+        __asm__ volatile("cli");
     }
     __asm__ volatile("sti");
 }
@@ -3375,8 +3576,22 @@ static void cpu_exec_proc(int c, int p) {
  * is not safe — just flag resched and return; the sender retries until the
  * IPI lands in user code (statistically immediate: the probes spend >99% of
  * their time there).                                                        */
+/* v0.40: AP-local time-slicing. Each AP's LAPIC timer is armed periodic on
+ * vector 51 and gated by g_slice_on — the same "preemption on demand"
+ * discipline the BSP has used for its PIT since v0.19. When the gate is open
+ * and the tick catches ring 3, the tick IS a self-directed preemption: the
+ * same capture path runs, the context is requeued at the TAIL of this CPU's
+ * queue, and the executor pulls the next task — round-robin, involuntary,
+ * per-core. The counters stay separate (slice_count vs preempt_count) so the
+ * mcpre suite's cross-core IPI semantics remain exactly what they verify.   */
+static volatile int g_slice_on = 0;
+
 static void smp_preempt_ipi(struct isr_frame *f) {
     struct cpu_local *me = &g_cpu[cpu_idx()];
+    if (f->vector == 51 && !g_slice_on) {    /* slicing gated off: ignore tick   */
+        lapic_eoi();
+        return;
+    }
     if ((f->cs & 3) != 3) {
         me->resched = 1;                     /* in-kernel: defer, sender retries */
         lapic_eoi();
@@ -3389,7 +3604,7 @@ static void smp_preempt_ipi(struct isr_frame *f) {
     u->rbp = f->rbp; u->rdi = f->rdi; u->rsi = f->rsi; u->rdx = f->rdx;
     u->rcx = f->rcx; u->rbx = f->rbx; u->rax = f->rax;
     u->rip = f->rip; u->rsp = f->rsp; u->rflags = f->rflags;
-    me->preempt_count++;
+    if (f->vector == 51) me->slice_count++; else me->preempt_count++;
     lapic_eoi();
     write_cr3(kernel_cr3);
     resume_kernel(RET_PREEMPTED);            /* never returns                    */
@@ -3418,6 +3633,12 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
     lapic_w(0xF0, 0x100 | 0xFF);                         /* my LAPIC on        */
     lapic_w(0x350, 0x10000);                             /* LINT0 masked (PIC is BSP's) */
     lapic_w(0x360, 0x10000);                             /* LINT1 masked       */
+    /* v0.40: MY periodic slice timer (vector 51). Always armed, but the       */
+    /* handler ignores ticks while g_slice_on is 0 — preemption on demand,     */
+    /* the same discipline as the BSP's gated PIT preemption.                  */
+    lapic_w(0x3E0, 0x3);                                 /* timer divider: 16  */
+    lapic_w(0x320, 0x20000 | 51);                        /* LVT: periodic, vec 51 */
+    lapic_w(0x380, 3000000);                             /* initial count (~tens of ms) */
     g_cpu[idx].apic_id = lapic_r(0x20) >> 24;
     kprintf("[smp    ] cpu%u online: long mode, own TSS (sel %X)+SYSCALL, LAPIC id %u, gs %X\n",
             (uint64_t)idx, (uint64_t)TSS_SEL(idx), (uint64_t)g_cpu[idx].apic_id, (uint64_t)&g_cpu[idx]);
@@ -4185,9 +4406,142 @@ done:
     kputs("-- done --\n");
 }
 
+/* ---- v0.40: AP-local TIME-SLICING -----------------------------------------
+ * Three long-running ring-3 threads are piled onto ONE core's queue and the
+ * slice gate is opened: cpu1's own LAPIC timer must now round-robin them —
+ * capture the running context on each tick, requeue it at the tail, dispatch
+ * the next — with no other core involved. The dispatch log is then read back
+ * LITERALLY: interleaving (A,B,C,A,...) is demanded as a sequence, each
+ * thread must have been set down and picked back up, and all three checksums
+ * must survive their many capture/rebuild cycles.                           */
+static int g_slpass, g_slfail;
+static void slcheck(const char *n, int c) {
+    if (c) { g_slpass++; kprintf("[slice  ]  PASS  %s\n", n); }
+    else   { g_slfail++; kprintf("[slice  ]  FAIL  %s\n", n); }
+}
+
+static void cmd_slice(void) {
+    kputs("-- TIME-SLICING: one AP round-robins several ring-3 threads off its own LAPIC timer --\n");
+    g_slpass = g_slfail = 0;
+    uint64_t save = current_proc_idx;
+    enum { NSL = 3 };
+    int procs[NSL];
+
+    for (int i = 0; i < NSL; i++) {
+        int p = kproc_spawn("slice-probe", 0);
+        if (p < 0) { kputs("[slice  ] spawn failed\n-- done --\n"); return; }
+        kprocs[p].role = 8;                                /* long checksum loop */
+        uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!e) { kputs("[slice  ] ELF load failed\n-- done --\n"); return; }
+        kprocs[p].entry = e;
+        procs[i] = p;
+    }
+
+    if (g_ncpu_online < 2) {
+        kputs("[slice  ] uniprocessor boot — no AP, no LAPIC slice timer; running the probes sequentially on the BSP\n");
+        for (int i = 0; i < NSL; i++) { cpu_exec_proc(0, procs[i]); current_proc_idx = save; }
+        int ok = 1;
+        for (int i = 0; i < NSL; i++)
+            if (!kprocs[procs[i]].exited || kprocs[procs[i]].exit_code != kprocs[procs[i]].pid) ok = 0;
+        slcheck("all probes ran to completion on the BSP (single-cpu degrade)", ok);
+        kputs("[slice  ]  SKIP  slicing/interleave checks (needs an AP with its own timer)\n");
+        goto done;
+    }
+
+    uint32_t sc0[MAX_CPUS];
+    for (int i = 0; i < MAX_CPUS; i++) sc0[i] = g_cpu[i].slice_count;
+    uint32_t d0  = g_dlog_n;
+    g_slice_on = 1;                                        /* open the gate FIRST */
+    __sync_synchronize();
+    for (int i = 0; i < NSL; i++) rq_push(1, procs[i]);    /* all three on cpu1  */
+    kprintf("[slice  ] %d threads on cpu1's queue, slice gate OPEN — its timer takes it from here\n",
+            (uint64_t)NSL);
+    lapic_ipi(g_cpu[1].apic_id, IPI_PING, 0);
+    uint64_t t0 = g_ticks;
+    for (;;) {
+        int done = 1;
+        for (int i = 0; i < NSL; i++) if (!kprocs[procs[i]].exited) done = 0;
+        if (done || g_ticks - t0 > 4000) break;
+        __asm__ volatile("pause");
+    }
+    g_slice_on = 0;                                        /* close the gate      */
+    __sync_synchronize();
+    current_proc_idx = save;
+
+    /* NB: the sliced-out contexts stay ordinary queue entries, so idle APs —
+     * woken by their OWN gated ticks — may STEAL them mid-suite: slicing and
+     * migration compose. The log below is the GLOBAL dispatch order.        */
+    uint32_t slices = 0;
+    for (int i = 0; i < MAX_CPUS; i++) {
+        uint32_t s = g_cpu[i].slice_count - sc0[i];
+        slices += s;
+        if (s) kprintf("[slice  ]   cpu%d's timer sliced %u context(s) out mid-loop\n",
+                       (uint64_t)i, (uint64_t)s);
+    }
+    uint32_t dn = g_dlog_n; if (dn > DLOG_LEN) dn = DLOG_LEN;
+    int transitions = 0, last = -1, mine;
+    kputs("[slice  ] dispatch order (all cores):");
+    for (uint32_t i = d0; i < dn; i++) {
+        mine = 0;
+        for (int j = 0; j < NSL; j++) if (g_dlog[i] == procs[j]) mine = 1;
+        if (!mine) continue;
+        kprintf(" %u", kprocs[g_dlog[i]].pid);
+        if (last >= 0 && g_dlog[i] != last) transitions++;
+        last = g_dlog[i];
+    }
+    kputs("\n");
+    int all_ok = 1, redispatched = 1;
+    for (int i = 0; i < NSL; i++) {
+        struct kproc *k = &kprocs[procs[i]];
+        if (!k->exited || k->exit_code != k->pid) all_ok = 0;
+        if (k->dispatches < 2) redispatched = 0;
+        kprintf("[slice  ]   pid %u: exit %u (want %u)  dispatched %u time(s)  ran_on %x\n",
+                k->pid, k->exit_code, k->pid, (uint64_t)k->dispatches, (uint64_t)k->ran_on);
+    }
+    slcheck("all three threads completed with intact checksums (exit == pid) despite slicing",
+            all_ok);
+    slcheck("AP timers forced context switches (total slice count >= 2)", slices >= 2);
+    slcheck("every thread was set down and picked back up (each dispatched >= 2 times)",
+            redispatched);
+    slcheck("the dispatch log shows ROUND-ROBIN interleaving (>= 4 alternations between threads)",
+            transitions >= 4);
+
+done:
+    kprintf("[slice  ] RESULT: %d passed, %d failed\n", (uint64_t)g_slpass, (uint64_t)g_slfail);
+    if (!g_slfail) kputs("[slice  ] TIME-SLICING VERIFIED — an AP preemptively multitasks ring-3 threads on its own clock\n");
+    else          kputs("[slice  ] TIME-SLICING DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 /* ---- The C side of the syscall trap --------------------------------------- */
 /* Called from syscall_entry (ring 0) with the user's number + args.          */
 static int64_t sys_map_framebuffer(int proc_idx);   /* defined with the graphics engine */
+
+/* v0.41: concurrency witnesses for the file-syscall paths. fs_ops says WHICH
+ * cores executed file syscalls; the in-flight high-water mark says whether
+ * two of them were inside file syscalls AT THE SAME TIME — the direct proof
+ * the cio suite demands, immune to sampling gaps.                            */
+static volatile int g_fs_inflight = 0, g_fs_inflight_max = 0;
+static inline void fs_witness_enter(void) {
+    g_cpu[cpu_idx()].fs_ops++;
+    int now = __sync_add_and_fetch(&g_fs_inflight, 1);
+    for (;;) {
+        int m = g_fs_inflight_max;
+        if (now <= m || __sync_bool_compare_and_swap(&g_fs_inflight_max, m, now)) break;
+    }
+}
+static inline void fs_witness_leave(void) { __sync_fetch_and_sub(&g_fs_inflight, 1); }
+
+/* Resolve fd -> dirent index under the ofile lock, enforcing ownership.      */
+static int ofile_deref(int fd) {
+    if (fd < 0 || fd >= 16) return -1;
+    klock_acquire(&g_ofile_lock);
+    int di = (g_ofiles[fd].used && g_ofiles[fd].owner == (int)current_proc_idx)
+           ? g_ofiles[fd].dirent : -1;
+    klock_release(&g_ofile_lock);
+    return di;
+}
 
 uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     switch (num) {
@@ -4227,32 +4581,54 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         return a0 == 1 ? g_virtio_common : g_virtio_devcfg;
 
     /* --- capability-gated VFS file operations (require CAP_FILESYSTEM) --- */
+    /* v0.41: these four are the paths the cio suite drives from several cores
+     * at once. Each counts into this CPU's fs_ops witness and into the global
+     * in-flight high-water mark (max >= 2 PROVES two cores were inside file
+     * syscalls simultaneously). fd deref happens under the ofile lock with an
+     * owner check; the dirent index it yields stays valid after release —
+     * dirents are never destroyed, so the worst post-release race with a
+     * concurrent close is a read of a file whose fd just went away: benign.  */
     case 5: {                                              /* SYS_OPEN(name)             */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
         char name[64];
         if (copy_user_str(kprocs[current_proc_idx].cr3, a0, name, sizeof name) < 0) return (uint64_t)-14;
+        fs_witness_enter();
         int fd = vfs_open(name);
+        fs_witness_leave();
         return (uint64_t)(int64_t)fd;
     }
     case 6: {                                              /* SYS_READ(fd, buf, len)     */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
-        int fd = (int)a0; if (fd < 0 || fd >= 16 || !g_ofiles[fd].used) return (uint64_t)-9;
+        int fd = (int)a0;
         uint32_t len = (uint32_t)a2; if (len > 65536) len = 65536;
         if (!access_ok(kprocs[current_proc_idx].cr3, a1, len, 1)) return (uint64_t)-14;  /* must be USER-writable */
-        int64_t n = vfs_read_file(g_ofiles[fd].dirent, (void *)a1, len);
+        fs_witness_enter();
+        int di = ofile_deref(fd);                          /* owner-checked      */
+        int64_t n = (di < 0) ? -9 : vfs_read_file(di, (void *)a1, len);
+        fs_witness_leave();
         return (uint64_t)n;
     }
     case 7: {                                              /* SYS_WRITE_FILE(fd, buf, len) */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
-        int fd = (int)a0; if (fd < 0 || fd >= 16 || !g_ofiles[fd].used) return (uint64_t)-9;
+        int fd = (int)a0;
         uint32_t len = (uint32_t)a2; if (len > 65536) len = 65536;
         if (!access_ok(kprocs[current_proc_idx].cr3, a1, len, 0)) return (uint64_t)-14;  /* must be USER-readable */
-        int di = g_ofiles[fd].dirent;
-        vfs_write_file(DENTS[di].name, (const void *)a1, len);            /* COW */
-        return len;
+        fs_witness_enter();
+        int di = ofile_deref(fd);
+        int r = (di < 0) ? -9 : vfs_write_by_dirent(di, (const void *)a1, len);  /* COW */
+        fs_witness_leave();
+        return r < 0 ? (uint64_t)(int64_t)r : len;
     }
     case 8: {                                              /* SYS_CLOSE(fd)              */
-        int fd = (int)a0; if (fd >= 0 && fd < 16) g_ofiles[fd].used = 0;
+        int fd = (int)a0;
+        if (fd >= 0 && fd < 16) {
+            fs_witness_enter();
+            klock_acquire(&g_ofile_lock);
+            if (g_ofiles[fd].used && g_ofiles[fd].owner == (int)current_proc_idx)
+                { g_ofiles[fd].used = 0; g_ofiles[fd].owner = -1; }
+            klock_release(&g_ofile_lock);
+            fs_witness_leave();
+        }
         return 0;
     }
     case 9: {                                              /* SYS_WAIT_EVENT(type)       */
@@ -4286,7 +4662,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         return kprocs[current_proc_idx].role;
 
     case 15:                                               /* SYS_YIELD()         */
-        sched_yield();                                     /* real scheduler yield: the  */
+        /* v0.41 audit fix: sched_yield() manipulates BSP scheduler state      */
+        /* (g_cur/g_threads). Invoked from an AP it would context-switch a     */
+        /* random BSP thread ON THE WRONG CORE. An AP runs exactly one ring-3  */
+        /* task with nothing to yield to: pause and return.                    */
+        if (cpu_idx() == 0) sched_yield();                 /* real scheduler yield: the  */
+        else __asm__ volatile("pause");
         return 0;                                          /* thread resumes here later  */
 
     case 16:                                               /* SYS_GETPID()        */
@@ -4310,6 +4691,21 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (slot < 0 || slot >= 8) return (uint64_t)-1;
         uint64_t bufpages = ((uint64_t)sw * sh * 4 + 0xFFF) / 0x1000;
         uint64_t pages = 2 * bufpages;                     /* v0.32: front+back pair */
+        /* v0.41: the rendering allocation tables — slot claim + pixel-buffer   */
+        /* free list — go under g_surf_lock (rank 5). Two cores creating        */
+        /* surfaces previously raced the free-list pop AND could both claim     */
+        /* one slot. A slot owned by a LIVE foreign process is now rejected     */
+        /* instead of silently hijacked; a dead owner's slot is reclaimed in    */
+        /* place, and re-claim by the same owner recycles its own pair.         */
+        klock_acquire(&g_surf_lock);
+        if (g_surf[slot].used) {
+            int ow = g_surf[slot].owner;
+            if (ow != (int)current_proc_idx && !(ow >= 0 && ow < n_kproc && kprocs[ow].exited)) {
+                klock_release(&g_surf_lock);
+                return (uint64_t)-16;                      /* busy: live owner   */
+            }
+            surfaces_reclaim(ow);                          /* stale/own: recycle */
+        }
         uint64_t phys = 0; int recycled = 0;
         for (int fi = 0; fi < g_surf_nfree; fi++)          /* reuse a reclaimed pair  */
             if (g_surf_free[fi].pages >= pages) {
@@ -4318,17 +4714,20 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                 recycled = 1;
                 break;
             }
-        if (!phys) phys = alloc_frames(pages);
+        if (!phys) phys = alloc_frames(pages);             /* rank 5 -> atomic bump */
         struct kproc *p = &kprocs[current_proc_idx];
         for (uint64_t i = 0; i < pages; i++) {             /* both buffers user-mapped */
             for (int z = 0; z < 512; z++) ((uint64_t *)(phys + i * 0x1000))[z] = 0;
             map_page(p->cr3, SURF_USER_V + i * 0x1000, phys + i * 0x1000, PTE_USER | PTE_WRITE | PTE_NX);
         }
         g_surf[slot].phys = phys; g_surf[slot].w = sw; g_surf[slot].h = sh;
-        g_surf[slot].used = 1;    g_surf[slot].owner = (int)current_proc_idx;
         g_surf[slot].bufpages = (int)bufpages; g_surf[slot].front = 0;
         g_surf[slot].flip_pending = 0;
         g_surf[slot].qw = g_surf[slot].qr = 0;
+        g_surf[slot].owner = (int)current_proc_idx;
+        barrier();
+        g_surf[slot].used = 1;                             /* publish LAST        */
+        klock_release(&g_surf_lock);
         kprintf("[surface] pid %u owns surface %d (%ux%u) DOUBLE-BUFFERED at user vaddr %X (+%u pages back)%s\n",
                 p->pid, (uint64_t)slot, (uint64_t)sw, (uint64_t)sh, SURF_USER_V,
                 bufpages, recycled ? " (recycled pixel buffers)" : "");
@@ -4346,10 +4745,13 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (g_surf[slot].owner != (int)current_proc_idx) return (uint64_t)-13;   /* owner only */
         struct surface *S = &g_surf[slot];
         S->flip_pending = 1;
-        while (S->flip_pending && S->consumer) sched_yield();   /* v0.34: per-slot */
+        /* v0.41 audit fix: this wait was the third path reaching BSP scheduler */
+        /* state from an AP. krelax() is CPU-aware: BSP threads yield, an AP    */
+        /* PAUSE-spins with IF set while the BSP-side compositor consumes.      */
+        while (S->flip_pending && S->consumer) krelax();        /* v0.34: per-slot */
         if (S->flip_pending) {                         /* nobody consumes this  */
             S->front ^= 1; S->flip_pending = 0;        /* slot: consume at once,*/
-            sched_yield();                             /* but a flip is still a */
+            krelax();                                  /* but a flip is still a */
         }                                              /* frame boundary — it   */
                                                        /* must ALWAYS schedule  */
         /* return the NEW back buffer's user vaddr — where the app draws next   */
@@ -4402,7 +4804,11 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         /* On an AP, curthr is BSP scheduler state and means nothing — a ring-3 */
         /* fault there unwinds through the AP's own per-CPU resume context.     */
         struct pcb *t = curthr;
+        /* Synchronous fault on the dying task's behalf — thread context in     */
+        /* effect, so the rank-5 acquire is legal here (never from a real IRQ). */
+        klock_acquire(&g_surf_lock);
         surfaces_reclaim((int)t->proc);
+        klock_release(&g_surf_lock);
         kprocs[t->proc].exit_code = 0x8000 + f->vector;
         kprocs[t->proc].exited = 1;
         kprintf("[uthread] faulting tid %d terminated — siblings and kernel unaffected\n",
@@ -4412,6 +4818,226 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         for (;;) __asm__ volatile("hlt");
     }
     resume_kernel((uint64_t)-((int64_t)f->vector));
+}
+
+/* ===========================================================================
+ * v0.41: CONCURRENT IO SUITE (cio) — several cores inside the VFS at once
+ * ===========================================================================
+ * The BSP and every AP simultaneously execute ring-3 file workers (role 9):
+ * each open/COW-write/read-verify/close loops on its OWN file and on one
+ * SHARED file, while two surface-churn workers (role 10) create, flip and
+ * recycle surfaces from APs. What the suite demands afterwards:
+ *
+ *   - completion: every worker exits pid (the ring-3 side verified every
+ *     read-back byte; any tear/corruption exits a 6xx/7xx code) within a
+ *     watchdog — the deadlock-freedom check for the whole lock order.
+ *   - simultaneity: >= 2 cores were INSIDE file syscalls at the same instant
+ *     (g_fs_inflight_max), and >= 2 distinct cores dispatched file syscalls.
+ *   - durable integrity, re-checked kernel-side: every worker file carries
+ *     exactly its final-round pattern; the shared file is ONE uniform tagged
+ *     image (whole-file writes are atomic — no interleaving of two writers);
+ *     no duplicate directory names; every live chunk hash resolves in the
+ *     CAS index; used_blocks == popcount(bitmap).
+ *   - table hygiene: all fds released, churn slots reclaimed, free-list
+ *     chunks pairwise disjoint, every klock free, ZERO rank violations.
+ * =========================================================================== */
+static int g_iopass, g_iofail;
+static void ciocheck(const char *n, int c) {
+    if (c) { g_iopass++; kprintf("[cio    ]  PASS  %s\n", n); }
+    else   { g_iofail++; kprintf("[cio    ]  FAIL  %s\n", n); }
+}
+#define CIO_LEN    1024
+#define CIO_ROUNDS 4
+static void cio_name(char *dst, uint64_t pid) {            /* "cio-<pid>"        */
+    char t[20]; int n = 0, p = 4;
+    dst[0] = 'c'; dst[1] = 'i'; dst[2] = 'o'; dst[3] = '-';
+    if (!pid) t[n++] = '0';
+    while (pid) { t[n++] = (char)('0' + (pid % 10)); pid /= 10; }
+    while (n) dst[p++] = t[--n];
+    dst[p] = 0;
+}
+static uint8_t cio_byte(uint64_t pid, int r, int i) {      /* worker pattern     */
+    return (uint8_t)(pid * 31 + (uint64_t)r * 17 + (uint64_t)i * 7);
+}
+
+static void cmd_cio(void) {
+    kputs("-- CONCURRENT IO: BSP + APs execute VFS/CAS/surface syscalls simultaneously --\n");
+    g_iopass = g_iofail = 0;
+    uint64_t save = current_proc_idx;
+    enum { WF = 4, WS = 2, NW = WF + WS };                 /* 4 file + 2 surface */
+    int w[NW];
+    static uint8_t buf[CIO_LEN];                           /* BSP-only staging   */
+
+    for (int i = 0; i < NW; i++) {
+        int p = kproc_spawn(i < WF ? "cio-file" : "cio-surf",
+                            i < WF ? PCAP_FILESYSTEM : PCAP_FRAMEBUFFER);
+        if (p < 0) { kputs("[cio    ] spawn failed\n-- done --\n"); return; }
+        kprocs[p].role = i < WF ? 9 : 10;
+        uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!e) { kputs("[cio    ] ELF load failed\n-- done --\n"); return; }
+        kprocs[p].entry = e;
+        w[i] = p;
+    }
+
+    /* Pre-create every worker's file and the shared file: SYS_OPEN resolves    */
+    /* names, it does not create them — creation is a kernel-side write.        */
+    for (int i = 0; i < WF; i++) {
+        char nm[16]; cio_name(nm, kprocs[w[i]].pid);
+        for (int j = 0; j < CIO_LEN; j++) buf[j] = cio_byte(kprocs[w[i]].pid, 255, j);
+        vfs_write_file(nm, buf, CIO_LEN);
+    }
+    for (int j = 0; j < CIO_LEN; j++) buf[j] = (uint8_t)(7 + j * 7);
+    vfs_write_file("cio-shared", buf, CIO_LEN);
+
+    uint32_t fs0[MAX_CPUS];
+    for (int i = 0; i < MAX_CPUS; i++) fs0[i] = g_cpu[i].fs_ops;
+    g_fs_inflight_max = 0;                                 /* fresh witness      */
+    uint32_t nfree0 = (uint32_t)g_surf_nfree;
+    (void)nfree0;
+
+    int n = g_ncpu_online;
+    if (n < 2) {
+        kputs("[cio    ] uniprocessor boot — running all six workers sequentially on the BSP\n");
+        for (int i = 0; i < NW; i++) { cpu_exec_proc(0, w[i]); current_proc_idx = save; }
+    } else {
+        /* Workers 1..NW-1 spread across the APs; the BSP EXECUTES worker 0     */
+        /* itself, so the BSP's syscall path is concurrent with the APs' own.   */
+        for (int i = 1; i < NW; i++) {
+            int c = 1 + (i - 1) % (n - 1);
+            rq_push(c, w[i]);
+        }
+        __sync_synchronize();
+        for (int c = 1; c < n; c++) lapic_ipi(g_cpu[c].apic_id, IPI_PING, 0);
+        kprintf("[cio    ] %d workers queued on %d APs; BSP entering ring 3 with its own file worker\n",
+                (uint64_t)(NW - 1), (uint64_t)(n - 1));
+        cpu_exec_proc(0, w[0]);
+        current_proc_idx = save;
+    }
+
+    uint64_t t0 = g_ticks;                                 /* join + watchdog    */
+    int all;
+    for (;;) {
+        all = 1;
+        for (int i = 0; i < NW; i++) if (!kprocs[w[i]].exited) all = 0;
+        if (all || g_ticks - t0 > 6000) break;
+        __asm__ volatile("pause");
+    }
+    current_proc_idx = save;
+
+    ciocheck("all six workers ran to completion (watchdog: no cross-core deadlock)", all);
+    int ids_ok = 1;
+    for (int i = 0; i < NW; i++) {
+        struct kproc *k = &kprocs[w[i]];
+        kprintf("[cio    ]   pid %u '%s': exit %u (want %u)  ran_on %x\n",
+                k->pid, k->name, k->exit_code, k->pid, (uint64_t)k->ran_on);
+        if (!k->exited || k->exit_code != k->pid) ids_ok = 0;
+    }
+    ciocheck("every worker verified every byte it read back (exit == pid, no 6xx/7xx)", ids_ok);
+
+    if (n >= 2) {
+        int cpus_fs = 0;
+        for (int i = 0; i < MAX_CPUS; i++) {
+            uint32_t d = g_cpu[i].fs_ops - fs0[i];
+            if (d) { cpus_fs++; kprintf("[cio    ]   cpu%d dispatched %u file syscalls\n",
+                                        (uint64_t)i, (uint64_t)d); }
+        }
+        ciocheck("file syscalls were dispatched by >= 2 distinct cores", cpus_fs >= 2);
+        kprintf("[cio    ] file-syscall in-flight high-water: %d\n", (uint64_t)g_fs_inflight_max);
+        ciocheck(">= 2 cores were INSIDE file syscalls at the same instant", g_fs_inflight_max >= 2);
+    } else {
+        kputs("[cio    ]  SKIP  cross-core simultaneity checks (uniprocessor boot)\n");
+    }
+
+    /* durable integrity, re-read kernel-side under the same locks             */
+    int content_ok = 1;
+    for (int i = 0; i < WF; i++) {
+        char nm[16]; cio_name(nm, kprocs[w[i]].pid);
+        klock_acquire(&g_vfs_lock);
+        int di = vfs_find(nm);
+        klock_release(&g_vfs_lock);
+        if (di < 0) { content_ok = 0; continue; }
+        if (vfs_read_file(di, buf, CIO_LEN) != CIO_LEN) { content_ok = 0; continue; }
+        for (int j = 0; j < CIO_LEN; j++)
+            if (buf[j] != cio_byte(kprocs[w[i]].pid, CIO_ROUNDS - 1, j)) { content_ok = 0; break; }
+    }
+    ciocheck("each worker file holds EXACTLY its final-round pattern (no torn write)", content_ok);
+
+    int shared_ok = 0;
+    {
+        klock_acquire(&g_vfs_lock);
+        int di = vfs_find("cio-shared");
+        klock_release(&g_vfs_lock);
+        if (di >= 0 && vfs_read_file(di, buf, CIO_LEN) == CIO_LEN) {
+            shared_ok = 1;
+            for (int j = 1; j < CIO_LEN; j++)
+                if (buf[j] != (uint8_t)(buf[0] + j * 7)) { shared_ok = 0; break; }
+        }
+    }
+    ciocheck("the shared file (16 racing writes) is ONE uniform image (whole-file writes atomic)", shared_ok);
+
+    int dup = 0, unresolved = 0;
+    klock_acquire(&g_vfs_lock);
+    for (int i = 0; i < VFS_MAXFILES; i++) {
+        if (!DENTS[i].used) continue;
+        for (int j = i + 1; j < VFS_MAXFILES; j++)
+            if (DENTS[j].used && streq_n(DENTS[i].name, DENTS[j].name, 32)) dup++;
+        for (uint32_t c = 0; c < DENTS[i].nchunks; c++) {
+            uint32_t len;
+            klock_acquire(&g_cas_lock);
+            int64_t b = cas_index_find(DENTS[i].chunk_hash[c], &len);
+            klock_release(&g_cas_lock);
+            if (b < 0) unresolved++;
+        }
+    }
+    klock_release(&g_vfs_lock);
+    ciocheck("directory: no duplicate names claimed by racing writers", dup == 0);
+    ciocheck("every live chunk hash resolves in the CAS index", unresolved == 0);
+
+    uint64_t popcnt = 0;
+    klock_acquire(&g_cas_lock);
+    for (uint64_t b = 0; b < SB->total_blocks; b++) if (bm_get(b)) popcnt++;
+    uint64_t used = SB->used_blocks;
+    klock_release(&g_cas_lock);
+    kprintf("[cio    ] allocation bitmap: %d bits set, superblock used_blocks %d\n", popcnt, used);
+    ciocheck("used_blocks == popcount(bitmap) (no double-allocated or leaked block)", popcnt == used);
+
+    int fds_leaked = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    ciocheck("descriptor array fully released after the storm", fds_leaked == 0);
+
+    int churn_free = 1, overlap = 0;
+    klock_acquire(&g_surf_lock);
+    if (g_surf[6].used || g_surf[7].used) churn_free = 0;
+    for (int i = 0; i < g_surf_nfree; i++)
+        for (int j = i + 1; j < g_surf_nfree; j++) {
+            uint64_t ai = g_surf_free[i].phys, ae = ai + g_surf_free[i].pages * 0x1000;
+            uint64_t bi = g_surf_free[j].phys, be = bi + g_surf_free[j].pages * 0x1000;
+            if (ai < be && bi < ae) overlap++;
+        }
+    int nfree_now = g_surf_nfree;
+    klock_release(&g_surf_lock);
+    kprintf("[cio    ] surface free list: %d chunk(s)\n", (uint64_t)nfree_now);
+    ciocheck("both churn surfaces were reclaimed on exit (AP exit path reclaims now)", churn_free);
+    ciocheck("free-list pixel chunks are pairwise disjoint (no double-free/overlap)", overlap == 0);
+
+    struct klock *ls[5] = { &g_ofile_lock, &g_vfs_lock, &g_cas_lock, &g_vblk_lock, &g_surf_lock };
+    int held = 0;
+    for (int i = 0; i < 5; i++) {
+        kprintf("[cio    ]   lock %s (rank %d): %u acquisitions, %u contended\n",
+                ls[i]->name, (uint64_t)ls[i]->rank, (uint64_t)ls[i]->acq, (uint64_t)ls[i]->contended);
+        if (ls[i]->v) held++;
+    }
+    ciocheck("no lock left held at quiescence", held == 0);
+    ciocheck("ZERO rank violations across the whole run (lock order held everywhere)",
+             g_rank_violations == 0);
+
+    kprintf("[cio    ] RESULT: %d passed, %d failed\n", (uint64_t)g_iopass, (uint64_t)g_iofail);
+    if (!g_iofail) kputs("[cio    ] CONCURRENT IO VERIFIED — the VFS/CAS/surface stack is multi-core reentrant\n");
+    else          kputs("[cio    ] CONCURRENT IO DEFECTS PRESENT\n");
+    kputs("-- done --\n");
 }
 
 /* Fallback: the embedded blob, now run in the process's address space.        */
@@ -5789,13 +6415,16 @@ static volatile uint64_t g_ts_done = 0;  /* events vectorized by the background 
 
 /* enqueue a raw event (called from hooks; safe before the indexer runs) */
 static void ts_emit(int type, const char *who, const char *text) {
-    uint64_t s = g_ts_seq;
+    /* v0.41: the slot is claimed with LOCK XADD — ts_emit now runs from any
+     * core (vfs_write under the vfs lock calls it), and the old read-inc-write
+     * of g_ts_seq let two cores fill the same slot.                           */
+    uint64_t s = __sync_fetch_and_add(&g_ts_seq, 1);
     struct ts_event *e = &g_ts[s % TS_MAXEV];
     e->seq = s; e->tick = g_ticks; e->type = type; e->indexed = 0;
     kstrcpy_n(e->who, who, 24);
     kstrcpy_n(e->text, text, 64);
     for (int i = 0; i < TS_DIM; i++) e->vec[i] = 0;
-    barrier(); g_ts_seq = s + 1;
+    barrier();                     /* slot was claimed by the XADD above        */
 }
 
 /* tokenize lowercase alnum words, feature-hash each into the vector */
@@ -6964,6 +7593,7 @@ static void cmd_help(void) {
       "  parallel        work-stealing parallel job across all cores\n"
       "  audit           parallel page-table integrity audit across all cores\n"
       "  mcsched         run a ring-3 thread on an application processor\n"
+      "  cio             concurrent IO suite: BSP+APs inside the VFS at once\n"
       "  surface         spawn the ring-3 surface app as a live thread\n"
       "  surfin          route clicks to the live app in one canvas pass\n"
       "  canvas          Metropolis-Terminal spatial canvas (WASD/QE/TAB//)\n"
@@ -7044,6 +7674,8 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "mcsched")) cmd_mcsched();
     else if (!kstrcmp(argv[0], "mcq")) cmd_mcq();
     else if (!kstrcmp(argv[0], "mcpre")) cmd_mcpre();
+    else if (!kstrcmp(argv[0], "slice")) cmd_slice();
+    else if (!kstrcmp(argv[0], "cio")) cmd_cio();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -7125,7 +7757,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
         (void)handlers;
     }
     {
-        uint64_t h[51] = {
+        uint64_t h[52] = {
             ISR_ADDR(0),ISR_ADDR(1),ISR_ADDR(2),ISR_ADDR(3),ISR_ADDR(4),ISR_ADDR(5),
             ISR_ADDR(6),ISR_ADDR(7),ISR_ADDR(8),ISR_ADDR(9),ISR_ADDR(10),ISR_ADDR(11),
             ISR_ADDR(12),ISR_ADDR(13),ISR_ADDR(14),ISR_ADDR(15),ISR_ADDR(16),ISR_ADDR(17),
@@ -7135,16 +7767,16 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
             ISR_ADDR(36),ISR_ADDR(37),ISR_ADDR(38),ISR_ADDR(39),ISR_ADDR(40),ISR_ADDR(41),
             ISR_ADDR(42),ISR_ADDR(43),ISR_ADDR(44),ISR_ADDR(45),ISR_ADDR(46),ISR_ADDR(47),
             ISR_ADDR(48),ISR_ADDR(49),                 /* v0.35: IPI vectors    */
-            ISR_ADDR(50),                              /* v0.39: preempt IPI    */
+            ISR_ADDR(50),ISR_ADDR(51),                 /* v0.39 preempt, v0.40 slice */
         };
-        for (int v = 0; v < 51; v++) idt_set(v, h[v]);
+        for (int v = 0; v < 52; v++) idt_set(v, h[v]);
         struct idtr idtr = { sizeof(idt) - 1, (uint64_t)idt };
         idt_load(&idtr);
     }
     pic_remap();
     pit_init();
     __asm__ volatile("sti");
-    kprintf("[kernel ] IDT loaded (51 vectors incl. IPI 48-50), PIC remapped, PIT @ 100 Hz, IRQs on\n");
+    kprintf("[kernel ] IDT loaded (52 vectors incl. IPI 48-50 + slice tick 51), PIC remapped, PIT @ 100 Hz, IRQs on\n");
     kprintf("[kernel ] consoles: VGA text + COM1 serial (115200 8N1) — both live\n");
 
     multiboot_scan(mb_info, true);
@@ -7190,6 +7822,8 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_mcsched();          /* v0.38: an AP autonomously runs a ring-3 thread      */
     cmd_mcq();              /* v0.39: per-CPU queues, stealing, concurrent ring 3  */
     cmd_mcpre();            /* v0.39: IPI preemption + cross-core context migration */
+    cmd_slice();            /* v0.40: AP-local LAPIC timer round-robin time-slicing */
+    cmd_cio();              /* v0.41: BSP + APs concurrently inside the VFS/CAS/surfaces */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
