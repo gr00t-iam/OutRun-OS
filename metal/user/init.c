@@ -327,6 +327,27 @@ static void cio_surface_churn(void) {
     sysc(SYS_EXIT, pid, 0, 0);
 }
 
+/* role 11: v0.44 DMA CHURN. Requests the demo device's MMIO passthrough and
+ * a small DMA buffer, touches both to prove they resolve, then exits
+ * normally through the MODERN scheduler path (cpu_exec_proc). nic_driver and
+ * cmd_capdma's dma-owner/dma-other already exercise SYS_HW_PASSTHROUGH and
+ * SYS_DMA_ALLOC, but only via the legacy one-shot enter_process excursion,
+ * which never reaches dma_teardown_kproc — this role is what actually
+ * exercises real grant revocation on exit. */
+static void dma_churn(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    i64 mmio = (i64)sysc(SYS_HW_PASSTHROUGH, 0xFFFF, 0, 0);
+    if (mmio <= 0) sysc(SYS_EXIT, 800, 0, 0);
+    u64 phys = 0;
+    i64 dma = (i64)sysc(SYS_DMA_ALLOC, 2, (u64)&phys, 0);
+    if (dma <= 0) sysc(SYS_EXIT, 810, 0, 0);
+    volatile u64 *buf = (volatile u64 *)dma;
+    u64 pattern = pid ^ 0xD44AC0DEull;
+    buf[0] = pattern;
+    if (buf[0] != pattern) sysc(SYS_EXIT, 820, 0, 0);
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
 static void nic_driver(void) {
     print("  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====\n");
 
@@ -446,6 +467,7 @@ void _start(void) {
     if (role == 8) { mcpre_long(); }                    /* preemptible long probe      */
     if (role == 9) { cio_file_worker(); }               /* v0.41 concurrent file worker */
     if (role == 10) { cio_surface_churn(); }            /* v0.41 surface churn (AP)     */
+    if (role == 11) { dma_churn(); }                    /* v0.44 DMA/passthrough churn  */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");
