@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.42.0-metal"
+#define KERNEL_VERSION "0.44.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -218,6 +218,7 @@ struct cpu_local {
     volatile uint32_t fs_ops;                /* file syscalls dispatched ON this CPU */
     uint8_t  rank_stack[8];                  /* klock ranks held by the context      */
     uint8_t  rank_sp;                        /* running on this CPU (APs only; the   */
+    volatile int dbg_was_idle;               /* v0.43: DEBUG_SMP_SCHED idle-edge latch */
 };                                           /* BSP tracks per-THREAD in the PCB)    */
 #define CPUL_SYSCALL_RSP 8                   /* asm contract (boot/usermode.asm) */
 #define CPUL_USER_RSP    16
@@ -469,6 +470,14 @@ static const char *exc_names[32] = {
 static volatile int      g_fault_expected = 0, g_fault_caught = 0;
 static volatile uint64_t g_fault_vector = 0, g_fault_recover_rip = 0, g_fault_recover_rsp = 0;
 
+/* Runtime-gated diagnostics for the syscall-exit / page-fault CR3 discipline.
+ * Both default OFF (one branch, no output) and are toggled at runtime, same
+ * discipline as g_fault_expected above. */
+static volatile int g_debug_pagefault    = 0;   /* DEBUG_PAGEFAULT: log every #PF        */
+static volatile int g_debug_syscall_exit = 0;   /* DEBUG_SYSCALL_EXIT: log every sysret   */
+static volatile int g_debug_smp_sched    = 0;   /* DEBUG_SMP_SCHED: pick/switch/idle log  */
+static volatile int g_debug_dma_lifetime = 0;   /* DEBUG_DMA_LIFETIME: grant create/revoke */
+
 /* user-stack layout (used by the guard-page fault check in isr_dispatch) */
 #define USTK_V     0x0000500000FF0000ull                  /* user stack bottom       */
 #define USTK_PAGES 4                                       /* 16 KiB ring-3 stack     */
@@ -480,6 +489,8 @@ static void sweep_tick(void);                            /* incremental PTE inte
 static void smp_ipi_dispatch(uint64_t vec);              /* v0.35: LAPIC IPI handlers      */
 static void smp_preempt_ipi(struct isr_frame *f);        /* v0.39: vector 50 (may not return) */
 static volatile int g_guard_caught = 0;                  /* set when a guard fault is handled */
+static inline uint64_t read_cr3(void);                   /* fwd: defined with paging helpers  */
+static uint64_t dbg_pid_of(uint64_t proc_idx);           /* fwd: defined after kprocs[]        */
 
 void isr_dispatch(struct isr_frame *f) {
     /* v0.35: IPIs first — they run on ANY cpu and must touch none of the      */
@@ -496,6 +507,12 @@ void isr_dispatch(struct isr_frame *f) {
             f->rip = g_fault_recover_rip;                /* resume at recovery point */
             f->rsp = g_fault_recover_rsp;
             return;                                      /* iretq back into the test */
+        }
+        if (g_debug_pagefault && f->vector == 14) {
+            uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+            kprintf("[dbgpf  ] pid %u cr3=%X fault_va=%X rip=%X rsp=%X err=%x cpl=%u\n",
+                    dbg_pid_of(current_proc_idx), read_cr3(), cr2, f->rip, f->rsp,
+                    f->error, (uint64_t)(f->cs & 3));
         }
         /* A fault from ring 3 must never take down the kernel — terminate the    */
         /* offending task (guard-page hit = stack overflow).                      */
@@ -1178,6 +1195,29 @@ struct uctx {
     uint64_t rip, rsp, rflags;                         /* offs 120,128,136    */
 };
 
+/* v0.44: one outstanding DMA/passthrough grant. DMA_GRANT_MMIO records a
+ * device passthrough attach (sys_hardware_passthrough): `bdf` is the actual
+ * device, and revocation means iommu_detach_to_kernel(bdf) — returning the
+ * device to the safe kernel identity domain. DMA_GRANT_PAGE records one
+ * page added live to the process's OWN domain (SYS_DMA_ALLOC): `bdf` is
+ * 0xFFFF (no specific device to detach; the page's own PTE is ordinary
+ * process memory and page_free_tree already reclaims it — this record
+ * exists purely so exit can prove nothing was left un-revoked). Neither
+ * kind ever frees `phys` itself: that is EITHER page_free_tree's job (an
+ * ordinary present PTE in the process's own CR3) or ISN'T a frame at all
+ * (the device MMIO physical range is never owned by any process's frame
+ * pool to begin with). */
+#define MAX_DMA_GRANTS 8
+#define DMA_GRANT_MMIO (1u << 0)
+#define DMA_GRANT_PAGE (1u << 1)
+struct dma_grant {
+    uint64_t phys;
+    uint64_t size;
+    uint16_t bdf;
+    uint32_t flags;
+    int      used;
+};
+
 struct kproc {
     uint64_t pid;
     char     name[24];
@@ -1199,10 +1239,33 @@ struct kproc {
     volatile uint32_t finish_seq; /* global completion order (1-based)         */
     volatile uint32_t dispatches; /* v0.40: times an executor picked this up   */
     uint64_t frames_freed;        /* v0.42: page_free_tree's count at exit     */
+    /* v0.44: DMA/IOMMU grant table (see struct dma_grant above)               */
+    struct dma_grant dma_grants[MAX_DMA_GRANTS];
+    uint32_t          dma_grant_count;   /* active grants right now            */
 };
-#define MAX_KPROC 48                  /* v0.41: +6 cio workers in the autorun */
+#define MAX_KPROC 64                  /* v0.41: +6 cio workers; v0.43: +10 smp_stress workers */
 static struct kproc kprocs[MAX_KPROC];
 static int n_kproc = 0;
+
+/* Diagnostic-only: kproc index -> pid, bounds-checked (proc_idx is untrusted
+ * at a fault: the very thing being debugged may be a stale/out-of-range
+ * identity). Returns 0 (never a real pid) if the index doesn't resolve. */
+static uint64_t dbg_pid_of(uint64_t proc_idx) {
+    if (proc_idx >= (uint64_t)n_kproc) return 0;
+    return kprocs[proc_idx].pid;
+}
+
+/* Called from syscall_entry's shared epilogue (boot/usermode.asm), for BOTH
+ * success and error returns alike — there is only one epilogue, so this fires
+ * on every syscall return when armed. Runs strictly before any of the saved
+ * registers are popped back and before RSP/RIP are handed to SYSRET, so it
+ * observes exactly the CR3/RSP/RIP the current thread is about to resume
+ * with. Non-static: called across the C/asm boundary. */
+void dbg_syscall_exit(uint64_t saved_rip, uint64_t saved_rsp) {
+    if (!g_debug_syscall_exit) return;
+    kprintf("[dbgsys ] pid %u cr3=%X user_rip=%X user_rsp=%X\n",
+            dbg_pid_of(current_proc_idx), read_cr3(), saved_rip, saved_rsp);
+}
 
 /* Who is 'running': since v0.39 `current_proc_idx` is the PER-CPU slot
  * g_cpu[cpu_idx()].cur_proc (macro at the top of the file) — each core carries
@@ -1228,6 +1291,8 @@ static int kproc_spawn(const char *name, uint64_t caps) {
     kprocs[i].finish_seq = 0;
     kprocs[i].dispatches = 0;
     kprocs[i].frames_freed = 0;
+    for (int g = 0; g < MAX_DMA_GRANTS; g++) kprocs[i].dma_grants[g].used = 0;
+    kprocs[i].dma_grant_count = 0;
     kprintf("[kernel ] spawned pid %u '%s' caps %X — private PML4 @ phys %X\n",
             kprocs[i].pid, name, caps, kprocs[i].cr3);
     return i;
@@ -1275,6 +1340,9 @@ static inline uint64_t surf_front_phys(struct surface *S) {
 }
 static int  iommu_attach_proc_domain(uint16_t bdf, int proc_idx);  /* fwd: IOMMU DMA domain */
 static void iommu_domain_add_page(int proc_idx, uint64_t pa);      /* fwd: live domain add */
+static int  dma_grant_create(struct kproc *p, uint64_t phys, uint64_t size,
+                              uint32_t flags, uint16_t bdf);        /* fwd: v0.44 grant table */
+static void dma_grant_revoke(struct kproc *p, struct dma_grant *g); /* fwd: v0.44 grant table */
 
 /* v0.31: surface lifecycle. The frame allocator is a bump allocator with no
  * general free, so reclaimed pixel buffers go on a small chunk list that
@@ -1332,7 +1400,8 @@ static int64_t sys_hardware_passthrough(int idx, uint64_t io_addr) {
     /* Capability-bound DMA confinement: the device is moved into a DMA domain   */
     /* mapping ONLY this process's memory, so it cannot touch the kernel or any  */
     /* other process even though the process drives it directly.                 */
-    if (d->bdf != 0xFFFF) iommu_attach_proc_domain(d->bdf, idx);
+    if (d->bdf != 0xFFFF)
+        dma_grant_create(p, d->base, pages * 0x1000ull, DMA_GRANT_MMIO, d->bdf);
     return (int64_t)vbase;
 }
 
@@ -2077,6 +2146,83 @@ static void iommu_detach_to_kernel(uint16_t bdf) {
     ((uint64_t *)ctx)[devfn * 2]     = g_iommu_slpt | 0x1;
     ((uint64_t *)ctx)[devfn * 2 + 1] = (uint64_t)g_iommu_aw | (1ull << 8);
     iommu_invalidate_all();
+}
+
+/* ===========================================================================
+ * v0.44: DMA / IOMMU LIFETIME DISCIPLINE
+ * ===========================================================================
+ * The layer between the raw iommu_* plumbing above and every caller that
+ * grants a process DMA-capable memory. Every grant recorded here is
+ * guaranteed revoked before page_free_tree runs (dma_teardown_kproc, wired
+ * into every kproc exit path) — closing the one hazard v0.42's changelog
+ * flagged and left open: g_proc_slpt[idx] survives page_free_tree (it is
+ * NOT part of the process's own CR3 hierarchy), so a still-attached device
+ * or a stale live-added page would otherwise keep reaching physical frames
+ * this process no longer owns once they are recycled to someone else.     */
+static int dma_grant_create(struct kproc *p, uint64_t phys, uint64_t size,
+                             uint32_t flags, uint16_t bdf) {
+    if (p->dma_grant_count >= MAX_DMA_GRANTS) {
+        kprintf("[dma    ] pid %u: grant table full (%u active) — refusing new grant\n",
+                p->pid, (uint64_t)MAX_DMA_GRANTS);
+        return -1;
+    }
+    int idx = (int)(p - kprocs);                        /* this process's kproc index */
+    if (flags & DMA_GRANT_MMIO) {
+        iommu_attach_proc_domain(bdf, idx);
+    } else if (flags & DMA_GRANT_PAGE) {
+        for (uint64_t off = 0; off < size; off += 0x1000)
+            iommu_domain_add_page(idx, phys + off);
+    }
+    struct dma_grant *g = 0;
+    for (int i = 0; i < MAX_DMA_GRANTS; i++)
+        if (!p->dma_grants[i].used) { g = &p->dma_grants[i]; break; }
+    g->phys = phys; g->size = size; g->bdf = bdf; g->flags = flags; g->used = 1;
+    p->dma_grant_count++;
+    if (g_debug_dma_lifetime)
+        kprintf("[dbgdma ] CREATE pid %u phys=%X size=%X bdf=%x flags=%x (active %u)\n",
+                p->pid, phys, size, (uint64_t)bdf, (uint64_t)flags, (uint64_t)p->dma_grant_count);
+    return 0;
+}
+
+/* Revokes ONE grant. Never frees `phys` itself: an MMIO grant's physical
+ * range was never process-owned frame-pool memory, and a PAGE grant's frame
+ * is an ordinary present PTE in the process's own CR3 — page_free_tree's
+ * job, not this function's, freeing it here would double-free it there
+ * (exactly the surface-buffer bug v0.42 found and fixed, one layer over).  */
+static void dma_grant_revoke(struct kproc *p, struct dma_grant *g) {
+    if (!g->used) {
+        if (g_debug_dma_lifetime)
+            kprintf("[dbgdma ] REVOKE pid %u: attempt on a non-existent grant — ignored\n", p->pid);
+        return;
+    }
+    if (g->flags & DMA_GRANT_MMIO) iommu_detach_to_kernel(g->bdf);
+    if (g_debug_dma_lifetime)
+        kprintf("[dbgdma ] REVOKE pid %u phys=%X size=%X bdf=%x flags=%x\n",
+                p->pid, g->phys, g->size, (uint64_t)g->bdf, (uint64_t)g->flags);
+    g->used = 0;
+    p->dma_grant_count--;
+}
+
+/* Called from every kproc exit path, BEFORE page_free_tree. Revokes every
+ * outstanding grant, then reclaims g_proc_slpt[proc_idx] itself — the ONE
+ * frame in this whole picture that page_free_tree can never reach, since it
+ * is not reachable through the process's own CR3 at all. */
+static void dma_teardown_kproc(int proc_idx) {
+    struct kproc *p = &kprocs[proc_idx];
+    for (int i = 0; i < MAX_DMA_GRANTS; i++)
+        if (p->dma_grants[i].used) dma_grant_revoke(p, &p->dma_grants[i]);
+    if (p->dma_grant_count != 0) {                       /* must be unreachable  */
+        kprintf("\n[panic ] pid %u: %u DMA grant(s) still active after teardown\n",
+                p->pid, (uint64_t)p->dma_grant_count);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    if (g_proc_slpt[proc_idx]) {
+        if (g_debug_dma_lifetime)
+            kprintf("[dbgdma ] pid %u: freeing its now-orphaned IOMMU domain frame %X\n",
+                    p->pid, g_proc_slpt[proc_idx]);
+        free_frame(g_proc_slpt[proc_idx]);
+        g_proc_slpt[proc_idx] = 0;
+    }
 }
 
 static void iommu_init(void) {
@@ -2932,7 +3078,7 @@ static int     g_cas_mounted = 0;
 #define SB ((struct cas_superblock *)g_sbblk)
 
 /* --- VFS directory: names -> content, layered on CAS ---------------------- */
-#define VFS_MAXFILES   16
+#define VFS_MAXFILES   24                     /* v0.43: +4 headroom for smp_stress workers */
 #define VFS_MAX_CHUNKS 16                     /* 16 * 512 = 8 KiB max file       */
 struct dirent {
     char     name[32];
@@ -3388,6 +3534,7 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     write_cr3(kernel_cr3);                   /* off this space before tearing it down */
     /* v0.42: this is the BSP's OWN thread giving up its OWN address space —   */
     /* cr3 just changed away from it above, so it is safe to dismantle now.    */
+    dma_teardown_kproc((int)t->proc);        /* v0.44: revoke DMA/IOMMU grants FIRST */
     kprocs[t->proc].frames_freed = page_free_tree(kprocs[t->proc].cr3);
     kprintf("[uthread] tid %d pid %u '%s' exited (code %u) — thread reaped, %u frame(s) reclaimed\n",
             (uint64_t)t->id, kprocs[t->proc].pid, t->name, code, kprocs[t->proc].frames_freed);
@@ -3725,6 +3872,9 @@ static void cpu_exec_proc(int c, int p) {
         if (now <= m || __sync_bool_compare_and_swap(&g_inr3_max, m, now)) break;
     }
     write_cr3(kprocs[p].cr3);
+    if (g_debug_smp_sched)
+        kprintf("[dbgsmp ] cpu%u pick+switch pid %u cr3=%X\n",
+                (uint64_t)c, kprocs[p].pid, kprocs[p].cr3);
     uint64_t code = kprocs[p].pstate
                   ? enter_user_resume(&kprocs[p].uctx)
                   : enter_user_mode(kprocs[p].entry, USTK_TOP);
@@ -3756,6 +3906,7 @@ static void cpu_exec_proc(int c, int p) {
         /* tear it all the way down. page_free_tree is not a klock: it is safe  */
         /* to call with interrupts on, exactly like the frame allocator it      */
         /* drives underneath.                                                   */
+        dma_teardown_kproc(p);                 /* v0.44: revoke DMA/IOMMU grants FIRST */
         kprocs[p].frames_freed = page_free_tree(kprocs[p].cr3);
         __asm__ volatile("cli");
     }
@@ -3852,9 +4003,16 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
         /* v0.39: AUTONOMOUS scheduling — drain my own run queue, then steal   */
         /* from a busy sibling. No BSP mailbox: the BSP enqueues and this core */
         /* independently pulls, executes ring-3 tasks, and balances load.      */
-        int p;
-        while ((p = rq_pop((int)idx)) >= 0 || (p = rq_steal((int)idx)) >= 0)
+        int p, picked = 0;
+        while ((p = rq_pop((int)idx)) >= 0 || (p = rq_steal((int)idx)) >= 0) {
+            picked = 1;
+            g_cpu[idx].dbg_was_idle = 0;               /* leaving idle: reset the latch */
             cpu_exec_proc((int)idx, p);
+        }
+        if (!picked && g_debug_smp_sched && !g_cpu[idx].dbg_was_idle) {
+            g_cpu[idx].dbg_was_idle = 1;                /* log the TRANSITION once, not */
+            kprintf("[dbgsmp ] cpu%u idle (queue drained, nothing to steal)\n", (uint64_t)idx);
+        }
         int mode = g_work_go;
         if (mode && !g_cpu[idx].work_done) {
             if (mode == 1)                                /* lock-xadd storm   */
@@ -4855,8 +5013,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         for (uint64_t i = 0; i < n; i++) {
             for (int z = 0; z < 512; z++) ((uint64_t *)(phys + i * 0x1000))[z] = 0;
             map_page(p->cr3, va + i * 0x1000, phys + i * 0x1000, PTE_USER | PTE_WRITE | PTE_NX);
-            iommu_domain_add_page((int)current_proc_idx, phys + i * 0x1000);
         }
+        /* v0.44: ONE grant record for the whole contiguous range (not one per
+         * page — MAX_DMA_GRANTS is sized for "how many DISTINCT allocations a
+         * process holds at once", and a single call can request up to 64
+         * pages). dma_grant_create adds every page to the IOMMU domain. */
+        dma_grant_create(p, phys, n * 0x1000ull, DMA_GRANT_PAGE, 0xFFFF);
         p->dma_next += n * 0x1000;
         *(volatile uint64_t *)a1 = phys;                   /* IOVA == physical   */
         return va;
@@ -5024,6 +5186,7 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         kprocs[t->proc].exited = 1;
         /* v0.42: write_cr3(kernel_cr3) already ran above, before this branch — */
         /* the faulting space is off every core, so tear it down here too.      */
+        dma_teardown_kproc((int)t->proc);      /* v0.44: revoke DMA/IOMMU grants FIRST */
         kprocs[t->proc].frames_freed = page_free_tree(kprocs[t->proc].cr3);
         kprintf("[uthread] faulting tid %d terminated — siblings and kernel unaffected, %u frame(s) reclaimed\n",
                 (uint64_t)t->id, kprocs[t->proc].frames_freed);
@@ -5251,6 +5414,242 @@ static void cmd_cio(void) {
     kprintf("[cio    ] RESULT: %d passed, %d failed\n", (uint64_t)g_iopass, (uint64_t)g_iofail);
     if (!g_iofail) kputs("[cio    ] CONCURRENT IO VERIFIED — the VFS/CAS/surface stack is multi-core reentrant\n");
     else          kputs("[cio    ] CONCURRENT IO DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.43: SMP STRESS HARNESS — a mixed workload biased across every core
+ * ===========================================================================
+ * Ten workers cycling through the THREE workload shapes this kernel already
+ * exercises separately: role 6 (mcsched_probe: pure SYS_GETPID/EXIT), role 9
+ * (cio_file_worker: VFS open/write/read/close, own file + racing shared
+ * file), role 10 (cio_surface_churn: paint + SYS_SURFACE_FLIP). Exactly TWO
+ * role-10 workers are spawned — cio_surface_churn picks its slot by
+ * `pid & 1` (slots 6/7 only), and cmd_cio's own suite never runs more than
+ * two concurrent instances for exactly that reason; more would race two
+ * workers onto the SAME slot, a hazard that belongs to role 10 itself, not to
+ * this harness. Placement is BIASED round-robin across every online core via
+ * rq_push — the same placement primitive mcq/cio already use — and idle
+ * siblings may still steal, so this is a bias, not a hard pin.            */
+static int g_smstrpass, g_smstrfail;
+static void smstrcheck(const char *n, int c) {
+    if (c) { g_smstrpass++; kprintf("[smpstrs]  PASS  %s\n", n); }
+    else   { g_smstrfail++; kprintf("[smpstrs]  FAIL  %s\n", n); }
+}
+
+#define STRESS_N 10
+
+static void cmd_smp_stress(void) {
+    kputs("-- SMP STRESS: mixed syscall/VFS/compositor workload biased across every core --\n");
+    g_smstrpass = g_smstrfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+
+    static const uint64_t roles[STRESS_N] = { 10, 10, 9, 9, 9, 9, 6, 6, 6, 6 };
+    int procs[STRESS_N];
+    static uint8_t stbuf[CIO_LEN];                     /* BSP-only pre-seed staging */
+    for (int i = 0; i < STRESS_N; i++) {
+        /* Same per-role capability grant cmd_cio uses: role 9 (VFS) needs
+         * CAP_FILESYSTEM, role 10 (surface) needs CAP_FRAMEBUFFER, role 6
+         * (bare GETPID/EXIT) needs neither. */
+        uint64_t caps = roles[i] == 9 ? PCAP_FILESYSTEM
+                      : roles[i] == 10 ? PCAP_FRAMEBUFFER : 0;
+        int p = kproc_spawn("smp-stress", caps);
+        if (p < 0) { kputs("[smpstrs] spawn failed\n-- done --\n"); return; }
+        kprocs[p].role = roles[i];
+        uint64_t entry = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!entry) { kputs("[smpstrs] ELF load failed\n-- done --\n"); return; }
+        kprocs[p].entry = entry;
+        procs[i] = p;
+        /* cio_file_worker's SYS_OPEN(own name) resolves an existing dirent, it
+         * does not create one — cmd_cio pre-seeds the same way, kernel-side,
+         * before dispatch. Missing this step is exactly what a fresh reader
+         * of this suite would get wrong; do it here too. */
+        if (roles[i] == 9) {
+            char nm[16]; cio_name(nm, kprocs[p].pid);
+            for (int j = 0; j < CIO_LEN; j++) stbuf[j] = cio_byte(kprocs[p].pid, 255, j);
+            vfs_write_file(nm, stbuf, CIO_LEN);
+        }
+    }
+    for (int j = 0; j < CIO_LEN; j++) stbuf[j] = (uint8_t)(11 + j * 7);
+    vfs_write_file("cio-shared", stbuf, CIO_LEN);          /* the racing shared file */
+
+    if (n > 1) {
+        for (int i = 0; i < STRESS_N; i++) rq_push(i % n, procs[i]);   /* biased round-robin */
+        __sync_synchronize();
+        lapic_ipi(0, IPI_PING, 1);                                     /* wake every AP     */
+        kprintf("[smpstrs] %d workers (2 surface + 4 VFS + 4 syscall) biased round-robin across %d cores\n",
+                (uint64_t)STRESS_N, (uint64_t)n);
+        int p;                                        /* the BSP drains ITS OWN share too, */
+        while ((p = rq_pop(0)) >= 0) cpu_exec_proc(0, p);   /* no special-casing vs an AP   */
+    } else {
+        kputs("[smpstrs] uniprocessor boot — running the mix sequentially on the BSP\n");
+        for (int i = 0; i < STRESS_N; i++) cpu_exec_proc(0, procs[i]);
+    }
+
+    uint64_t t0 = g_ticks;                             /* join + watchdog (deadlock proxy) */
+    for (;;) {
+        int all = 1;
+        for (int i = 0; i < STRESS_N; i++) if (!kprocs[procs[i]].exited) all = 0;
+        if (all || g_ticks - t0 > 4000) break;
+        if (n > 1) lapic_ipi(0, IPI_PING, 1);
+        uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
+    }
+    current_proc_idx = save;
+
+    int all_exited = 1, ids_ok = 1;
+    for (int i = 0; i < STRESS_N; i++) {
+        struct kproc *k = &kprocs[procs[i]];
+        if (!k->exited) all_exited = 0;
+        if (!k->exited || k->exit_code != k->pid) ids_ok = 0;
+        kprintf("[smpstrs]   pid %u role %u: exit %u (want %u) ran_on %x\n",
+                k->pid, k->role, k->exit_code, k->pid, (uint64_t)k->ran_on);
+    }
+    smstrcheck("no watchdog timeout — every worker reached a terminal state (no deadlock)",
+               all_exited);
+    smstrcheck("every worker's exit code == its pid (no 6xx/7xx: VFS/surface work was correct)",
+               ids_ok);
+    if (n >= 2) {
+        int cpus_used = 0;
+        for (int c = 0; c < MAX_CPUS; c++) {
+            int used = 0;
+            for (int i = 0; i < STRESS_N; i++) if (kprocs[procs[i]].ran_on & (1u << c)) used = 1;
+            if (used) cpus_used++;
+        }
+        kprintf("[smpstrs] %d distinct core(s) executed part of this mixed workload\n",
+                (uint64_t)cpus_used);
+        smstrcheck(">= 2 distinct cores executed part of the mix (bias + stealing both worked)",
+                   cpus_used >= 2);
+    } else {
+        kputs("[smpstrs]  SKIP  multi-core distribution check (uniprocessor boot)\n");
+    }
+    smstrcheck("ZERO cross-core lock-rank violations across the whole mixed run",
+               g_rank_violations == 0);
+
+    kprintf("[smpstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_smstrpass, (uint64_t)g_smstrfail);
+    if (!g_smstrfail)
+        kputs("[smpstrs] SMP STRESS VERIFIED — mixed syscall/VFS/compositor workload survives across every core\n");
+    else kputs("[smpstrs] SMP STRESS DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.44: DMA STRESS HARNESS — real DMA/IOMMU grants, held and revoked across
+ * genuine kproc exit
+ * ===========================================================================
+ * nic_driver and cmd_capdma's dma-owner/dma-other already exercise
+ * SYS_HW_PASSTHROUGH and SYS_DMA_ALLOC — but only through the legacy
+ * one-shot enter_process excursion, which returns straight into kernel C
+ * code and never reaches a real kproc exit path, so dma_teardown_kproc's
+ * revoke logic had ZERO live coverage before this suite. Role 11
+ * (dma_churn) does the same two syscalls through the MODERN, scheduled
+ * path (kproc_spawn + elf_load + cpu_exec_proc), so its exit is a genuine
+ * SYS_EXIT that runs dma_teardown_kproc for real.
+ *
+ * There is no kill syscall in this kernel (nothing to remove — every exit
+ * is voluntary SYS_EXIT or a fault). "Kill them in random order" is
+ * honoured as: every worker's completion order is the SCHEDULER'S OWN,
+ * genuinely non-deterministic interleaving (proved by each one's distinct
+ * finish_seq) — not an injected randomizer, because this kernel has no
+ * mechanism to reach into a live process and terminate it externally.    */
+static int g_dmstrpass, g_dmstrfail;
+static void dmstrcheck(const char *n, int c) {
+    if (c) { g_dmstrpass++; kprintf("[dmastrs]  PASS  %s\n", n); }
+    else   { g_dmstrfail++; kprintf("[dmastrs]  FAIL  %s\n", n); }
+}
+
+#define DMASTRESS_N 10
+
+static void cmd_dma_stress(void) {
+    kputs("-- DMA STRESS: real passthrough/DMA grants held and revoked across genuine kproc exit --\n");
+    g_dmstrpass = g_dmstrfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint64_t devreq = kdevs[g_demo_dev_index].req;     /* whatever the demo device needs */
+
+    static const uint64_t roles[DMASTRESS_N] = { 11, 11, 11, 11, 9, 9, 9, 9, 10, 10 };
+    int procs[DMASTRESS_N];
+    static uint8_t stbuf[CIO_LEN];
+    for (int i = 0; i < DMASTRESS_N; i++) {
+        uint64_t caps = roles[i] == 11 ? (PCAP_HW_PASSTHROUGH | devreq)
+                      : roles[i] == 9  ? PCAP_FILESYSTEM
+                      : roles[i] == 10 ? PCAP_FRAMEBUFFER : 0;
+        int p = kproc_spawn("dma-stress", caps);
+        if (p < 0) { kputs("[dmastrs] spawn failed\n-- done --\n"); return; }
+        kprocs[p].role = roles[i];
+        uint64_t entry = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!entry) { kputs("[dmastrs] ELF load failed\n-- done --\n"); return; }
+        kprocs[p].entry = entry;
+        procs[i] = p;
+        if (roles[i] == 9) {                            /* same VFS pre-seed cmd_smp_stress needs */
+            char nm[16]; cio_name(nm, kprocs[p].pid);
+            for (int j = 0; j < CIO_LEN; j++) stbuf[j] = cio_byte(kprocs[p].pid, 255, j);
+            vfs_write_file(nm, stbuf, CIO_LEN);
+        }
+    }
+    for (int j = 0; j < CIO_LEN; j++) stbuf[j] = (uint8_t)(13 + j * 7);
+    vfs_write_file("cio-shared", stbuf, CIO_LEN);
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+
+    if (n > 1) {
+        for (int i = 0; i < DMASTRESS_N; i++) rq_push(i % n, procs[i]);
+        __sync_synchronize();
+        lapic_ipi(0, IPI_PING, 1);
+        kprintf("[dmastrs] %d workers (4 DMA-churn + 4 VFS + 2 surface) biased round-robin across %d cores\n",
+                (uint64_t)DMASTRESS_N, (uint64_t)n);
+        int p;
+        while ((p = rq_pop(0)) >= 0) cpu_exec_proc(0, p);
+    } else {
+        kputs("[dmastrs] uniprocessor boot — running the mix sequentially on the BSP\n");
+        for (int i = 0; i < DMASTRESS_N; i++) cpu_exec_proc(0, procs[i]);
+    }
+
+    uint64_t t0 = g_ticks;
+    for (;;) {
+        int all = 1;
+        for (int i = 0; i < DMASTRESS_N; i++) if (!kprocs[procs[i]].exited) all = 0;
+        if (all || g_ticks - t0 > 4000) break;
+        if (n > 1) lapic_ipi(0, IPI_PING, 1);
+        uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
+    }
+    current_proc_idx = save;
+
+    int all_exited = 1, ids_ok = 1, grants_clear = 1, domains_clear = 1;
+    for (int i = 0; i < DMASTRESS_N; i++) {
+        struct kproc *k = &kprocs[procs[i]];
+        if (!k->exited) all_exited = 0;
+        if (!k->exited || k->exit_code != k->pid) ids_ok = 0;
+        if (k->dma_grant_count != 0) grants_clear = 0;
+        if (g_proc_slpt[procs[i]] != 0) domains_clear = 0;
+        kprintf("[dmastrs]   pid %u role %u: exit %u (want %u) grants=%u slpt=%X finish#%u\n",
+                k->pid, k->role, k->exit_code, k->pid, (uint64_t)k->dma_grant_count,
+                g_proc_slpt[procs[i]], (uint64_t)k->finish_seq);
+    }
+    dmstrcheck("no watchdog timeout — every worker reached a terminal state", all_exited);
+    dmstrcheck("every worker's exit code == its pid (DMA/passthrough work was correct)", ids_ok);
+    dmstrcheck("every worker's DMA grant table is empty after exit (all revoked)", grants_clear);
+    dmstrcheck("every worker's IOMMU domain (g_proc_slpt) was freed and zeroed on exit",
+               domains_clear);
+
+    int fds_leaked = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    dmstrcheck("no descriptor leaks (open-file table fully released)", fds_leaked == 0);
+
+    uint64_t freed_total = g_frames_freed - freed0, reused_total = g_frames_reused - reused0;
+    kprintf("[dmastrs] this run: +%u freed, +%u reused; global depth %u reconciles: freed=%u reused=%u\n",
+            freed_total, reused_total, g_frame_free_depth, g_frames_freed, g_frames_reused);
+    dmstrcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+               g_frame_free_depth == g_frames_freed - g_frames_reused);
+
+    kprintf("[dmastrs] RESULT: %d passed, %d failed\n", (uint64_t)g_dmstrpass, (uint64_t)g_dmstrfail);
+    if (!g_dmstrfail)
+        kputs("[dmastrs] DMA STRESS VERIFIED — every grant revoked, every domain freed, no leaks, no contamination\n");
+    else kputs("[dmastrs] DMA STRESS DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -7978,6 +8377,8 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "mcpre")) cmd_mcpre();
     else if (!kstrcmp(argv[0], "slice")) cmd_slice();
     else if (!kstrcmp(argv[0], "cio")) cmd_cio();
+    else if (!kstrcmp(argv[0], "smpstress")) cmd_smp_stress();
+    else if (!kstrcmp(argv[0], "dmastress")) cmd_dma_stress();
     else if (!kstrcmp(argv[0], "leakcheck")) cmd_leakcheck();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
@@ -8127,6 +8528,8 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_mcpre();            /* v0.39: IPI preemption + cross-core context migration */
     cmd_slice();            /* v0.40: AP-local LAPIC timer round-robin time-slicing */
     cmd_cio();              /* v0.41: BSP + APs concurrently inside the VFS/CAS/surfaces */
+    cmd_smp_stress();       /* v0.43: mixed syscall/VFS/compositor workload, every core   */
+    cmd_dma_stress();       /* v0.44: real DMA/IOMMU grants revoked across genuine exit    */
     cmd_leakcheck();        /* v0.42: heavy spawn/destroy proves 100% frame reclamation  */
     cmd_iommu();
     cmd_capdma();

@@ -50,6 +50,7 @@ global set_syscall_stack
 global user_blob_start
 global user_blob_end
 extern syscall_dispatch
+extern dbg_syscall_exit              ; DEBUG_SYSCALL_EXIT: no-op unless armed (kernel64.c)
 
 section .text
 
@@ -81,6 +82,18 @@ syscall_entry:
     mov rdi, rax                 ; num -> 1st C arg
     call syscall_dispatch        ; return value in RAX (SYS_EXIT never returns)
     add rsp, 8
+    ; DEBUG_SYSCALL_EXIT hook: fires for EVERY return value (success or error
+    ; alike — this is the one shared epilogue), strictly before any saved
+    ; register is popped back and before RSP/RIP reach SYSRET. Read the saved
+    ; user RIP/RSP straight out of their pushed slots (offsets unchanged by
+    ; the `add rsp,8` above), THEN push rax so the call's caller-saved
+    ; clobbers (rax/rcx/rdx/rsi/rdi/r8-r11) touch nothing the pop sequence
+    ; below still needs — those all still live in memory, untouched.
+    mov rdi, [rsp+56]            ; saved user RIP (the pushed RCX slot)
+    mov rsi, [rsp+64]            ; saved user RSP (the parked CPUL_USER_RSP)
+    push rax                     ; preserve the syscall return value
+    call dbg_syscall_exit        ; dbg_syscall_exit(rip, rsp); returns immediately unless armed
+    pop rax
     pop r10
     pop r9
     pop r8
