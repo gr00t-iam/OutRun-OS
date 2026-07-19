@@ -251,6 +251,82 @@ static void mcpre_long(void) {
     sysc(SYS_EXIT, pid, 0, 0);
 }
 
+/* role 9: v0.41 CONCURRENT FILE WORKER. Several of these run in ring 3 on
+ * DIFFERENT cores at once, each hammering the VFS: open its own "cio-<pid>"
+ * file, COW-write a (pid,round)-tagged pattern, read it back and verify EVERY
+ * byte, close — then do a racing write/read cycle on ONE SHARED file, where
+ * the read must come back as a single uniform image (any interleaving of two
+ * writers shows up as a mixed-tag buffer). Every failure exits a distinct
+ * 7xx code; the kernel suite FAILs on anything but exit == pid.              */
+#define CIO_LEN    1024
+#define CIO_ROUNDS 4
+static void u64_dec(u64 v, char *dst) {
+    char t[20]; int n = 0, p = 0;
+    if (!v) t[n++] = '0';
+    while (v) { t[n++] = (char)('0' + (v % 10)); v /= 10; }
+    while (n) dst[p++] = t[--n];
+    dst[p] = 0;
+}
+static void cio_file_worker(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    char name[20];
+    name[0] = 'c'; name[1] = 'i'; name[2] = 'o'; name[3] = '-';
+    u64_dec(pid, name + 4);
+    unsigned char wb[CIO_LEN], rb[CIO_LEN];
+    for (int r = 0; r < CIO_ROUNDS; r++) {
+        /* own file: write must read back byte-exact despite sibling cores     */
+        for (int i = 0; i < CIO_LEN; i++)
+            wb[i] = (u8)(pid * 31 + (u64)r * 17 + (u64)i * 7);
+        i64 fd = (i64)sysc(SYS_OPEN, (u64)name, 0, 0);
+        if (fd < 0)                                        sysc(SYS_EXIT, 700 + (u64)r, 0, 0);
+        if ((i64)sysc(SYS_WRITE_FILE, (u64)fd, (u64)wb, CIO_LEN) != CIO_LEN)
+                                                           sysc(SYS_EXIT, 710 + (u64)r, 0, 0);
+        for (int i = 0; i < CIO_LEN; i++) rb[i] = 0;
+        if ((i64)sysc(SYS_READ, (u64)fd, (u64)rb, CIO_LEN) != CIO_LEN)
+                                                           sysc(SYS_EXIT, 720 + (u64)r, 0, 0);
+        for (int i = 0; i < CIO_LEN; i++)
+            if (rb[i] != wb[i])                            sysc(SYS_EXIT, 730 + (u64)r, 0, 0);
+        sysc(SYS_CLOSE, (u64)fd, 0, 0);
+
+        /* shared file: whole-file atomicity across racing writers. We may     */
+        /* read ANY single writer's image — but never a mix of two.            */
+        i64 sfd = (i64)sysc(SYS_OPEN, (u64)"cio-shared", 0, 0);
+        if (sfd < 0)                                       sysc(SYS_EXIT, 740 + (u64)r, 0, 0);
+        u8 tag = (u8)(pid * 31 + (u64)r * 17);
+        for (int i = 0; i < CIO_LEN; i++) wb[i] = (u8)(tag + (u64)i * 7);
+        if ((i64)sysc(SYS_WRITE_FILE, (u64)sfd, (u64)wb, CIO_LEN) != CIO_LEN)
+                                                           sysc(SYS_EXIT, 750 + (u64)r, 0, 0);
+        if ((i64)sysc(SYS_READ, (u64)sfd, (u64)rb, CIO_LEN) != CIO_LEN)
+                                                           sysc(SYS_EXIT, 760 + (u64)r, 0, 0);
+        for (int i = 1; i < CIO_LEN; i++)
+            if (rb[i] != (u8)(rb[0] + (u64)i * 7))         sysc(SYS_EXIT, 770 + (u64)r, 0, 0);
+        sysc(SYS_CLOSE, (u64)sfd, 0, 0);
+
+        volatile u64 acc = 0;                    /* stagger the cores so rounds */
+        for (u64 i = 0; i < 120000ull; i++)      /* overlap instead of lockstep */
+            acc += i ^ pid;
+    }
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
+/* role 10: v0.41 SURFACE CHURN. Runs on an AP: claims a churn slot (6 or 7 by
+ * pid parity), paints, flips through the CPU-aware flip path, then re-creates
+ * the SAME slot — which recycles its own pixel pair through the locked free
+ * list — and exits, leaving reclamation to the executor's exit path.         */
+static void cio_surface_churn(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    u64 slot = 6 + (pid & 1);
+    for (int r = 0; r < 2; r++) {
+        i64 va = (i64)sysc(SYS_SURFACE, (64u << 16) | 64u, slot, 0);
+        if (va <= 0) sysc(SYS_EXIT, 600 + (u64)r, 0, 0);
+        volatile unsigned int *back = (volatile unsigned int *)((u64)va + 64 * 64 * 4);
+        for (int i = 0; i < 64 * 64; i++) back[i] = 0x00C10000u | (u32)(pid & 0xFFu);
+        for (int f = 0; f < 3; f++)
+            back = (volatile unsigned int *)sysc(SYS_SURFACE_FLIP, slot, 0, 0);
+    }
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
 static void nic_driver(void) {
     print("  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====\n");
 
@@ -368,6 +444,8 @@ void _start(void) {
     if (role == 6) { mcsched_probe(); }                 /* exits itself (on an AP) */
     if (role == 7) { mcq_probe(); }                     /* concurrent multi-core probe */
     if (role == 8) { mcpre_long(); }                    /* preemptible long probe      */
+    if (role == 9) { cio_file_worker(); }               /* v0.41 concurrent file worker */
+    if (role == 10) { cio_surface_churn(); }            /* v0.41 surface churn (AP)     */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");
