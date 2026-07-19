@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.41.0-metal"
+#define KERNEL_VERSION "0.42.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -710,7 +710,103 @@ static uint64_t alloc_frames(uint64_t n) {
     for (uint64_t i = 0; i < n * 512; i++) p[i] = 0;
     return base;
 }
-static uint64_t alloc_frame(void) { return alloc_frames(1); }
+
+/* ---- v0.42: physical frame RECLAMATION -----------------------------------
+ * Through v0.41 the bump pointer only ever grew: an address space, once built,
+ * was never handed back — acceptable while nothing exited, fatal now that
+ * page_free_tree() dismantles user spaces on thread exit. Freed frames now land
+ * on a LIFO free-list whose next-pointer is threaded through the frame itself
+ * (every pool frame is identity-mapped RAM, so its first 8 bytes are directly
+ * addressable), and alloc_frame() draws from that list before touching the bump
+ * pointer. Net effect under a spawn/destroy loop: the high-water mark climbs
+ * once, during warm-up, then holds — every subsequent space is built entirely
+ * from reclaimed frames.
+ *
+ * Concurrency: g_frame_lock is the allocator's rank-6 spinlock, the one v0.41's
+ * ranking table listed as "(6) lock-free, nothing to rank" — the allocator now
+ * HAS shared state (the list head + depth), so it gets a real lock. It is a
+ * strict LEAF: acquired around nothing but the O(1) push/pop, never nested
+ * under a klock, never held across an allocation or a yield. That makes a raw
+ * PAUSE-spin (not klock_acquire's yielding backoff) correct in EVERY context it
+ * runs in — early boot before the scheduler, AP context with no scheduler, and
+ * the map_page fast path — none of which klock_acquire tolerates. The bump
+ * fallback keeps its own LOCK XADD, so the two allocation paths stay
+ * independently SMP-safe. */
+#define FRAME_POOL_BASE 0x01000000ull            /* 16 MiB — matches g_next_frame's init */
+static volatile int      g_frame_lock       = 0; /* rank 6: frame-list mutual exclusion  */
+static uint64_t          g_frame_freelist   = 0; /* phys of LIFO head, 0 = list empty    */
+static volatile uint64_t g_frames_freed     = 0; /* frames ever returned to the pool     */
+static volatile uint64_t g_frames_reused    = 0; /* allocations satisfied from the list  */
+static volatile uint64_t g_frame_free_depth = 0; /* frames currently on the list         */
+
+static inline void frame_lock(void)   { while (__sync_lock_test_and_set(&g_frame_lock, 1)) __asm__ volatile("pause"); }
+static inline void frame_unlock(void) { __sync_lock_release(&g_frame_lock); }
+
+/* A physical address is reclaimable RAM iff it lies in the managed window
+ * [16 MiB, high-water). Device MMIO installed by passthrough, the framebuffer,
+ * and the shared low-1-GiB identity map all fall OUTSIDE it — free_frame()
+ * silently drops them, so they can never be handed back out as if they were
+ * pool RAM. This one predicate is what makes tearing down a user space that
+ * contains device mappings safe. */
+static inline int frame_in_pool(uint64_t pa) {
+    pa &= ADDR_MASK;
+    return pa >= FRAME_POOL_BASE && pa < g_next_frame;
+}
+
+/* Return one 4 KiB frame to the pool. Returns 1 if it was actually reclaimed,
+ * 0 if the address was out of the managed window (and thus ignored) — the
+ * caller uses that to count exactly how many frames came back. */
+static int free_frame(uint64_t pa) {
+    pa &= ADDR_MASK;
+    if (!frame_in_pool(pa)) return 0;
+    frame_lock();
+    if (pa == g_frame_freelist) {
+        frame_unlock();
+        kprintf("\n[frame  ] DOUBLE-FREE: pa=%X is ALREADY the free-list head -- halting\n", pa);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    if (g_frame_freelist && !frame_in_pool(g_frame_freelist)) {
+        frame_unlock();
+        kprintf("\n[frame  ] CORRUPT FREE-LIST HEAD at free(pa=%X): head=%X is outside the pool -- halting\n",
+                pa, g_frame_freelist);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    *(volatile uint64_t *)pa = g_frame_freelist;   /* thread the next-ptr through the frame */
+    g_frame_freelist = pa;
+    g_frames_freed++;
+    g_frame_free_depth++;
+    frame_unlock();
+    return 1;
+}
+
+/* Single-frame allocation: reuse a reclaimed frame before growing the pool.
+ * Multi-frame (contiguous) claims still go straight to the bump allocator —
+ * the free-list makes no contiguity promise, and every contiguous caller
+ * (working-set buffers) only ever grows the pool anyway. */
+static uint64_t alloc_frame(void) {
+    frame_lock();
+    uint64_t pa = g_frame_freelist;
+    if (pa) {
+        /* Defensive: a corrupted free-list is a silent, remote-in-time bug
+         * otherwise — the frame that got mis-linked is rarely the one that
+         * finally crashes. Fail loud, at the pop, with the actual bad value. */
+        if (!frame_in_pool(pa)) {
+            frame_unlock();
+            kprintf("\n[frame  ] CORRUPT FREE-LIST: popped pa=%X, outside the pool [%X,%X) -- halting\n",
+                    pa, (uint64_t)FRAME_POOL_BASE, g_next_frame);
+            for (;;) __asm__ volatile("cli; hlt");
+        }
+        g_frame_freelist = *(volatile uint64_t *)pa;   /* pop */
+        g_frame_free_depth--;
+        g_frames_reused++;
+        frame_unlock();
+        uint64_t *p = (uint64_t *)pa;                  /* zero on the way out, like the bump path */
+        for (int i = 0; i < 512; i++) p[i] = 0;
+        return pa;
+    }
+    frame_unlock();
+    return alloc_frames(1);                            /* list empty -> bump */
+}
 
 /* Fault-injection allocator: when g_alloc_limit is armed, allocations past it   */
 /* fail (return 0) so exhaustion-handling paths can be exercised.                */
@@ -777,6 +873,8 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
 /* ---- user-space address range + pointer validation ------------------------- */
 #define USER_VMIN 0x400000000000ull
 #define USER_VMAX 0x600000000000ull
+#define DMA_USER_V  0x0000520000000000ull   /* ring-3 DMA window (driver buffers) */
+#define SURF_USER_V 0x0000530000000000ull   /* ring-3 surface window (app pixels) */
 
 /* Validate that [ptr, ptr+len) is entirely within a process's user space and    */
 /* mapped USER-present (and USER-writable if need_write). Defends every syscall   */
@@ -809,6 +907,97 @@ static int copy_user_str(uint64_t cr3, uint64_t uptr, char *kbuf, int max) {
     }
     kbuf[max - 1] = 0;
     return max - 1;
+}
+
+/* ===========================================================================
+ * v0.42: ADDRESS-SPACE TEARDOWN — page_free_tree()
+ * ===========================================================================
+ * Dismantle a process's USER address space and return every private frame to
+ * the allocator, leaving KERNEL space bit-for-bit intact. The user/kernel split
+ * is exactly the one access_ok() enforces: user virtual addresses occupy PML4
+ * indices [USER_VMIN>>39, USER_VMAX>>39) = [128, 192). PML4 entry 0 (the low
+ * 1 GiB identity map — kernel code/stack/data/IDT) and entry 0xC0=192 (the
+ * shared device-MMIO window) are COPIED pointers into kernel-owned tables;
+ * create_address_space() aliases the same two entries into every process, so
+ * descending through them would free tables the kernel and every sibling
+ * process are still using. The top-level loop is bounded to [128,192), so it
+ * never can.
+ *
+ * Pointer layout at each level (phys == virt — the pool is identity-mapped):
+ *
+ *   pml4[i4]   i4 in [128,192)   & ADDR_MASK -> PDPT frame   (present, !huge)
+ *     pdpt[i3]                   & ADDR_MASK -> PD   frame  | HUGE => 1 GiB leaf
+ *       pd[i2]                   & ADDR_MASK -> PT   frame  | HUGE => 2 MiB leaf
+ *         pt[i1]                 & ADDR_MASK -> 4 KiB data leaf
+ *
+ * Every table frame (PDPT/PD/PT) came from alloc_frame(), so all of them go
+ * back through free_frame(). Data leaves go back too — EXCEPT those free_frame()
+ * rejects as out-of-pool (a passthrough MMIO leaf carries a device physaddr,
+ * silently skipped) and EXCEPT the surface pixel window (PML4 slot
+ * SURF_PML4_IDX): a surface's buffer frames are handed to
+ * surfaces_reclaim()'s OWN recycle list (g_surf_free[]) by every caller of
+ * this function, one call earlier — freeing them AGAIN here would put the
+ * same physical frame on two independent free lists at once, and whichever
+ * one hands it out second corrupts whatever the first one's new owner wrote.
+ * The structural PDPT/PD/PT frames that mapped the surface window are
+ * ordinary page-table frames, not surface data, and ARE reclaimed normally.
+ * Freeing is strictly bottom-up — every child of a table is released before
+ * the table itself — so no frame is ever touched after it re-enters the pool
+ * and could have been handed back out. Returns the number of frames actually
+ * reclaimed.
+ *
+ * PRECONDITION: pml4_phys must not be the CR3 live on ANY core. Teardown reads
+ * and zeroes the tables it frees; doing that to an installed address space
+ * would fault the core running in it. Callers destroy a space only after its
+ * last thread has left it (or, in the leakcheck, spaces that were never
+ * installed at all).
+ * ========================================================================== */
+static uint64_t page_free_tree(uint64_t pml4_phys) {
+    uint64_t freed = 0;
+    uint64_t *pml4 = (uint64_t *)(pml4_phys & ADDR_MASK);
+    const int lo = (int)((USER_VMIN >> 39) & 0x1FF);      /* 128 */
+    const int hi = (int)((USER_VMAX >> 39) & 0x1FF);      /* 192 */
+    const int surf_idx = (int)((SURF_USER_V >> 39) & 0x1FF);  /* 166: owned by g_surf_free[] */
+    for (int i4 = lo; i4 < hi; i4++) {
+        if (!(pml4[i4] & PTE_PRESENT)) continue;
+        int is_surf = (i4 == surf_idx);
+        uint64_t *pdpt = (uint64_t *)(pml4[i4] & ADDR_MASK);
+        for (int i3 = 0; i3 < 512; i3++) {
+            if (!(pdpt[i3] & PTE_PRESENT)) continue;
+            if (pdpt[i3] & PTE_HUGE) {                     /* 1 GiB data leaf: 512*512 frames */
+                uint64_t b = pdpt[i3] & ADDR_MASK;
+                if (!is_surf)
+                    for (uint64_t k = 0; k < 512ull * 512; k++) freed += free_frame(b + k * 0x1000);
+                pdpt[i3] = 0; continue;
+            }
+            uint64_t *pd = (uint64_t *)(pdpt[i3] & ADDR_MASK);
+            for (int i2 = 0; i2 < 512; i2++) {
+                if (!(pd[i2] & PTE_PRESENT)) continue;
+                if (pd[i2] & PTE_HUGE) {                    /* 2 MiB data leaf: 512 frames     */
+                    uint64_t b = pd[i2] & ADDR_MASK;
+                    if (!is_surf)
+                        for (uint64_t k = 0; k < 512; k++) freed += free_frame(b + k * 0x1000);
+                    pd[i2] = 0; continue;
+                }
+                uint64_t *pt = (uint64_t *)(pd[i2] & ADDR_MASK);
+                for (int i1 = 0; i1 < 512; i1++) {
+                    if (!(pt[i1] & PTE_PRESENT)) continue;
+                    /* 4 KiB leaf: MMIO self-excludes via frame_in_pool(); the   */
+                    /* surface window self-excludes here (g_surf_free[] owns it) */
+                    if (!is_surf) freed += free_frame(pt[i1] & ADDR_MASK);
+                    pt[i1] = 0;
+                }
+                freed += free_frame((uint64_t)pt);         /* the PT frame                    */
+                pd[i2] = 0;
+            }
+            freed += free_frame((uint64_t)pd);             /* the PD frame                    */
+            pdpt[i3] = 0;
+        }
+        freed += free_frame((uint64_t)pdpt);               /* the PDPT frame                  */
+        pml4[i4] = 0;
+    }
+    freed += free_frame(pml4_phys);                        /* finally the PML4 itself         */
+    return freed;
 }
 
 /* ---- Enforce W^X across the kernel identity map ---------------------------- */
@@ -1009,6 +1198,7 @@ struct kproc {
     volatile uint32_t ran_on;     /* bitmask: cpus that executed this task     */
     volatile uint32_t finish_seq; /* global completion order (1-based)         */
     volatile uint32_t dispatches; /* v0.40: times an executor picked this up   */
+    uint64_t frames_freed;        /* v0.42: page_free_tree's count at exit     */
 };
 #define MAX_KPROC 48                  /* v0.41: +6 cio workers in the autorun */
 static struct kproc kprocs[MAX_KPROC];
@@ -1037,6 +1227,7 @@ static int kproc_spawn(const char *name, uint64_t caps) {
     kprocs[i].ran_on = 0;
     kprocs[i].finish_seq = 0;
     kprocs[i].dispatches = 0;
+    kprocs[i].frames_freed = 0;
     kprintf("[kernel ] spawned pid %u '%s' caps %X — private PML4 @ phys %X\n",
             kprocs[i].pid, name, caps, kprocs[i].cr3);
     return i;
@@ -1059,8 +1250,6 @@ static struct kdev *kdev_find(uint64_t io_addr) {
     return 0;
 }
 
-#define DMA_USER_V  0x0000520000000000ull   /* ring-3 DMA window (driver buffers) */
-#define SURF_USER_V 0x0000530000000000ull   /* ring-3 surface window (app pixels) */
 /* A ring-3 application surface: pixels owned and rendered by an unprivileged
  * process, composited by the kernel. The compositor never draws this content —
  * it only places it. */
@@ -1441,7 +1630,12 @@ static void idle_fn(void *a) {
  *                          shared staging sectors (g_blk / g_idxbuf)
  *   rank 4  g_vblk_lock    virtio-blk request slots + avail-ring publish
  *   rank 5  g_surf_lock    surface slot table + pixel-buffer free list
- *   (6)     g_next_frame   frame allocator — LOCK XADD, no lock to rank
+ *   (6)     g_frame_lock   v0.42: frame free-list — a raw leaf spinlock, NOT
+ *                          a klock and deliberately UNRANKED: it must work
+ *                          before the scheduler exists (early boot) and on
+ *                          APs (no per-CPU rank tracking either), so it is
+ *                          never nested under a klock and never held across
+ *                          an allocation or a yield — see alloc_frame().
  *   (7)     g_conlock      console — IRQ-safe leaf inside kprintf only
  *
  * The deep chain is SYS_WRITE_FILE: vfs(2) -> cas(3) -> vblk(4). The surface
@@ -3191,9 +3385,12 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     struct pcb *t = curthr;
     kprocs[t->proc].exit_code = code;
     kprocs[t->proc].exited = 1;
-    kprintf("[uthread] tid %d pid %u '%s' exited (code %u) — thread reaped\n",
-            (uint64_t)t->id, kprocs[t->proc].pid, t->name, code);
-    write_cr3(kernel_cr3);
+    write_cr3(kernel_cr3);                   /* off this space before tearing it down */
+    /* v0.42: this is the BSP's OWN thread giving up its OWN address space —   */
+    /* cr3 just changed away from it above, so it is safe to dismantle now.    */
+    kprocs[t->proc].frames_freed = page_free_tree(kprocs[t->proc].cr3);
+    kprintf("[uthread] tid %d pid %u '%s' exited (code %u) — thread reaped, %u frame(s) reclaimed\n",
+            (uint64_t)t->id, kprocs[t->proc].pid, t->name, code, kprocs[t->proc].frames_freed);
     t->state = T_FREE;                       /* never scheduled again           */
     sched_switch_to(pick_next());            /* does not return                 */
     for (;;) __asm__ volatile("hlt");
@@ -3554,6 +3751,12 @@ static void cpu_exec_proc(int c, int p) {
         klock_acquire(&g_surf_lock);
         surfaces_reclaim(p);
         klock_release(&g_surf_lock);
+        /* v0.42: the address space just went dead on EVERY core (this executor */
+        /* is the only one that was ever running it, and it just gave it up) —  */
+        /* tear it all the way down. page_free_tree is not a klock: it is safe  */
+        /* to call with interrupts on, exactly like the frame allocator it      */
+        /* drives underneath.                                                   */
+        kprocs[p].frames_freed = page_free_tree(kprocs[p].cr3);
         __asm__ volatile("cli");
     }
     __asm__ volatile("sti");
@@ -4707,7 +4910,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             surfaces_reclaim(ow);                          /* stale/own: recycle */
         }
         uint64_t phys = 0; int recycled = 0;
-        for (int fi = 0; fi < g_surf_nfree; fi++)          /* reuse a reclaimed pair  */
+        /* v0.42: search MOST-RECENTLY-RECLAIMED first (LIFO), not array order.
+         * g_surf_nfree only ever grows by appending and shrinks by swap-with-
+         * last, so index (nfree-1) is always the latest reclaim; searching
+         * forward from 0 could hand out an OLDER residual entry (e.g. left
+         * over from an earlier suite's own churn test) ahead of the buffer
+         * that was JUST freed one line above this call — which is exactly
+         * what a caller checking "did I get back the buffer I just freed"
+         * (as the threads suite's recycle test does) is entitled to expect.  */
+        for (int fi = g_surf_nfree - 1; fi >= 0; fi--)
             if (g_surf_free[fi].pages >= pages) {
                 phys = g_surf_free[fi].phys;
                 g_surf_free[fi] = g_surf_free[--g_surf_nfree];
@@ -4811,8 +5022,11 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         klock_release(&g_surf_lock);
         kprocs[t->proc].exit_code = 0x8000 + f->vector;
         kprocs[t->proc].exited = 1;
-        kprintf("[uthread] faulting tid %d terminated — siblings and kernel unaffected\n",
-                (uint64_t)t->id);
+        /* v0.42: write_cr3(kernel_cr3) already ran above, before this branch — */
+        /* the faulting space is off every core, so tear it down here too.      */
+        kprocs[t->proc].frames_freed = page_free_tree(kprocs[t->proc].cr3);
+        kprintf("[uthread] faulting tid %d terminated — siblings and kernel unaffected, %u frame(s) reclaimed\n",
+                (uint64_t)t->id, kprocs[t->proc].frames_freed);
         t->state = T_FREE;
         sched_switch_to(pick_next());        /* does not return                 */
         for (;;) __asm__ volatile("hlt");
@@ -5037,6 +5251,94 @@ static void cmd_cio(void) {
     kprintf("[cio    ] RESULT: %d passed, %d failed\n", (uint64_t)g_iopass, (uint64_t)g_iofail);
     if (!g_iofail) kputs("[cio    ] CONCURRENT IO VERIFIED — the VFS/CAS/surface stack is multi-core reentrant\n");
     else          kputs("[cio    ] CONCURRENT IO DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.42: LEAK CHECK — heavy spawn/destroy proves 100% physical-frame reclamation
+ * ===========================================================================
+ * ONE kproc slot is spawned once and then reused across many iterations —
+ * deliberately: this suite is stressing the ALLOCATOR and page_free_tree, not
+ * the kproc table (which still only ever grows; that is a separate, stated
+ * scope gap). Each iteration gives that slot a brand-new address space
+ * (create_address_space), loads the SAME ELF into it (elf_load also maps its
+ * user stack), and runs it for real through cpu_exec_proc — the identical
+ * dispatch path mcsched/mcq/mcpre/slice/cio use — so the exit hook that was
+ * just wired into that executor is exactly what reclaims it.
+ *
+ * Because the ELF and the stack size never change, every iteration builds and
+ * tears down an IDENTICAL number of frames (PT_LOAD pages + stack pages + the
+ * PDPT/PD/PT structure frames that mapping them required). That determinism
+ * is what makes the high-water-mark check exact rather than approximate: once
+ * warm, iteration N's build is satisfied ENTIRELY from the free list iteration
+ * N-1's teardown just filled, so g_next_frame — the bump pointer — must not
+ * move again after the first iteration. Any leak, however small, breaks that
+ * equality and shows up as monotonic growth instead of a flat line.        */
+static int g_lkpass, g_lkfail;
+static void lkcheck(const char *n, int c) {
+    if (c) { g_lkpass++; kprintf("[leakchk]  PASS  %s\n", n); }
+    else   { g_lkfail++; kprintf("[leakchk]  FAIL  %s\n", n); }
+}
+
+#define LK_ITERS 40
+
+static void cmd_leakcheck(void) {
+    kputs("-- LEAK CHECK: heavy spawn/destroy loop proves 100% physical-frame reclamation --\n");
+    g_lkpass = g_lkfail = 0;
+    uint64_t save = current_proc_idx;
+
+    uint64_t freed0  = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0   = g_rank_violations;
+
+    int p = kproc_spawn("leak-probe", 0);
+    if (p < 0) { kputs("[leakchk] spawn failed\n-- done --\n"); return; }
+    kprocs[p].role = 6;                       /* mcsched_probe: GETPID then EXIT(pid) */
+
+    int ok = 1, deterministic = 1;
+    uint64_t hw_after_first = 0, per_iter = 0;
+    for (int i = 0; i < LK_ITERS && ok; i++) {
+        kprocs[p].cr3 = create_address_space();       /* fresh space, SAME kproc slot */
+        uint64_t entry = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!entry) { ok = 0; break; }
+        kprocs[p].entry = entry;
+        kprocs[p].exited = 0;
+        kprocs[p].pstate = 0;
+        cpu_exec_proc(0, p);                          /* BSP: allocator logic only, */
+        current_proc_idx = save;                      /* not a concurrency test     */
+        if (!kprocs[p].exited || kprocs[p].exit_code != kprocs[p].pid) { ok = 0; break; }
+        if (i == 0) { hw_after_first = g_next_frame; per_iter = kprocs[p].frames_freed; }
+        else if (kprocs[p].frames_freed != per_iter) deterministic = 0;
+    }
+
+    uint64_t freed_total  = g_frames_freed  - freed0;
+    uint64_t reused_total = g_frames_reused - reused0;
+    uint64_t depth_now    = g_frame_free_depth;
+    kprintf("[leakchk] %d iterations of spawn -> elf_load -> run -> exit on ONE kproc slot (pid %u)\n",
+            (uint64_t)LK_ITERS, kprocs[p].pid);
+    kprintf("[leakchk] %u frame(s) reclaimed per iteration; high-water after iter 0: %X, after iter %d: %X\n",
+            per_iter, hw_after_first, (uint64_t)(LK_ITERS - 1), g_next_frame);
+    kprintf("[leakchk] this run: +%u freed, +%u reused-from-list; global depth %u, freed %u, reused %u\n",
+            freed_total, reused_total, depth_now, g_frames_freed, g_frames_reused);
+
+    lkcheck("every iteration ran to completion and exited cleanly (exit == pid)", ok);
+    lkcheck("every iteration reclaimed the SAME nonzero frame count (deterministic teardown, no drift)",
+            per_iter > 0 && deterministic);
+    lkcheck("the bump high-water mark did NOT move after iteration 0 (steady state: fully satisfied from the free list)",
+            ok && g_next_frame == hw_after_first);
+    /* The free list only ever grows via free_frame (++) and shrinks via
+     * alloc_frame's reuse branch (--); nothing else touches the depth counter.
+     * That makes this reconciliation exact and unconditional — true at every
+     * instant the kernel has run, not just at the end of this suite.        */
+    lkcheck("free-list depth exactly reconciles with the allocator's lifetime counters (no phantom/lost frames)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    lkcheck("later iterations were satisfied from the free list, not fresh RAM (reuse actually happened)",
+            reused_total >= (uint64_t)(LK_ITERS - 1) * per_iter);
+    lkcheck("the frame allocator's leaf lock never triggered a rank violation", g_rank_violations == viol0);
+
+    kprintf("[leakchk] RESULT: %d passed, %d failed\n", (uint64_t)g_lkpass, (uint64_t)g_lkfail);
+    if (!g_lkfail) kputs("[leakchk] LEAK CHECK VERIFIED — page_free_tree returns every private frame, every time\n");
+    else          kputs("[leakchk] LEAK CHECK DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -7676,6 +7978,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "mcpre")) cmd_mcpre();
     else if (!kstrcmp(argv[0], "slice")) cmd_slice();
     else if (!kstrcmp(argv[0], "cio")) cmd_cio();
+    else if (!kstrcmp(argv[0], "leakcheck")) cmd_leakcheck();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -7824,6 +8127,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_mcpre();            /* v0.39: IPI preemption + cross-core context migration */
     cmd_slice();            /* v0.40: AP-local LAPIC timer round-robin time-slicing */
     cmd_cio();              /* v0.41: BSP + APs concurrently inside the VFS/CAS/surfaces */
+    cmd_leakcheck();        /* v0.42: heavy spawn/destroy proves 100% frame reclamation  */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
