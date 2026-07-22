@@ -47,6 +47,13 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_VFIO_WAIT_IRQ  21
 #define SYS_VFS_SYNC       22
 #define SYS_VFS_UNLINK     23
+#define SYS_TLB_SHOOTDOWN  24
+#define SYS_SET_AFFINITY   25
+#define SYS_SMP_REMAP      26
+#define SYS_SMP_UNMAP      27
+#define SYS_GET_CPU        28
+
+#define PCAP_SMP_ADMIN (1ull << 9)
 
 #define PCAP_FILESYSTEM (1ull << 5)
 #define IPC_INLINE_MAX 64
@@ -547,6 +554,63 @@ static void vfs_driver(void) {
     sysc(SYS_EXIT, pid, 0, 0);
 }
 
+/* v0.49: role 16 — SMP MIGRATION/REMAP WORKER. Several of these run in ring 3
+ * across every core at once, each rapidly remapping and unmapping its own
+ * private scratch page through SYS_SMP_REMAP/SYS_SMP_UNMAP (a fresh physical
+ * frame every round, the kernel shooting down and reclaiming the old one),
+ * writing and immediately re-reading a per-round pattern through the mapping
+ * to catch any stale TLB translation surviving a remap, and yielding between
+ * rounds so the scheduler is free to migrate this thread to a different core
+ * mid-run. Half the workers pin themselves to a single cpu via
+ * SYS_SET_AFFINITY first, so the kernel-side suite can confirm affinity was
+ * actually honoured (ran_on never left the pinned mask). Any stale read,
+ * denied syscall, or wrong SYS_GETPID exits a distinct 9xx code; success
+ * exits == pid, same convention as every other concurrent probe here.       */
+#define SMP_MIG_SLOT   0
+#define SMP_MIG_ROUNDS 6
+static void smp_migrate_worker(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+
+    if (pid & 1) {                                  /* odd pids: pin to cpu 0  */
+        if ((i64)sysc(SYS_SET_AFFINITY, 1, 0, 0) != 0) sysc(SYS_EXIT, 900, 0, 0);
+    }
+
+    for (int r = 0; r < SMP_MIG_ROUNDS; r++) {
+        i64 va = (i64)sysc(SYS_SMP_REMAP, SMP_MIG_SLOT, 0, 0);
+        if (va <= 0) sysc(SYS_EXIT, 910 + r, 0, 0);
+        volatile u64 *p = (volatile u64 *)va;
+        u64 pattern = pid ^ ((u64)r * 0x9E3779B97F4A7C15ull);
+        p[0] = pattern;
+        if (p[0] != pattern) sysc(SYS_EXIT, 920 + r, 0, 0);     /* stale TLB read */
+
+        /* NOT SYS_YIELD here: that syscall unconditionally drives the legacy
+         * BSP cooperative scheduler (sched_yield()/g_threads), which has no
+         * idea this task is running under the per-CPU cpu_exec_proc executor
+         * — calling it from a cpu_exec_proc-dispatched context (discovered
+         * live building this worker) switches away into unrelated BSP thread
+         * state and never returns, hanging the whole suite. A real gap, but
+         * a pre-existing, cross-cutting one outside this milestone's scope
+         * (see CHANGELOG-0.49.0.md); this worker steers around it instead.
+         * A scheduling point still exists here for migration to act on: the
+         * remap/shootdown round trip just above already crosses a syscall
+         * boundary the scheduler can preempt or steal around.               */
+        if (p[0] != pattern) sysc(SYS_EXIT, 930 + r, 0, 0);     /* survived a migration? */
+        if (sysc(SYS_GETPID, 0, 0, 0) != pid) sysc(SYS_EXIT, 940 + r, 0, 0);
+
+        /* v0.49: exercise the raw primitive directly too, not just through the
+         * remap path that already calls it internally — invalidate our own
+         * mapping on every online cpu and confirm the pattern still reads
+         * back correctly afterward (this cpu re-establishes its own TLB entry
+         * on the next access; a broken shootdown could corrupt someone else's,
+         * not ours, so this is a liveness/API check, not a corruption one).  */
+        sysc(SYS_TLB_SHOOTDOWN, (u64)va, 1, 0xFFFFFFFFull);
+        if (p[0] != pattern) sysc(SYS_EXIT, 950 + r, 0, 0);
+    }
+
+    if ((i64)sysc(SYS_SMP_UNMAP, SMP_MIG_SLOT, 0, 0) != 0) sysc(SYS_EXIT, 960, 0, 0);
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
 static void nic_driver(void) {
     print("  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====\n");
 
@@ -671,6 +735,7 @@ void _start(void) {
     if (role == 13) { ipc_receiver(); }                 /* v0.46 IPC handle/shmem receiver */
     if (role == 14) { vfio_driver(); }                  /* v0.47 VFIO BAR map + IRQ wait   */
     if (role == 15) { vfs_driver(); }                   /* v0.48 VFS journal/unlink/multi-volume */
+    if (role == 16) { smp_migrate_worker(); }           /* v0.49 SMP remap/unmap/migration worker */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");

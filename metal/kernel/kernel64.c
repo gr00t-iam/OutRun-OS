@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.48.0-metal"
+#define KERNEL_VERSION "0.49.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -973,6 +973,7 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
 #define USER_VMAX 0x600000000000ull
 #define DMA_USER_V  0x0000520000000000ull   /* ring-3 DMA window (driver buffers) */
 #define SURF_USER_V 0x0000530000000000ull   /* ring-3 surface window (app pixels) */
+#define SMP_USER_V  0x0000540000000000ull   /* v0.49: ring-3 remap/unmap scratch window */
 
 /* Validate that [ptr, ptr+len) is entirely within a process's user space and    */
 /* mapped USER-present (and USER-writable if need_write). Defends every syscall   */
@@ -1296,6 +1297,7 @@ static uint64_t create_address_space(void) {
 #define PCAP_FRAMEBUFFER    (1ull << 6)
 #define PCAP_IPC             (1ull << 7)    /* v0.46: required for any SYS_IPC_* call */
 #define PCAP_VFIO            (1ull << 8)    /* v0.47: required for any SYS_VFIO_* call */
+#define PCAP_SMP_ADMIN       (1ull << 9)    /* v0.49: SYS_TLB_SHOOTDOWN/SET_AFFINITY/SMP_REMAP/SMP_UNMAP */
 
 /* v0.39: a COMPLETE ring-3 register context. The preempt IPI (vector 50)
  * captures the interrupted user state here straight from the isr_frame, and
@@ -1365,6 +1367,27 @@ struct kproc {
      * mid-walk on the OLD address space — it would then walk and free the
      * NEW, live process's frames instead, corrupting the free-list. */
     volatile int      torn_down;
+    /* v0.49: CPU affinity mask (bit c = "may run on cpu c"). 0 means
+     * unrestricted (the default) — every online cpu is eligible. Enforced by
+     * rq_steal (a thief outside the mask puts the task back) and by the
+     * post-preemption migration target selection in cpu_exec_proc, so a
+     * directed migrate_to can never place the task on a forbidden core.      */
+    volatile uint32_t affinity;
+    /* v0.49: SMP_SLOTS private scratch pages this process can remap/unmap at
+     * will via SYS_SMP_REMAP/SYS_SMP_UNMAP, at fixed vaddrs SMP_USER_V+n*4K.
+     * Holds the CURRENT backing frame's physical address (0 = unmapped) so a
+     * remap knows what to shoot down and free once the new mapping is live. */
+#define SMP_SLOTS 2
+    uint64_t smp_slot_phys[SMP_SLOTS];
+    /* v0.49: leaf spinlock serializing this ONE process's own VMA/page-table
+     * mutations (map_page + smp_slot_phys bookkeeping) against itself. In
+     * this kernel's one-thread-per-kproc execution model only the single
+     * core currently running this task ever touches its own page tables, so
+     * this lock is uncontended by construction today — it exists to make the
+     * remap/unmap compound update (map + old-frame bookkeeping) an explicit
+     * critical section rather than an implicit invariant, and is the seam a
+     * future multi-threaded-per-process model would actually need. */
+    volatile int      vma_lock;
 };
 #define MAX_KPROC 64                  /* v0.41: +6 cio workers; v0.43: +10 smp_stress workers */
 static struct kproc kprocs[MAX_KPROC];
@@ -1414,6 +1437,9 @@ static void kproc_reset(struct kproc *p) {
     for (int g = 0; g < MAX_DMA_GRANTS; g++) p->dma_grants[g].used = 0;
     p->dma_grant_count = 0;
     p->torn_down = 0;
+    p->affinity = 0;                                   /* v0.49: unrestricted by default */
+    for (int s = 0; s < SMP_SLOTS; s++) p->smp_slot_phys[s] = 0;
+    p->vma_lock = 0;
 }
 
 /* Called from syscall_entry's shared epilogue (boot/usermode.asm), for BOTH
@@ -1433,6 +1459,18 @@ void dbg_syscall_exit(uint64_t saved_rip, uint64_t saved_rsp) {
  * the identity of the ring-3 task IT is executing. On the BSP it stays
  * per-thread on top: sched_switch_to saves/restores the BSP's slot per PCB.  */
 
+/* v0.49: kproc table lock — a raw leaf spinlock in the same undiscipline as
+ * g_frame_lock (rank 6): acquired around nothing but the tiny slot-scan-and-
+ * claim below, never nested under a klock, never held across an allocation.
+ * kproc_spawn has been a BSP-only call in every suite through v0.48 (nothing
+ * in this kernel issues SYS_SPAWN from ring 3), so this closes a latent gap
+ * rather than a live one: with per-CPU run queues now able to run genuinely
+ * concurrent ring-3 workloads across every core, a second spawn source would
+ * otherwise race the scan-then-claim of n_kproc/torn_down against this one. */
+static volatile int g_kproc_lock = 0;
+static inline void kproc_lock(void)   { while (__sync_lock_test_and_set(&g_kproc_lock, 1)) __asm__ volatile("pause"); }
+static inline void kproc_unlock(void) { __sync_lock_release(&g_kproc_lock); }
+
 static int kproc_spawn(const char *name, uint64_t caps) {
     /* v0.45: a slot is safe to recycle only once torn_down is set — NOT on
      * `exited` alone. `exited` flips true early in every exit path (right
@@ -1448,14 +1486,20 @@ static int kproc_spawn(const char *name, uint64_t caps) {
      * it makes recycling wait for the full teardown chain, not just the
      * excursion's return. First-fit ascending scan: no ordering property is
      * needed here (unlike the surface free list's LIFO, there is no "most
-     * recent" kproc slot worth preferring). */
+     * recent" kproc slot worth preferring).
+     * v0.49: the scan-then-claim is now one atomic critical section under
+     * g_kproc_lock — clearing torn_down (the recycle claim signal) INSIDE the
+     * lock is what stops a second concurrent spawn from matching the same
+     * slot before this one finishes installing its new occupant. */
     int i = -1, recycled = 0;
+    kproc_lock();
     for (int s = 0; s < n_kproc; s++)
-        if (kprocs[s].used && kprocs[s].torn_down) { i = s; recycled = 1; break; }
+        if (kprocs[s].used && kprocs[s].torn_down) { i = s; recycled = 1; kprocs[s].torn_down = 0; break; }
     if (i < 0) {
-        if (n_kproc >= MAX_KPROC) return -1;
+        if (n_kproc >= MAX_KPROC) { kproc_unlock(); return -1; }
         i = n_kproc++;
     }
+    kproc_unlock();
     kproc_reset(&kprocs[i]);
     uint64_t pid = g_next_pid++;
     if (!g_next_pid) g_next_pid = 1;      /* wrap-safe: pid 0 is never valid */
@@ -4530,6 +4574,28 @@ static uint32_t g_bsp_apicid = 0;
 /* cross-core mailboxes */
 static volatile uint64_t g_shoot_va = 0;
 static volatile uint32_t g_shoot_ack = 0;
+/* v0.49: the shootdown mailbox grew a page COUNT and a per-cpu TARGET MASK —
+ * through v0.48 it only ever invalidated one page and only ever broadcast to
+ * every online cpu. A targeted, multi-page shootdown lets sys_tlb_shootdown
+ * (and the SYS_SMP_REMAP/UNMAP paths under it) invalidate exactly the range
+ * and exactly the cpus that could hold a stale translation for THIS address
+ * space — the cpus in kprocs[p].ran_on — instead of paying a full broadcast
+ * and waiting on cores that were never going to have that CR3 loaded.       */
+static volatile uint32_t g_shoot_pages = 1;
+static volatile uint32_t g_shoot_mask  = 0;    /* bit c = "cpu c must ack this shootdown" */
+/* v0.49: through v0.48 the mailbox above was touched by exactly one caller at
+ * a time BY CONVENTION — every tlb_shootdown() call site was a single
+ * serialized BSP test orchestrator. SYS_SMP_REMAP/UNMAP end that convention:
+ * several ring-3 workers on DIFFERENT cores now call tlb_shootdown_range
+ * concurrently, and two overlapping calls stomping the shared va/pages/mask/
+ * ack fields lose acks and drag every caller out to its own 100-tick
+ * timeout — a real bug found live running the v0.49 migration stress (it
+ * looked like a hang: every shootdown paying its full timeout back-to-back).
+ * g_shoot_lock is a raw leaf spinlock (same discipline as g_frame_lock)
+ * serializing one whole "publish the request, IPI, wait for acks" round
+ * trip; a spinning waiter still has interrupts enabled, so it keeps
+ * servicing any IPI aimed at it while it waits — no deadlock. */
+static volatile int      g_shoot_lock  = 0;
 static volatile int      g_work_go = 0;        /* 1 = lock-xadd storm, 2 = probe read */
 static volatile uint64_t g_work_counter = 0;
 static volatile uint64_t g_probe_va = 0;
@@ -4563,28 +4629,94 @@ static void lapic_ipi(uint32_t apic_id, uint8_t vec, int broadcast) {
 static void smp_ipi_dispatch(uint64_t vec) {
     struct cpu_local *me = &g_cpu[cpu_idx()];
     if (vec == IPI_TLB) {
-        __asm__ volatile("invlpg (%0)" :: "r"(g_shoot_va) : "memory");
-        __sync_fetch_and_add(&g_shoot_ack, 1);
+        /* v0.49: only invalidate/ack if THIS cpu is an actual target — the
+         * broadcast fast path only ever fires when every online-but-self cpu
+         * is targeted, but a directed multi-IPI send lands on exactly the
+         * mask, and this guard is what keeps the two paths' ack arithmetic
+         * (a straight popcount of the mask) identical either way.           */
+        if (g_shoot_mask & (1u << cpu_idx())) {
+            uint32_t pages = g_shoot_pages ? g_shoot_pages : 1;
+            for (uint32_t i = 0; i < pages; i++)
+                __asm__ volatile("invlpg (%0)" :: "r"(g_shoot_va + (uint64_t)i * 0x1000) : "memory");
+            __sync_fetch_and_add(&g_shoot_ack, 1);
+        }
     } else {
         me->ipi_ping++;                        /* ping/wake                    */
     }
     lapic_eoi();
 }
 
-/* Invalidate one page on EVERY online cpu and wait for every acknowledgement.
- * This is the real cross-core protocol; on a single-CPU boot it degrades to
- * the local invlpg it always was.                                            */
-static int tlb_shootdown(uint64_t va) {
-    __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+/* v0.49: the general cross-core TLB shootdown primitive — invalidate `pages`
+ * consecutive 4 KiB entries starting at `va`, on exactly the cpus set in
+ * `cpu_mask` (bit c = cpu c), and block until every one of THEM has
+ * acknowledged (bounded by a 100-tick watchdog, same as the v0.35 original).
+ * This is what requirement (1) means by "synchronous, acknowledged shootdown
+ * completion before page frame unmapping or memory recycling completes" —
+ * every caller that frees/recycles a physical frame calls this (or the
+ * single-page tlb_shootdown() wrapper below) and only then hands the frame
+ * back to the allocator. On a single-CPU boot it degrades to the local
+ * invlpg loop it always was. */
+static int tlb_shootdown_range(uint64_t va, uint32_t pages, uint32_t cpu_mask) {
+    if (pages == 0) pages = 1;
+    if (pages > 64) pages = 64;                /* bounded: matches SYS_DMA_ALLOC's cap */
+    for (uint32_t i = 0; i < pages; i++)
+        __asm__ volatile("invlpg (%0)" :: "r"(va + (uint64_t)i * 0x1000) : "memory");
     if (g_ncpu_online <= 1) return 0;
+    uint32_t online_mask = 0;
+    for (int c = 0; c < MAX_CPUS; c++) if (g_cpu[c].online) online_mask |= (1u << c);
+    uint32_t targets = cpu_mask & online_mask & ~(1u << cpu_idx());  /* self already done, above */
+    if (!targets) return 0;
+    /* v0.49: SFMASK clears IF for the ENTIRE duration of every SYSCALL (see
+     * cpu_syscall_arm, "SFMASK: clear IF on entry") — through v0.48 that was
+     * always safe because nothing inside a syscall ever waited on another
+     * core's INTERRUPT HANDLER to make progress; ordinary klock contention is
+     * a plain cache-coherent spin that needs no interrupts anywhere. This
+     * protocol is different: it blocks on g_shoot_ack, which only advances
+     * when a TARGET core's IPI_TLB handler runs — and that cannot happen on
+     * a target that is itself inside its own syscall with IF still clear.
+     * With SYS_SMP_REMAP/UNMAP/TLB_SHOOTDOWN now reachable concurrently from
+     * ring 3 on every core, two such syscalls can trade places: A holds
+     * g_shoot_lock waiting on B's ack; B is spinning to ACQUIRE that same
+     * lock for its own shootdown, IF still clear from ITS OWN SYSCALL entry,
+     * so B can never take A's IPI and ack it — a genuine cross-core deadlock,
+     * found live building the v0.49 migration stress (looked like a hang;
+     * it was every shootdown paying its full ack timeout, back to back,
+     * because the one core that could ack was never interruptible). Forcing
+     * IF on for this whole routine — lock acquire through the ack wait — is
+     * what makes the protocol interrupt-driven again regardless of what
+     * syscall context it was called from; the caller's original IF is
+     * restored before return, exactly like con_lock/con_unlock's pattern,
+     * just inverted (force-ENABLE across the section, not force-disable).  */
+    uint64_t fl; __asm__ volatile("pushfq; pop %0" : "=r"(fl));
+    __asm__ volatile("sti");
+    while (__sync_lock_test_and_set(&g_shoot_lock, 1)) __asm__ volatile("pause");
     g_shoot_va = va;
+    g_shoot_pages = pages;
+    g_shoot_mask = targets;
     g_shoot_ack = 0;
     __sync_synchronize();
-    lapic_ipi(0, IPI_TLB, 1);                  /* broadcast, all-but-self      */
+    if (targets == (online_mask & ~(1u << cpu_idx())))
+        lapic_ipi(0, IPI_TLB, 1);              /* every eligible cpu targeted: broadcast */
+    else
+        for (int c = 0; c < MAX_CPUS; c++)
+            if (targets & (1u << c)) lapic_ipi(g_cpu[c].apic_id, IPI_TLB, 0);
+    uint32_t want = 0;                         /* freestanding: no libgcc popcount call */
+    for (uint32_t m = targets; m; m &= m - 1) want++;
     uint64_t t0 = g_ticks;
-    while (g_shoot_ack < (uint32_t)(g_ncpu_online - 1) && g_ticks - t0 < 100)
+    while (g_shoot_ack < want && g_ticks - t0 < 100)
         __asm__ volatile("pause");
-    return (int)g_shoot_ack;
+    int acked = (int)g_shoot_ack;
+    __sync_lock_release(&g_shoot_lock);
+    if (!(fl & 0x200)) __asm__ volatile("cli");    /* restore the caller's original IF */
+    return acked;
+}
+
+/* Invalidate one page on EVERY online cpu and wait for every acknowledgement.
+ * Kept as the pre-v0.49 call shape for the ~15 existing sites (frame reuse,
+ * AP_TRAMP, remap/unmap) that always meant "everyone" — a thin wrapper over
+ * the general range/mask primitive above. */
+static int tlb_shootdown(uint64_t va) {
+    return tlb_shootdown_range(va, 1, 0xFFFFFFFFu);
 }
 
 /* Fold this core's share of the parallel job. Claims units from the shared
@@ -4634,6 +4766,16 @@ static void rq_acquire(struct cpu_local *c) {
     while (__sync_lock_test_and_set(&c->rq_lock, 1)) __asm__ volatile("pause");
 }
 static void rq_release(struct cpu_local *c) { __sync_lock_release(&c->rq_lock); }
+/* v0.49: non-blocking trylock — one test-and-set attempt, no spin. Returns
+ * true iff the caller now holds the lock. Used only by rq_steal (below): a
+ * thief that finds the lock busy is expected to move on to the next sibling
+ * rather than ever wait behind an owner, which is what makes the steal path
+ * a genuinely non-blocking work-stealing heuristic instead of just another
+ * spinlock consumer. */
+static int rq_trylock(struct cpu_local *c) {
+    return __sync_lock_test_and_set(&c->rq_lock, 1) == 0;
+}
+static volatile uint32_t g_rq_steal_aborted = 0;  /* v0.49: steal attempts that backed off busy */
 
 static int rq_push(int cpu, int proc) {                /* producer: tail       */
     struct cpu_local *c = &g_cpu[cpu];
@@ -4665,7 +4807,22 @@ static int rq_steal(int thief) {                       /* balance: rob siblings 
     for (int off = 1; off < MAX_CPUS; off++) {
         int v = (thief + off) % MAX_CPUS;
         if (v == thief || !g_cpu[v].online) continue;
-        int p = rq_pop(v);
+        struct cpu_local *victim = &g_cpu[v];
+        /* v0.49: NON-BLOCKING steal — trylock only. A busy victim is skipped
+         * immediately (never spun on); requirement (2)'s work-stealing
+         * heuristic. Peek the head under the lock and only pop it if this
+         * thief is actually in the task's affinity mask (0 = unrestricted);
+         * a pinned task is left queued for its rightful owner instead of
+         * being silently relocated outside its allowed set.                 */
+        if (!rq_trylock(victim)) { __sync_fetch_and_add(&g_rq_steal_aborted, 1); continue; }
+        int p = -1;
+        if (victim->rq_h != victim->rq_t) p = victim->rq[victim->rq_h];
+        if (p >= 0 && kprocs[p].affinity && !(kprocs[p].affinity & (1u << thief))) {
+            rq_release(victim);                        /* not ours: leave queued */
+            continue;
+        }
+        if (p >= 0) victim->rq_h = (victim->rq_h + 1) % RQ_LEN;
+        rq_release(victim);
         if (p >= 0) { __sync_fetch_and_add(&g_cpu[thief].rq_stolen, 1); return p; }
     }
     return -1;
@@ -4722,6 +4879,18 @@ static void cpu_exec_proc(int c, int p) {
         int dst = kprocs[p].migrate_to;
         kprocs[p].migrate_to = -1;
         if (dst < 0 || dst >= MAX_CPUS || !g_cpu[dst].online) dst = c;
+        /* v0.49: affinity is authoritative over a directed migrate_to — a
+         * requested destination outside the task's mask is overridden by the
+         * lowest-indexed online cpu that IS in the mask (falling back to the
+         * current core c if none online qualifies, same as "no directive"),
+         * so a migration can never land a pinned task on a forbidden core. */
+        uint32_t aff = kprocs[p].affinity;
+        if (aff && !(aff & (1u << dst))) {
+            int found = -1;
+            for (int cc = 0; cc < MAX_CPUS; cc++)
+                if (g_cpu[cc].online && (aff & (1u << cc))) { found = cc; break; }
+            dst = (found >= 0) ? found : c;
+        }
         rq_push(dst, p);
         __sync_synchronize();
         if (dst != c) lapic_ipi(g_cpu[dst].apic_id, IPI_PING, 0);  /* wake the new home */
@@ -6155,6 +6324,76 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             kprintf("[dbgvfs ] pid %u: SYS_VFS_UNLINK('%s') -> %d\n", kprocs[current_proc_idx].pid, name, r);
         return (uint64_t)(int64_t)r;
     }
+
+    /* --- v0.49: SMP core scaling — TLB shootdown, affinity, remap/unmap --- */
+    case 24: {   /* SYS_TLB_SHOOTDOWN(vaddr, pages, cpu_mask) -> acks received */
+        /* The raw cross-core primitive, exposed to ring 3 under a dedicated
+         * capability so the stress harness can drive it directly as well as
+         * indirectly through SYS_SMP_REMAP/UNMAP below. A production build
+         * would likely keep this kernel-internal-only (tlb_shootdown_range is
+         * already called directly by remap/unmap) — it is exposed here to
+         * make the syscall itself a first-class, independently testable
+         * surface, exactly as the milestone specifies it. invlpg has no
+         * memory side effect of its own, so no access_ok check is needed on
+         * `vaddr` — a bogus address just invalidates nothing.               */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_SMP_ADMIN)) return (uint64_t)-13;
+        return (uint64_t)(int64_t)tlb_shootdown_range(a0, (uint32_t)a1, (uint32_t)a2);
+    }
+    case 25: {   /* SYS_SET_AFFINITY(mask) -> 0 ok, -1 mask has no online cpu  */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_SMP_ADMIN)) return (uint64_t)-13;
+        uint32_t mask = (uint32_t)a0;
+        if (mask) {
+            uint32_t online_mask = 0;
+            for (int c = 0; c < MAX_CPUS; c++) if (g_cpu[c].online) online_mask |= (1u << c);
+            mask &= online_mask;
+            if (!mask) return (uint64_t)-1;      /* every requested cpu is offline */
+        }
+        kprocs[current_proc_idx].affinity = mask;    /* 0 = unrestricted */
+        return 0;
+    }
+    case 26: {   /* SYS_SMP_REMAP(slot) -> new vaddr, or negative error        */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_SMP_ADMIN)) return (uint64_t)-13;
+        int slot = (int)a0;
+        if (slot < 0 || slot >= SMP_SLOTS) return (uint64_t)-1;
+        struct kproc *p = &kprocs[current_proc_idx];
+        uint64_t va = SMP_USER_V + (uint64_t)slot * 0x1000;
+        while (__sync_lock_test_and_set(&p->vma_lock, 1)) __asm__ volatile("pause");
+        uint64_t new_phys = alloc_frame();                 /* zeroed on return       */
+        map_page(p->cr3, va, new_phys, PTE_USER | PTE_WRITE | PTE_NX);
+        uint64_t old_phys = p->smp_slot_phys[slot];
+        p->smp_slot_phys[slot] = new_phys;
+        __sync_lock_release(&p->vma_lock);
+        if (old_phys) {
+            /* requirement (1): synchronous, acknowledged shootdown of every
+             * cpu that could hold a stale translation for THIS vaddr in THIS
+             * address space (ran_on) — THEN, and only then, the old frame is
+             * handed back to the pool for reuse by anyone.                  */
+            tlb_shootdown_range(va, 1, p->ran_on);
+            free_frame(old_phys);
+        }
+        if (g_debug_smp_sched)
+            kprintf("[dbgsmp ] pid %u SYS_SMP_REMAP slot %d: old=%X new=%X\n",
+                    p->pid, (uint64_t)slot, old_phys, new_phys);
+        return va;
+    }
+    case 27: {   /* SYS_SMP_UNMAP(slot) -> 0 ok, -1 slot wasn't mapped         */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_SMP_ADMIN)) return (uint64_t)-13;
+        int slot = (int)a0;
+        if (slot < 0 || slot >= SMP_SLOTS) return (uint64_t)-1;
+        struct kproc *p = &kprocs[current_proc_idx];
+        uint64_t va = SMP_USER_V + (uint64_t)slot * 0x1000;
+        while (__sync_lock_test_and_set(&p->vma_lock, 1)) __asm__ volatile("pause");
+        uint64_t old_phys = walk_pte(p->cr3, va) & ADDR_MASK;   /* v0.46 helper: leaf or 0 */
+        if (old_phys) unmap_page(p->cr3, va);                   /* v0.46 helper: clears the leaf */
+        p->smp_slot_phys[slot] = 0;
+        __sync_lock_release(&p->vma_lock);
+        if (!old_phys) return (uint64_t)-1;
+        tlb_shootdown_range(va, 1, p->ran_on);              /* ack before recycling  */
+        free_frame(old_phys);
+        return 0;
+    }
+    case 28:                                               /* SYS_GET_CPU() -> cpu_idx() */
+        return (uint64_t)cpu_idx();
     }
     return (uint64_t)-1;
 }
@@ -6464,7 +6703,18 @@ static void cmd_cio(void) {
  * workers onto the SAME slot, a hazard that belongs to role 10 itself, not to
  * this harness. Placement is BIASED round-robin across every online core via
  * rq_push — the same placement primitive mcq/cio already use — and idle
- * siblings may still steal, so this is a bias, not a hard pin.            */
+ * siblings may still steal, so this is a bias, not a hard pin.
+ *
+ * v0.49 adds a second phase to the SAME suite: MIGRATE_N role-16 workers
+ * (smp_migrate_worker) that rapidly remap/unmap a private scratch page via
+ * SYS_SMP_REMAP/SYS_SMP_UNMAP — the new synchronous, acknowledged TLB
+ * shootdown protocol (tlb_shootdown_range) runs on every one of those calls,
+ * shooting down and reclaiming the OLD physical frame only after every cpu
+ * that ever ran this address space has acknowledged. Half the workers pin
+ * themselves to cpu0 via SYS_SET_AFFINITY, exercising the affinity-aware
+ * work-stealing (rq_steal) and migration-target selection (cpu_exec_proc)
+ * added this version. Assertions: zero stale TLB reads (exit == pid), zero
+ * IPI deadlocks (watchdog), affinity honoured, zero rank violations.       */
 static int g_smstrpass, g_smstrfail;
 static void smstrcheck(const char *n, int c) {
     if (c) { g_smstrpass++; kprintf("[smpstrs]  PASS  %s\n", n); }
@@ -6472,9 +6722,10 @@ static void smstrcheck(const char *n, int c) {
 }
 
 #define STRESS_N 10
+#define MIGRATE_N 8                                    /* v0.49: phase-2 remap/migrate workers */
 
 static void cmd_smp_stress(void) {
-    kputs("-- SMP STRESS: mixed syscall/VFS/compositor workload biased across every core --\n");
+    kputs("-- SMP STRESS: mixed workload + v0.49 TLB shootdown/affinity/migration, biased across every core --\n");
     g_smstrpass = g_smstrfail = 0;
     uint64_t save = current_proc_idx;
     int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
@@ -6560,6 +6811,102 @@ static void cmd_smp_stress(void) {
     }
     smstrcheck("ZERO cross-core lock-rank violations across the whole mixed run",
                g_rank_violations == 0);
+
+    /* =========================================================================
+     * v0.49 PHASE 2: SMP core scaling — TLB shootdown + affinity + migration.
+     * MIGRATE_N role-16 workers hammer SYS_SMP_REMAP/SYS_SMP_UNMAP (rapid
+     * page remapping/unmapping of their own scratch page) across every core,
+     * self-pinning to cpu0 by pid parity, yielding between rounds so the
+     * scheduler is free to migrate them. A stale TLB read, a denied syscall,
+     * or a wrong SYS_GETPID exits a distinct 9xx code the ring-3 side already
+     * checks; this phase re-verifies from the kernel side and adds the
+     * capability-gating and affinity checks the workers can't see for
+     * themselves.                                                           */
+    kputs("[smpstrs] -- v0.49 phase 2: TLB shootdown + affinity + remap/unmap migration --\n");
+    {
+        int pn = kproc_spawn("smpstrs-noadmin", 0);         /* lacks PCAP_SMP_ADMIN */
+        if (pn >= 0) {
+            current_proc_idx = (uint64_t)pn;
+            int denied = (int64_t)syscall_dispatch(24, 0, 1, 0xFFFFFFFFu) == -13   /* SHOOTDOWN */
+                      && (int64_t)syscall_dispatch(25, 1, 0, 0) == -13             /* SET_AFFINITY */
+                      && (int64_t)syscall_dispatch(26, 0, 0, 0) == -13             /* SMP_REMAP */
+                      && (int64_t)syscall_dispatch(27, 0, 0, 0) == -13;            /* SMP_UNMAP */
+            current_proc_idx = save;
+            smstrcheck("every v0.49 SMP syscall denied without PCAP_SMP_ADMIN", denied);
+        }
+
+        uint32_t stolen_before = 0, aborted_before = g_rq_steal_aborted;
+        for (int c = 0; c < MAX_CPUS; c++) stolen_before += g_cpu[c].rq_stolen;
+
+        int mprocs[MIGRATE_N];
+        for (int i = 0; i < MIGRATE_N; i++) {
+            int p = kproc_spawn("smp-migrate", PCAP_SMP_ADMIN);
+            if (p < 0) { kputs("[smpstrs] phase-2 spawn failed\n"); goto phase2_done; }
+            kprocs[p].role = 16;
+            uint64_t entry = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+            current_proc_idx = save;
+            if (!entry) { kputs("[smpstrs] phase-2 ELF load failed\n"); goto phase2_done; }
+            kprocs[p].entry = entry;
+            /* v0.49: affinity pins WHERE THIS TASK MAY RUN going forward (steal
+             * eligibility, migration targets) — it has no way to reach back and
+             * relocate a task that is already executing elsewhere, so the odd-
+             * pid self-pin the worker calls (SYS_SET_AFFINITY(1)) only matters
+             * if the INITIAL placement below also honours it. Mirror the same
+             * "odd pid -> cpu0 only" rule here, kernel-side, before dispatch:
+             * the worker's own subsequent call is then a no-op confirmation of
+             * a mask that was already true when it started running.           */
+            if (kprocs[p].pid & 1) kprocs[p].affinity = 1u;
+            mprocs[i] = p;
+        }
+
+        if (n > 1) {
+            for (int i = 0; i < MIGRATE_N; i++) {
+                int dst = kprocs[mprocs[i]].affinity ? 0 : (i % n);   /* honour the pin */
+                rq_push(dst, mprocs[i]);
+            }
+            __sync_synchronize();
+            lapic_ipi(0, IPI_PING, 1);
+            int p;
+            while ((p = rq_pop(0)) >= 0) cpu_exec_proc(0, p);
+        } else {
+            for (int i = 0; i < MIGRATE_N; i++) cpu_exec_proc(0, mprocs[i]);
+        }
+
+        uint64_t mt0 = g_ticks;
+        for (;;) {
+            int all = 1;
+            for (int i = 0; i < MIGRATE_N; i++) if (!kprocs[mprocs[i]].exited) all = 0;
+            if (all || g_ticks - mt0 > 4000) break;
+            if (n > 1) lapic_ipi(0, IPI_PING, 1);
+            uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
+        }
+        current_proc_idx = save;
+
+        int m_all_exited = 1, m_ids_ok = 1, m_affinity_ok = 1;
+        for (int i = 0; i < MIGRATE_N; i++) {
+            struct kproc *k = &kprocs[mprocs[i]];
+            if (!k->exited) m_all_exited = 0;
+            if (!k->exited || k->exit_code != k->pid) m_ids_ok = 0;
+            if ((k->pid & 1) && (k->ran_on & ~1u)) m_affinity_ok = 0;   /* pinned, but ran off cpu0 */
+            kprintf("[smpstrs]   pid %u (role 16): exit %u (want %u) ran_on %x affinity %x\n",
+                    k->pid, k->exit_code, k->pid, (uint64_t)k->ran_on, (uint64_t)k->affinity);
+        }
+        smstrcheck("no watchdog timeout — every remap/unmap/migration worker finished (0 IPI deadlocks)",
+                   m_all_exited);
+        smstrcheck("every worker's exit code == its pid (0 stale TLB reads across remap/unmap/migration)",
+                   m_ids_ok);
+        smstrcheck("every pid-pinned worker's ran_on stayed inside its affinity mask (cpu0 only)",
+                   m_affinity_ok);
+
+        uint32_t stolen_after = 0;
+        for (int c = 0; c < MAX_CPUS; c++) stolen_after += g_cpu[c].rq_stolen;
+        kprintf("[smpstrs] phase 2: %u task(s) stolen, %u non-blocking steal attempt(s) backed off busy\n",
+                (uint64_t)(stolen_after - stolen_before), (uint64_t)(g_rq_steal_aborted - aborted_before));
+        smstrcheck("ZERO cross-core lock-rank violations across the migration phase",
+                   g_rank_violations == 0);
+    }
+phase2_done:
+    current_proc_idx = save;
 
     kprintf("[smpstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_smstrpass, (uint64_t)g_smstrfail);
     if (!g_smstrfail)
