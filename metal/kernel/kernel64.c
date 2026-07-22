@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.44.0-metal"
+#define KERNEL_VERSION "0.45.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -477,6 +477,7 @@ static volatile int g_debug_pagefault    = 0;   /* DEBUG_PAGEFAULT: log every #P
 static volatile int g_debug_syscall_exit = 0;   /* DEBUG_SYSCALL_EXIT: log every sysret   */
 static volatile int g_debug_smp_sched    = 0;   /* DEBUG_SMP_SCHED: pick/switch/idle log  */
 static volatile int g_debug_dma_lifetime = 0;   /* DEBUG_DMA_LIFETIME: grant create/revoke */
+static volatile int g_debug_kproc_lifetime = 0; /* DEBUG_KPROC_LIFETIME: recycle/descriptor teardown */
 
 /* user-stack layout (used by the guard-page fault check in isr_dispatch) */
 #define USTK_V     0x0000500000FF0000ull                  /* user stack bottom       */
@@ -491,6 +492,8 @@ static void smp_preempt_ipi(struct isr_frame *f);        /* v0.39: vector 50 (ma
 static volatile int g_guard_caught = 0;                  /* set when a guard fault is handled */
 static inline uint64_t read_cr3(void);                   /* fwd: defined with paging helpers  */
 static uint64_t dbg_pid_of(uint64_t proc_idx);           /* fwd: defined after kprocs[]        */
+struct kdev;                                              /* fwd: defined with the device registry */
+static struct kdev *kdev_find(uint64_t io_addr);          /* fwd: v0.45 page_free_tree device guard */
 
 void isr_dispatch(struct isr_frame *f) {
     /* v0.35: IPIs first — they run on ANY cpu and must touch none of the      */
@@ -770,6 +773,21 @@ static inline int frame_in_pool(uint64_t pa) {
     return pa >= FRAME_POOL_BASE && pa < g_next_frame;
 }
 
+/* v0.45: a shadow "is this frame currently on the free list" bit per frame,
+ * independent of the list's own linkage. The existing `pa == g_frame_freelist`
+ * check above only catches a double-free of the CURRENT head — a double-free
+ * with any other free_frame()/alloc_frame() call in between (the common case
+ * under real scheduling) threads silently into the middle of the list, and
+ * the count-based invariants (g_frame_free_depth == freed - reused) can't
+ * catch it either: a double-free increments both counters together, so the
+ * arithmetic still reconciles even though the list now holds a corrupt
+ * duplicate. This bit catches it AT THE SECOND free_frame() call that causes
+ * it. Found live, load-bearing: this is exactly what caught the sensor0
+ * demo-device double-free documented on page_free_tree below. Sized for a
+ * 256 MiB pool — comfortably more than this kernel's observed pool usage. */
+#define FRAME_DBG_MAX ((256ull * 1024 * 1024) / 0x1000)
+static uint8_t g_frame_dbg_isfree[FRAME_DBG_MAX];
+
 /* Return one 4 KiB frame to the pool. Returns 1 if it was actually reclaimed,
  * 0 if the address was out of the managed window (and thus ignored) — the
  * caller uses that to count exactly how many frames came back. */
@@ -787,6 +805,16 @@ static int free_frame(uint64_t pa) {
         kprintf("\n[frame  ] CORRUPT FREE-LIST HEAD at free(pa=%X): head=%X is outside the pool -- halting\n",
                 pa, g_frame_freelist);
         for (;;) __asm__ volatile("cli; hlt");
+    }
+    uint64_t dbgidx = (pa - FRAME_POOL_BASE) / 0x1000;
+    if (dbgidx < FRAME_DBG_MAX) {
+        if (g_frame_dbg_isfree[dbgidx]) {
+            frame_unlock();
+            kprintf("\n[frame  ] TRUE DOUBLE-FREE (shadow bit): pa=%X was ALREADY marked free"
+                    " -- halting\n", pa);
+            for (;;) __asm__ volatile("cli; hlt");
+        }
+        g_frame_dbg_isfree[dbgidx] = 1;
     }
     *(volatile uint64_t *)pa = g_frame_freelist;   /* thread the next-ptr through the frame */
     g_frame_freelist = pa;
@@ -816,6 +844,8 @@ static uint64_t alloc_frame(void) {
         g_frame_freelist = *(volatile uint64_t *)pa;   /* pop */
         g_frame_free_depth--;
         g_frames_reused++;
+        { uint64_t dbgidx = (pa - FRAME_POOL_BASE) / 0x1000;   /* TEMPORARY DIAGNOSTIC */
+          if (dbgidx < FRAME_DBG_MAX) g_frame_dbg_isfree[dbgidx] = 0; }
         frame_unlock();
         uint64_t *p = (uint64_t *)pa;                  /* zero on the way out, like the bump path */
         for (int i = 0; i < 512; i++) p[i] = 0;
@@ -969,6 +999,25 @@ static int copy_user_str(uint64_t cr3, uint64_t uptr, char *kbuf, int max) {
  * last thread has left it (or, in the leakcheck, spaces that were never
  * installed at all).
  * ========================================================================== */
+/* v0.45: a data leaf must not be freed if it is a registered device's MMIO
+ * frame — found live, the hard way, while verifying this milestone's
+ * cmd_kproc_stress: page_free_tree's original design (v0.42) assumed every
+ * passthrough MMIO leaf carries a physaddr OUTSIDE the frame pool, so
+ * free_frame()'s own frame_in_pool() check would silently reject it. That
+ * holds for real hardware (a PCI BAR lives far outside RAM), but cmd_
+ * passthrough's demo device ("sensor0") stands in for a register file with
+ * `alloc_frame()` — i.e. its "MMIO" physaddr IS pool RAM. Multiple processes
+ * granted passthrough to that SAME device each map the SAME physical page,
+ * and each one's page_free_tree call would free it independently on exit:
+ * a genuine double-free of shared device memory (confirmed with a shadow
+ * free-bit added during this investigation — TRUE DOUBLE-FREE at the
+ * demo device's own physaddr, triggered by cmd_dma_stress's four sensor0
+ * grantees exiting through the modern path once kproc recycling made that
+ * a live path for the first time). A leaf frame belonging to ANY registered
+ * kdev is never process-private, real hardware or not — checked explicitly
+ * here rather than relying on frame_in_pool() to reject it. */
+static inline int frame_is_device_mmio(uint64_t pa) { return kdev_find(pa) != 0; }
+
 static uint64_t page_free_tree(uint64_t pml4_phys) {
     uint64_t freed = 0;
     uint64_t *pml4 = (uint64_t *)(pml4_phys & ADDR_MASK);
@@ -984,7 +1033,10 @@ static uint64_t page_free_tree(uint64_t pml4_phys) {
             if (pdpt[i3] & PTE_HUGE) {                     /* 1 GiB data leaf: 512*512 frames */
                 uint64_t b = pdpt[i3] & ADDR_MASK;
                 if (!is_surf)
-                    for (uint64_t k = 0; k < 512ull * 512; k++) freed += free_frame(b + k * 0x1000);
+                    for (uint64_t k = 0; k < 512ull * 512; k++) {
+                        uint64_t f = b + k * 0x1000;
+                        if (!frame_is_device_mmio(f)) freed += free_frame(f);
+                    }
                 pdpt[i3] = 0; continue;
             }
             uint64_t *pd = (uint64_t *)(pdpt[i3] & ADDR_MASK);
@@ -993,15 +1045,22 @@ static uint64_t page_free_tree(uint64_t pml4_phys) {
                 if (pd[i2] & PTE_HUGE) {                    /* 2 MiB data leaf: 512 frames     */
                     uint64_t b = pd[i2] & ADDR_MASK;
                     if (!is_surf)
-                        for (uint64_t k = 0; k < 512; k++) freed += free_frame(b + k * 0x1000);
+                        for (uint64_t k = 0; k < 512; k++) {
+                            uint64_t f = b + k * 0x1000;
+                            if (!frame_is_device_mmio(f)) freed += free_frame(f);
+                        }
                     pd[i2] = 0; continue;
                 }
                 uint64_t *pt = (uint64_t *)(pd[i2] & ADDR_MASK);
                 for (int i1 = 0; i1 < 512; i1++) {
                     if (!(pt[i1] & PTE_PRESENT)) continue;
-                    /* 4 KiB leaf: MMIO self-excludes via frame_in_pool(); the   */
-                    /* surface window self-excludes here (g_surf_free[] owns it) */
-                    if (!is_surf) freed += free_frame(pt[i1] & ADDR_MASK);
+                    /* 4 KiB leaf: a real device's MMIO self-excludes via        */
+                    /* frame_in_pool() too, but frame_is_device_mmio() is now    */
+                    /* the actual guarantee — it holds even for the demo device, */
+                    /* whose "MMIO" physaddr is ordinary pool RAM. The surface   */
+                    /* window self-excludes here (g_surf_free[] owns it).       */
+                    uint64_t f = pt[i1] & ADDR_MASK;
+                    if (!is_surf && !frame_is_device_mmio(f)) freed += free_frame(f);
                     pt[i1] = 0;
                 }
                 freed += free_frame((uint64_t)pt);         /* the PT frame                    */
@@ -1242,10 +1301,27 @@ struct kproc {
     /* v0.44: DMA/IOMMU grant table (see struct dma_grant above)               */
     struct dma_grant dma_grants[MAX_DMA_GRANTS];
     uint32_t          dma_grant_count;   /* active grants right now            */
+    /* v0.45: `exited` is set EARLY in every exit path (right after the ring-3
+     * excursion returns) so watchdogs elsewhere see completion without
+     * waiting on this core's own descriptor/DMA/page-table teardown — that
+     * was fine as long as nothing ever reused the slot on that signal alone.
+     * kproc_spawn's recycler needs the TRUE end of teardown: torn_down is set
+     * once, last, only after page_free_tree returns. Recycling on `exited`
+     * instead would let a new occupant's create_address_space() overwrite
+     * `cr3` while another core's page_free_tree(kprocs[p].cr3) was still
+     * mid-walk on the OLD address space — it would then walk and free the
+     * NEW, live process's frames instead, corrupting the free-list. */
+    volatile int      torn_down;
 };
 #define MAX_KPROC 64                  /* v0.41: +6 cio workers; v0.43: +10 smp_stress workers */
 static struct kproc kprocs[MAX_KPROC];
 static int n_kproc = 0;
+/* v0.45: pid identity is now separate from slot index — a recycled slot
+ * must never hand out a pid a still-live reference could mistake for the
+ * process that used to occupy it. Monotonic across the whole boot; 0 is
+ * never a valid pid (used as a "no process" sentinel elsewhere), so the
+ * wraparound skips it. */
+static uint64_t g_next_pid = 1;
 
 /* Diagnostic-only: kproc index -> pid, bounds-checked (proc_idx is untrusted
  * at a fault: the very thing being debugged may be a stale/out-of-range
@@ -1253,6 +1329,38 @@ static int n_kproc = 0;
 static uint64_t dbg_pid_of(uint64_t proc_idx) {
     if (proc_idx >= (uint64_t)n_kproc) return 0;
     return kprocs[proc_idx].pid;
+}
+
+/* v0.45: clears every field of a kproc slot's PER-PROCESS lifetime state —
+ * identity, address-space handle, scheduling state, and the v0.44 DMA grant
+ * table — so the slot is indistinguishable from a never-used one before its
+ * next occupant is installed. Deliberately does NOT touch anything kernel-
+ * global: the frame allocator, VFS/CAS tables, the IOMMU domain tables, or
+ * the kernel's own PML4 identity map. Those are reclaimed by their own
+ * dedicated teardown (descriptor_teardown_kproc, dma_teardown_kproc,
+ * page_free_tree) BEFORE this ever runs — kproc_reset only blanks the
+ * bookkeeping struct itself, once nothing outside it still points in.      */
+static void kproc_reset(struct kproc *p) {
+    p->pid = 0;
+    p->name[0] = 0;
+    p->caps = 0;
+    p->cr3 = 0;
+    p->used = false;
+    p->role = 0;
+    p->dma_next = 0;
+    p->exit_code = 0;
+    p->exited = 0;
+    p->entry = 0;
+    p->pstate = 0;
+    p->migrate_to = -1;
+    p->uctx = (struct uctx){0};
+    p->ran_on = 0;
+    p->finish_seq = 0;
+    p->dispatches = 0;
+    p->frames_freed = 0;
+    for (int g = 0; g < MAX_DMA_GRANTS; g++) p->dma_grants[g].used = 0;
+    p->dma_grant_count = 0;
+    p->torn_down = 0;
 }
 
 /* Called from syscall_entry's shared epilogue (boot/usermode.asm), for BOTH
@@ -1273,26 +1381,39 @@ void dbg_syscall_exit(uint64_t saved_rip, uint64_t saved_rsp) {
  * per-thread on top: sched_switch_to saves/restores the BSP's slot per PCB.  */
 
 static int kproc_spawn(const char *name, uint64_t caps) {
-    if (n_kproc >= MAX_KPROC) return -1;
-    int i = n_kproc++;
-    kprocs[i].pid  = (uint64_t)i + 1;
+    /* v0.45: a slot is safe to recycle only once torn_down is set — NOT on
+     * `exited` alone. `exited` flips true early in every exit path (right
+     * after the ring-3 excursion returns, before that core has run
+     * descriptor_teardown_kproc/dma_teardown_kproc/page_free_tree), so a
+     * scan keyed on `exited` could grab a slot while another core's
+     * page_free_tree(kprocs[s].cr3) was still walking the OLD address space
+     * — this function would then overwrite `cr3` with a fresh one out from
+     * under it, and that in-flight page_free_tree would free the NEW,
+     * live process's frames instead (corrupts the free-list — caught live
+     * running cmd_kproc_stress while building this milestone). torn_down is
+     * set once, last, strictly after page_free_tree returns, so waiting on
+     * it makes recycling wait for the full teardown chain, not just the
+     * excursion's return. First-fit ascending scan: no ordering property is
+     * needed here (unlike the surface free list's LIFO, there is no "most
+     * recent" kproc slot worth preferring). */
+    int i = -1, recycled = 0;
+    for (int s = 0; s < n_kproc; s++)
+        if (kprocs[s].used && kprocs[s].torn_down) { i = s; recycled = 1; break; }
+    if (i < 0) {
+        if (n_kproc >= MAX_KPROC) return -1;
+        i = n_kproc++;
+    }
+    kproc_reset(&kprocs[i]);
+    uint64_t pid = g_next_pid++;
+    if (!g_next_pid) g_next_pid = 1;      /* wrap-safe: pid 0 is never valid */
+    kprocs[i].pid  = pid;
     kstrcpy_n(kprocs[i].name, name, sizeof kprocs[i].name);
     kprocs[i].caps = caps;
     kprocs[i].cr3  = create_address_space();
     kprocs[i].used = true;
-    kprocs[i].role = 0;
-    kprocs[i].dma_next = 0;
-    kprocs[i].exit_code = 0;
-    kprocs[i].exited = 0;
-    kprocs[i].entry = 0;
-    kprocs[i].pstate = 0;
-    kprocs[i].migrate_to = -1;
-    kprocs[i].ran_on = 0;
-    kprocs[i].finish_seq = 0;
-    kprocs[i].dispatches = 0;
-    kprocs[i].frames_freed = 0;
-    for (int g = 0; g < MAX_DMA_GRANTS; g++) kprocs[i].dma_grants[g].used = 0;
-    kprocs[i].dma_grant_count = 0;
+    if (g_debug_kproc_lifetime)
+        kprintf("[dbgkpr ] spawn: slot %d %s -> pid %u '%s' caps %X\n",
+                i, recycled ? "RECYCLED" : "fresh", pid, name, caps);
     kprintf("[kernel ] spawned pid %u '%s' caps %X — private PML4 @ phys %X\n",
             kprocs[i].pid, name, caps, kprocs[i].cr3);
     return i;
@@ -1343,6 +1464,7 @@ static void iommu_domain_add_page(int proc_idx, uint64_t pa);      /* fwd: live 
 static int  dma_grant_create(struct kproc *p, uint64_t phys, uint64_t size,
                               uint32_t flags, uint16_t bdf);        /* fwd: v0.44 grant table */
 static void dma_grant_revoke(struct kproc *p, struct dma_grant *g); /* fwd: v0.44 grant table */
+static void descriptor_teardown_kproc(int proc_idx);   /* fwd: v0.45 fd/descriptor teardown, defined after g_ofiles */
 
 /* v0.31: surface lifecycle. The frame allocator is a bump allocator with no
  * general free, so reclaimed pixel buffers go on a small chunk list that
@@ -3340,6 +3462,51 @@ static int vfs_open_for(const char *name, int owner) {
 }
 static int vfs_open(const char *name) { return vfs_open_for(name, (int)current_proc_idx); }
 
+/* ===========================================================================
+ * v0.45: DESCRIPTOR TEARDOWN — the fd-leak half of kproc lifetime discipline
+ * ===========================================================================
+ * The one gap every exit path left open through v0.44: g_ofiles[] entries
+ * are owner-tagged (v0.41) but were ONLY ever released by the owning
+ * process's own SYS_CLOSE call. A process that never reaches that call —
+ * terminated by a fault in handle_cpl3_fault instead of running to its own
+ * SYS_EXIT — left its fd permanently marked used, attributed to a kproc
+ * slot that (as of this milestone) can be recycled out from under it: the
+ * next process to land in that slot would NOT inherit the fd (ownership is
+ * checked by slot index, and the new occupant gets a fresh one), but the
+ * leaked g_ofiles entry itself would sit there forever, one of 16 possible
+ * descriptors gone for the life of the boot. Surfaces already had this exact
+ * guarantee since v0.41 (surfaces_reclaim, called at every exit site); this
+ * closes the same class of gap for file descriptors. Called from every exit
+ * path immediately before dma_teardown_kproc, so a descriptor never survives
+ * past the process that opened it — whether that process exited cleanly,
+ * faulted, or is about to have its slot handed to someone else.            */
+static void descriptor_teardown_kproc(int proc_idx) {
+    struct kproc *p = &kprocs[proc_idx];
+    int before = 0, after = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++)
+        if (g_ofiles[fd].used && g_ofiles[fd].owner == proc_idx) before++;
+    for (int fd = 0; fd < 16; fd++) {
+        if (!g_ofiles[fd].used || g_ofiles[fd].owner != proc_idx) continue;
+        if (g_debug_kproc_lifetime)
+            kprintf("[dbgkpr ] pid %u slot %d: force-closing fd %d (dirent %d) — never reached SYS_CLOSE\n",
+                    p->pid, proc_idx, fd, g_ofiles[fd].dirent);
+        g_ofiles[fd].used = 0; g_ofiles[fd].owner = -1;
+    }
+    for (int fd = 0; fd < 16; fd++)
+        if (g_ofiles[fd].used && g_ofiles[fd].owner == proc_idx) after++;
+    klock_release(&g_ofile_lock);
+
+    if (g_debug_kproc_lifetime)
+        kprintf("[dbgkpr ] pid %u slot %d: descriptors before=%d after=%d, DMA grants=%u\n",
+                p->pid, proc_idx, before, after, (uint64_t)p->dma_grant_count);
+    if (after != 0) {                                     /* must be unreachable  */
+        kprintf("\n[panic ] pid %u slot %d: %d descriptor(s) still owned after teardown\n",
+                p->pid, proc_idx, after);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+}
+
 /* Validate the C++ ring object is live in the boot image.                     */
 static void cpp_ring_selftest(void) {
     cpp_ring_init();
@@ -3534,8 +3701,10 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     write_cr3(kernel_cr3);                   /* off this space before tearing it down */
     /* v0.42: this is the BSP's OWN thread giving up its OWN address space —   */
     /* cr3 just changed away from it above, so it is safe to dismantle now.    */
+    descriptor_teardown_kproc((int)t->proc); /* v0.45: force-close any leaked fd FIRST */
     dma_teardown_kproc((int)t->proc);        /* v0.44: revoke DMA/IOMMU grants FIRST */
     kprocs[t->proc].frames_freed = page_free_tree(kprocs[t->proc].cr3);
+    kprocs[t->proc].torn_down = 1;      /* v0.45: NOW the slot is safe to recycle */
     kprintf("[uthread] tid %d pid %u '%s' exited (code %u) — thread reaped, %u frame(s) reclaimed\n",
             (uint64_t)t->id, kprocs[t->proc].pid, t->name, code, kprocs[t->proc].frames_freed);
     t->state = T_FREE;                       /* never scheduled again           */
@@ -3906,8 +4075,10 @@ static void cpu_exec_proc(int c, int p) {
         /* tear it all the way down. page_free_tree is not a klock: it is safe  */
         /* to call with interrupts on, exactly like the frame allocator it      */
         /* drives underneath.                                                   */
+        descriptor_teardown_kproc(p);           /* v0.45: force-close any leaked fd FIRST */
         dma_teardown_kproc(p);                 /* v0.44: revoke DMA/IOMMU grants FIRST */
         kprocs[p].frames_freed = page_free_tree(kprocs[p].cr3);
+        kprocs[p].torn_down = 1;           /* v0.45: NOW the slot is safe to recycle */
         __asm__ volatile("cli");
     }
     __asm__ volatile("sti");
@@ -5186,8 +5357,13 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         kprocs[t->proc].exited = 1;
         /* v0.42: write_cr3(kernel_cr3) already ran above, before this branch — */
         /* the faulting space is off every core, so tear it down here too.      */
+        /* v0.45: this is the ONE path that could previously leak a descriptor  */
+        /* forever — a fault mid-syscall means the process's own SYS_CLOSE     */
+        /* never runs. descriptor_teardown_kproc force-closes it here instead.  */
+        descriptor_teardown_kproc((int)t->proc);
         dma_teardown_kproc((int)t->proc);      /* v0.44: revoke DMA/IOMMU grants FIRST */
         kprocs[t->proc].frames_freed = page_free_tree(kprocs[t->proc].cr3);
+        kprocs[t->proc].torn_down = 1;      /* v0.45: NOW the slot is safe to recycle */
         kprintf("[uthread] faulting tid %d terminated — siblings and kernel unaffected, %u frame(s) reclaimed\n",
                 (uint64_t)t->id, kprocs[t->proc].frames_freed);
         t->state = T_FREE;
@@ -5738,6 +5914,198 @@ static void cmd_leakcheck(void) {
     kprintf("[leakchk] RESULT: %d passed, %d failed\n", (uint64_t)g_lkpass, (uint64_t)g_lkfail);
     if (!g_lkfail) kputs("[leakchk] LEAK CHECK VERIFIED — page_free_tree returns every private frame, every time\n");
     else          kputs("[leakchk] LEAK CHECK DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.45: KPROC STRESS — 200 spawn/run/exit cycles prove slots truly recycle
+ * ===========================================================================
+ * Every earlier stress suite (smp_stress, dma_stress) spawns its whole batch
+ * ONCE and never asks kproc_spawn for another slot afterward, so none of them
+ * ever touches the recycle branch this milestone adds to kproc_spawn. This
+ * suite is built specifically to hit it, repeatedly: KPSTRESS_CYCLES batches
+ * of three workers each — one cio/VFS worker (role 9: exercises VFS/CAS and,
+ * transitively, virtio-blk, since vfs_write_locked/vfs_read_file both call
+ * straight into virtio_write_block/virtio_read_block), one surface-churn
+ * worker (role 10), one DMA-churn worker (role 11) — spawned, run to
+ * completion and reaped before the NEXT cycle's kproc_spawn calls run. Once
+ * the table has filled once, every later cycle's spawns land on a RECYCLED
+ * slot, not a fresh one — the exact path smp_stress/dma_stress never touch.
+ *
+ * "Kill in random order": OutrunOS still has no kill syscall (unchanged since
+ * v0.44's cmd_dma_stress) — every worker terminates itself via its own
+ * SYS_EXIT. Pushed across every online core with rq_push, a cycle's three
+ * workers finish in whatever order the scheduler's own timing produces, not
+ * launch order — the same proxy for "termination order is not the harness's
+ * to control" this codebase has used since v0.39's finish_seq.
+ *
+ * virtio-net is deliberately NOT one of this suite's roles: its only ring-3
+ * driver (role 1, nic_driver) does raw, unsynchronized MMIO register writes
+ * bringing up the ONE real, non-process-isolated NIC from reset — running
+ * several of those concurrently and recycling them through 200 cycles would
+ * race live hardware state for no proof this milestone needs. It stays
+ * exercised exactly once, unchanged, through the existing cmd_nicdriver
+ * path.
+ *
+ * The role-9 (cio/VFS) worker is capped to the first KPSTRESS_VFS_CYCLES
+ * cycles, not all 200. cio_file_worker (user/init.c) names its own file
+ * from its OWN pid, and VFS files are durable, global, and never deleted —
+ * confirmed in v0.44 (cmd_cas's own log line: "state persisted to disk").
+ * Every cycle's role-9 worker therefore claims a BRAND NEW, permanent
+ * VFS_MAXFILES (24) directory slot, unlike its kproc slot, its DMA grants,
+ * or its surface buffer, none of which are global — those three genuinely
+ * recycle every cycle, which is exactly what the rest of this suite spends
+ * all 200 cycles proving. Running full VFS churn for 200 cycles would need
+ * ~200 dirents, and growing VFS_MAXFILES to accommodate an intentionally
+ * bounded stress loop would fight the very discipline this milestone is
+ * proving, so cio/VFS/CAS coverage here is deliberately bounded instead —
+ * still real, still through the modern exit path, still with proper
+ * descriptor teardown and kproc recycling, just not unbounded. */
+#define KPSTRESS_CYCLES     200
+#define KPSTRESS_VFS_CYCLES 6     /* well within the ~8 dirents free by this point */
+static int g_kppass, g_kpfail;
+static void kpcheck(const char *n, int c) {
+    if (c) { g_kppass++; kprintf("[kpstrs]  PASS  %s\n", n); }
+    else   { g_kpfail++; kprintf("[kpstrs]  FAIL  %s\n", n); }
+}
+
+static void cmd_kproc_stress(void) {
+    kputs("-- KPROC STRESS: 200 spawn/run/exit cycles across surface/DMA roles (+ cio/VFS for the first few) --\n");
+    g_kppass = g_kpfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+
+    static uint8_t seen_slot[MAX_KPROC];
+    int distinct_slots = 0, recycled_spawns = 0;
+    int cycles_ok = 1, grants_ok = 1, domains_ok = 1, fds_ok = 1, aborted = 0;
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    static uint8_t stbuf[CIO_LEN];
+
+    int cyc;
+    for (cyc = 0; cyc < KPSTRESS_CYCLES; cyc++) {
+        int with_vfs = cyc < KPSTRESS_VFS_CYCLES;
+        int nworkers = with_vfs ? 3 : 2;
+        uint64_t role_batch[3];
+        if (with_vfs) { role_batch[0] = 9; role_batch[1] = 10; role_batch[2] = 11; }
+        else          { role_batch[0] = 10; role_batch[1] = 11; }
+
+        int procs[3];
+        int spawn_failed = 0;
+        for (int i = 0; i < nworkers; i++) {
+            uint64_t role = role_batch[i];
+            uint64_t caps = role == 9  ? PCAP_FILESYSTEM
+                          : role == 10 ? PCAP_FRAMEBUFFER
+                          : (PCAP_HW_PASSTHROUGH | kdevs[g_demo_dev_index].req);
+            int p = kproc_spawn("kp-stress", caps);
+            if (p < 0) { spawn_failed = 1; break; }
+            if (seen_slot[p]) recycled_spawns++;
+            else { seen_slot[p] = 1; distinct_slots++; }
+            kprocs[p].role = role;
+            uint64_t entry = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+            current_proc_idx = save;
+            if (!entry) { spawn_failed = 1; break; }
+            kprocs[p].entry = entry;
+            procs[i] = p;
+            if (role == 9) {
+                char nm[16]; cio_name(nm, kprocs[p].pid);
+                for (int j = 0; j < CIO_LEN; j++) stbuf[j] = cio_byte(kprocs[p].pid, 255, j);
+                vfs_write_file(nm, stbuf, CIO_LEN);
+            }
+        }
+        if (spawn_failed) { aborted = 1; break; }
+
+        if (n > 1) {
+            for (int i = 0; i < nworkers; i++) rq_push(i % n, procs[i]);
+            __sync_synchronize();
+            lapic_ipi(0, IPI_PING, 1);
+            int p;
+            while ((p = rq_pop(0)) >= 0) cpu_exec_proc(0, p);
+        } else {
+            for (int i = 0; i < nworkers; i++) cpu_exec_proc(0, procs[i]);
+        }
+
+        /* v0.45: wait for torn_down, NOT exited — this suite is about to hand
+         * these exact slots back to kproc_spawn on the next cycle, and
+         * exited flips true before this task's own core has run
+         * descriptor_teardown_kproc/dma_teardown_kproc/page_free_tree. See
+         * the comment on kproc_spawn's recycle scan for the corruption this
+         * would otherwise race. */
+        uint64_t t0 = g_ticks;
+        for (;;) {
+            int all = 1;
+            for (int i = 0; i < nworkers; i++) if (!kprocs[procs[i]].torn_down) all = 0;
+            if (all || g_ticks - t0 > 2000) break;
+            if (n > 1) lapic_ipi(0, IPI_PING, 1);
+            uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
+        }
+        current_proc_idx = save;
+
+        int cyc_ok = 1, cyc_grants = 1, cyc_domains = 1;
+        for (int i = 0; i < nworkers; i++) {
+            struct kproc *k = &kprocs[procs[i]];
+            if (!k->exited || k->exit_code != k->pid) cyc_ok = 0;
+            if (k->dma_grant_count != 0) cyc_grants = 0;
+            if (g_proc_slpt[procs[i]] != 0) cyc_domains = 0;
+        }
+        int cyc_fds = 0;
+        klock_acquire(&g_ofile_lock);
+        for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) cyc_fds++;
+        klock_release(&g_ofile_lock);
+
+        if (!cyc_ok) cycles_ok = 0;
+        if (!cyc_grants) grants_ok = 0;
+        if (!cyc_domains) domains_ok = 0;
+        if (cyc_fds != 0) fds_ok = 0;
+
+        if (!cyc_ok || !cyc_grants || !cyc_domains || cyc_fds != 0) {
+            kprintf("[kpstrs] cycle %d FAILED: ok=%d grants=%d domains=%d fds_leaked=%d\n",
+                    cyc, cyc_ok, cyc_grants, cyc_domains, cyc_fds);
+            for (int i = 0; i < nworkers; i++) {
+                struct kproc *k = &kprocs[procs[i]];
+                kprintf("[kpstrs]   slot %d pid %u role %u: exit %u (want %u) grants=%u slpt=%X\n",
+                        procs[i], k->pid, k->role, k->exit_code, k->pid,
+                        (uint64_t)k->dma_grant_count, g_proc_slpt[procs[i]]);
+            }
+        } else if ((cyc % 50) == 49) {
+            kprintf("[kpstrs] cycle %d/%d clean (slots seen so far: %d, recycled spawns: %d)\n",
+                    cyc + 1, (uint64_t)KPSTRESS_CYCLES, distinct_slots, recycled_spawns);
+        }
+    }
+
+    kpcheck("kproc_spawn never failed mid-storm (recycling kept the table from exhausting)",
+            !aborted && cyc == KPSTRESS_CYCLES);
+    kpcheck("every cycle's workers exited cleanly (exit == pid, recycled or fresh alike)", cycles_ok);
+    kpcheck("no stale DMA grants survived any cycle's teardown", grants_ok);
+    kpcheck("no stale IOMMU domain (g_proc_slpt) survived any cycle's teardown", domains_ok);
+    kpcheck("no descriptor leaked past any cycle (open-file table fully released each time)", fds_ok);
+    kpcheck("recycling actually happened (>= 1 spawn reused an already-seen slot)",
+            recycled_spawns > 0);
+    kpcheck("distinct slots used stayed within MAX_KPROC (the table never grew past its cap)",
+            distinct_slots <= MAX_KPROC);
+
+    int surf_leaked = 0;
+    klock_acquire(&g_surf_lock);
+    for (int i = 0; i < 8; i++) if (g_surf[i].used && g_surf[i].owner >= 0 &&
+                                     g_surf[i].owner < n_kproc && kprocs[g_surf[i].owner].exited)
+        surf_leaked++;
+    klock_release(&g_surf_lock);
+    kpcheck("no stale surface buffer still owned by an exited worker", surf_leaked == 0);
+
+    uint64_t freed_total = g_frames_freed - freed0, reused_total = g_frames_reused - reused0;
+    kprintf("[kpstrs] %d cycles (%d total spawns, %d distinct slots, %d recycled): "
+            "+%u freed, +%u reused; global depth %u\n",
+            cyc, distinct_slots + recycled_spawns, distinct_slots, recycled_spawns,
+            freed_total, reused_total, g_frame_free_depth);
+    kpcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    kpcheck("the frame allocator's leaf lock never triggered a rank violation (no double-free race)",
+            g_rank_violations == viol0);
+
+    kprintf("[kpstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_kppass, (uint64_t)g_kpfail);
+    if (!g_kpfail)
+        kputs("[kpstrs] KPROC STRESS VERIFIED — slots recycle, every descriptor/grant/domain/surface torn down, no drift across 200 cycles\n");
+    else kputs("[kpstrs] KPROC STRESS DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -8380,6 +8748,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "smpstress")) cmd_smp_stress();
     else if (!kstrcmp(argv[0], "dmastress")) cmd_dma_stress();
     else if (!kstrcmp(argv[0], "leakcheck")) cmd_leakcheck();
+    else if (!kstrcmp(argv[0], "kpstress")) cmd_kproc_stress();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -8531,6 +8900,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_smp_stress();       /* v0.43: mixed syscall/VFS/compositor workload, every core   */
     cmd_dma_stress();       /* v0.44: real DMA/IOMMU grants revoked across genuine exit    */
     cmd_leakcheck();        /* v0.42: heavy spawn/destroy proves 100% frame reclamation  */
+    cmd_kproc_stress();     /* v0.45: 200-cycle kproc/descriptor recycle stress          */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
