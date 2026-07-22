@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.45.0-metal"
+#define KERNEL_VERSION "0.46.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -478,6 +478,7 @@ static volatile int g_debug_syscall_exit = 0;   /* DEBUG_SYSCALL_EXIT: log every
 static volatile int g_debug_smp_sched    = 0;   /* DEBUG_SMP_SCHED: pick/switch/idle log  */
 static volatile int g_debug_dma_lifetime = 0;   /* DEBUG_DMA_LIFETIME: grant create/revoke */
 static volatile int g_debug_kproc_lifetime = 0; /* DEBUG_KPROC_LIFETIME: recycle/descriptor teardown */
+static volatile int g_debug_ipc = 0;            /* DEBUG_IPC: send/recv/xfer/teardown log            */
 
 /* user-stack layout (used by the guard-page fault check in isr_dispatch) */
 #define USTK_V     0x0000500000FF0000ull                  /* user stack bottom       */
@@ -902,6 +903,29 @@ static int translate(uint64_t pml4_phys, uint64_t vaddr, uint64_t *out_phys) {
     return 1;
 }
 
+/* v0.46: clears one 4 KiB leaf PTE, leaving the structural PDPT/PD/PT frames
+ * alone (map_page creates them on demand; page_free_tree reclaims them
+ * normally when the rest of the process goes down). A no-op, not an error,
+ * if the vaddr was never actually mapped — used by IPC shared-memory
+ * teardown to drop a mapping that may only ever have been RESERVED, never
+ * installed (a message queued but never RECV'd). Doing this BEFORE
+ * page_free_tree runs is what keeps a shared frame from being double-freed
+ * the same way an unguarded hardware-passthrough MMIO leaf was in v0.45 —
+ * except here the fix is to make the leaf simply not present anymore,
+ * rather than teach page_free_tree a second exception list. */
+static void unmap_page(uint64_t pml4_phys, uint64_t vaddr) {
+    uint64_t i4 = (vaddr >> 39) & 0x1FF, i3 = (vaddr >> 30) & 0x1FF;
+    uint64_t i2 = (vaddr >> 21) & 0x1FF, i1 = (vaddr >> 12) & 0x1FF;
+    uint64_t *pml4 = (uint64_t *)(pml4_phys & ADDR_MASK);
+    if (!(pml4[i4] & PTE_PRESENT)) return;
+    uint64_t *pdpt = (uint64_t *)(pml4[i4] & ADDR_MASK);
+    if (!(pdpt[i3] & PTE_PRESENT) || (pdpt[i3] & PTE_HUGE)) return;
+    uint64_t *pd = (uint64_t *)(pdpt[i3] & ADDR_MASK);
+    if (!(pd[i2] & PTE_PRESENT) || (pd[i2] & PTE_HUGE)) return;
+    uint64_t *pt = (uint64_t *)(pd[i2] & ADDR_MASK);
+    pt[i1] = 0;
+}
+
 /* ---- Return the leaf PTE (with flags) for a vaddr, or 0 if not present ----- */
 static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
     uint64_t i4 = (vaddr >> 39) & 0x1FF, i3 = (vaddr >> 30) & 0x1FF;
@@ -1243,6 +1267,7 @@ static uint64_t create_address_space(void) {
 #define PCAP_CONTROLLER     (1ull << 3)
 #define PCAP_FILESYSTEM     (1ull << 5)
 #define PCAP_FRAMEBUFFER    (1ull << 6)
+#define PCAP_IPC             (1ull << 7)    /* v0.46: required for any SYS_IPC_* call */
 
 /* v0.39: a COMPLETE ring-3 register context. The preempt IPI (vector 50)
  * captures the interrupted user state here straight from the isr_frame, and
@@ -3200,7 +3225,9 @@ static int     g_cas_mounted = 0;
 #define SB ((struct cas_superblock *)g_sbblk)
 
 /* --- VFS directory: names -> content, layered on CAS ---------------------- */
-#define VFS_MAXFILES   24                     /* v0.43: +4 headroom for smp_stress workers */
+#define VFS_MAXFILES   26                     /* v0.43: +4 for smp_stress; v0.46: +2 fixed, */
+                                               /* reused, non-growing names ("ipc-payload", */
+                                               /* "ipc-peer") for cmd_ipc_stress             */
 #define VFS_MAX_CHUNKS 16                     /* 16 * 512 = 8 KiB max file       */
 struct dirent {
     char     name[32];
@@ -3507,6 +3534,205 @@ static void descriptor_teardown_kproc(int proc_idx) {
     }
 }
 
+/* ===========================================================================
+ * v0.46: CAPABILITY-BOUND IPC & SHARED-MEMORY MESSAGING
+ * ===========================================================================
+ * A fixed-size mailbox per kproc slot (g_ipc_q[], indexed the same way
+ * g_proc_slpt[]/g_surf[].owner already are) plus a small global pool of
+ * shared physical frames (g_ipc_shm[]). A VFS file descriptor or a shared
+ * memory frame can ride along in a message and change hands without ever
+ * copying the underlying bytes:
+ *
+ *   - a transferred fd is a straight ownership reassignment of the EXISTING
+ *     g_ofiles[] entry (only the `owner` slot index moves; the dirent/CAS
+ *     blocks behind it never move). Ownership moves at SEND time, not RECV
+ *     time — exactly like handing someone a key: v0.45's
+ *     descriptor_teardown_kproc already force-closes any fd owned by a
+ *     dying slot regardless of how it got there, so a recipient who dies
+ *     before ever calling SYS_IPC_RECV still can't leak it.
+ *   - a shared frame is a NEW mechanism, deliberately distinct from v0.44's
+ *     struct dma_grant: dma_grant is bound to ONE process's IOMMU domain
+ *     (device isolation, not general RAM sharing), and re-architecting it
+ *     to support a second simultaneous owner is out of scope and would
+ *     conflate two different kinds of isolation. ipc_shmem is a small pool
+ *     of alloc_frame() pages, refcounted via a per-slot bitmask (MAX_KPROC
+ *     == 64 fits exactly in one uint64_t), mapped into each holder's OWN
+ *     address space at a fixed, id-derived vaddr (IPC_SHM_V + id*0x1000) —
+ *     genuinely zero-copy: two processes read and write the SAME physical
+ *     page, the kernel only ever touches the mapping, never the payload.
+ *
+ * Exactly the double-free hazard v0.45 fixed for hardware-passthrough MMIO
+ * applies here too: a shared frame is a present PTE in every holder's OWN
+ * page tables, so page_free_tree would try to free it right along with
+ * that process's private memory the moment two processes shared one.
+ * ipc_teardown_kproc runs BEFORE page_free_tree (like descriptor_teardown_
+ * kproc and dma_teardown_kproc) and explicitly unmap_page()s the holder's
+ * mapping first — by the time page_free_tree walks, the PTE is simply gone,
+ * not present, nothing to double-free. */
+#define IPC_INLINE_MAX 64
+#define IPC_QLEN        8
+#define IPC_MSG_DATA     0    /* plain message, no descriptor transfer     */
+#define IPC_MSG_XFER_FD  1    /* xfer_handle is a VFS fd the sender owns   */
+#define IPC_MSG_XFER_SHM 2    /* xfer_handle is an ipc_shmem id (-1 = new) */
+
+struct ipc_msg {
+    uint64_t sender_pid;
+    uint64_t recipient_pid;
+    uint32_t msg_type;                    /* IPC_MSG_* above                */
+    uint32_t cap_mask;                    /* capability the RECIPIENT needs */
+    uint32_t payload_len;                 /* bytes of inline_data valid     */
+    int64_t  xfer_handle;                 /* meaning depends on msg_type    */
+    /* For IPC_MSG_XFER_SHM, the kernel overwrites inline_data[0..8] on the
+     * copy handed back to BOTH the sender (right after SYS_IPC_SEND
+     * returns) and the recipient (right after SYS_IPC_RECV returns) with
+     * the little-endian vaddr the shared frame is mapped at in THEIR OWN
+     * address space — the same convention SYS_SURFACE_CREATE already uses
+     * (hand back where it landed, rather than a formula userspace must
+     * hardcode). For every other msg_type, inline_data is the caller's
+     * free-form payload. */
+    uint8_t  inline_data[IPC_INLINE_MAX];
+};
+
+struct ipc_queue {
+    struct ipc_msg msgs[IPC_QLEN];
+    uint32_t head, tail, count;            /* ring state; g_ipc_lock-owned  */
+};
+static struct ipc_queue g_ipc_q[MAX_KPROC];
+
+#define MAX_IPC_SHMEM 16
+#define IPC_SHM_V (0x0000540000000000ull)  /* fixed per-id window, one page each; far   */
+                                            /* from the passthrough/ELF/surface windows */
+struct ipc_shmem {
+    uint64_t phys;
+    uint64_t owner_mask;                   /* bit i set => kprocs[i] holds a mapping */
+    int      used;
+};
+static struct ipc_shmem g_ipc_shm[MAX_IPC_SHMEM];
+/* rank 6: the next free slot in the g_ofile(1)/g_vfs(2)/g_cas(3)/g_vblk(4)/g_surf(5)
+ * ranked-klock chain. Never acquired while already holding any of those —
+ * every IPC helper below takes g_ofile_lock (for fd transfer) as its own,
+ * separate, non-nested critical section, then g_ipc_lock as a second,
+ * later one, so the ascending-rank rule is never at risk of being broken
+ * by nesting the wrong way. (g_frame_lock's own "rank 6" comment is an
+ * unrelated raw spinlock, not part of this ranked array — no actual
+ * collision, just two independent numbering schemes that happen to reuse
+ * the same next integer.) */
+static struct klock g_ipc_lock = { 0, "ipc", 6, 0, 0 };
+
+static void ipc_queue_clear(int idx) {
+    struct ipc_queue *q = &g_ipc_q[idx];
+    q->head = q->tail = q->count = 0;
+}
+
+static int ipc_queue_push(int idx, const struct ipc_msg *m) {
+    klock_acquire(&g_ipc_lock);
+    struct ipc_queue *q = &g_ipc_q[idx];
+    if (q->count >= IPC_QLEN) { klock_release(&g_ipc_lock); return 0; }
+    q->msgs[q->tail] = *m;
+    q->tail = (q->tail + 1) % IPC_QLEN;
+    q->count++;
+    klock_release(&g_ipc_lock);
+    return 1;
+}
+
+static int ipc_queue_pop(int idx, struct ipc_msg *out) {
+    klock_acquire(&g_ipc_lock);
+    struct ipc_queue *q = &g_ipc_q[idx];
+    if (q->count == 0) { klock_release(&g_ipc_lock); return 0; }
+    *out = q->msgs[q->head];
+    q->head = (q->head + 1) % IPC_QLEN;
+    q->count--;
+    klock_release(&g_ipc_lock);
+    return 1;
+}
+
+/* pid is monotonic and slot-independent since v0.45; every IPC entry point
+ * needs to resolve a caller-supplied pid back to a live slot index. */
+static int kproc_find_by_pid(uint64_t pid) {
+    for (int i = 0; i < n_kproc; i++) if (kprocs[i].used && kprocs[i].pid == pid) return i;
+    return -1;
+}
+
+/* Grants recipient_idx access to shmem `want_id` (or a freshly allocated one
+ * if want_id < 0), setting its owner_mask bit — this is the reservation,
+ * completed atomically at SEND time, exactly like fd ownership moving at
+ * SEND time. Does NOT install any page-table mapping; that is
+ * ipc_shmem_map_self's job, called separately by whichever side (sender or
+ * recipient) actually wants to touch the memory right now. Returns the id,
+ * or -1 (bad id, or `want_id` wasn't the SENDER's to re-share). */
+static int64_t ipc_shmem_grant(int64_t want_id, int sender_idx, int recipient_idx) {
+    klock_acquire(&g_ipc_lock);
+    int64_t id = want_id;
+    int need_alloc = 0;
+    if (id < 0) {
+        id = -1;
+        for (int i = 0; i < MAX_IPC_SHMEM; i++) if (!g_ipc_shm[i].used) { id = i; break; }
+        if (id < 0) { klock_release(&g_ipc_lock); return -1; }
+        g_ipc_shm[id].used = 1;
+        g_ipc_shm[id].owner_mask = (1ull << sender_idx);
+        g_ipc_shm[id].phys = 0;                     /* filled in below, outside the lock */
+        need_alloc = 1;
+    } else if (id >= MAX_IPC_SHMEM || !g_ipc_shm[id].used ||
+               !(g_ipc_shm[id].owner_mask & (1ull << sender_idx))) {
+        klock_release(&g_ipc_lock);
+        return -1;                                  /* not the sender's to re-share      */
+    }
+    g_ipc_shm[id].owner_mask |= (1ull << recipient_idx);
+    klock_release(&g_ipc_lock);
+
+    if (need_alloc) {
+        uint64_t phys = alloc_frame();
+        klock_acquire(&g_ipc_lock);
+        g_ipc_shm[id].phys = phys;
+        klock_release(&g_ipc_lock);
+    }
+    return id;
+}
+
+/* Installs (or re-installs — idempotent) proc_idx's own mapping of a shmem
+ * it already holds a grant for. Safe to call speculatively; fails quietly
+ * if proc_idx isn't actually a grantee. */
+static int ipc_shmem_map_self(int proc_idx, int64_t id) {
+    if (id < 0 || id >= MAX_IPC_SHMEM) return -1;
+    klock_acquire(&g_ipc_lock);
+    int ok = g_ipc_shm[id].used && (g_ipc_shm[id].owner_mask & (1ull << proc_idx));
+    uint64_t phys = g_ipc_shm[id].phys;
+    klock_release(&g_ipc_lock);
+    if (!ok) return -1;
+    map_page(kprocs[proc_idx].cr3, IPC_SHM_V + (uint64_t)id * 0x1000, phys,
+             PTE_USER | PTE_WRITE | PTE_NX);
+    return 0;
+}
+
+/* Called from every kproc exit path, BEFORE descriptor_teardown_kproc —
+ * same ordering discipline v0.44/v0.45 established, extended one step
+ * earlier. Clears this slot's OWN inbound mailbox (a recycled slot must not
+ * start with stale messages) and releases every shared-frame grant this
+ * process held: unmap first (safe even if it was only ever reserved, never
+ * actually mapped — unmap_page on an unmapped vaddr is a no-op), then drop
+ * this process's owner bit, then free the physical frame once the LAST
+ * holder is gone. */
+static void ipc_teardown_kproc(int proc_idx) {
+    ipc_queue_clear(proc_idx);
+    for (int i = 0; i < MAX_IPC_SHMEM; i++) {
+        klock_acquire(&g_ipc_lock);
+        int held = g_ipc_shm[i].used && (g_ipc_shm[i].owner_mask & (1ull << proc_idx));
+        klock_release(&g_ipc_lock);
+        if (!held) continue;
+        unmap_page(kprocs[proc_idx].cr3, IPC_SHM_V + (uint64_t)i * 0x1000);
+        klock_acquire(&g_ipc_lock);
+        g_ipc_shm[i].owner_mask &= ~(1ull << proc_idx);
+        int last = g_ipc_shm[i].used && g_ipc_shm[i].owner_mask == 0;
+        uint64_t phys = g_ipc_shm[i].phys;
+        if (last) g_ipc_shm[i].used = 0;
+        klock_release(&g_ipc_lock);
+        if (g_debug_ipc)
+            kprintf("[dbgipc ] pid %u slot %d: released shmem id %d%s\n",
+                    kprocs[proc_idx].pid, proc_idx, i, last ? " (last holder, freeing frame)" : "");
+        if (last) free_frame(phys);
+    }
+}
+
 /* Validate the C++ ring object is live in the boot image.                     */
 static void cpp_ring_selftest(void) {
     cpp_ring_init();
@@ -3701,6 +3927,7 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     write_cr3(kernel_cr3);                   /* off this space before tearing it down */
     /* v0.42: this is the BSP's OWN thread giving up its OWN address space —   */
     /* cr3 just changed away from it above, so it is safe to dismantle now.    */
+    ipc_teardown_kproc((int)t->proc);        /* v0.46: release IPC mailbox/shmem FIRST */
     descriptor_teardown_kproc((int)t->proc); /* v0.45: force-close any leaked fd FIRST */
     dma_teardown_kproc((int)t->proc);        /* v0.44: revoke DMA/IOMMU grants FIRST */
     kprocs[t->proc].frames_freed = page_free_tree(kprocs[t->proc].cr3);
@@ -4075,6 +4302,7 @@ static void cpu_exec_proc(int c, int p) {
         /* tear it all the way down. page_free_tree is not a klock: it is safe  */
         /* to call with interrupts on, exactly like the frame allocator it      */
         /* drives underneath.                                                   */
+        ipc_teardown_kproc(p);                 /* v0.46: release IPC mailbox/shmem FIRST */
         descriptor_teardown_kproc(p);           /* v0.45: force-close any leaked fd FIRST */
         dma_teardown_kproc(p);                 /* v0.44: revoke DMA/IOMMU grants FIRST */
         kprocs[p].frames_freed = page_free_tree(kprocs[p].cr3);
@@ -5301,6 +5529,89 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         /* return the NEW back buffer's user vaddr — where the app draws next   */
         return SURF_USER_V + (uint64_t)(S->front ^ 1) * S->bufpages * 0x1000;
     }
+
+    /* --- v0.46: capability-bound IPC (require CAP_IPC) --------------------- */
+    case 18: {   /* SYS_IPC_SEND(msg_ptr) — capability-gated, zero-copy handle/frame transfer */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_IPC)) return (uint64_t)-13;
+        if (!access_ok(kprocs[current_proc_idx].cr3, a0, sizeof(struct ipc_msg), 0)) return (uint64_t)-14;
+        struct ipc_msg kmsg;
+        { const volatile uint8_t *s = (const volatile uint8_t *)a0; uint8_t *d = (uint8_t *)&kmsg;
+          for (uint64_t i = 0; i < sizeof kmsg; i++) d[i] = s[i]; }
+        if (kmsg.payload_len > IPC_INLINE_MAX) return (uint64_t)-1;
+        kmsg.sender_pid = kprocs[current_proc_idx].pid;   /* authoritative — never the caller's claim */
+        int rcpt = kproc_find_by_pid(kmsg.recipient_pid);
+        if (rcpt < 0) return (uint64_t)-9;                /* no such process (dead or never existed)  */
+
+        if (kmsg.msg_type == IPC_MSG_XFER_FD) {
+            if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+            int fd = (int)kmsg.xfer_handle;
+            klock_acquire(&g_ofile_lock);
+            int ok = fd >= 0 && fd < 16 && g_ofiles[fd].used && g_ofiles[fd].owner == (int)current_proc_idx;
+            if (ok) g_ofiles[fd].owner = rcpt;            /* ownership moves NOW, not at RECV  */
+            klock_release(&g_ofile_lock);
+            if (!ok) return (uint64_t)-9;
+        } else if (kmsg.msg_type == IPC_MSG_XFER_SHM) {
+            int64_t id = ipc_shmem_grant(kmsg.xfer_handle, (int)current_proc_idx, rcpt);
+            if (id < 0) return (uint64_t)-9;
+            kmsg.xfer_handle = id;
+            ipc_shmem_map_self((int)current_proc_idx, id);   /* sender can write into it right away */
+            uint64_t v = IPC_SHM_V + (uint64_t)id * 0x1000;
+            for (int b = 0; b < 8; b++) kmsg.inline_data[b] = (uint8_t)(v >> (8 * b));
+        }
+
+        if (!ipc_queue_push(rcpt, &kmsg)) return (uint64_t)-12;    /* recipient mailbox full */
+        if (g_debug_ipc)
+            kprintf("[dbgipc ] SEND pid %u -> pid %u type=%u xfer=%X len=%u\n",
+                    kmsg.sender_pid, kmsg.recipient_pid, (uint64_t)kmsg.msg_type,
+                    (uint64_t)kmsg.xfer_handle, (uint64_t)kmsg.payload_len);
+        { volatile uint8_t *d = (volatile uint8_t *)a0; uint8_t *s = (uint8_t *)&kmsg;
+          for (uint64_t i = 0; i < sizeof kmsg; i++) d[i] = s[i]; }   /* hand back sender_pid/xfer id/vaddr */
+        return 0;
+    }
+    case 19: {   /* SYS_IPC_RECV(out_msg_ptr, blocking) -> 1 if a message was popped, 0 if none */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_IPC)) return (uint64_t)-13;
+        if (!access_ok(kprocs[current_proc_idx].cr3, a0, sizeof(struct ipc_msg), 1)) return (uint64_t)-14;
+        struct ipc_msg kmsg;
+        uint64_t t0 = g_ticks; int got = 0;
+        for (;;) {
+            got = ipc_queue_pop((int)current_proc_idx, &kmsg);
+            if (got || !a1 || g_ticks - t0 > 4000) break;     /* a1==0: poll once, never block */
+            krelax();
+        }
+        if (!got) return 0;
+        if (kmsg.cap_mask && !rust_cap_check(kprocs[current_proc_idx].caps, kmsg.cap_mask)) {
+            /* Recipient lacks the capability the message declared as required.       */
+            /* Ownership already moved at SEND time, so rejecting here must release   */
+            /* the resource outright rather than trying to bounce it back to a sender */
+            /* that may no longer even exist — keeps the reject path as simple as the */
+            /* accept path instead of inventing a return-to-sender protocol.          */
+            if (kmsg.msg_type == IPC_MSG_XFER_FD) {
+                int fd = (int)kmsg.xfer_handle;
+                klock_acquire(&g_ofile_lock);
+                if (fd >= 0 && fd < 16 && g_ofiles[fd].used && g_ofiles[fd].owner == (int)current_proc_idx)
+                    { g_ofiles[fd].used = 0; g_ofiles[fd].owner = -1; }
+                klock_release(&g_ofile_lock);
+            } else if (kmsg.msg_type == IPC_MSG_XFER_SHM) {
+                klock_acquire(&g_ipc_lock);
+                if (kmsg.xfer_handle >= 0 && kmsg.xfer_handle < MAX_IPC_SHMEM)
+                    g_ipc_shm[kmsg.xfer_handle].owner_mask &= ~(1ull << current_proc_idx);
+                klock_release(&g_ipc_lock);
+            }
+            return (uint64_t)-13;
+        }
+        if (kmsg.msg_type == IPC_MSG_XFER_SHM) {
+            ipc_shmem_map_self((int)current_proc_idx, kmsg.xfer_handle);
+            uint64_t v = IPC_SHM_V + (uint64_t)kmsg.xfer_handle * 0x1000;
+            for (int b = 0; b < 8; b++) kmsg.inline_data[b] = (uint8_t)(v >> (8 * b));
+        }
+        { uint8_t *s = (uint8_t *)&kmsg; volatile uint8_t *d = (volatile uint8_t *)a0;
+          for (uint64_t i = 0; i < sizeof kmsg; i++) d[i] = s[i]; }
+        if (g_debug_ipc)
+            kprintf("[dbgipc ] RECV pid %u <- pid %u type=%u xfer=%X len=%u\n",
+                    kmsg.recipient_pid, kmsg.sender_pid, (uint64_t)kmsg.msg_type,
+                    (uint64_t)kmsg.xfer_handle, (uint64_t)kmsg.payload_len);
+        return 1;
+    }
     }
     return (uint64_t)-1;
 }
@@ -5360,6 +5671,8 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         /* v0.45: this is the ONE path that could previously leak a descriptor  */
         /* forever — a fault mid-syscall means the process's own SYS_CLOSE     */
         /* never runs. descriptor_teardown_kproc force-closes it here instead.  */
+        /* v0.46: same reasoning extends to an in-flight IPC shmem grant.       */
+        ipc_teardown_kproc((int)t->proc);
         descriptor_teardown_kproc((int)t->proc);
         dma_teardown_kproc((int)t->proc);      /* v0.44: revoke DMA/IOMMU grants FIRST */
         kprocs[t->proc].frames_freed = page_free_tree(kprocs[t->proc].cr3);
@@ -6106,6 +6419,134 @@ static void cmd_kproc_stress(void) {
     if (!g_kpfail)
         kputs("[kpstrs] KPROC STRESS VERIFIED — slots recycle, every descriptor/grant/domain/surface torn down, no drift across 200 cycles\n");
     else kputs("[kpstrs] KPROC STRESS DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.46: IPC STRESS — repeated sender/receiver churn proves the mailbox,
+ * fd-transfer, and shared-memory-grant lifetimes are all leak-free
+ * ===========================================================================
+ * Each round spawns two workers — role 12 (ipc_sender) and role 13
+ * (ipc_receiver) — that exchange exactly two messages: a transferred VFS fd
+ * (whose content the receiver reads THROUGH the transferred descriptor,
+ * never its own), then a shared-memory frame (whose content the receiver
+ * reads with NO syscall at all — genuine zero-copy). Rounds run back-to-back
+ * across the run-queue/watchdog idiom every *_stress suite since v0.43 uses,
+ * so this exercises the SAME kproc recycling v0.45 proved safe, but for a
+ * genuinely two-sided, capability-checked, cross-process handoff instead of
+ * v0.44/v0.45's one-sided churn against a fixed demo device.
+ *
+ * "ipc-payload" and "ipc-peer" are fixed, reused VFS names, not pid-keyed —
+ * the exact lesson v0.45's kpstress learned the hard way: a pid-keyed name
+ * claims a brand-new, permanent VFS_MAXFILES dirent every round, and VFS
+ * files are durable/never-deleted by design. Reused names cost nothing per
+ * round (vfs_write_file overwrites in place); what genuinely IS per-round
+ * and genuinely does recycle — the kproc slots, the fd numbers in
+ * g_ofiles, the shmem ids in g_ipc_shm — is exactly what this suite's
+ * assertions check. */
+#define IPCSTRESS_ROUNDS 20
+static int g_ipcpass, g_ipcfail;
+static void ipccheck(const char *n, int c) {
+    if (c) { g_ipcpass++; kprintf("[ipcstrs]  PASS  %s\n", n); }
+    else   { g_ipcfail++; kprintf("[ipcstrs]  FAIL  %s\n", n); }
+}
+
+static void cmd_ipc_stress(void) {
+    kputs("-- IPC STRESS: capability-gated fd/shared-memory handoff, sender/receiver churn --\n");
+    g_ipcpass = g_ipcfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    int rounds_ok = 1, fds_ok = 1, shm_ok = 1;
+    static const uint8_t payload[16] = "IPC-PAYLOAD-TEST";
+    int rnd;
+
+    for (rnd = 0; rnd < IPCSTRESS_ROUNDS; rnd++) {
+        int sp = kproc_spawn("ipc-sender", PCAP_IPC | PCAP_FILESYSTEM);
+        int rp = kproc_spawn("ipc-recv",   PCAP_IPC | PCAP_FILESYSTEM);
+        if (sp < 0 || rp < 0) { ipccheck("kproc_spawn never fails mid-storm (recycling keeps the table bounded)", 0);
+                                 rounds_ok = 0; break; }
+        kprocs[sp].role = 12; kprocs[rp].role = 13;
+
+        uint64_t es = elf_load(sp, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        uint64_t er = elf_load(rp, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!es || !er) { ipccheck("every worker's ELF loads", 0); rounds_ok = 0; break; }
+        kprocs[sp].entry = es; kprocs[rp].entry = er;
+
+        vfs_write_file("ipc-payload", payload, sizeof payload);
+        uint8_t peerbuf[8];
+        for (int b = 0; b < 8; b++) peerbuf[b] = (uint8_t)(kprocs[rp].pid >> (8 * b));
+        vfs_write_file("ipc-peer", peerbuf, 8);
+
+        int procs[2] = { sp, rp };
+        if (n > 1) {
+            rq_push(0 % n, sp); rq_push(1 % n, rp);
+            __sync_synchronize();
+            lapic_ipi(0, IPI_PING, 1);
+            int p;
+            while ((p = rq_pop(0)) >= 0) cpu_exec_proc(0, p);
+        } else {
+            cpu_exec_proc(0, sp); cpu_exec_proc(0, rp);
+        }
+
+        uint64_t t0 = g_ticks;
+        for (;;) {
+            int all = 1;
+            for (int i = 0; i < 2; i++) if (!kprocs[procs[i]].torn_down) all = 0;
+            if (all || g_ticks - t0 > 3000) break;
+            if (n > 1) lapic_ipi(0, IPI_PING, 1);
+            uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
+        }
+        current_proc_idx = save;
+
+        int ok = kprocs[sp].exited && kprocs[sp].exit_code == kprocs[sp].pid
+              && kprocs[rp].exited && kprocs[rp].exit_code == kprocs[rp].pid;
+        if (!ok) {
+            kprintf("[ipcstrs] round %d FAILED: sender exit %u (want %u), receiver exit %u (want %u)\n",
+                    rnd, kprocs[sp].exit_code, kprocs[sp].pid, kprocs[rp].exit_code, kprocs[rp].pid);
+            rounds_ok = 0;
+        }
+
+        int fds_leaked = 0;
+        klock_acquire(&g_ofile_lock);
+        for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+        klock_release(&g_ofile_lock);
+        if (fds_leaked) fds_ok = 0;
+
+        int shm_leaked = 0;
+        klock_acquire(&g_ipc_lock);
+        for (int i = 0; i < MAX_IPC_SHMEM; i++) if (g_ipc_shm[i].used) shm_leaked++;
+        klock_release(&g_ipc_lock);
+        if (shm_leaked) shm_ok = 0;
+
+        if (fds_leaked || shm_leaked)
+            kprintf("[ipcstrs] round %d: fds_leaked=%d shm_leaked=%d\n", rnd, fds_leaked, shm_leaked);
+        else if (ok && (rnd % 5) == 4)
+            kprintf("[ipcstrs] round %d/%d clean\n", rnd + 1, (uint64_t)IPCSTRESS_ROUNDS);
+    }
+
+    ipccheck("every round completed without a watchdog timeout (no deadlock across preemption)",
+             rnd == IPCSTRESS_ROUNDS);
+    ipccheck("every round's sender AND receiver exited cleanly (exit == own pid)", rounds_ok);
+    ipccheck("no descriptor leaked past any round (open-file table fully released each time)", fds_ok);
+    ipccheck("no shared-memory grant survived past any round (g_ipc_shm fully released each time)", shm_ok);
+
+    uint64_t freed_total = g_frames_freed - freed0, reused_total = g_frames_reused - reused0;
+    kprintf("[ipcstrs] %d rounds: +%u freed, +%u reused; global depth %u\n",
+            rnd, freed_total, reused_total, g_frame_free_depth);
+    ipccheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+             g_frame_free_depth == g_frames_freed - g_frames_reused);
+    ipccheck("the frame allocator's leaf lock never triggered a rank violation (no double-free race)",
+             g_rank_violations == viol0);
+
+    kprintf("[ipcstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_ipcpass, (uint64_t)g_ipcfail);
+    if (!g_ipcfail)
+        kputs("[ipcstrs] IPC STRESS VERIFIED — handle and shared-memory transfer both leak-free across sender/receiver churn\n");
+    else kputs("[ipcstrs] IPC STRESS DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -8749,6 +9190,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "dmastress")) cmd_dma_stress();
     else if (!kstrcmp(argv[0], "leakcheck")) cmd_leakcheck();
     else if (!kstrcmp(argv[0], "kpstress")) cmd_kproc_stress();
+    else if (!kstrcmp(argv[0], "ipcstress")) cmd_ipc_stress();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -8901,6 +9343,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_dma_stress();       /* v0.44: real DMA/IOMMU grants revoked across genuine exit    */
     cmd_leakcheck();        /* v0.42: heavy spawn/destroy proves 100% frame reclamation  */
     cmd_kproc_stress();     /* v0.45: 200-cycle kproc/descriptor recycle stress          */
+    cmd_ipc_stress();       /* v0.46: capability-gated IPC fd/shmem handoff, sender/receiver churn */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
