@@ -43,6 +43,8 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_SURFACE_FLIP   17
 #define SYS_IPC_SEND       18
 #define SYS_IPC_RECV       19
+#define SYS_VFIO_MAP_BAR   20
+#define SYS_VFIO_WAIT_IRQ  21
 
 #define PCAP_FILESYSTEM (1ull << 5)
 #define IPC_INLINE_MAX 64
@@ -466,6 +468,38 @@ static void ipc_receiver(void) {
     sysc(SYS_EXIT, pid, 0, 0);
 }
 
+/* v0.47: role 14 — a ring-3 "driver" for the dummy VFIO test device. Maps
+ * both of its BARs directly into its own address space (no kernel mediation
+ * of the reads/writes that follow — that's the whole point of VFIO-style
+ * passthrough), then blocks on the device's routed interrupt. */
+static void vfio_driver(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+
+    i64 didfd = (i64)sysc(SYS_OPEN, (u64)"vfio-devid", 0, 0);
+    if (didfd < 0) sysc(SYS_EXIT, 980, 0, 0);
+    u8 idbuf[8];
+    if ((i64)sysc(SYS_READ, (u64)didfd, (u64)idbuf, 8) != 8) sysc(SYS_EXIT, 981, 0, 0);
+    sysc(SYS_CLOSE, (u64)didfd, 0, 0);
+    u64 devid = 0; for (int i = 0; i < 8; i++) devid |= ((u64)idbuf[i]) << (8 * i);
+
+    i64 v0 = (i64)sysc(SYS_VFIO_MAP_BAR, devid, 0, 0);
+    if (v0 <= 0) sysc(SYS_EXIT, 982, 0, 0);
+    volatile u32 *bar0 = (volatile u32 *)v0;
+    if (*bar0 != 0xCAFEBABEu) sysc(SYS_EXIT, 983, 0, 0);
+
+    i64 v1 = (i64)sysc(SYS_VFIO_MAP_BAR, devid, 1, 0);
+    if (v1 <= 0) sysc(SYS_EXIT, 984, 0, 0);
+    volatile u64 *bar1 = (volatile u64 *)v1;
+    u64 pattern = pid ^ 0xB4700000ull;
+    bar1[0] = pattern;
+    if (bar1[0] != pattern) sysc(SYS_EXIT, 985, 0, 0);
+
+    i64 fired = (i64)sysc(SYS_VFIO_WAIT_IRQ, 16, 2000, 0);
+    if (fired != 1) sysc(SYS_EXIT, 986, 0, 0);
+
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
 static void nic_driver(void) {
     print("  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====\n");
 
@@ -588,6 +622,7 @@ void _start(void) {
     if (role == 11) { dma_churn(); }                    /* v0.44 DMA/passthrough churn  */
     if (role == 12) { ipc_sender(); }                   /* v0.46 IPC handle/shmem sender */
     if (role == 13) { ipc_receiver(); }                 /* v0.46 IPC handle/shmem receiver */
+    if (role == 14) { vfio_driver(); }                  /* v0.47 VFIO BAR map + IRQ wait   */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");

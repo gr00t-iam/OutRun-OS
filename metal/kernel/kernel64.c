@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.46.0-metal"
+#define KERNEL_VERSION "0.47.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -359,6 +359,21 @@ static void pit_init(void) {
 
 static volatile uint64_t g_ticks = 0;
 
+/* v0.47: IRQ-line pending state for ring-3 VFIO waiters, declared here (not
+ * with the rest of the v0.47 VFIO section further down) because isr_dispatch
+ * — defined just below, long before struct kproc/kdev exist — needs to bump
+ * it directly from the real device-IRQ path and the timer tick. Lines
+ * [0,16) mirror the real PIC IRQ lines vector 34..47 dispatches; [16,24) are
+ * reserved, software-only test vectors (see the full section comment near
+ * vfio_teardown_kproc for why no real device IRQ line is safe to hijack for
+ * deterministic testing). */
+#define MAX_VFIO_LINES 24
+static volatile uint32_t g_vfio_irq_seq[MAX_VFIO_LINES];
+/* Armed by cmd_vfio_stress before dispatching its ring-3 driver: once
+ * g_ticks reaches this value, the timer-tick path below fires the simulated
+ * interrupt exactly once and disarms. 0 = disarmed. */
+static volatile uint64_t g_vfio_test_fire_at = 0;
+
 /* ---- PS/2 keyboard -------------------------------------------------------------- */
 static const char sc_map[128] = {
     0, 27, '1','2','3','4','5','6','7','8','9','0','-','=', '\b',
@@ -479,6 +494,7 @@ static volatile int g_debug_smp_sched    = 0;   /* DEBUG_SMP_SCHED: pick/switch/
 static volatile int g_debug_dma_lifetime = 0;   /* DEBUG_DMA_LIFETIME: grant create/revoke */
 static volatile int g_debug_kproc_lifetime = 0; /* DEBUG_KPROC_LIFETIME: recycle/descriptor teardown */
 static volatile int g_debug_ipc = 0;            /* DEBUG_IPC: send/recv/xfer/teardown log            */
+static volatile int g_debug_vfio = 0;           /* DEBUG_VFIO: BAR map/irq-wait/teardown log         */
 
 /* user-stack layout (used by the guard-page fault check in isr_dispatch) */
 #define USTK_V     0x0000500000FF0000ull                  /* user stack bottom       */
@@ -527,11 +543,21 @@ void isr_dispatch(struct isr_frame *f) {
         kprintf("[panic ] system halted — the fault was contained to this core\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
-    if (f->vector == 32) { g_ticks++; sweep_tick(); }  /* PIT + incremental audit */
+    if (f->vector == 32) {
+        g_ticks++; sweep_tick();                     /* PIT + incremental audit */
+        /* v0.47: cmd_vfio_stress's simulated device interrupt — fires once,   */
+        /* from the SAME timer path that already drives everything else here,  */
+        /* rather than a separate injection mechanism. */
+        if (g_vfio_test_fire_at && g_ticks >= g_vfio_test_fire_at) {
+            g_vfio_irq_seq[16]++;
+            g_vfio_test_fire_at = 0;
+        }
+    }
     if (f->vector == 33) keyboard_irq();             /* PS/2                    */
     if (f->vector >= 34 && f->vector < 48) {         /* device IRQs (top half)  */
         uint8_t irq = (uint8_t)(f->vector - 32);
         for (int i = 0; i < 4; i++) if (g_irq_handlers[irq][i]) g_irq_handlers[irq][i]();
+        g_vfio_irq_seq[irq]++;    /* v0.47: flag pending state for any ring-3 VFIO waiter */
     }
     if (f->vector >= 40) outb(0xA0, 0x20);           /* EOI slave               */
     outb(0x20, 0x20);                                /* EOI master              */
@@ -1268,6 +1294,7 @@ static uint64_t create_address_space(void) {
 #define PCAP_FILESYSTEM     (1ull << 5)
 #define PCAP_FRAMEBUFFER    (1ull << 6)
 #define PCAP_IPC             (1ull << 7)    /* v0.46: required for any SYS_IPC_* call */
+#define PCAP_VFIO            (1ull << 8)    /* v0.47: required for any SYS_VFIO_* call */
 
 /* v0.39: a COMPLETE ring-3 register context. The preempt IPI (vector 50)
  * captures the interrupted user state here straight from the isr_frame, and
@@ -1450,15 +1477,64 @@ struct kdev { const char *name; uint64_t base, len, req; bool used; uint16_t bdf
 static struct kdev kdevs[MAX_KDEV];
 static int n_kdev = 0;
 
+/* v0.47: an optional SECOND MMIO region per device, for VFIO's bar_index — no
+ * currently-registered device (sensor0, virtio-net) genuinely has more than
+ * one discrete PCI BAR in this kernel's simplified device model (virtio's
+ * own common/notify/isr/devcfg split is offsets WITHIN one BAR, not separate
+ * BARs), so rather than fabricate a multi-BAR array with no real backing,
+ * this parallel table is populated only for the dedicated VFIO test device
+ * (see cmd_vfio_stress) — bar_index 0 always means kdevs[idx] itself;
+ * bar_index 1 is valid only where g_kdev_bar1_len[idx] != 0. */
+static uint64_t g_kdev_bar1_phys[MAX_KDEV];
+static uint64_t g_kdev_bar1_len[MAX_KDEV];
+/* -1 = no interrupt associated with this device (true of every device before */
+/* v0.47); see the MAX_VFIO_LINES section below for what a real value means.  */
+static int g_kdev_irq_line[MAX_KDEV] = { [0 ... MAX_KDEV - 1] = -1 };
+
 static void kdev_register(const char *name, uint64_t base, uint64_t len, uint64_t req) {
     if (n_kdev >= MAX_KDEV) return;
     kdevs[n_kdev++] = (struct kdev){ name, base, len, req, true, 0xFFFF };
 }
 static struct kdev *kdev_find(uint64_t io_addr) {
-    for (int i = 0; i < n_kdev; i++)
-        if (kdevs[i].used && io_addr >= kdevs[i].base && io_addr < kdevs[i].base + kdevs[i].len)
-            return &kdevs[i];
+    for (int i = 0; i < n_kdev; i++) {
+        if (!kdevs[i].used) continue;
+        if (io_addr >= kdevs[i].base && io_addr < kdevs[i].base + kdevs[i].len) return &kdevs[i];
+        if (g_kdev_bar1_len[i] && io_addr >= g_kdev_bar1_phys[i] &&
+            io_addr < g_kdev_bar1_phys[i] + g_kdev_bar1_len[i]) return &kdevs[i];
+    }
     return 0;
+}
+
+/* ===========================================================================
+ * v0.47: USER-SPACE INTERRUPT ROUTING — IRQ-line ownership + teardown
+ * ===========================================================================
+ * g_vfio_irq_seq/g_vfio_test_fire_at (the parts isr_dispatch itself needs)
+ * are declared much earlier, right after g_ticks — isr_dispatch runs long
+ * before struct kproc or the kdev registry exist in this file. What belongs
+ * here, alongside kdevs[]/struct kproc, is per-process OWNERSHIP of a line:
+ * which kproc slot may SYS_VFIO_WAIT_IRQ on it right now; -1 = none. Set the
+ * moment a process maps the BAR of the device that owns the line (mirrors
+ * real VFIO: the process that opened the device group owns its interrupt
+ * eventfd); cleared by vfio_teardown_kproc on that process's exit. */
+static int g_vfio_irq_owner[MAX_VFIO_LINES] = { [0 ... MAX_VFIO_LINES - 1] = -1 };
+
+/* Called from every kproc exit path, alongside ipc_teardown_kproc/
+ * descriptor_teardown_kproc/dma_teardown_kproc. Its scope is deliberately
+ * tiny: dma_teardown_kproc (already wired into all three exit paths since
+ * v0.44) and page_free_tree already fully unmap a VFIO BAR mapping and
+ * restore its frame's ownership — SYS_VFIO_MAP_BAR routes through the SAME
+ * dma_grant_create(..., DMA_GRANT_MMIO, ...) sys_hardware_passthrough uses,
+ * so that machinery (including v0.45's device-MMIO double-free guard) is
+ * reused, not reimplemented. The one thing v0.44/v0.45 know nothing about
+ * is IRQ-line ownership, so that is all this function releases. */
+static void vfio_teardown_kproc(int proc_idx) {
+    for (int i = 0; i < MAX_VFIO_LINES; i++) {
+        if (g_vfio_irq_owner[i] != proc_idx) continue;
+        if (g_debug_vfio)
+            kprintf("[dbgvfio] pid %u slot %d: released IRQ line %d ownership\n",
+                    kprocs[proc_idx].pid, proc_idx, i);
+        g_vfio_irq_owner[i] = -1;
+    }
 }
 
 /* A ring-3 application surface: pixels owned and rendered by an unprivileged
@@ -3225,9 +3301,10 @@ static int     g_cas_mounted = 0;
 #define SB ((struct cas_superblock *)g_sbblk)
 
 /* --- VFS directory: names -> content, layered on CAS ---------------------- */
-#define VFS_MAXFILES   26                     /* v0.43: +4 for smp_stress; v0.46: +2 fixed, */
+#define VFS_MAXFILES   27                     /* v0.43: +4 for smp_stress; v0.46: +2 fixed, */
                                                /* reused, non-growing names ("ipc-payload", */
-                                               /* "ipc-peer") for cmd_ipc_stress             */
+                                               /* "ipc-peer") for cmd_ipc_stress; v0.47: +1  */
+                                               /* fixed name ("vfio-devid") for cmd_vfio_stress */
 #define VFS_MAX_CHUNKS 16                     /* 16 * 512 = 8 KiB max file       */
 struct dirent {
     char     name[32];
@@ -3602,6 +3679,14 @@ static struct ipc_queue g_ipc_q[MAX_KPROC];
 #define MAX_IPC_SHMEM 16
 #define IPC_SHM_V (0x0000540000000000ull)  /* fixed per-id window, one page each; far   */
                                             /* from the passthrough/ELF/surface windows */
+/* v0.47: VFIO BAR mapping window — per-process stride (0x100000, 1 MiB) is
+ * far more than any BAR here needs (all are 0x1000-0x4000), leaving headroom
+ * if a BAR ever grows; per-bar-index stride (0x10000) keeps bar0/bar1 apart
+ * within one process's own sub-window. Comfortably clear of every other
+ * fixed window (surface 0x530000000000, IPC shmem 0x540000000000, and
+ * hw-passthrough's pid-scaled 0x400000000000+pid<<30, which would need an
+ * implausible pid > ~21000 to ever reach here). */
+#define VFIO_BAR_V (0x0000550000000000ull)
 struct ipc_shmem {
     uint64_t phys;
     uint64_t owner_mask;                   /* bit i set => kprocs[i] holds a mapping */
@@ -3927,6 +4012,7 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     write_cr3(kernel_cr3);                   /* off this space before tearing it down */
     /* v0.42: this is the BSP's OWN thread giving up its OWN address space —   */
     /* cr3 just changed away from it above, so it is safe to dismantle now.    */
+    vfio_teardown_kproc((int)t->proc);       /* v0.47: release any IRQ-line ownership FIRST */
     ipc_teardown_kproc((int)t->proc);        /* v0.46: release IPC mailbox/shmem FIRST */
     descriptor_teardown_kproc((int)t->proc); /* v0.45: force-close any leaked fd FIRST */
     dma_teardown_kproc((int)t->proc);        /* v0.44: revoke DMA/IOMMU grants FIRST */
@@ -4302,6 +4388,7 @@ static void cpu_exec_proc(int c, int p) {
         /* tear it all the way down. page_free_tree is not a klock: it is safe  */
         /* to call with interrupts on, exactly like the frame allocator it      */
         /* drives underneath.                                                   */
+        vfio_teardown_kproc(p);                /* v0.47: release any IRQ-line ownership FIRST */
         ipc_teardown_kproc(p);                 /* v0.46: release IPC mailbox/shmem FIRST */
         descriptor_teardown_kproc(p);           /* v0.45: force-close any leaked fd FIRST */
         dma_teardown_kproc(p);                 /* v0.44: revoke DMA/IOMMU grants FIRST */
@@ -5612,6 +5699,66 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                     (uint64_t)kmsg.xfer_handle, (uint64_t)kmsg.payload_len);
         return 1;
     }
+
+    /* --- v0.47: user-space interrupt architecture & VFIO MMIO mapping (require CAP_VFIO) --- */
+    case 20: {   /* SYS_VFIO_MAP_BAR(device_id, bar_index, flags) -> vaddr or negative error */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_VFIO)) return (uint64_t)-13;
+        int idx = (a0 == 0xFFFF) ? g_demo_dev_index : (a0 < (uint64_t)n_kdev ? (int)a0 : -1);
+        if (idx < 0) return (uint64_t)-1;
+        struct kdev *d = &kdevs[idx];
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, d->req)) return (uint64_t)-13;
+        uint64_t phys, len;
+        if (a1 == 0) { phys = d->base; len = d->len; }
+        else if (a1 == 1 && g_kdev_bar1_len[idx]) { phys = g_kdev_bar1_phys[idx]; len = g_kdev_bar1_len[idx]; }
+        else return (uint64_t)-1;                       /* invalid, or unbacked bar_index */
+
+        /* Isolation: the ONLY physical ranges ever reachable here are ones the  */
+        /* kernel itself registered as a device (kdevs[idx].base or its bar1) — */
+        /* SYS_VFIO_MAP_BAR never accepts a raw physaddr from userspace, so      */
+        /* there is no path to map arbitrary system RAM as if it were MMIO.      */
+        uint64_t vbase = VFIO_BAR_V + (uint64_t)current_proc_idx * 0x100000ull + a1 * 0x10000ull;
+        uint64_t pages = (len + 0xFFF) / 0x1000;
+        /* flags bit0: write-combining requested. NOT actually implemented —     */
+        /* WC needs a PAT entry this kernel's default (unreprogrammed) PAT table */
+        /* doesn't have, and reprogramming IA32_PAT is a global change affecting */
+        /* every existing mapping's cache behavior, out of scope for one         */
+        /* syscall. Every mapping is uncacheable (PCD) regardless of the flag —  */
+        /* correct, just not the weaker/faster ordering WC would give a real     */
+        /* framebuffer-style bulk-write driver. */
+        uint64_t pteflags = PTE_WRITE | PTE_USER | PTE_NX | PTE_PCD;
+        for (uint64_t k = 0; k < pages; k++)
+            map_page(kprocs[current_proc_idx].cr3, vbase + k * 0x1000, phys + k * 0x1000, pteflags);
+        if (dma_grant_create(&kprocs[current_proc_idx], phys, pages * 0x1000ull,
+                              DMA_GRANT_MMIO, d->bdf) < 0)
+            return (uint64_t)-12;                       /* grant table full */
+        if (g_kdev_irq_line[idx] >= 0) {
+            int line = g_kdev_irq_line[idx];
+            g_vfio_irq_owner[line] = (int)current_proc_idx;
+            if (g_debug_vfio)
+                kprintf("[dbgvfio] pid %u slot %u: MAP_BAR dev %d bar %u -> vaddr %X (%u pages), owns IRQ line %d\n",
+                        kprocs[current_proc_idx].pid, current_proc_idx, idx, (uint64_t)a1,
+                        vbase, pages, (uint64_t)line);
+        } else if (g_debug_vfio)
+            kprintf("[dbgvfio] pid %u slot %u: MAP_BAR dev %d bar %u -> vaddr %X (%u pages)\n",
+                    kprocs[current_proc_idx].pid, current_proc_idx, idx, (uint64_t)a1, vbase, pages);
+        return vbase;
+    }
+    case 21: {   /* SYS_VFIO_WAIT_IRQ(vector_id, timeout_ms) -> 1 if fired, 0 if timed out */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_VFIO)) return (uint64_t)-13;
+        int line = (int)a0;
+        if (line < 0 || line >= MAX_VFIO_LINES) return (uint64_t)-1;
+        if (g_vfio_irq_owner[line] != (int)current_proc_idx) return (uint64_t)-13;  /* not yours to wait on */
+        uint64_t timeout_ticks = a1 / 10; if (a1 && !timeout_ticks) timeout_ticks = 1;
+        uint32_t seen = g_vfio_irq_seq[line];
+        uint64_t t0 = g_ticks;
+        while (g_vfio_irq_seq[line] == seen && g_ticks - t0 < timeout_ticks) krelax();
+        int fired = (g_vfio_irq_seq[line] != seen);
+        if (g_debug_vfio)
+            kprintf("[dbgvfio] pid %u slot %u: WAIT_IRQ line %d %s\n",
+                    kprocs[current_proc_idx].pid, current_proc_idx, (uint64_t)line,
+                    fired ? "fired" : "timed out");
+        return fired ? 1 : 0;
+    }
     }
     return (uint64_t)-1;
 }
@@ -5672,6 +5819,8 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         /* forever — a fault mid-syscall means the process's own SYS_CLOSE     */
         /* never runs. descriptor_teardown_kproc force-closes it here instead.  */
         /* v0.46: same reasoning extends to an in-flight IPC shmem grant.       */
+        /* v0.47: and to IRQ-line ownership, for the exact same reason.         */
+        vfio_teardown_kproc((int)t->proc);
         ipc_teardown_kproc((int)t->proc);
         descriptor_teardown_kproc((int)t->proc);
         dma_teardown_kproc((int)t->proc);      /* v0.44: revoke DMA/IOMMU grants FIRST */
@@ -6547,6 +6696,129 @@ static void cmd_ipc_stress(void) {
     if (!g_ipcfail)
         kputs("[ipcstrs] IPC STRESS VERIFIED — handle and shared-memory transfer both leak-free across sender/receiver churn\n");
     else kputs("[ipcstrs] IPC STRESS DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.47: VFIO STRESS — a ring-3 driver maps a dummy device's two BARs, waits
+ * on a routed interrupt, and tears down leak-free, repeatedly
+ * ===========================================================================
+ * The dummy device ("vfio-dev0") is registered lazily, once, the first time
+ * this suite runs: two alloc_frame() pages standing in for BAR0 (a register
+ * file, sentinel-stamped like cmd_passthrough's sensor0) and BAR1 (a scratch
+ * page the driver writes a pattern into and reads back, proving the mapping
+ * is real), plus a reserved, software-only IRQ line (16 — see the
+ * MAX_VFIO_LINES section comment for why no real device's line is safe to
+ * hijack for deterministic testing here).
+ *
+ * Same churn idiom as every other *_stress suite since v0.43: VFIOSTRESS_
+ * ROUNDS repetitions of spawn -> map BAR0 -> map BAR1 -> wait on the
+ * simulated IRQ -> exit, reusing v0.45's kproc recycling. */
+#define VFIOSTRESS_ROUNDS 15
+static int g_vfiopass, g_vfiofail;
+static void vfiocheck(const char *n, int c) {
+    if (c) { g_vfiopass++; kprintf("[vfiostrs]  PASS  %s\n", n); }
+    else   { g_vfiofail++; kprintf("[vfiostrs]  FAIL  %s\n", n); }
+}
+
+static int g_vfio_test_dev = -1;   /* lazily registered, once, across suite invocations */
+
+static void cmd_vfio_stress(void) {
+    kputs("-- VFIO STRESS: ring-3 BAR mapping + routed interrupt wait, driver churn --\n");
+    g_vfiopass = g_vfiofail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+
+    if (g_vfio_test_dev < 0) {
+        uint64_t bar0 = alloc_frame();
+        *(volatile uint32_t *)bar0 = 0xCAFEBABEu;
+        uint64_t bar1 = alloc_frame();
+        g_vfio_test_dev = n_kdev;
+        kdev_register("vfio-dev0", bar0, 0x1000, PCAP_VFIO);
+        g_kdev_bar1_phys[g_vfio_test_dev] = bar1;
+        g_kdev_bar1_len[g_vfio_test_dev] = 0x1000;
+        g_kdev_irq_line[g_vfio_test_dev] = 16;
+        kprintf("[vfiostrs] registered dummy device 'vfio-dev0' (idx %d): BAR0 %X, BAR1 %X, IRQ line 16\n",
+                g_vfio_test_dev, bar0, bar1);
+    }
+
+    uint8_t devidbuf[8];
+    for (int b = 0; b < 8; b++) devidbuf[b] = (uint8_t)((uint64_t)g_vfio_test_dev >> (8 * b));
+    vfs_write_file("vfio-devid", devidbuf, 8);   /* fixed, reused name — see v0.45/v0.46 precedent */
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    int rounds_ok = 1, grants_ok = 1, irq_ok = 1;
+    int rnd;
+
+    for (rnd = 0; rnd < VFIOSTRESS_ROUNDS; rnd++) {
+        int p = kproc_spawn("vfio-driver", PCAP_VFIO | PCAP_FILESYSTEM);
+        if (p < 0) { vfiocheck("kproc_spawn never fails mid-storm (recycling keeps the table bounded)", 0);
+                     rounds_ok = 0; break; }
+        kprocs[p].role = 14;
+        uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!e) { vfiocheck("every worker's ELF loads", 0); rounds_ok = 0; break; }
+        kprocs[p].entry = e;
+
+        g_vfio_test_fire_at = g_ticks + 5;    /* fire the simulated IRQ ~50ms in */
+
+        if (n > 1) {
+            rq_push(0 % n, p);
+            __sync_synchronize();
+            lapic_ipi(0, IPI_PING, 1);
+            int q; while ((q = rq_pop(0)) >= 0) cpu_exec_proc(0, q);
+        } else {
+            cpu_exec_proc(0, p);
+        }
+
+        uint64_t t0 = g_ticks;
+        while (!kprocs[p].torn_down && g_ticks - t0 < 3000) {
+            if (n > 1) lapic_ipi(0, IPI_PING, 1);
+            uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
+        }
+        current_proc_idx = save;
+
+        int ok = kprocs[p].exited && kprocs[p].exit_code == kprocs[p].pid;
+        if (!ok) {
+            kprintf("[vfiostrs] round %d FAILED: exit %u (want %u)\n", rnd, kprocs[p].exit_code, kprocs[p].pid);
+            rounds_ok = 0;
+        }
+        if (kprocs[p].dma_grant_count != 0) grants_ok = 0;
+        if (g_vfio_irq_owner[16] == p) irq_ok = 0;    /* must have been released on exit */
+
+        g_vfio_test_fire_at = 0;    /* disarm in case this round failed before consuming it */
+
+        if (ok && (rnd % 5) == 4)
+            kprintf("[vfiostrs] round %d/%d clean\n", rnd + 1, (uint64_t)VFIOSTRESS_ROUNDS);
+    }
+
+    vfiocheck("every round completed without a watchdog timeout (no deadlock across preemption)",
+              rnd == VFIOSTRESS_ROUNDS);
+    vfiocheck("every round's driver exited cleanly (exit == own pid: BAR reads/writes and IRQ wait all verified in ring 3)",
+              rounds_ok);
+    vfiocheck("no DMA/MMIO grant survived past any round's teardown", grants_ok);
+    vfiocheck("no IRQ-line ownership survived past any round's teardown", irq_ok);
+
+    /* Both BAR frames are kernel-owned for the life of the boot (like sensor0) —  */
+    /* this confirms page_free_tree's device-MMIO guard never let BAR0 get freed   */
+    /* out from under the device across all VFIOSTRESS_ROUNDS teardowns.           */
+    int dev_frame_ok = (*(volatile uint32_t *)kdevs[g_vfio_test_dev].base == 0xCAFEBABEu);
+    vfiocheck("BAR0's sentinel survived every round's teardown (device frame never freed)",
+              dev_frame_ok);
+
+    uint64_t freed_total = g_frames_freed - freed0, reused_total = g_frames_reused - reused0;
+    kprintf("[vfiostrs] %d rounds: +%u freed, +%u reused; global depth %u\n",
+            rnd, freed_total, reused_total, g_frame_free_depth);
+    vfiocheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+              g_frame_free_depth == g_frames_freed - g_frames_reused);
+    vfiocheck("the frame allocator's leaf lock never triggered a rank violation (no double-free race)",
+              g_rank_violations == viol0);
+
+    kprintf("[vfiostrs] RESULT: %d passed, %d failed\n", (uint64_t)g_vfiopass, (uint64_t)g_vfiofail);
+    if (!g_vfiofail)
+        kputs("[vfiostrs] VFIO STRESS VERIFIED — BAR mapping and routed interrupts both leak-free across driver churn\n");
+    else kputs("[vfiostrs] VFIO STRESS DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -9191,6 +9463,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "leakcheck")) cmd_leakcheck();
     else if (!kstrcmp(argv[0], "kpstress")) cmd_kproc_stress();
     else if (!kstrcmp(argv[0], "ipcstress")) cmd_ipc_stress();
+    else if (!kstrcmp(argv[0], "vfiostress")) cmd_vfio_stress();
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -9344,6 +9617,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_leakcheck();        /* v0.42: heavy spawn/destroy proves 100% frame reclamation  */
     cmd_kproc_stress();     /* v0.45: 200-cycle kproc/descriptor recycle stress          */
     cmd_ipc_stress();       /* v0.46: capability-gated IPC fd/shmem handoff, sender/receiver churn */
+    cmd_vfio_stress();      /* v0.47: VFIO BAR mapping + routed interrupt wait, driver churn        */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
