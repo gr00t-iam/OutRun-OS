@@ -43,6 +43,10 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_SURFACE_FLIP   17
 #define SYS_IPC_SEND       18
 #define SYS_IPC_RECV       19
+#define SYS_VFIO_MAP_BAR   20
+#define SYS_VFIO_WAIT_IRQ  21
+#define SYS_VFS_SYNC       22
+#define SYS_VFS_UNLINK     23
 
 #define PCAP_FILESYSTEM (1ull << 5)
 #define IPC_INLINE_MAX 64
@@ -466,6 +470,83 @@ static void ipc_receiver(void) {
     sysc(SYS_EXIT, pid, 0, 0);
 }
 
+/* v0.47: role 14 — a ring-3 "driver" for the dummy VFIO test device. Maps
+ * both of its BARs directly into its own address space (no kernel mediation
+ * of the reads/writes that follow — that's the whole point of VFIO-style
+ * passthrough), then blocks on the device's routed interrupt. */
+static void vfio_driver(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+
+    i64 didfd = (i64)sysc(SYS_OPEN, (u64)"vfio-devid", 0, 0);
+    if (didfd < 0) sysc(SYS_EXIT, 980, 0, 0);
+    u8 idbuf[8];
+    if ((i64)sysc(SYS_READ, (u64)didfd, (u64)idbuf, 8) != 8) sysc(SYS_EXIT, 981, 0, 0);
+    sysc(SYS_CLOSE, (u64)didfd, 0, 0);
+    u64 devid = 0; for (int i = 0; i < 8; i++) devid |= ((u64)idbuf[i]) << (8 * i);
+
+    i64 v0 = (i64)sysc(SYS_VFIO_MAP_BAR, devid, 0, 0);
+    if (v0 <= 0) sysc(SYS_EXIT, 982, 0, 0);
+    volatile u32 *bar0 = (volatile u32 *)v0;
+    if (*bar0 != 0xCAFEBABEu) sysc(SYS_EXIT, 983, 0, 0);
+
+    i64 v1 = (i64)sysc(SYS_VFIO_MAP_BAR, devid, 1, 0);
+    if (v1 <= 0) sysc(SYS_EXIT, 984, 0, 0);
+    volatile u64 *bar1 = (volatile u64 *)v1;
+    u64 pattern = pid ^ 0xB4700000ull;
+    bar1[0] = pattern;
+    if (bar1[0] != pattern) sysc(SYS_EXIT, 985, 0, 0);
+
+    i64 fired = (i64)sysc(SYS_VFIO_WAIT_IRQ, 16, 2000, 0);
+    if (fired != 1) sysc(SYS_EXIT, 986, 0, 0);
+
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
+/* v0.48: role 15 — exercises the new journaling/reclamation/multi-volume
+ * surface entirely through real ring-3 syscalls: reads a kernel-pre-seeded
+ * ROOT file, overwrites it, syncs the journal, unlinks it and confirms it's
+ * gone, creates/writes/reads a TMP file, and reads (but is refused writing)
+ * the DEV volume's read-only device listing. */
+static void vfs_driver(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    static const u8 seed[16] = "VFS-SEED-PATTERN";
+
+    i64 fd = (i64)sysc(SYS_OPEN, (u64)"vfs-stress", 0, 0);
+    if (fd < 0) sysc(SYS_EXIT, 1001, 0, 0);
+    u8 rb[16];
+    if ((i64)sysc(SYS_READ, (u64)fd, (u64)rb, 16) != 16) sysc(SYS_EXIT, 1002, 0, 0);
+    for (int i = 0; i < 16; i++) if (rb[i] != seed[i]) sysc(SYS_EXIT, 1002, 0, 0);
+
+    u8 pat2[8]; for (int i = 0; i < 8; i++) pat2[i] = (u8)(pid >> (8 * i)) ^ 0xAB;
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)fd, (u64)pat2, 8) != 8) sysc(SYS_EXIT, 1003, 0, 0);
+    sysc(SYS_CLOSE, (u64)fd, 0, 0);
+
+    sysc(SYS_VFS_SYNC, 0, 0, 0);   /* return value not asserted here — the kernel harness checks disk state directly */
+
+    if ((i64)sysc(SYS_VFS_UNLINK, (u64)"vfs-stress", 0, 0) != 0) sysc(SYS_EXIT, 1004, 0, 0);
+    i64 fd2 = (i64)sysc(SYS_OPEN, (u64)"vfs-stress", 0, 0);
+    if (fd2 >= 0) sysc(SYS_EXIT, 1005, 0, 0);          /* must be gone after unlink */
+
+    i64 tfd = (i64)sysc(SYS_OPEN, (u64)"tmp/scratch", 0, 0);
+    if (tfd < 0) sysc(SYS_EXIT, 1006, 0, 0);
+    u8 tpat[8]; for (int i = 0; i < 8; i++) tpat[i] = (u8)(pid >> (8 * i)) ^ 0x7C;
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)tfd, (u64)tpat, 8) != 8) sysc(SYS_EXIT, 1007, 0, 0);
+    u8 trb[8];
+    if ((i64)sysc(SYS_READ, (u64)tfd, (u64)trb, 8) != 8) sysc(SYS_EXIT, 1008, 0, 0);
+    for (int i = 0; i < 8; i++) if (trb[i] != tpat[i]) sysc(SYS_EXIT, 1008, 0, 0);
+    sysc(SYS_CLOSE, (u64)tfd, 0, 0);
+
+    i64 dfd = (i64)sysc(SYS_OPEN, (u64)"dev/devices", 0, 0);
+    if (dfd < 0) sysc(SYS_EXIT, 1009, 0, 0);
+    u8 devbuf[256];
+    if ((i64)sysc(SYS_READ, (u64)dfd, (u64)devbuf, sizeof devbuf) < 0) sysc(SYS_EXIT, 1010, 0, 0);
+    u8 one = 'x';
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)dfd, (u64)&one, 1) >= 0) sysc(SYS_EXIT, 1011, 0, 0);  /* must be denied */
+    sysc(SYS_CLOSE, (u64)dfd, 0, 0);
+
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
 static void nic_driver(void) {
     print("  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====\n");
 
@@ -588,6 +669,8 @@ void _start(void) {
     if (role == 11) { dma_churn(); }                    /* v0.44 DMA/passthrough churn  */
     if (role == 12) { ipc_sender(); }                   /* v0.46 IPC handle/shmem sender */
     if (role == 13) { ipc_receiver(); }                 /* v0.46 IPC handle/shmem receiver */
+    if (role == 14) { vfio_driver(); }                  /* v0.47 VFIO BAR map + IRQ wait   */
+    if (role == 15) { vfs_driver(); }                   /* v0.48 VFS journal/unlink/multi-volume */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");
