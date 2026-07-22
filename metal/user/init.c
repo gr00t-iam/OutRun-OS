@@ -41,6 +41,25 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_YIELD          15
 #define SYS_GETPID         16
 #define SYS_SURFACE_FLIP   17
+#define SYS_IPC_SEND       18
+#define SYS_IPC_RECV       19
+
+#define PCAP_FILESYSTEM (1ull << 5)
+#define IPC_INLINE_MAX 64
+#define IPC_MSG_XFER_FD  1
+#define IPC_MSG_XFER_SHM 2
+/* Mirrors kernel/kernel64.c's struct ipc_msg exactly (same field order/types,
+ * so the kernel's raw byte copy lands correctly) — the kernel never exposes
+ * this layout across the boundary any other way. */
+struct ipc_msg {
+    u64 sender_pid;
+    u64 recipient_pid;
+    u32 msg_type;
+    u32 cap_mask;
+    u32 payload_len;
+    i64 xfer_handle;
+    u8  inline_data[IPC_INLINE_MAX];
+};
 
 #define DEV_DEFAULT 0xFFFF
 
@@ -348,6 +367,105 @@ static void dma_churn(void) {
     sysc(SYS_EXIT, pid, 0, 0);
 }
 
+/* v0.46: role 12 — the SENDER half of an IPC handle/shared-memory exchange.
+ * Transfers an open VFS fd, then a shared memory frame, to whichever pid the
+ * kernel pre-seeded at "ipc-peer". The shared-memory step is deliberately
+ * two-stage: a SELF-addressed send (recipient_pid == our own pid) creates
+ * and maps the frame, and — because that send's own g_ipc_lock release is
+ * what makes the loopback message visible at all — our own subsequent
+ * pattern write is guaranteed to happen-before anything we send the REAL
+ * peer next. Sending the real peer straight after the loopback (skipping
+ * the write) would race: the peer could pop that notification and read the
+ * shared page on another core before our write instruction ever executed. */
+static void ipc_sender(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+
+    i64 pfd = (i64)sysc(SYS_OPEN, (u64)"ipc-peer", 0, 0);
+    if (pfd < 0) sysc(SYS_EXIT, 950, 0, 0);
+    u8 pbuf[8];
+    if ((i64)sysc(SYS_READ, (u64)pfd, (u64)pbuf, 8) != 8) sysc(SYS_EXIT, 951, 0, 0);
+    sysc(SYS_CLOSE, (u64)pfd, 0, 0);
+    u64 peer = 0; for (int i = 0; i < 8; i++) peer |= ((u64)pbuf[i]) << (8 * i);
+
+    /* Fixed name, reused every round: unlike cio_file_worker's pid-keyed own-
+     * file, this content never needs to vary, and VFS files are durable/
+     * never-deleted (v0.44) — a pid-keyed name here would claim a brand-new,
+     * permanent VFS_MAXFILES dirent every round, exactly the growth v0.45's
+     * kpstress hit and deliberately bounded. Reopening the SAME name every
+     * round still hands back a fresh, distinct global fd number each time
+     * (g_ofiles is the thing that's actually per-round here, not the name). */
+    i64 fd = (i64)sysc(SYS_OPEN, (u64)"ipc-payload", 0, 0);
+    if (fd < 0) sysc(SYS_EXIT, 952, 0, 0);
+
+    struct ipc_msg m;
+    for (int i = 0; i < (int)sizeof m; i++) ((u8 *)&m)[i] = 0;
+    m.recipient_pid = peer;
+    m.msg_type = IPC_MSG_XFER_FD;
+    m.cap_mask = PCAP_FILESYSTEM;
+    m.payload_len = 11;
+    m.xfer_handle = fd;
+    const char *tag = "IPC-FD-XFER";
+    for (int i = 0; i < 11; i++) m.inline_data[i] = (u8)tag[i];
+    if ((i64)sysc(SYS_IPC_SEND, (u64)&m, 0, 0) != 0) sysc(SYS_EXIT, 953, 0, 0);
+
+    struct ipc_msg self;
+    for (int i = 0; i < (int)sizeof self; i++) ((u8 *)&self)[i] = 0;
+    self.recipient_pid = pid;                 /* loopback: creates the shared frame */
+    self.msg_type = IPC_MSG_XFER_SHM;
+    self.xfer_handle = -1;                    /* -1 = allocate a NEW shared frame    */
+    if ((i64)sysc(SYS_IPC_SEND, (u64)&self, 0, 0) != 0) sysc(SYS_EXIT, 954, 0, 0);
+    i64 shm_id = self.xfer_handle;            /* SEND wrote back the assigned id     */
+    u64 vaddr = 0; for (int i = 0; i < 8; i++) vaddr |= ((u64)self.inline_data[i]) << (8 * i);
+    if (shm_id < 0 || !vaddr) sysc(SYS_EXIT, 955, 0, 0);
+
+    struct ipc_msg drain;                      /* pop our own loopback so it doesn't  */
+    if ((i64)sysc(SYS_IPC_RECV, (u64)&drain, 1, 0) != 1) sysc(SYS_EXIT, 956, 0, 0);
+
+    volatile u64 *shm = (volatile u64 *)vaddr;
+    u64 pattern = pid ^ 0x5EA5FEEDull;
+    shm[0] = pattern;
+
+    struct ipc_msg m2;
+    for (int i = 0; i < (int)sizeof m2; i++) ((u8 *)&m2)[i] = 0;
+    m2.recipient_pid = peer;
+    m2.msg_type = IPC_MSG_XFER_SHM;
+    m2.xfer_handle = shm_id;                  /* re-share the SAME, now-populated id */
+    if ((i64)sysc(SYS_IPC_SEND, (u64)&m2, 0, 0) != 0) sysc(SYS_EXIT, 957, 0, 0);
+
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
+/* v0.46: role 13 — the RECEIVER half. Blocks on SYS_IPC_RECV for each of the
+ * two messages ipc_sender issues, uses the transferred fd exactly as if it
+ * had opened the file itself, then reads the shared frame directly — no
+ * syscall at all for that last step, which is the entire point. */
+static void ipc_receiver(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+
+    struct ipc_msg m1;
+    if ((i64)sysc(SYS_IPC_RECV, (u64)&m1, 1, 0) != 1) sysc(SYS_EXIT, 960, 0, 0);
+    if (m1.msg_type != IPC_MSG_XFER_FD) sysc(SYS_EXIT, 961, 0, 0);
+    const char *tag = "IPC-FD-XFER";
+    for (int i = 0; i < 11; i++) if (m1.inline_data[i] != (u8)tag[i]) sysc(SYS_EXIT, 962, 0, 0);
+
+    u8 rb[16];
+    if ((i64)sysc(SYS_READ, (u64)m1.xfer_handle, (u64)rb, 16) != 16) sysc(SYS_EXIT, 963, 0, 0);
+    const char *expect = "IPC-PAYLOAD-TEST";
+    for (int i = 0; i < 16; i++) if (rb[i] != (u8)expect[i]) sysc(SYS_EXIT, 964, 0, 0);
+    sysc(SYS_CLOSE, (u64)m1.xfer_handle, 0, 0);
+
+    struct ipc_msg m2;
+    if ((i64)sysc(SYS_IPC_RECV, (u64)&m2, 1, 0) != 1) sysc(SYS_EXIT, 965, 0, 0);
+    if (m2.msg_type != IPC_MSG_XFER_SHM) sysc(SYS_EXIT, 966, 0, 0);
+    u64 vaddr = 0; for (int i = 0; i < 8; i++) vaddr |= ((u64)m2.inline_data[i]) << (8 * i);
+    if (!vaddr) sysc(SYS_EXIT, 967, 0, 0);
+    volatile u64 *shm = (volatile u64 *)vaddr;
+    u64 pattern = m1.sender_pid ^ 0x5EA5FEEDull;
+    if (shm[0] != pattern) sysc(SYS_EXIT, 968, 0, 0);
+
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
 static void nic_driver(void) {
     print("  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====\n");
 
@@ -468,6 +586,8 @@ void _start(void) {
     if (role == 9) { cio_file_worker(); }               /* v0.41 concurrent file worker */
     if (role == 10) { cio_surface_churn(); }            /* v0.41 surface churn (AP)     */
     if (role == 11) { dma_churn(); }                    /* v0.44 DMA/passthrough churn  */
+    if (role == 12) { ipc_sender(); }                   /* v0.46 IPC handle/shmem sender */
+    if (role == 13) { ipc_receiver(); }                 /* v0.46 IPC handle/shmem receiver */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");
