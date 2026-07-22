@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.47.0-metal"
+#define KERNEL_VERSION "0.48.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -495,6 +495,7 @@ static volatile int g_debug_dma_lifetime = 0;   /* DEBUG_DMA_LIFETIME: grant cre
 static volatile int g_debug_kproc_lifetime = 0; /* DEBUG_KPROC_LIFETIME: recycle/descriptor teardown */
 static volatile int g_debug_ipc = 0;            /* DEBUG_IPC: send/recv/xfer/teardown log            */
 static volatile int g_debug_vfio = 0;           /* DEBUG_VFIO: BAR map/irq-wait/teardown log         */
+static volatile int g_debug_vfs  = 0;           /* DEBUG_VFS: journal commit/apply/unlink log        */
 
 /* user-stack layout (used by the guard-page fault check in isr_dispatch) */
 #define USTK_V     0x0000500000FF0000ull                  /* user stack bottom       */
@@ -3287,10 +3288,59 @@ struct cas_superblock {
     uint64_t used_blocks;
     uint64_t put_count, dedup_hits;
     uint64_t dir_start, dir_blocks;    /* VFS directory region (v2)             */
+    /* v0.48 (version 3): WAL journal regions. A version-2 on-disk superblock  */
+    /* never wrote these bytes (cas_format zeroed the whole 512B sector first, */
+    /* so they read back as zero) — cas_mount() gates ALL journal activity on */
+    /* SB->version == 3, so a version-2 volume is mounted in legacy            */
+    /* compatibility mode instead of trusting these fields. See cas_mount().   */
+    uint64_t vjournal_start, vjournal_blocks;   /* VFS-directory journal        */
+    uint64_t cjournal_start, cjournal_blocks;   /* CAS-metadata journal          */
 } __attribute__((packed));
 
 struct cas_islot { uint64_t hash; uint32_t block; uint32_t len; } __attribute__((packed));
 #define CAS_SLOTS_PER_BLOCK (CAS_BS / (int)sizeof(struct cas_islot))   /* 32 */
+
+/* ===========================================================================
+ * v0.48: WAL JOURNAL HEADERS
+ * ===========================================================================
+ * Two independent, narrowly-scoped journals — see CHANGELOG-0.48.0.md for the
+ * crash-consistency hazards each one closes.
+ *
+ * CAS-metadata journal: one header block + 3 shadow blocks {superblock,
+ * the ONE bitmap block touched by this put, the ONE index block touched by
+ * this put}. Written PENDING, then the two real home writes happen, then
+ * cleared — applied (replayed) IMMEDIATELY on the next mount if a crash
+ * left it PENDING, since cas_put runs constantly and every put must be
+ * durable on its own.
+ *
+ * VFS-directory journal: one header block + VFS_DIR_BLOCKS shadow blocks
+ * holding a full copy of g_dir. Written PENDING on every directory mutation
+ * (write or unlink); DEFERRED apply — nothing copies the shadow to the real
+ * dir_start region until SYS_VFS_SYNC is called or the next boot's recovery
+ * runs. This gives SYS_VFS_SYNC a genuine, demonstrable purpose instead of
+ * being a no-op: without it, a crash still recovers everything (recovery
+ * replays whatever was last journaled), but the on-disk dir_start region
+ * stays stale until either sync or reboot recovery applies it.
+ * =========================================================================== */
+#define CJ_STATE_EMPTY   0
+#define CJ_STATE_PENDING 1
+struct cjournal_header {
+    char     magic[8];          /* "CJRNL001" */
+    uint32_t state;
+    uint32_t seq;
+    uint64_t bitmap_block;      /* home location the bitmap shadow replays to */
+    uint64_t index_block;       /* home location the index shadow replays to  */
+} __attribute__((packed));
+
+#define VJ_STATE_EMPTY   0
+#define VJ_STATE_PENDING 1
+struct vjournal_header {
+    char     magic[8];          /* "VJRNL001" */
+    uint32_t state;
+    uint32_t seq;
+} __attribute__((packed));
+
+static uint32_t g_cj_seq = 0, g_vj_seq = 0;
 
 /* All disk-facing buffers are a full 512-byte sector.                         */
 static uint8_t g_sbblk[512]  __attribute__((aligned(512)));
@@ -3298,14 +3348,25 @@ static uint8_t g_bitmap[8192] __attribute__((aligned(512)));           /* up to 
 static uint8_t g_idxbuf[512]  __attribute__((aligned(512)));
 static uint8_t g_blk[512]     __attribute__((aligned(512)));
 static int     g_cas_mounted = 0;
+static int     g_cas_legacy  = 0;      /* v0.48: mounted a pre-journal (version 2) volume */
 #define SB ((struct cas_superblock *)g_sbblk)
 
 /* --- VFS directory: names -> content, layered on CAS ---------------------- */
-#define VFS_MAXFILES   27                     /* v0.43: +4 for smp_stress; v0.46: +2 fixed, */
+#define VFS_MAXFILES   29                     /* v0.43: +4 for smp_stress; v0.46: +2 fixed, */
                                                /* reused, non-growing names ("ipc-payload", */
                                                /* "ipc-peer") for cmd_ipc_stress; v0.47: +1  */
-                                               /* fixed name ("vfio-devid") for cmd_vfio_stress */
+                                               /* fixed name ("vfio-devid") for cmd_vfio_stress; */
+                                               /* v0.48: +2 fixed names ("vfs-stress",       */
+                                               /* "vfs-crash-test") for cmd_vfs_stress        */
 #define VFS_MAX_CHUNKS 16                     /* 16 * 512 = 8 KiB max file       */
+/* v0.48: the ACTUAL number of 512B blocks needed to hold VFS_MAXFILES 256-byte
+ * dirents — cas_format()/vfs_flush()/cas_mount() used to hardcode "8", which
+ * was only ever correct for the original VFS_MAXFILES==16 (8*512/256==16).
+ * Every bump since (v0.43/46/47/48) silently left the new dirent slots
+ * memory-only: never persisted to disk, never restored across a mount. See
+ * CHANGELOG-0.48.0.md for how this was found and confirmed with a direct read
+ * of the pre-fix code. */
+#define VFS_DIR_BLOCKS ((VFS_MAXFILES * 256 + CAS_BS - 1) / CAS_BS)
 struct dirent {
     char     name[32];
     uint32_t used;
@@ -3349,7 +3410,13 @@ static int64_t cas_index_find(uint64_t hash, uint32_t *out_len) {
     }
     return -1;
 }
-static int cas_index_insert(uint64_t hash, uint32_t block, uint32_t len) {
+/* v0.48: STAGES the insert into g_idxbuf (the correct home sector loaded and
+ * mutated in memory) WITHOUT writing it home. cas_put journals this staged
+ * block BEFORE it ever reaches its home sector, so a crash between the two
+ * writes below can never leave the index and bitmap disagreeing about who
+ * owns a block. Returns the home sector, -1 if the index is full, -2 if the
+ * hash is already present (caller treats that as a dedup, same as before). */
+static int64_t cas_index_stage(uint64_t hash, uint32_t block, uint32_t len) {
     uint64_t slots = SB->index_blocks * CAS_SLOTS_PER_BLOCK;
     uint64_t start = hash % slots;
     for (uint64_t probe = 0; probe < slots; probe++) {
@@ -3358,13 +3425,68 @@ static int cas_index_insert(uint64_t hash, uint32_t block, uint32_t len) {
         uint32_t off = (uint32_t)(s % CAS_SLOTS_PER_BLOCK) * sizeof(struct cas_islot);
         virtio_read_block(sec, g_idxbuf);
         struct cas_islot *sl = (struct cas_islot *)(g_idxbuf + off);
-        if (sl->hash == hash) return 0;
+        if (sl->hash == hash) return -2;
         if (sl->hash == 0 && sl->block == 0) {
             sl->hash = hash; sl->block = block; sl->len = len;
-            virtio_write_block(sec, g_idxbuf); return 0;
+            return (int64_t)sec;
         }
     }
     return -1;
+}
+
+/* ===========================================================================
+ * v0.48: CAS-METADATA JOURNAL — closes the exact hazard the audit found in
+ * cas_put's original sequence (index home-write lands, then a crash before
+ * cas_flush_meta's bitmap/superblock write lands -> index says "hash X is at
+ * block B", bitmap says "block B is free" -> a future put legitimately
+ * overwrites block B, silently corrupting a different dedup'd file).
+ *
+ * Scope is deliberately narrow: {superblock, the ONE bitmap block touched by
+ * THIS put, the ONE index block touched by THIS put} — not the whole ~18-
+ * block metadata region — because cas_put runs on every single write in
+ * every existing suite; shadowing the whole region every call would be a
+ * real performance regression against every suite's existing timing budget,
+ * for no benefit this narrower shadow doesn't already provide. Applied
+ * (replayed) IMMEDIATELY: either right here if bm_alloc/cas_index_stage
+ * built a real transaction, or at the next mount if a crash intervened.      */
+static void cas_journal_write(uint64_t idx_sec, uint64_t bitmap_blk) {
+    struct cjournal_header h; cmemset(&h, 0, sizeof h);
+    const char mg[8] = { 'C','J','R','N','L','0','0','1' };
+    cmemcpy(h.magic, mg, 8);
+    h.state = CJ_STATE_PENDING; h.seq = ++g_cj_seq;
+    h.bitmap_block = bitmap_blk; h.index_block = idx_sec;
+    uint8_t hdrblk[CAS_BS]; cmemset(hdrblk, 0, CAS_BS); cmemcpy(hdrblk, &h, sizeof h);
+    virtio_write_block(SB->cjournal_start + 0, hdrblk);
+    virtio_write_block(SB->cjournal_start + 1, g_sbblk);
+    uint8_t bmblk[CAS_BS];
+    cmemcpy(bmblk, g_bitmap + (bitmap_blk - SB->bitmap_start) * CAS_BS, CAS_BS);
+    virtio_write_block(SB->cjournal_start + 2, bmblk);
+    virtio_write_block(SB->cjournal_start + 3, g_idxbuf);      /* the STAGED block, not yet home */
+}
+static void cas_journal_clear(void) {
+    uint8_t z[CAS_BS]; cmemset(z, 0, CAS_BS);
+    virtio_write_block(SB->cjournal_start + 0, z);
+}
+/* Called once, from cas_mount(), BEFORE the bitmap/index are trusted. Replays
+ * a PENDING transaction to its recorded home locations so the disk always
+ * ends up in the "both writes landed" state regardless of exactly how far a
+ * prior crash interrupted the real writes.                                   */
+static void cas_journal_recover(void) {
+    uint8_t hdrblk[CAS_BS]; virtio_read_block(SB->cjournal_start + 0, hdrblk);
+    struct cjournal_header *h = (struct cjournal_header *)hdrblk;
+    const char mg[8] = { 'C','J','R','N','L','0','0','1' };
+    if (h->state != CJ_STATE_PENDING || cmemcmp(h->magic, mg, 8) != 0) return;
+    uint8_t sbblk[CAS_BS]; virtio_read_block(SB->cjournal_start + 1, sbblk);
+    virtio_write_block(0, sbblk);
+    uint8_t bmblk[CAS_BS]; virtio_read_block(SB->cjournal_start + 2, bmblk);
+    virtio_write_block(h->bitmap_block, bmblk);
+    uint8_t ixblk[CAS_BS]; virtio_read_block(SB->cjournal_start + 3, ixblk);
+    virtio_write_block(h->index_block, ixblk);
+    uint8_t z[CAS_BS]; cmemset(z, 0, CAS_BS);
+    virtio_write_block(SB->cjournal_start + 0, z);
+    kprintf("[cas    ] CAS journal recovery: replayed a pending metadata transaction "
+            "(bitmap blk %d, index blk %d, seq %u)\n",
+            h->bitmap_block, h->index_block, (uint64_t)h->seq);
 }
 
 /* store content -> return its content hash (address). Deduplicates.          */
@@ -3390,8 +3512,21 @@ static uint64_t cas_put(const void *data, uint32_t len) {
     cmemset(g_blk, 0, CAS_BS);
     cmemcpy(g_blk, data, len > CAS_BS ? CAS_BS : len);
     virtio_write_block((uint64_t)b, g_blk);
-    cas_index_insert(h, (uint32_t)b, len);
-    cas_flush_meta();
+    int64_t idx_sec = cas_index_stage(h, (uint32_t)b, len);
+    if (idx_sec >= 0) {
+        if (!g_cas_legacy) {
+            uint64_t bitmap_blk = SB->bitmap_start + ((uint64_t)b >> 3) / CAS_BS;
+            cas_journal_write((uint64_t)idx_sec, bitmap_blk);
+            virtio_write_block((uint64_t)idx_sec, g_idxbuf);   /* home index write   */
+            cas_flush_meta();                                  /* home sb+bitmap write */
+            cas_journal_clear();
+        } else {
+            virtio_write_block((uint64_t)idx_sec, g_idxbuf);
+            cas_flush_meta();
+        }
+    } else {
+        cas_flush_meta();          /* index full: bitmap/put_count still need to land */
+    }
     klock_release(&g_cas_lock);
     kprintf("[cas    ] put len %d hash %X -> block %d (stored)\n", (uint64_t)len, h, (uint64_t)b);
     return h;
@@ -3415,26 +3550,38 @@ static void cas_format(void) {
     cmemset(g_sbblk, 0, CAS_BS);
     const char mg[8] = { 'O','R','U','N','C','A','S','1' };
     cmemcpy(SB->magic, mg, 8);
-    SB->version = 2; SB->block_size = CAS_BS; SB->total_blocks = total;
+    /* v0.48: version 3 — adds the two journal regions below. A version-2       */
+    /* volume never had them; cas_mount() gates all journal use on this bump.    */
+    SB->version = 3; SB->block_size = CAS_BS; SB->total_blocks = total;
     SB->bitmap_start  = 1;
     SB->bitmap_blocks = (total / 8 + CAS_BS - 1) / CAS_BS;
     SB->index_start   = SB->bitmap_start + SB->bitmap_blocks;
     SB->index_blocks  = 16;
     SB->dir_start     = SB->index_start + SB->index_blocks;
-    SB->dir_blocks    = 8;                                 /* VFS directory      */
-    SB->data_start    = SB->dir_start + SB->dir_blocks;
+    SB->dir_blocks    = VFS_DIR_BLOCKS;                    /* VFS directory (fixed, was hardcoded 8) */
+    SB->vjournal_start  = SB->dir_start + SB->dir_blocks;
+    SB->vjournal_blocks = 1 + VFS_DIR_BLOCKS;              /* header + full-dir shadow  */
+    SB->cjournal_start  = SB->vjournal_start + SB->vjournal_blocks;
+    SB->cjournal_blocks = 4;                               /* header + sb + bitmap-blk + index-blk */
+    SB->data_start    = SB->cjournal_start + SB->cjournal_blocks;
     SB->used_blocks   = SB->data_start;
     cmemset(g_bitmap, 0, sizeof g_bitmap);
     for (uint64_t b = 0; b < SB->data_start; b++) bm_set(b);
     cmemset(g_idxbuf, 0, CAS_BS);
     for (uint64_t i = 0; i < SB->index_blocks; i++) virtio_write_block(SB->index_start + i, g_idxbuf);
     for (uint64_t i = 0; i < SB->dir_blocks; i++) virtio_write_block(SB->dir_start + i, g_idxbuf);
+    for (uint64_t i = 0; i < SB->vjournal_blocks; i++) virtio_write_block(SB->vjournal_start + i, g_idxbuf);
+    for (uint64_t i = 0; i < SB->cjournal_blocks; i++) virtio_write_block(SB->cjournal_start + i, g_idxbuf);
     cas_flush_meta();
     g_cas_mounted = 1;
-    kprintf("[cas    ] formatted %d blocks: bitmap@%d(%d) index@%d(%d) dir@%d(%d) data@%d\n",
+    g_cas_legacy = 0;
+    kprintf("[cas    ] formatted %d blocks: bitmap@%d(%d) index@%d(%d) dir@%d(%d) vjrnl@%d(%d) cjrnl@%d(%d) data@%d\n",
             SB->total_blocks, SB->bitmap_start, SB->bitmap_blocks,
-            SB->index_start, SB->index_blocks, SB->dir_start, SB->dir_blocks, SB->data_start);
+            SB->index_start, SB->index_blocks, SB->dir_start, SB->dir_blocks,
+            SB->vjournal_start, SB->vjournal_blocks, SB->cjournal_start, SB->cjournal_blocks, SB->data_start);
 }
+
+static void vfs_journal_apply(void);   /* fwd: v0.48, defined in the VFS section below */
 
 /* format/mount are UNLOCKED by design: both run on the boot core before the
  * APs are online (and from the BSP shell with no AP tasks queued). Taking
@@ -3443,13 +3590,27 @@ static void cas_format(void) {
 static int cas_mount(void) {
     virtio_read_block(0, g_sbblk);
     const char mg[8] = { 'O','R','U','N','C','A','S','1' };
-    if (cmemcmp(SB->magic, mg, 8) != 0 || SB->version != 2) return 0;
+    if (cmemcmp(SB->magic, mg, 8) != 0 || (SB->version != 2 && SB->version != 3)) return 0;
+    /* v0.48: a version-2 volume predates both the dir_blocks fix and the        */
+    /* journal regions — its on-disk bytes past dir_blocks/8 are DATA blocks,    */
+    /* not journal headers, so trusting SB->vjournal_start/cjournal_start here   */
+    /* would read (and later write!) garbage. Mount it read/write-compatible in  */
+    /* a legacy mode instead: same 8-block dir clamp this kernel always used,    */
+    /* journaling simply inactive until the volume is reformatted.               */
+    g_cas_legacy = (SB->version == 2);
+    if (!g_cas_legacy) {
+        cas_journal_recover();
+        virtio_read_block(0, g_sbblk);      /* recovery may have rewritten the superblock */
+    }
     for (uint64_t i = 0; i < SB->bitmap_blocks; i++)
         virtio_read_block(SB->bitmap_start + i, g_bitmap + i * CAS_BS);
-    for (uint64_t i = 0; i < SB->dir_blocks && i < 8; i++)
+    if (!g_cas_legacy) vfs_journal_apply();  /* replay any pending directory commit before load */
+    uint64_t dirlim = g_cas_legacy ? 8 : VFS_DIR_BLOCKS;
+    for (uint64_t i = 0; i < SB->dir_blocks && i < dirlim; i++)
         virtio_read_block(SB->dir_start + i, g_dir + i * CAS_BS);
     g_cas_mounted = 1;
-    kprintf("[cas    ] mounted existing volume: %d/%d blocks used, %d puts, %d dedup hits\n",
+    kprintf("[cas    ] mounted existing volume (v%d%s): %d/%d blocks used, %d puts, %d dedup hits\n",
+            SB->version, g_cas_legacy ? ", legacy/no-journal" : "",
             SB->used_blocks, SB->total_blocks, SB->put_count, SB->dedup_hits);
     return 1;
 }
@@ -3466,6 +3627,10 @@ static int streq_n(const char *a, const char *b, int n) {
     for (int i = 0; i < n; i++) { if (a[i] != b[i]) return 0; if (!a[i]) return 1; }
     return 1;
 }
+/* v0.48: legacy-only direct flush — a version-2 (pre-journal) volume has no
+ * journal region to defer into, so it keeps writing dir_start straight away,
+ * exactly like every version before this one. Non-legacy volumes never call
+ * this; they go through vfs_journal_commit()/vfs_journal_apply() instead.    */
 static void vfs_flush(void) {
     for (uint64_t i = 0; i < SB->dir_blocks && i < 8; i++)
         virtio_write_block(SB->dir_start + i, g_dir + i * CAS_BS);
@@ -3476,6 +3641,54 @@ static int vfs_find(const char *name) {
     return -1;
 }
 static void ts_emit(int type, const char *who, const char *text);  /* Time-Stream (Phase 5) */
+
+/* ===========================================================================
+ * v0.48: VFS-DIRECTORY JOURNAL
+ * ===========================================================================
+ * A single-slot whole-directory shadow: every mutation (write or unlink)
+ * copies the CURRENT in-memory g_dir into the journal payload region and
+ * marks the header PENDING. That commit alone is what makes an update
+ * crash-safe — a boot that never reaches SYS_VFS_SYNC still recovers it, via
+ * vfs_journal_apply() running from cas_mount(). What SYS_VFS_SYNC actually
+ * buys the caller is EAGER application: without calling it, the on-disk
+ * dir_start region stays stale (last-applied state) until the next mount's
+ * recovery runs, even though the journal already holds the true state.       */
+static void vfs_journal_commit(void) {
+    if (g_cas_legacy) { vfs_flush(); return; }             /* no journal region to use */
+    struct vjournal_header h; cmemset(&h, 0, sizeof h);
+    const char mg[8] = { 'V','J','R','N','L','0','0','1' };
+    cmemcpy(h.magic, mg, 8);
+    h.state = VJ_STATE_PENDING; h.seq = ++g_vj_seq;
+    uint8_t hdrblk[CAS_BS]; cmemset(hdrblk, 0, CAS_BS); cmemcpy(hdrblk, &h, sizeof h);
+    virtio_write_block(SB->vjournal_start + 0, hdrblk);
+    for (uint64_t i = 0; i < VFS_DIR_BLOCKS; i++)
+        virtio_write_block(SB->vjournal_start + 1 + i, g_dir + i * CAS_BS);
+}
+/* Applies a PENDING journal commit to the real dir_start region — called
+ * both from cas_mount() (boot-time recovery) and SYS_VFS_SYNC (explicit,
+ * eager flush). Idempotent: a CLEAN/EMPTY journal is a no-op. Returns 1 if
+ * it actually applied a pending commit, 0 otherwise.                        */
+static int g_vfs_last_sync_applied = 0;   /* diagnostic only, read by cmd_vfs_stress */
+static void vfs_journal_apply(void) {
+    if (g_cas_legacy) { g_vfs_last_sync_applied = 0; return; }
+    uint8_t hdrblk[CAS_BS]; virtio_read_block(SB->vjournal_start + 0, hdrblk);
+    struct vjournal_header *h = (struct vjournal_header *)hdrblk;
+    const char mg[8] = { 'V','J','R','N','L','0','0','1' };
+    if (h->state != VJ_STATE_PENDING || cmemcmp(h->magic, mg, 8) != 0) {
+        g_vfs_last_sync_applied = 0;
+        return;
+    }
+    uint8_t buf[CAS_BS];
+    for (uint64_t i = 0; i < VFS_DIR_BLOCKS && i < SB->dir_blocks; i++) {
+        virtio_read_block(SB->vjournal_start + 1 + i, buf);
+        virtio_write_block(SB->dir_start + i, buf);
+    }
+    uint8_t z[CAS_BS]; cmemset(z, 0, CAS_BS);
+    virtio_write_block(SB->vjournal_start + 0, z);
+    kprintf("[vfs    ] VFS journal: applied a pending directory commit (seq %u) to disk\n",
+            (uint64_t)h->seq);
+    g_vfs_last_sync_applied = 1;
+}
 
 /* v0.41: the whole-file COW rewrite runs under g_vfs_lock (rank 2), held
  * across every chunk's cas_put (rank 3 — strictly upward) and the directory
@@ -3498,7 +3711,7 @@ static int vfs_write_locked(int idx, const char *name, const void *data, uint32_
         d->chunk_hash[i] = cas_put(p + i * 512, cl);       /* CAS stores each block */
     }
     d->file_hash = len ? rust_cas_hash((uint64_t)data, len) : 0;
-    vfs_flush();
+    vfs_journal_commit();          /* v0.48: journal-commit; see comment above */
     { char msg[64]; int mp = 0;
       const char *pre = "wrote file "; while (pre[mp]) { msg[mp] = pre[mp]; mp++; }
       for (int q = 0; name[q] && mp < 60; q++) msg[mp++] = name[q];
@@ -3538,6 +3751,79 @@ static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
     klock_release(&g_vfs_lock);
     return got;
 }
+/* ===========================================================================
+ * v0.48: MULTI-VOLUME ABSTRACTION — ROOT (unchanged), TMP (ephemeral RAM-only,
+ * no CAS/journaling — matches real tmpfs semantics), DEV (read-only, a thin
+ * text listing over the existing kdevs[] registry — NOT a second way to touch
+ * raw MMIO; that's SYS_HW_PASSTHROUGH/SYS_VFIO_MAP_BAR's job, unchanged).
+ * Path-prefix routing ("tmp/", "dev/", else ROOT) keeps every existing
+ * suite's bare filenames working exactly as before — this is purely additive.
+ * =========================================================================== */
+#define VOL_ROOT 0
+#define VOL_TMP  1
+#define VOL_DEV  2
+
+#define TMP_MAXFILES 4                 /* small, ephemeral, RAM-only scratch area */
+#define TMP_MAXBYTES 512
+struct tmpfile { char name[32]; int used; uint32_t len; uint8_t data[TMP_MAXBYTES]; };
+static struct tmpfile g_tmpfiles[TMP_MAXFILES];
+
+static int path_has_prefix(const char *name, const char *prefix) {
+    int i = 0;
+    while (prefix[i]) { if (name[i] != prefix[i]) return 0; i++; }
+    return 1;
+}
+
+static int64_t tmp_read_file(int ti, void *buf, uint32_t max) {
+    if (ti < 0 || ti >= TMP_MAXFILES) return -1;
+    klock_acquire(&g_vfs_lock);            /* reuses rank 2: VFS-adjacent, not CAS state */
+    if (!g_tmpfiles[ti].used) { klock_release(&g_vfs_lock); return -1; }
+    uint32_t n = g_tmpfiles[ti].len; if (n > max) n = max;
+    cmemcpy(buf, g_tmpfiles[ti].data, n);
+    klock_release(&g_vfs_lock);
+    return (int64_t)n;
+}
+static int tmp_write_file(int ti, const void *data, uint32_t len) {
+    if (ti < 0 || ti >= TMP_MAXFILES) return -1;
+    if (len > TMP_MAXBYTES) len = TMP_MAXBYTES;
+    klock_acquire(&g_vfs_lock);
+    if (!g_tmpfiles[ti].used) { klock_release(&g_vfs_lock); return -1; }
+    cmemcpy(g_tmpfiles[ti].data, data, len);
+    g_tmpfiles[ti].len = len;
+    klock_release(&g_vfs_lock);
+    return (int)len;
+}
+
+/* dev/devices: a read-only text snapshot of the kdevs[] registry, built fresh
+ * on every read (no persistent backing — it's a live VIEW, not a file).       */
+static uint32_t u64_to_dec_buf(uint8_t *out, uint64_t v) {
+    char tmp[20]; int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v) { tmp[n++] = (char)('0' + v % 10); v /= 10; }
+    for (int i = 0; i < n; i++) out[i] = (uint8_t)tmp[n - 1 - i];
+    return (uint32_t)n;
+}
+static uint32_t dev_build_listing(uint8_t *buf, uint32_t max) {
+    uint32_t p = 0;
+    for (int i = 0; i < n_kdev && p + 96 < max; i++) {
+        const char *nm = kdevs[i].name;
+        for (int j = 0; nm[j] && p < max; j++) buf[p++] = (uint8_t)nm[j];
+        if (p < max) buf[p++] = ' ';
+        p += u64_to_dec_buf(buf + p, kdevs[i].base);
+        if (p < max) buf[p++] = ' ';
+        p += u64_to_dec_buf(buf + p, kdevs[i].len);
+        if (p < max) buf[p++] = '\n';
+    }
+    return p;
+}
+static int64_t dev_read_file(void *buf, uint32_t max) {
+    uint8_t tmp[768];
+    uint32_t n = dev_build_listing(tmp, sizeof tmp);
+    if (n > max) n = max;
+    cmemcpy(buf, tmp, n);
+    return (int64_t)n;
+}
+
 /* Open-descriptor array. v0.41: fd claim/free/deref go under g_ofile_lock
  * (rank 1) and every descriptor records its OWNING process — before this,
  * any process could close (or write through) any other process's fd, and two
@@ -3545,26 +3831,76 @@ static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
  * between ranks 1 and 2: vfs_open resolves the name under the vfs lock,
  * RELEASES it, then claims the fd under the ofile lock. Nesting them here
  * (vfs->ofile) against SYS_READ's ofile->vfs would be the classic ABBA
- * inversion — the one concrete deadlock this design had to engineer out.    */
-struct ofile { int used; int dirent; uint64_t off; int owner; };
+ * inversion — the one concrete deadlock this design had to engineer out.
+ * v0.48: `.volume` records which of the three volumes this fd was opened
+ * against — a fd is bound to its volume for life; there is no operation that
+ * lets one fd be reinterpreted as a different volume's handle, which is what
+ * makes the volume boundary an isolation guarantee rather than a convention. */
+struct ofile { int used; int dirent; uint64_t off; int owner; int volume; };
 static struct ofile g_ofiles[16];
-static int vfs_open_for(const char *name, int owner) {
-    klock_acquire(&g_vfs_lock);
-    int di = vfs_find(name);
-    klock_release(&g_vfs_lock);                /* released BEFORE the fd claim  */
-    if (di < 0) return -1;
+static int ofile_claim(int owner, int volume, int dirent) {
     klock_acquire(&g_ofile_lock);
     for (int fd = 0; fd < 16; fd++)
         if (!g_ofiles[fd].used) {
-            g_ofiles[fd].used = 1; g_ofiles[fd].dirent = di;
+            g_ofiles[fd].used = 1; g_ofiles[fd].dirent = dirent;
             g_ofiles[fd].off = 0; g_ofiles[fd].owner = owner;
+            g_ofiles[fd].volume = volume;
             klock_release(&g_ofile_lock);
             return fd;
         }
     klock_release(&g_ofile_lock);
     return -1;
 }
+static int vfs_open_for(const char *name, int owner) {
+    if (path_has_prefix(name, "tmp/")) {
+        const char *rest = name + 4;
+        klock_acquire(&g_vfs_lock);
+        int ti = -1;
+        for (int i = 0; i < TMP_MAXFILES; i++)
+            if (g_tmpfiles[i].used && streq_n(g_tmpfiles[i].name, rest, 32)) { ti = i; break; }
+        if (ti < 0) for (int i = 0; i < TMP_MAXFILES; i++) if (!g_tmpfiles[i].used) {
+            ti = i; g_tmpfiles[i].used = 1; g_tmpfiles[i].len = 0;
+            kstrcpy_n(g_tmpfiles[i].name, rest, 32); break;
+        }
+        klock_release(&g_vfs_lock);
+        if (ti < 0) return -1;
+        return ofile_claim(owner, VOL_TMP, ti);
+    }
+    if (path_has_prefix(name, "dev/"))
+        return ofile_claim(owner, VOL_DEV, 0);     /* dirent unused: a live view, not a file */
+
+    klock_acquire(&g_vfs_lock);
+    int di = vfs_find(name);
+    klock_release(&g_vfs_lock);                /* released BEFORE the fd claim  */
+    if (di < 0) return -1;
+    return ofile_claim(owner, VOL_ROOT, di);
+}
 static int vfs_open(const char *name) { return vfs_open_for(name, (int)current_proc_idx); }
+
+/* ===========================================================================
+ * v0.48: SYS_VFS_UNLINK — zero the dirent, journal-commit the directory
+ * change, then force-close any g_ofiles[] entry still pointing at it,
+ * regardless of owner (mirrors descriptor_teardown_kproc's "regardless of how
+ * it got there" philosophy, just triggered by unlink instead of process exit).
+ * Deliberately NOT reclaiming the CAS blocks/index slots the file's chunks
+ * used: there is no reference counting across dirents (two files can share a
+ * chunk_hash via dedup), so freeing them here could silently corrupt a
+ * different, still-live file. Disclosed as a scope boundary, not fixed here.  */
+static int vfs_unlink(const char *name) {
+    klock_acquire(&g_vfs_lock);
+    int idx = vfs_find(name);
+    if (idx < 0) { klock_release(&g_vfs_lock); return -1; }
+    DENTS[idx].used = 0;
+    vfs_journal_commit();
+    klock_release(&g_vfs_lock);
+
+    klock_acquire(&g_ofile_lock);              /* separate, non-nested section (rank 1) */
+    for (int fd = 0; fd < 16; fd++)
+        if (g_ofiles[fd].used && g_ofiles[fd].volume == VOL_ROOT && g_ofiles[fd].dirent == idx)
+            { g_ofiles[fd].used = 0; g_ofiles[fd].owner = -1; }
+    klock_release(&g_ofile_lock);
+    return 0;
+}
 
 /* ===========================================================================
  * v0.45: DESCRIPTOR TEARDOWN — the fd-leak half of kproc lifetime discipline
@@ -3834,6 +4170,25 @@ static void cmd_cas(void) {
     if (!g_vblk_ready) { kputs("[cas    ] no virtio-blk device; cannot mount CAS\n"); return; }
     kputs("-- content-addressable storage on virtio-blk (Rust-hashed) --\n");
     if (!cas_mount()) { kputs("[cas    ] no volume signature; formatting a fresh CAS volume\n"); cas_format(); }
+
+    /* v0.48: genuine cross-QEMU-reboot journal-recovery proof. "vfscrashwrite"
+     * (below) commits this file's journal entry and halts WITHOUT ever
+     * calling SYS_VFS_SYNC — simulating real power loss. If it shows up here,
+     * on a LATER, completely separate QEMU process sharing the same disk
+     * image, cas_mount()'s automatic recovery (not this in-kernel test, a
+     * genuinely different boot) is what put it there. See CHANGELOG-0.48.0.md. */
+    {
+        int rti = vfs_find("vfs-reboot-test");
+        if (rti >= 0) {
+            uint8_t rb[32];
+            int64_t n = vfs_read_file(rti, rb, sizeof rb);
+            static const uint8_t want[24] = "CROSS-REBOOT-JOURNAL-OK";
+            int ok = (n == (int64_t)sizeof want) && (cmemcmp(rb, want, sizeof want) == 0);
+            kputs("[vfs    ] cross-reboot journal probe: 'vfs-reboot-test' found from a PRIOR boot\n");
+            kputs(ok ? "[vfs    ] cross-reboot journal probe: content VERIFIED\n"
+                     : "[vfs    ] cross-reboot journal probe: content MISMATCH\n");
+        }
+    }
 
     const char *a = "Hello, Outrun CAS! The content is the address.";
     const char *b = "A completely different block of bytes entirely.";
@@ -5380,12 +5735,16 @@ static inline void fs_witness_enter(void) {
 }
 static inline void fs_witness_leave(void) { __sync_fetch_and_sub(&g_fs_inflight, 1); }
 
-/* Resolve fd -> dirent index under the ofile lock, enforcing ownership.      */
-static int ofile_deref(int fd) {
+/* Resolve fd -> dirent index under the ofile lock, enforcing ownership.
+ * v0.48: also reports which VOLUME the fd was opened against, so callers can
+ * dispatch to the right backing store — a fd's volume never changes after
+ * open, so this is the one place that isolation boundary is enforced.        */
+static int ofile_deref(int fd, int *out_vol) {
     if (fd < 0 || fd >= 16) return -1;
     klock_acquire(&g_ofile_lock);
     int di = (g_ofiles[fd].used && g_ofiles[fd].owner == (int)current_proc_idx)
            ? g_ofiles[fd].dirent : -1;
+    if (di >= 0 && out_vol) *out_vol = g_ofiles[fd].volume;
     klock_release(&g_ofile_lock);
     return di;
 }
@@ -5450,8 +5809,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         uint32_t len = (uint32_t)a2; if (len > 65536) len = 65536;
         if (!access_ok(kprocs[current_proc_idx].cr3, a1, len, 1)) return (uint64_t)-14;  /* must be USER-writable */
         fs_witness_enter();
-        int di = ofile_deref(fd);                          /* owner-checked      */
-        int64_t n = (di < 0) ? -9 : vfs_read_file(di, (void *)a1, len);
+        int vol = VOL_ROOT;
+        int di = ofile_deref(fd, &vol);                     /* owner-checked      */
+        int64_t n = -9;
+        if (di >= 0) {
+            if (vol == VOL_ROOT)      n = vfs_read_file(di, (void *)a1, len);
+            else if (vol == VOL_TMP)  n = tmp_read_file(di, (void *)a1, len);
+            else /* VOL_DEV */        n = dev_read_file((void *)a1, len);
+        }
         fs_witness_leave();
         return (uint64_t)n;
     }
@@ -5461,8 +5826,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         uint32_t len = (uint32_t)a2; if (len > 65536) len = 65536;
         if (!access_ok(kprocs[current_proc_idx].cr3, a1, len, 0)) return (uint64_t)-14;  /* must be USER-readable */
         fs_witness_enter();
-        int di = ofile_deref(fd);
-        int r = (di < 0) ? -9 : vfs_write_by_dirent(di, (const void *)a1, len);  /* COW */
+        int vol = VOL_ROOT;
+        int di = ofile_deref(fd, &vol);
+        int r = -9;
+        if (di >= 0) {
+            if (vol == VOL_ROOT)      r = vfs_write_by_dirent(di, (const void *)a1, len);  /* COW */
+            else if (vol == VOL_TMP)  r = tmp_write_file(di, (const void *)a1, len);
+            else /* VOL_DEV */        r = -13;              /* read-only volume: capability-style denial */
+        }
         fs_witness_leave();
         return r < 0 ? (uint64_t)(int64_t)r : len;
     }
@@ -5758,6 +6129,31 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                     kprocs[current_proc_idx].pid, current_proc_idx, (uint64_t)line,
                     fired ? "fired" : "timed out");
         return fired ? 1 : 0;
+    }
+
+    /* --- v0.48: VFS journaling / directory reclamation (require CAP_FILESYSTEM) --- */
+    case 22: {   /* SYS_VFS_SYNC() -> 1 if a pending journal commit was applied, 0 if none pending */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+        if (!g_cas_mounted) return (uint64_t)-1;
+        klock_acquire(&g_vfs_lock);
+        vfs_journal_apply();
+        int applied = g_vfs_last_sync_applied;
+        klock_release(&g_vfs_lock);
+        if (g_debug_vfs)
+            kprintf("[dbgvfs ] pid %u: SYS_VFS_SYNC applied=%u\n", kprocs[current_proc_idx].pid, (uint64_t)applied);
+        return (uint64_t)applied;
+    }
+    case 23: {   /* SYS_VFS_UNLINK(name) -> 0 on success, negative on failure */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+        char name[64];
+        if (copy_user_str(kprocs[current_proc_idx].cr3, a0, name, sizeof name) < 0) return (uint64_t)-14;
+        if (path_has_prefix(name, "tmp/") || path_has_prefix(name, "dev/")) return (uint64_t)-1;  /* ROOT-only */
+        fs_witness_enter();
+        int r = vfs_unlink(name);
+        fs_witness_leave();
+        if (g_debug_vfs)
+            kprintf("[dbgvfs ] pid %u: SYS_VFS_UNLINK('%s') -> %d\n", kprocs[current_proc_idx].pid, name, r);
+        return (uint64_t)(int64_t)r;
     }
     }
     return (uint64_t)-1;
@@ -6819,6 +7215,167 @@ static void cmd_vfio_stress(void) {
     if (!g_vfiofail)
         kputs("[vfiostrs] VFIO STRESS VERIFIED — BAR mapping and routed interrupts both leak-free across driver churn\n");
     else kputs("[vfiostrs] VFIO STRESS DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.48: VFS STRESS — journaling, unlink/reclamation, and multi-volume
+ * mounts, all driven through real ring-3 syscalls, plus a direct in-kernel
+ * proof that the VFS-directory journal's deferred apply and automatic
+ * boot-time recovery both do real work.
+ * ===========================================================================
+ * "vfs-stress" is a single, fixed, reused ROOT name — exactly the v0.45
+ * lesson: the kernel harness re-seeds it before every round, the ring-3
+ * driver overwrites then UNLINKS it, so the directory never grows past
+ * baseline no matter how many rounds run. "tmp/scratch" is likewise fixed
+ * and reused (TMP_MAXFILES never exceeded). "dev/devices" is a live view,
+ * not a file at all — nothing to grow. */
+#define VFSSTRESS_ROUNDS 15
+static int g_vfspass, g_vfsfail;
+static void vfscheck(const char *n, int c) {
+    if (c) { g_vfspass++; kprintf("[vfsstrs]  PASS  %s\n", n); }
+    else   { g_vfsfail++; kprintf("[vfsstrs]  FAIL  %s\n", n); }
+}
+
+static int vfs_dirents_in_use(void) {
+    int n = 0;
+    for (int i = 0; i < VFS_MAXFILES; i++) if (DENTS[i].used) n++;
+    return n;
+}
+static int vfs_tmp_in_use(void) {
+    int n = 0;
+    for (int i = 0; i < TMP_MAXFILES; i++) if (g_tmpfiles[i].used) n++;
+    return n;
+}
+
+static void cmd_vfs_stress(void) {
+    kputs("-- VFS STRESS: journaling, unlink/reclamation, multi-volume mounts, driver churn --\n");
+    g_vfspass = g_vfsfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+
+    if (!g_cas_mounted) { vfscheck("CAS mounted before VFS stress can run", 0);
+                           kprintf("[vfsstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_vfspass, (uint64_t)g_vfsfail);
+                           return; }
+
+    static const uint8_t seed[16] = "VFS-SEED-PATTERN";
+    /* baseline is measured AFTER round 0 (the round that FIRST creates
+     * tmp/scratch and first re-seeds+unlinks vfs-stress) — round 0 is
+     * expected to change the counts from empty to steady-state; rounds 1..N
+     * are the ones that must hold steady at that state, proving reclamation
+     * rather than growth.                                                   */
+    int baseline_dirents = -1, baseline_tmp = -1;
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    int rounds_ok = 1, fds_ok = 1, unlink_ok = 1, dirent_bound_ok = 1, tmp_bound_ok = 1;
+    int rnd;
+
+    for (rnd = 0; rnd < VFSSTRESS_ROUNDS; rnd++) {
+        vfs_write_file("vfs-stress", seed, sizeof seed);   /* re-seed: driver unlinked it last round */
+
+        int p = kproc_spawn("vfs-driver", PCAP_FILESYSTEM);
+        if (p < 0) { vfscheck("kproc_spawn never fails mid-storm (recycling keeps the table bounded)", 0);
+                     rounds_ok = 0; break; }
+        kprocs[p].role = 15;
+        uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!e) { vfscheck("every worker's ELF loads", 0); rounds_ok = 0; break; }
+        kprocs[p].entry = e;
+
+        if (n > 1) {
+            rq_push(0 % n, p);
+            __sync_synchronize();
+            lapic_ipi(0, IPI_PING, 1);
+            int q; while ((q = rq_pop(0)) >= 0) cpu_exec_proc(0, q);
+        } else {
+            cpu_exec_proc(0, p);
+        }
+
+        uint64_t t0 = g_ticks;
+        while (!kprocs[p].torn_down && g_ticks - t0 < 3000) {
+            if (n > 1) lapic_ipi(0, IPI_PING, 1);
+            uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
+        }
+        current_proc_idx = save;
+
+        int ok = kprocs[p].exited && kprocs[p].exit_code == kprocs[p].pid;
+        if (!ok) {
+            kprintf("[vfsstrs] round %d FAILED: exit %u (want %u)\n", rnd, kprocs[p].exit_code, kprocs[p].pid);
+            rounds_ok = 0;
+        }
+
+        if (vfs_find("vfs-stress") >= 0) unlink_ok = 0;    /* driver must have unlinked it */
+
+        int fds_leaked = 0;
+        klock_acquire(&g_ofile_lock);
+        for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+        klock_release(&g_ofile_lock);
+        if (fds_leaked) fds_ok = 0;
+
+        if (rnd == 0) { baseline_dirents = vfs_dirents_in_use(); baseline_tmp = vfs_tmp_in_use(); }
+        else {
+            if (vfs_dirents_in_use() != baseline_dirents) dirent_bound_ok = 0;
+            if (vfs_tmp_in_use() != baseline_tmp) tmp_bound_ok = 0;
+        }
+
+        if (ok && (rnd % 5) == 4)
+            kprintf("[vfsstrs] round %d/%d clean\n", rnd + 1, (uint64_t)VFSSTRESS_ROUNDS);
+    }
+
+    vfscheck("every round completed without a watchdog timeout (no deadlock across preemption)",
+             rnd == VFSSTRESS_ROUNDS);
+    vfscheck("every round's driver exited cleanly (ROOT read/overwrite/sync, TMP write/read, DEV read-only all verified in ring 3)",
+             rounds_ok);
+    vfscheck("no descriptor leaked past any round (open-file table fully released each time)", fds_ok);
+    vfscheck("SYS_VFS_UNLINK actually removed the dirent every round (vfs_find fails immediately after)", unlink_ok);
+    vfscheck("directory dirent count never grew past baseline (unlink+reclaim, not one-new-dirent-per-round)",
+             dirent_bound_ok);
+    vfscheck("TMP volume slot count never grew past baseline (fixed reused name, not one-new-slot-per-round)",
+             tmp_bound_ok);
+
+    uint64_t freed_total = g_frames_freed - freed0, reused_total = g_frames_reused - reused0;
+    kprintf("[vfsstrs] %d rounds: +%u freed, +%u reused; global depth %u\n",
+            rnd, freed_total, reused_total, g_frame_free_depth);
+    vfscheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+             g_frame_free_depth == g_frames_freed - g_frames_reused);
+    vfscheck("the frame allocator's leaf lock never triggered a rank violation (no double-free race)",
+             g_rank_violations == viol0);
+
+    /* --- direct in-kernel proof: deferred journal apply + automatic boot recovery --- */
+    static const uint8_t crashpat[24] = "VFS-CRASH-RECOVERY-TEST";
+    vfs_write_file("vfs-crash-test", crashpat, sizeof crashpat);   /* commits journal PENDING; dir_start left stale */
+    int idx = vfs_find("vfs-crash-test");
+    int deferred_ok = 0, recovered_ok = 0, reload_ok = 0;
+    if (idx >= 0 && !g_cas_legacy) {
+        uint64_t blk = SB->dir_start + (uint64_t)idx / 2;
+        uint32_t off = (uint32_t)(idx % 2) * 256;
+        uint8_t raw[512]; virtio_read_block(blk, raw);
+        struct dirent *praw = (struct dirent *)(raw + off);
+        /* on-disk copy must NOT yet reflect the commit — proves apply is deferred, not eager */
+        deferred_ok = (praw->used == 0 || praw->file_hash != DENTS[idx].file_hash);
+
+        g_cas_mounted = 0;
+        int remounted = cas_mount();                       /* simulates a reboot: recovery runs for real */
+
+        virtio_read_block(blk, raw);
+        praw = (struct dirent *)(raw + off);
+        recovered_ok = (remounted && praw->used == 1 && praw->file_hash == DENTS[idx].file_hash);
+
+        int idx2 = vfs_find("vfs-crash-test");
+        uint8_t rb[32];
+        int64_t got = (idx2 >= 0) ? vfs_read_file(idx2, rb, sizeof rb) : -1;
+        reload_ok = (idx2 >= 0 && got == (int64_t)sizeof crashpat && cmemcmp(rb, crashpat, sizeof crashpat) == 0);
+    }
+    vfscheck("VFS journal commit is genuinely DEFERRED (on-disk dir region is stale before apply)", deferred_ok);
+    vfscheck("a simulated reboot's cas_mount() automatically recovers the pending commit", recovered_ok);
+    vfscheck("the recovered directory reloads with correct content (post-recovery read matches what was written)",
+             reload_ok);
+
+    kprintf("[vfsstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_vfspass, (uint64_t)g_vfsfail);
+    if (!g_vfsfail)
+        kputs("[vfsstrs] VFS STRESS VERIFIED — journaling, reclamation and multi-volume mounts all leak-free and crash-safe\n");
+    else kputs("[vfsstrs] VFS STRESS DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -9464,6 +10021,19 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "kpstress")) cmd_kproc_stress();
     else if (!kstrcmp(argv[0], "ipcstress")) cmd_ipc_stress();
     else if (!kstrcmp(argv[0], "vfiostress")) cmd_vfio_stress();
+    else if (!kstrcmp(argv[0], "vfsstress")) cmd_vfs_stress();
+    else if (!kstrcmp(argv[0], "vfscrashwrite")) {
+        /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
+         * (see the probe in cmd_cas()): commit this write's journal entry,
+         * then halt WITHOUT ever calling SYS_VFS_SYNC or shutting down
+         * cleanly — simulating real power loss mid-write. A SEPARATE later
+         * boot against the same disk image is what proves recovery, not
+         * this process. Not part of the automated suite by design. */
+        static const uint8_t crashpat2[24] = "CROSS-REBOOT-JOURNAL-OK";
+        vfs_write_file("vfs-reboot-test", crashpat2, sizeof crashpat2);
+        kputs("[vfs    ] vfscrashwrite: journal-committed 'vfs-reboot-test', halting WITHOUT sync (simulated power loss)\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
     else if (!kstrcmp(argv[0], "uptime")) kprintf("%u.%u s since boot (%u ticks)\n",
                                                   g_ticks / 100, (g_ticks % 100) / 10, g_ticks);
@@ -9618,6 +10188,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_kproc_stress();     /* v0.45: 200-cycle kproc/descriptor recycle stress          */
     cmd_ipc_stress();       /* v0.46: capability-gated IPC fd/shmem handoff, sender/receiver churn */
     cmd_vfio_stress();      /* v0.47: VFIO BAR mapping + routed interrupt wait, driver churn        */
+    cmd_vfs_stress();       /* v0.48: VFS journaling, unlink/reclamation, multi-volume mounts       */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
