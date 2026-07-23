@@ -20,7 +20,7 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-VERSION := 0.49.0
+VERSION := 0.50.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga clean
@@ -98,11 +98,24 @@ $(VBLK_IMG): | $(BUILD)
 
 QEMU_NET := -netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,mac=52:54:00:ab:cd:ef
 
+# v0.50: virtio-vga is VGA-compatible (bochs/VBE DISPI), so GRUB's existing
+# video_bochs framebuffer bring-up (multiboot2 tag 8) works completely
+# unchanged — verified standalone before adopting this device-wide, and
+# re-verified across all 3 configs with 0 FAIL after. It ALSO exposes the
+# real modern virtio-gpu PCI capability list (vendor 1af4 device 1050,
+# class 0x03) our new virtio_gpu_probe() drives for real 2D acceleration.
+# A separate `-vga std -device virtio-gpu-pci` (two independent devices)
+# was tried to avoid SYS_GPU_SET_SCANOUT visually taking over the shared
+# device's display output (see CHANGELOG-0.50.0.md) — but it introduced an
+# unexplained hang under -smp 4 that virtio-vga does not have, so this
+# kernel ships with the proven, fully-verified combined device instead.
+QEMU_GPU := -vga none -device virtio-vga
+
 qemu: $(ISO) $(VBLK_IMG)
-	qemu-system-x86_64 -cdrom $(ISO) -m 512M -nographic -no-reboot $(QEMU_BLK) $(QEMU_NET)
+	qemu-system-x86_64 -cdrom $(ISO) -m 512M -nographic -no-reboot $(QEMU_GPU) $(QEMU_BLK) $(QEMU_NET)
 
 qemu-vga: $(ISO) $(VBLK_IMG)
-	qemu-system-x86_64 -cdrom $(ISO) -m 512M -serial stdio -no-reboot $(QEMU_BLK) $(QEMU_NET)
+	qemu-system-x86_64 -cdrom $(ISO) -m 512M -serial stdio -no-reboot $(QEMU_GPU) $(QEMU_BLK) $(QEMU_NET)
 
 clean:
 	rm -rf $(BUILD) iso/boot/outrun-kernel.elf iso/boot/user_init.elf
@@ -112,14 +125,14 @@ install-img: all
 	./mkinstall.sh
 
 qemu-nvme: install-img
-	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd -m 512M -nographic -no-reboot \
+	qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd -m 512M -nographic -no-reboot $(QEMU_GPU) \
 	  -drive file=build/outrun-install.img,format=raw,if=none,id=nvm -device nvme,drive=nvm,serial=OUTRUN01 \
 	  $(QEMU_BLK) $(QEMU_NET)
 
 # Boot on q35 with an emulated Intel VT-d IOMMU; virtio devices behind it.
 QEMU_IOMMU := -machine q35,kernel-irqchip=split -device intel-iommu,intremap=off,caching-mode=on
 qemu-iommu: all
-	qemu-system-x86_64 $(QEMU_IOMMU) -cdrom build/outrun-os-$(VERSION).iso -m 512M -nographic -no-reboot \
+	qemu-system-x86_64 $(QEMU_IOMMU) -cdrom build/outrun-os-$(VERSION).iso -m 512M -nographic -no-reboot $(QEMU_GPU) \
 	  -drive file=/tmp/cas.img,if=none,format=raw,id=vd0 \
 	  -device virtio-blk-pci,drive=vd0,disable-legacy=on,disable-modern=off,iommu_platform=on \
 	  -netdev user,id=n0 \
