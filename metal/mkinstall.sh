@@ -2,7 +2,7 @@
 # Build a dd-able, UEFI-bootable GPT disk image (install onto raw NVMe via dd).
 set -e
 cd "$(dirname "$0")"
-VER=0.49.0
+VER=0.50.0
 cat > /tmp/embed.cfg << 'CFG'
 set timeout=0
 insmod part_gpt

@@ -52,6 +52,10 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_SMP_REMAP      26
 #define SYS_SMP_UNMAP      27
 #define SYS_GET_CPU        28
+#define SYS_GPU_RESOURCE_CREATE 29
+#define SYS_GPU_SET_SCANOUT     30
+#define SYS_GPU_SUBMIT_FLUSH    31
+#define SYS_GPU_FENCE_WAIT      32
 
 #define PCAP_SMP_ADMIN (1ull << 9)
 
@@ -611,6 +615,39 @@ static void smp_migrate_worker(void) {
     sysc(SYS_EXIT, pid, 0, 0);
 }
 
+/* v0.50: role 17/18 — a ring-3 "GPU client". Creates a real virtio-gpu 2D
+ * resource, draws directly into its mapped backing (zero-copy at the app
+ * level: no syscall touches the pixel data, only ordinary memory writes),
+ * sets it as the scanout, submits an async flush, and fence-waits for it.
+ * Role 18 deliberately faults right after creating the resource (before
+ * ever flushing or exiting cleanly) so cmd_gpu_stress can prove
+ * gpu_teardown_kproc reclaims the resource/grant via the FAULT exit path,
+ * not just SYS_EXIT — mirrors v0.44/45's fault-injection precedent.        */
+static void gpu_driver(int fault_before_flush) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+
+    u64 resid = 0;
+    i64 vaddr = (i64)sysc(SYS_GPU_RESOURCE_CREATE, 64, 64, (u64)&resid);
+    if (vaddr <= 0) sysc(SYS_EXIT, 1101, 0, 0);
+
+    volatile u32 *px = (volatile u32 *)vaddr;
+    u32 pattern = 0xFF000000u | (u32)(pid & 0x00FFFFFFu);
+    for (int i = 0; i < 64 * 64; i++) px[i] = pattern;      /* direct draw: zero-copy */
+    if (px[0] != pattern) sysc(SYS_EXIT, 1102, 0, 0);
+
+    if (fault_before_flush) {
+        volatile u32 *bad = (volatile u32 *)0x1;
+        *bad = 0xDEAD;                                      /* deliberate fault: never reached past here */
+    }
+
+    if ((i64)sysc(SYS_GPU_SET_SCANOUT, resid, 64, 64) != 0) sysc(SYS_EXIT, 1103, 0, 0);
+    i64 fence = (i64)sysc(SYS_GPU_SUBMIT_FLUSH, resid, 64, 64);
+    if (fence <= 0) sysc(SYS_EXIT, 1104, 0, 0);
+    if ((i64)sysc(SYS_GPU_FENCE_WAIT, (u64)fence, 2000, 0) != 1) sysc(SYS_EXIT, 1105, 0, 0);
+
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
 static void nic_driver(void) {
     print("  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====\n");
 
@@ -736,6 +773,8 @@ void _start(void) {
     if (role == 14) { vfio_driver(); }                  /* v0.47 VFIO BAR map + IRQ wait   */
     if (role == 15) { vfs_driver(); }                   /* v0.48 VFS journal/unlink/multi-volume */
     if (role == 16) { smp_migrate_worker(); }           /* v0.49 SMP remap/unmap/migration worker */
+    if (role == 17) { gpu_driver(0); }                  /* v0.50 GPU client: clean create/draw/scanout/flush */
+    if (role == 18) { gpu_driver(1); }                  /* v0.50 GPU client: deliberate fault before flush   */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");

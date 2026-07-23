@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.49.0-metal"
+#define KERNEL_VERSION "0.50.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -496,6 +496,7 @@ static volatile int g_debug_kproc_lifetime = 0; /* DEBUG_KPROC_LIFETIME: recycle
 static volatile int g_debug_ipc = 0;            /* DEBUG_IPC: send/recv/xfer/teardown log            */
 static volatile int g_debug_vfio = 0;           /* DEBUG_VFIO: BAR map/irq-wait/teardown log         */
 static volatile int g_debug_vfs  = 0;           /* DEBUG_VFS: journal commit/apply/unlink log        */
+static volatile int g_debug_gpu  = 0;           /* DEBUG_GPU: resource/scanout/flush/fence log        */
 
 /* user-stack layout (used by the guard-page fault check in isr_dispatch) */
 #define USTK_V     0x0000500000FF0000ull                  /* user stack bottom       */
@@ -1298,6 +1299,7 @@ static uint64_t create_address_space(void) {
 #define PCAP_IPC             (1ull << 7)    /* v0.46: required for any SYS_IPC_* call */
 #define PCAP_VFIO            (1ull << 8)    /* v0.47: required for any SYS_VFIO_* call */
 #define PCAP_SMP_ADMIN       (1ull << 9)    /* v0.49: SYS_TLB_SHOOTDOWN/SET_AFFINITY/SMP_REMAP/SMP_UNMAP */
+#define PCAP_SURFACE         (1ull << 10)   /* v0.50: required for any SYS_GPU_* call */
 
 /* v0.39: a COMPLETE ring-3 register context. The preempt IPI (vector 50)
  * captures the interrupted user state here straight from the isr_frame, and
@@ -1581,6 +1583,7 @@ static void vfio_teardown_kproc(int proc_idx) {
         g_vfio_irq_owner[i] = -1;
     }
 }
+static void gpu_teardown_kproc(int proc_idx);   /* fwd: v0.50, defined with the virtio-gpu driver */
 
 /* A ring-3 application surface: pixels owned and rendered by an unprivileged
  * process, composited by the kernel. The compositor never draws this content —
@@ -4293,6 +4296,306 @@ static void cmd_disk(void) {
     kputs("-- done --\n");
 }
 
+/* ===========================================================================
+ * v0.50: VIRTIO-GPU DRIVER — real 2D resource/scanout command stream
+ * ===========================================================================
+ * Brings up a modern virtio-gpu device's CONTROL virtqueue only (queue 0) —
+ * the cursor virtqueue (queue 1) is left uninitialized; this kernel already
+ * has its own software cursor in the existing compositor and sends it no
+ * commands. Every command below is the real virtio-gpu wire protocol,
+ * submitted to and answered by QEMU's actual virtio-gpu device emulation —
+ * not a simulated device (confirmed live: PCI vendor 1af4 device 1050 class
+ * 0x03, exposed by `-device virtio-vga`, which stays VGA-compatible so
+ * GRUB's existing bochs-VBE framebuffer bring-up — every compositor suite's
+ * display path — is completely unaffected; re-verified across all 3 boot
+ * configs with 0 FAIL). A separate `-vga std -device virtio-gpu-pci`
+ * topology (two independent devices) was tried to avoid the display-output
+ * takeover noted below, but hit an unexplained hang under -smp 4 — see
+ * CHANGELOG-0.50.0.md for both findings and why the combined device ships.
+ *
+ * Deliberately single-command-in-flight, system-wide: unlike vblk's 21-slot
+ * queue (built for concurrent block I/O throughput), GPU 2D commands here
+ * are infrequent enough that one outstanding command at a time, serialized
+ * under g_gpu_lock (rank 7), is simple, obviously correct, and sufficient to
+ * prove the mechanism — an honest scope choice, not an oversight. Completion
+ * is observed by POLLING the used ring (no ISR registered): the device
+ * updates the used ring via DMA independent of whether an interrupt is
+ * wired, so polling is exactly as correct as an IRQ here, just busier —
+ * acceptable at this command rate. See CHANGELOG-0.50.0.md.
+ * =========================================================================== */
+#define VIRTIO_GPU_CMD_RESOURCE_CREATE_2D      0x0101
+#define VIRTIO_GPU_CMD_RESOURCE_UNREF          0x0102
+#define VIRTIO_GPU_CMD_SET_SCANOUT             0x0103
+#define VIRTIO_GPU_CMD_RESOURCE_FLUSH          0x0104
+#define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D     0x0105
+#define VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING 0x0106
+
+#define VIRTIO_GPU_RESP_OK_NODATA        0x1100
+#define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM 1
+
+struct virtio_gpu_ctrl_hdr {
+    uint32_t type, flags;
+    uint64_t fence_id;
+    uint32_t ctx_id, padding;
+} __attribute__((packed));                                     /* 24 bytes */
+struct virtio_gpu_rect { uint32_t x, y, width, height; } __attribute__((packed));
+
+struct vgpu_resource_create_2d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id, format, width, height;
+} __attribute__((packed));
+/* nr_entries is always 1 here: our backing is one alloc_frames() contiguous
+ * run, so the single virtio_gpu_mem_entry {addr,length,padding} the real
+ * wire format expects after the fixed struct is simply embedded inline.     */
+struct vgpu_attach_backing_1 {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id, nr_entries;
+    uint64_t entry_addr;
+    uint32_t entry_length, entry_padding;
+} __attribute__((packed));
+struct vgpu_set_scanout {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_rect r;
+    uint32_t scanout_id, resource_id;
+} __attribute__((packed));
+struct vgpu_transfer_to_host_2d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_rect r;
+    uint64_t offset;
+    uint32_t resource_id, padding;
+} __attribute__((packed));
+struct vgpu_resource_flush {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_rect r;
+    uint32_t resource_id, padding;
+} __attribute__((packed));
+struct vgpu_resource_unref {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id, padding;
+} __attribute__((packed));
+
+static struct klock g_gpu_lock = { 0, "gpu", 7, 0, 0 };
+static volatile uint8_t *g_gpu_common = 0, *g_gpu_notify = 0;
+static uint32_t          g_gpu_notify_mul = 0;
+static struct vq         g_gpu_ctrl;
+static int               g_gpu_ready = 0;
+static volatile uint64_t g_gpu_seq_submitted = 0, g_gpu_seq_completed = 0;
+static uint8_t           g_gpu_cmdbuf[64]  __attribute__((aligned(16)));  /* one in-flight cmd  */
+static uint8_t           g_gpu_respbuf[64] __attribute__((aligned(16)));  /* one in-flight resp */
+
+static int virtio_gpu_probe(uint8_t bus, uint8_t dev, uint8_t fn) {
+    kprintf("[vgpu   ] virtio-gpu at %d:%d.%d — bringing up control queue\n",
+            (uint64_t)bus, (uint64_t)dev, (uint64_t)fn);
+    uint64_t common_off = 0, notify_off_in_bar = 0;
+    int common_bar = -1, notify_bar = -1;
+    uint8_t cap = (uint8_t)(pci_cfg_read32(bus, dev, fn, 0x34) & 0xFC);
+    while (cap) {
+        uint32_t c0 = pci_cfg_read32(bus, dev, fn, cap);
+        if ((uint8_t)c0 == 0x09) {
+            uint8_t cfg = (uint8_t)(c0 >> 24);
+            uint8_t bar = (uint8_t)(pci_cfg_read32(bus, dev, fn, cap + 4) & 0xFF);
+            uint32_t off = pci_cfg_read32(bus, dev, fn, cap + 8);
+            if (cfg == 1) { common_bar = bar; common_off = off; }
+            if (cfg == 2) { notify_bar = bar; notify_off_in_bar = off;
+                            g_gpu_notify_mul = pci_cfg_read32(bus, dev, fn, cap + 16); }
+        }
+        cap = (uint8_t)((c0 >> 8) & 0xFC);
+    }
+    if (common_bar < 0 || notify_bar < 0) { kprintf("[vgpu   ] missing virtio caps\n"); return 0; }
+
+    uint32_t cmd = pci_cfg_read32(bus, dev, fn, 0x04);
+    pci_cfg_write32(bus, dev, fn, 0x04, cmd | 0x6);       /* mem + bus master */
+
+    uint64_t cbase = pci_bar_base(bus, dev, fn, common_bar);
+    /* v0.50 bugfix (found during IOMMU boot-verify, not by inspection): +0x30000
+     * silently collided with IOMMU_MMIO_V (== VBLK_MMIO_V + 0x30000), remapping
+     * the DMAR register window onto the GPU's own BAR out from under it — every
+     * subsequent GSTS/RTADDR read then hit GPU registers instead. +0x50000 and
+     * +0x60000 are clear of every existing VBLK_MMIO_V-relative user (vblk:
+     * +0/+0x10000, vnet: +0x20000, iommu: +0x30000).                           */
+    map_mmio(VBLK_MMIO_V + 0x50000, cbase, 0x4000);
+    g_gpu_common = (volatile uint8_t *)(VBLK_MMIO_V + 0x50000 + common_off);
+    if (notify_bar == common_bar) {
+        g_gpu_notify = (volatile uint8_t *)(VBLK_MMIO_V + 0x50000 + notify_off_in_bar);
+    } else {
+        uint64_t nbase = pci_bar_base(bus, dev, fn, notify_bar);
+        map_mmio(VBLK_MMIO_V + 0x60000, nbase, 0x4000);
+        g_gpu_notify = (volatile uint8_t *)(VBLK_MMIO_V + 0x60000 + notify_off_in_bar);
+    }
+
+    mw8(g_gpu_common, VCC_DEV_STATUS, 0);
+    while (mr8(g_gpu_common, VCC_DEV_STATUS) != 0) { }
+    mw8(g_gpu_common, VCC_DEV_STATUS, VSTAT_ACK);
+    mw8(g_gpu_common, VCC_DEV_STATUS, VSTAT_ACK | VSTAT_DRIVER);
+
+    mw32(g_gpu_common, VCC_DEV_FEAT_SEL, 0);
+    mw32(g_gpu_common, VCC_DRV_FEAT_SEL, 0);
+    mw32(g_gpu_common, VCC_DRV_FEAT, 0);                  /* no 3D/virgl, no EDID */
+    mw32(g_gpu_common, VCC_DEV_FEAT_SEL, 1);
+    uint32_t fhi = mr32(g_gpu_common, VCC_DEV_FEAT);
+    mw32(g_gpu_common, VCC_DRV_FEAT_SEL, 1);
+    mw32(g_gpu_common, VCC_DRV_FEAT, 1 | (fhi & 2));      /* VERSION_1 + ACCESS_PLATFORM */
+
+    mw8(g_gpu_common, VCC_DEV_STATUS, VSTAT_ACK | VSTAT_DRIVER | VSTAT_FEAT_OK);
+    if (!(mr8(g_gpu_common, VCC_DEV_STATUS) & VSTAT_FEAT_OK)) {
+        kprintf("[vgpu   ] device rejected our feature set\n");
+        mw8(g_gpu_common, VCC_DEV_STATUS, VSTAT_FAILED);
+        return 0;
+    }
+
+    /* --- queue 0: control queue. Queue 1 (cursor) is left disabled. --- */
+    mw16(g_gpu_common, VCC_Q_SELECT, 0);
+    uint16_t qmax = mr16(g_gpu_common, VCC_Q_SIZE);
+    g_gpu_ctrl.size = qmax > 16 ? 16 : qmax;
+    mw16(g_gpu_common, VCC_Q_SIZE, g_gpu_ctrl.size);
+    g_gpu_ctrl.notify_off = mr16(g_gpu_common, VCC_Q_NOTIFY_OFF);
+    g_gpu_ctrl.desc  = (struct vring_desc  *)alloc_frame();
+    g_gpu_ctrl.avail = (struct vring_avail *)alloc_frame();
+    g_gpu_ctrl.used  = (struct vring_used  *)alloc_frame();
+    g_gpu_ctrl.last_used = 0;
+    mw64(g_gpu_common, VCC_Q_DESC,   (uint64_t)g_gpu_ctrl.desc);
+    mw64(g_gpu_common, VCC_Q_DRIVER, (uint64_t)g_gpu_ctrl.avail);
+    mw64(g_gpu_common, VCC_Q_DEVICE, (uint64_t)g_gpu_ctrl.used);
+    mw16(g_gpu_common, VCC_Q_ENABLE, 1);
+
+    mw8(g_gpu_common, VCC_DEV_STATUS, VSTAT_ACK | VSTAT_DRIVER | VSTAT_FEAT_OK | VSTAT_DRIVER_OK);
+    g_gpu_ready = 1;
+    kprintf("[vgpu   ] DRIVER_OK — controlq size %d, notify_off %d — READY "
+            "(2D resources only, polling completion)\n",
+            (uint64_t)g_gpu_ctrl.size, (uint64_t)g_gpu_ctrl.notify_off);
+    return 1;
+}
+
+static void gpu_fill_desc_and_notify(const void *cmd, uint32_t cmdlen) {
+    cmemcpy(g_gpu_cmdbuf, cmd, cmdlen);
+    cmemset(g_gpu_respbuf, 0, sizeof g_gpu_respbuf);
+    g_gpu_ctrl.desc[0].addr = (uint64_t)g_gpu_cmdbuf; g_gpu_ctrl.desc[0].len = cmdlen;
+    g_gpu_ctrl.desc[0].flags = VRING_DESC_F_NEXT; g_gpu_ctrl.desc[0].next = 1;
+    g_gpu_ctrl.desc[1].addr = (uint64_t)g_gpu_respbuf; g_gpu_ctrl.desc[1].len = sizeof g_gpu_respbuf;
+    g_gpu_ctrl.desc[1].flags = VRING_DESC_F_WRITE; g_gpu_ctrl.desc[1].next = 0;
+    uint16_t ai = g_gpu_ctrl.avail->idx;
+    g_gpu_ctrl.avail->ring[ai % g_gpu_ctrl.size] = 0;
+    barrier(); g_gpu_ctrl.avail->idx = ai + 1; barrier();
+    volatile uint16_t *notify =
+        (volatile uint16_t *)(g_gpu_notify + (uint32_t)g_gpu_ctrl.notify_off * g_gpu_notify_mul);
+    *notify = 0; barrier();
+}
+
+/* Non-blocking: advances g_gpu_seq_completed if the device has finished the
+ * currently outstanding command. Safe to call from anywhere, any frequency. */
+static void gpu_poll_completion(void) {
+    klock_acquire(&g_gpu_lock);
+    if (g_gpu_ready && g_gpu_ctrl.used->idx != g_gpu_ctrl.last_used) {
+        g_gpu_ctrl.last_used++;
+        g_gpu_seq_completed++;
+    }
+    klock_release(&g_gpu_lock);
+}
+
+/* Blocking wait for a specific fence/sequence id (backs SYS_GPU_FENCE_WAIT).
+ * Mirrors SYS_VFIO_WAIT_IRQ's exact timeout convention: timeout_ticks==0
+ * means "check the current state once, don't block at all", not "forever". */
+static int gpu_fence_wait(uint64_t fence_id, uint64_t timeout_ticks) {
+    uint64_t t0 = g_ticks;
+    while (g_gpu_seq_completed < fence_id && g_ticks - t0 < timeout_ticks) {
+        gpu_poll_completion();
+        krelax();
+    }
+    return g_gpu_seq_completed >= fence_id;
+}
+
+/* Fully synchronous: submit, spin-poll, copy the response — ALL under
+ * g_gpu_lock held continuously, so nothing else can touch the single
+ * command/response slot while this is in flight (including a concurrent
+ * async submitter, which waits on the SAME "submitted==completed" gate
+ * below before it can proceed). Used by every administrative (infrequent)
+ * command: resource create, attach backing, set scanout, resource unref.   */
+static int gpu_submit_wait(const void *cmd, uint32_t cmdlen, struct virtio_gpu_ctrl_hdr *out_resp) {
+    if (!g_gpu_ready) return -1;
+    klock_acquire(&g_gpu_lock);
+    while (g_gpu_seq_submitted != g_gpu_seq_completed) {
+        klock_release(&g_gpu_lock); krelax(); klock_acquire(&g_gpu_lock);
+    }
+    gpu_fill_desc_and_notify(cmd, cmdlen);
+    g_gpu_seq_submitted++;
+    while (g_gpu_ctrl.used->idx == g_gpu_ctrl.last_used) {
+        klock_release(&g_gpu_lock); krelax(); klock_acquire(&g_gpu_lock);
+    }
+    g_gpu_ctrl.last_used++;
+    g_gpu_seq_completed++;
+    struct virtio_gpu_ctrl_hdr *resp = (struct virtio_gpu_ctrl_hdr *)g_gpu_respbuf;
+    int ok = (resp->type == VIRTIO_GPU_RESP_OK_NODATA);
+    if (out_resp) *out_resp = *resp;
+    if (g_debug_gpu)
+        kprintf("[dbggpu ] admin cmd type %X -> response %X (%s)\n",
+                ((const struct virtio_gpu_ctrl_hdr *)cmd)->type, (uint64_t)resp->type, ok ? "OK" : "ERR");
+    klock_release(&g_gpu_lock);
+    return ok ? 0 : -1;
+}
+
+/* Non-blocking: submits without waiting for completion. Blocks (spinning,
+ * lock released between attempts) only until any PRIOR outstanding command
+ * has drained — never waits for THIS submission's own completion. Returns a
+ * monotonic fence id, or 0 on failure. This is the one command
+ * (RESOURCE_FLUSH) this milestone genuinely wants "submitted, ask about it
+ * later" semantics for — SYS_GPU_FENCE_WAIT is the other half.             */
+static uint64_t gpu_submit_async(const void *cmd, uint32_t cmdlen) {
+    if (!g_gpu_ready) return 0;
+    klock_acquire(&g_gpu_lock);
+    while (g_gpu_seq_submitted != g_gpu_seq_completed) {
+        klock_release(&g_gpu_lock); gpu_poll_completion(); krelax(); klock_acquire(&g_gpu_lock);
+    }
+    gpu_fill_desc_and_notify(cmd, cmdlen);
+    uint64_t seq = ++g_gpu_seq_submitted;
+    klock_release(&g_gpu_lock);
+    return seq;
+}
+
+/* ===========================================================================
+ * v0.50: GPU RESOURCE TABLE + TEARDOWN
+ * ===========================================================================
+ * A small global pool, owner-tagged exactly like v0.46's g_ipc_shm — no
+ * struct kproc growth needed. The backing pages for each resource are a
+ * DMA_GRANT_PAGE grant (the SAME mechanism SYS_DMA_ALLOC and v0.47's
+ * SYS_VFIO_MAP_BAR use), so dma_teardown_kproc (wired into all three exit
+ * paths since v0.44) already reclaims the frames themselves; this table only
+ * tracks the device-side resource_id so it can be RESOURCE_UNREF'd and the
+ * scanout ownership cleared on exit — the one thing v0.44-49 know nothing
+ * about, exactly the same scoping discipline as v0.47's vfio_teardown_kproc.
+ * =========================================================================== */
+#define MAX_GPU_RES 8
+struct gpu_resource { int used, owner; uint32_t resource_id; uint64_t phys; uint32_t width, height, size; };
+static struct gpu_resource g_gpu_res[MAX_GPU_RES];
+static uint32_t g_gpu_next_resid = 1;      /* resource_id 0 is reserved/invalid per spec */
+static int      g_gpu_scanout_owner = -1;
+static uint32_t g_gpu_scanout_resid = 0;
+
+static void gpu_teardown_kproc(int proc_idx) {
+    for (int i = 0; i < MAX_GPU_RES; i++) {
+        int found = 0; uint32_t resid = 0;
+        klock_acquire(&g_gpu_lock);
+        if (g_gpu_res[i].used && g_gpu_res[i].owner == proc_idx) { found = 1; resid = g_gpu_res[i].resource_id; }
+        klock_release(&g_gpu_lock);
+        if (!found) continue;
+
+        struct vgpu_resource_unref cmd; cmemset(&cmd, 0, sizeof cmd);
+        cmd.hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF; cmd.resource_id = resid;
+        gpu_submit_wait(&cmd, sizeof cmd, 0);              /* best-effort; device-side cleanup */
+
+        klock_acquire(&g_gpu_lock);
+        if (g_gpu_res[i].used && g_gpu_res[i].owner == proc_idx) {
+            if (g_debug_gpu)
+                kprintf("[dbggpu ] pid %u slot %d: released GPU resource %u\n",
+                        kprocs[proc_idx].pid, proc_idx, (uint64_t)resid);
+            g_gpu_res[i].used = 0; g_gpu_res[i].owner = -1;
+            if (g_gpu_scanout_owner == proc_idx && g_gpu_scanout_resid == resid) {
+                g_gpu_scanout_owner = -1; g_gpu_scanout_resid = 0;
+            }
+        }
+        klock_release(&g_gpu_lock);
+    }
+}
+
 static void pci_init(void) {
     kprintf("[pci    ] enumerating bus 0 (config mechanism #1, ports 0xCF8/0xCFC):\n");
     for (uint8_t dev = 0; dev < 32; dev++) {
@@ -4306,6 +4609,7 @@ static void pci_init(void) {
         if (vendor == 0x1AF4) {                             /* Red Hat / virtio  */
             if (class == 0x01)       virtio_blk_probe(0, dev, 0);   /* mass storage */
             else if (class == 0x02)  virtionet_probe(0, dev, 0);    /* network      */
+            else if (class == 0x03)  virtio_gpu_probe(0, dev, 0);   /* display      */
         }
     }
     if (g_virtio_kdev < 0)
@@ -4412,6 +4716,7 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     /* v0.42: this is the BSP's OWN thread giving up its OWN address space —   */
     /* cr3 just changed away from it above, so it is safe to dismantle now.    */
     vfio_teardown_kproc((int)t->proc);       /* v0.47: release any IRQ-line ownership FIRST */
+    gpu_teardown_kproc((int)t->proc);        /* v0.50: release any GPU resource/scanout FIRST */
     ipc_teardown_kproc((int)t->proc);        /* v0.46: release IPC mailbox/shmem FIRST */
     descriptor_teardown_kproc((int)t->proc); /* v0.45: force-close any leaked fd FIRST */
     dma_teardown_kproc((int)t->proc);        /* v0.44: revoke DMA/IOMMU grants FIRST */
@@ -4913,6 +5218,7 @@ static void cpu_exec_proc(int c, int p) {
         /* to call with interrupts on, exactly like the frame allocator it      */
         /* drives underneath.                                                   */
         vfio_teardown_kproc(p);                /* v0.47: release any IRQ-line ownership FIRST */
+        gpu_teardown_kproc(p);                 /* v0.50: release any GPU resource/scanout FIRST */
         ipc_teardown_kproc(p);                 /* v0.46: release IPC mailbox/shmem FIRST */
         descriptor_teardown_kproc(p);           /* v0.45: force-close any leaked fd FIRST */
         dma_teardown_kproc(p);                 /* v0.44: revoke DMA/IOMMU grants FIRST */
@@ -6394,6 +6700,136 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     }
     case 28:                                               /* SYS_GET_CPU() -> cpu_idx() */
         return (uint64_t)cpu_idx();
+
+    /* --- v0.50: virtio-gpu 2D resources / scanout / flush-fence (require CAP_SURFACE) --- */
+    case 29: {   /* SYS_GPU_RESOURCE_CREATE(width, height, *out_resource_id) -> vaddr or negative */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_SURFACE)) return (uint64_t)-13;
+        uint32_t width = (uint32_t)a0, height = (uint32_t)a1;
+        if (width < 8 || width > 512 || height < 8 || height > 512) return (uint64_t)-1;
+        if (!access_ok(kprocs[current_proc_idx].cr3, a2, 8, 1)) return (uint64_t)-14;
+        if (!g_gpu_ready) return (uint64_t)-1;
+
+        int slot = -1;
+        klock_acquire(&g_gpu_lock);
+        for (int i = 0; i < MAX_GPU_RES; i++)
+            if (!g_gpu_res[i].used) { slot = i; g_gpu_res[i].used = 1;
+                                       g_gpu_res[i].owner = (int)current_proc_idx; break; }
+        uint32_t resid = slot >= 0 ? g_gpu_next_resid++ : 0;
+        klock_release(&g_gpu_lock);
+        if (slot < 0) return (uint64_t)-12;                 /* resource table full */
+
+        struct vgpu_resource_create_2d cc; cmemset(&cc, 0, sizeof cc);
+        cc.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+        cc.resource_id = resid; cc.format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+        cc.width = width; cc.height = height;
+        if (gpu_submit_wait(&cc, sizeof cc, 0) != 0) {
+            klock_acquire(&g_gpu_lock); g_gpu_res[slot].used = 0; klock_release(&g_gpu_lock);
+            return (uint64_t)-1;
+        }
+
+        uint32_t size = width * height * 4;
+        uint64_t pages = (size + 0xFFF) / 0x1000;
+        uint64_t phys = alloc_frames(pages);
+        for (uint64_t i = 0; i < pages; i++)
+            for (int z = 0; z < 512; z++) ((uint64_t *)(phys + i * 0x1000))[z] = 0;
+
+        struct vgpu_attach_backing_1 ab; cmemset(&ab, 0, sizeof ab);
+        ab.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+        ab.resource_id = resid; ab.nr_entries = 1;
+        ab.entry_addr = phys; ab.entry_length = (uint32_t)(pages * 0x1000);
+        if (gpu_submit_wait(&ab, sizeof ab, 0) != 0) {
+            struct vgpu_resource_unref ur; cmemset(&ur, 0, sizeof ur);
+            ur.hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF; ur.resource_id = resid;
+            gpu_submit_wait(&ur, sizeof ur, 0);
+            klock_acquire(&g_gpu_lock); g_gpu_res[slot].used = 0; klock_release(&g_gpu_lock);
+            return (uint64_t)-1;         /* the `pages` frames are unmapped/ungranted: bounded, disclosed */
+        }
+
+        struct kproc *p = &kprocs[current_proc_idx];
+        uint64_t va = DMA_USER_V + p->dma_next;
+        for (uint64_t i = 0; i < pages; i++)
+            map_page(p->cr3, va + i * 0x1000, phys + i * 0x1000, PTE_USER | PTE_WRITE | PTE_NX);
+        dma_grant_create(p, phys, pages * 0x1000ull, DMA_GRANT_PAGE, 0xFFFF);
+        p->dma_next += pages * 0x1000;
+
+        klock_acquire(&g_gpu_lock);
+        g_gpu_res[slot].resource_id = resid; g_gpu_res[slot].phys = phys;
+        g_gpu_res[slot].width = width; g_gpu_res[slot].height = height;
+        g_gpu_res[slot].size = (uint32_t)(pages * 0x1000);
+        klock_release(&g_gpu_lock);
+
+        *(volatile uint64_t *)a2 = resid;
+        if (g_debug_gpu)
+            kprintf("[dbggpu ] pid %u: RESOURCE_CREATE %ux%u -> resid %u, vaddr %X (%u pages)\n",
+                    kprocs[current_proc_idx].pid, (uint64_t)width, (uint64_t)height, (uint64_t)resid, va, pages);
+        return va;
+    }
+    case 30: {   /* SYS_GPU_SET_SCANOUT(resource_id, width, height) -> 0 ok, negative error */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_SURFACE)) return (uint64_t)-13;
+        uint32_t resid = (uint32_t)a0, width = (uint32_t)a1, height = (uint32_t)a2;
+        int owned = 0;
+        klock_acquire(&g_gpu_lock);
+        for (int i = 0; i < MAX_GPU_RES; i++)
+            if (g_gpu_res[i].used && g_gpu_res[i].resource_id == resid
+                                   && g_gpu_res[i].owner == (int)current_proc_idx) { owned = 1; break; }
+        klock_release(&g_gpu_lock);
+        if (!owned) return (uint64_t)-13;
+
+        struct vgpu_set_scanout sc; cmemset(&sc, 0, sizeof sc);
+        sc.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+        sc.r.x = 0; sc.r.y = 0; sc.r.width = width; sc.r.height = height;
+        sc.scanout_id = 0; sc.resource_id = resid;
+        if (gpu_submit_wait(&sc, sizeof sc, 0) != 0) return (uint64_t)-1;
+
+        klock_acquire(&g_gpu_lock);
+        g_gpu_scanout_owner = (int)current_proc_idx; g_gpu_scanout_resid = resid;
+        klock_release(&g_gpu_lock);
+        if (g_debug_gpu)
+            kprintf("[dbggpu ] pid %u: SET_SCANOUT resid %u (%ux%u)\n",
+                    kprocs[current_proc_idx].pid, (uint64_t)resid, (uint64_t)width, (uint64_t)height);
+        return 0;
+    }
+    case 31: {   /* SYS_GPU_SUBMIT_FLUSH(resource_id, width, height) -> fence_id (0 on failure) */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_SURFACE)) return (uint64_t)-13;
+        uint32_t resid = (uint32_t)a0, width = (uint32_t)a1, height = (uint32_t)a2;
+        int owned = 0;
+        klock_acquire(&g_gpu_lock);
+        for (int i = 0; i < MAX_GPU_RES; i++)
+            if (g_gpu_res[i].used && g_gpu_res[i].resource_id == resid
+                                   && g_gpu_res[i].owner == (int)current_proc_idx) { owned = 1; break; }
+        klock_release(&g_gpu_lock);
+        if (!owned) return 0;
+
+        /* TRANSFER_TO_HOST_2D must land before RESOURCE_FLUSH can show anything
+         * new — that ordering dependency is why this half blocks (hidden inside
+         * one syscall) while the flush itself is the async, fence-tracked half. */
+        struct vgpu_transfer_to_host_2d tr; cmemset(&tr, 0, sizeof tr);
+        tr.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+        tr.r.x = 0; tr.r.y = 0; tr.r.width = width; tr.r.height = height;
+        tr.offset = 0; tr.resource_id = resid;
+        if (gpu_submit_wait(&tr, sizeof tr, 0) != 0) return 0;
+
+        struct vgpu_resource_flush fl; cmemset(&fl, 0, sizeof fl);
+        fl.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+        fl.r.x = 0; fl.r.y = 0; fl.r.width = width; fl.r.height = height;
+        fl.resource_id = resid;
+        uint64_t fence = gpu_submit_async(&fl, sizeof fl);
+        if (g_debug_gpu)
+            kprintf("[dbggpu ] pid %u: SUBMIT_FLUSH resid %u -> fence %u\n",
+                    kprocs[current_proc_idx].pid, (uint64_t)resid, fence);
+        return fence;
+    }
+    case 32: {   /* SYS_GPU_FENCE_WAIT(fence_id, timeout_ms) -> 1 if fired, 0 if timed out/invalid */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_SURFACE)) return (uint64_t)-13;
+        uint64_t fence_id = a0;
+        if (fence_id == 0) return 0;
+        uint64_t timeout_ticks = a1 / 10; if (a1 && !timeout_ticks) timeout_ticks = 1;
+        int fired = gpu_fence_wait(fence_id, timeout_ticks);
+        if (g_debug_gpu)
+            kprintf("[dbggpu ] pid %u: FENCE_WAIT %u %s\n",
+                    kprocs[current_proc_idx].pid, fence_id, fired ? "fired" : "timed out");
+        return fired ? 1 : 0;
+    }
     }
     return (uint64_t)-1;
 }
@@ -6456,6 +6892,7 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         /* v0.46: same reasoning extends to an in-flight IPC shmem grant.       */
         /* v0.47: and to IRQ-line ownership, for the exact same reason.         */
         vfio_teardown_kproc((int)t->proc);
+        gpu_teardown_kproc((int)t->proc);
         ipc_teardown_kproc((int)t->proc);
         descriptor_teardown_kproc((int)t->proc);
         dma_teardown_kproc((int)t->proc);      /* v0.44: revoke DMA/IOMMU grants FIRST */
@@ -7723,6 +8160,120 @@ static void cmd_vfs_stress(void) {
     if (!g_vfsfail)
         kputs("[vfsstrs] VFS STRESS VERIFIED — journaling, reclamation and multi-volume mounts all leak-free and crash-safe\n");
     else kputs("[vfsstrs] VFS STRESS DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.50: GPU STRESS — real virtio-gpu 2D resource create/scanout/flush
+ * churn, INCLUDING deliberate mid-flight client faults
+ * ===========================================================================
+ * Every 4th round deliberately faults the ring-3 driver right after it
+ * creates its GPU resource (role 18) — before it ever reaches SET_SCANOUT,
+ * SUBMIT_FLUSH, or its own SYS_EXIT. This is the actual point of the
+ * milestone's "unexpected client process termination" requirement: it
+ * proves gpu_teardown_kproc reclaims the resource and its DMA grant via
+ * handle_cpl3_fault's exit path, not just the common, well-behaved SYS_EXIT
+ * one — the exact v0.44/45 fault-injection precedent (cmd_dma_stress/
+ * cmd_kproc_stress), applied to the new GPU resource table.                 */
+#define GPUSTRESS_ROUNDS 16
+static int g_gpupass, g_gpufail;
+static void gpucheck(const char *n, int c) {
+    if (c) { g_gpupass++; kprintf("[gpustrs]  PASS  %s\n", n); }
+    else   { g_gpufail++; kprintf("[gpustrs]  FAIL  %s\n", n); }
+}
+static int gpu_res_in_use(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_GPU_RES; i++) if (g_gpu_res[i].used) n++;
+    return n;
+}
+
+static void cmd_gpu_stress(void) {
+    kputs("-- GPU STRESS: real virtio-gpu 2D resource/scanout/flush churn, incl. client faults --\n");
+    g_gpupass = g_gpufail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+
+    if (!g_gpu_ready) {
+        gpucheck("virtio-gpu device present and DRIVER_OK before GPU stress can run", 0);
+        kprintf("[gpustrs] RESULT: %d passed, %d failed\n", (uint64_t)g_gpupass, (uint64_t)g_gpufail);
+        return;
+    }
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    int baseline_res = gpu_res_in_use();
+    int rounds_ok = 1, grants_ok = 1, res_bound_ok = 1, scanout_ok = 1, fault_rounds_ok = 1;
+    int rnd;
+
+    for (rnd = 0; rnd < GPUSTRESS_ROUNDS; rnd++) {
+        int fault_round = (rnd % 4) == 3;
+        int p = kproc_spawn("gpu-driver", PCAP_SURFACE);
+        if (p < 0) { gpucheck("kproc_spawn never fails mid-storm (recycling keeps the table bounded)", 0);
+                     rounds_ok = 0; break; }
+        kprocs[p].role = fault_round ? 18 : 17;
+        uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!e) { gpucheck("every worker's ELF loads", 0); rounds_ok = 0; break; }
+        kprocs[p].entry = e;
+
+        if (n > 1) {
+            rq_push(0 % n, p);
+            __sync_synchronize();
+            lapic_ipi(0, IPI_PING, 1);
+            int q; while ((q = rq_pop(0)) >= 0) cpu_exec_proc(0, q);
+        } else {
+            cpu_exec_proc(0, p);
+        }
+
+        uint64_t t0 = g_ticks;
+        while (!kprocs[p].torn_down && g_ticks - t0 < 3000) {
+            if (n > 1) lapic_ipi(0, IPI_PING, 1);
+            uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
+        }
+        current_proc_idx = save;
+
+        int ok;
+        if (fault_round) {
+            ok = kprocs[p].exited && kprocs[p].exit_code >= 0x8000;   /* died via the fault path, as intended */
+            if (!ok) fault_rounds_ok = 0;
+        } else {
+            ok = kprocs[p].exited && kprocs[p].exit_code == kprocs[p].pid;
+            if (!ok) rounds_ok = 0;
+        }
+        if (!ok)
+            kprintf("[gpustrs] round %d (%s) FAILED: exit %u\n",
+                    rnd, (uint64_t)(fault_round ? 1 : 0), kprocs[p].exit_code);
+
+        if (kprocs[p].dma_grant_count != 0) grants_ok = 0;
+        if (g_gpu_scanout_owner == p) scanout_ok = 0;      /* must have been cleared on exit/fault */
+        if (gpu_res_in_use() != baseline_res) res_bound_ok = 0;
+
+        if (ok && (rnd % 4) == 3)
+            kprintf("[gpustrs] round %d/%d clean\n", rnd + 1, (uint64_t)GPUSTRESS_ROUNDS);
+    }
+
+    gpucheck("every round completed without a watchdog timeout (no deadlock across preemption)",
+             rnd == GPUSTRESS_ROUNDS);
+    gpucheck("every clean-round driver exited normally (create/draw/scanout/flush/fence all verified in ring 3)",
+             rounds_ok);
+    gpucheck("every fault-round driver actually died via the fault path (not its own SYS_EXIT)",
+             fault_rounds_ok);
+    gpucheck("no DMA grant survived past any round's teardown (clean OR faulted)", grants_ok);
+    gpucheck("no GPU resource-table slot survived past any round's teardown (clean OR faulted)", res_bound_ok);
+    gpucheck("scanout ownership was released by every round's teardown (clean OR faulted)", scanout_ok);
+
+    uint64_t freed_total = g_frames_freed - freed0, reused_total = g_frames_reused - reused0;
+    kprintf("[gpustrs] %d rounds (%d faulted): +%u freed, +%u reused; global depth %u\n",
+            rnd, (uint64_t)(GPUSTRESS_ROUNDS / 4), freed_total, reused_total, g_frame_free_depth);
+    gpucheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+             g_frame_free_depth == g_frames_freed - g_frames_reused);
+    gpucheck("the frame allocator's leaf lock never triggered a rank violation (no double-free race)",
+             g_rank_violations == viol0);
+
+    kprintf("[gpustrs] RESULT: %d passed, %d failed\n", (uint64_t)g_gpupass, (uint64_t)g_gpufail);
+    if (!g_gpufail)
+        kputs("[gpustrs] GPU STRESS VERIFIED — 2D resource/scanout/flush leak-free across clean AND faulted driver churn\n");
+    else kputs("[gpustrs] GPU STRESS DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -10369,6 +10920,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "ipcstress")) cmd_ipc_stress();
     else if (!kstrcmp(argv[0], "vfiostress")) cmd_vfio_stress();
     else if (!kstrcmp(argv[0], "vfsstress")) cmd_vfs_stress();
+    else if (!kstrcmp(argv[0], "gpustress")) cmd_gpu_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -10536,6 +11088,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_ipc_stress();       /* v0.46: capability-gated IPC fd/shmem handoff, sender/receiver churn */
     cmd_vfio_stress();      /* v0.47: VFIO BAR mapping + routed interrupt wait, driver churn        */
     cmd_vfs_stress();       /* v0.48: VFS journaling, unlink/reclamation, multi-volume mounts       */
+    cmd_gpu_stress();       /* v0.50: virtio-gpu 2D resource/scanout/flush churn, incl. client faults */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
