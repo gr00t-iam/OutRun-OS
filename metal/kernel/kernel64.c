@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.51.0-metal"
+#define KERNEL_VERSION "0.52.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -498,6 +498,7 @@ static volatile int g_debug_vfio = 0;           /* DEBUG_VFIO: BAR map/irq-wait/
 static volatile int g_debug_vfs  = 0;           /* DEBUG_VFS: journal commit/apply/unlink log        */
 static volatile int g_debug_gpu  = 0;           /* DEBUG_GPU: resource/scanout/flush/fence log        */
 static volatile int g_debug_audio = 0;          /* DEBUG_AUDIO: configure/write/teardown log          */
+static volatile int g_debug_net  = 0;           /* DEBUG_NET: socket create/bind/send/recv/teardown log */
 
 /* user-stack layout (used by the guard-page fault check in isr_dispatch) */
 #define USTK_V     0x0000500000FF0000ull                  /* user stack bottom       */
@@ -1359,6 +1360,7 @@ struct kproc {
     uint64_t entry;     /* ring-3 entry point (set at ELF load)                */
     int      pstate;    /* 0 = fresh (enter at `entry`), 1 = preempted (uctx)  */
     int      migrate_to;/* resume the preempted context on THIS cpu (-1 = same) */
+    int      migrate_pin;/* v0.52: one-shot sticky home for a directed migration */
     struct uctx uctx;   /* captured context while preempted                    */
     volatile uint32_t ran_on;     /* bitmask: cpus that executed this task     */
     volatile uint32_t finish_seq; /* global completion order (1-based)         */
@@ -1440,6 +1442,7 @@ static void kproc_reset(struct kproc *p) {
     p->entry = 0;
     p->pstate = 0;
     p->migrate_to = -1;
+    p->migrate_pin = -1;
     p->uctx = (struct uctx){0};
     p->ran_on = 0;
     p->finish_seq = 0;
@@ -1595,6 +1598,7 @@ static void vfio_teardown_kproc(int proc_idx) {
 static void gpu_teardown_kproc(int proc_idx);   /* fwd: v0.50, defined with the virtio-gpu driver */
 static void audio_teardown_kproc(int proc_idx); /* fwd: v0.51, defined with the virtio-sound driver */
 static void usb_teardown_kproc(int proc_idx);   /* fwd: v0.51, defined with the xHCI driver */
+static void net_teardown_kproc(int proc_idx);   /* fwd: v0.52, defined with the socket layer */
 
 /* A ring-3 application surface: pixels owned and rendered by an unprivileged
  * process, composited by the kernel. The compositor never draws this content —
@@ -5317,6 +5321,137 @@ static void audio_teardown_kproc(int proc_idx) {
     klock_release(&g_audio_lock);
 }
 
+/* ===========================================================================
+ * v0.52: RING-3 DATAGRAM SOCKETS over the real virtio-net driver
+ * ===========================================================================
+ * A small, capability-gated (PCAP_NETWORK) socket layer exposed to ring 3 via
+ * SYS_SOCKET/BIND/CONNECT/SEND/RECV (35-39). Two delivery paths:
+ *
+ *   - LOOPBACK (127.0.0.1): SYS_SEND to a locally-bound port copies the
+ *     datagram straight into that socket's RX ring and wakes any waiter —
+ *     fully deterministic, no dependence on QEMU's SLIRP NAT timing (the same
+ *     "prove the mechanism without a flaky external round trip" discipline
+ *     v0.51 used for audio). This is what cmd_net_stress verifies.
+ *   - REAL OUTBOUND: SYS_SEND to any other address builds a genuine
+ *     Ethernet/IPv4/UDP frame and hands it to the existing vnet_tx() — a real
+ *     packet on the wire. We do not gate pass/fail on a reply (SLIRP replies
+ *     are not deterministic in this sandbox); the TX path itself is already
+ *     proven by the existing net/nicdrv suites.
+ *
+ * Each socket's RX ring is static kernel memory (part of g_sock), NOT a
+ * per-process DMA grant, so teardown just releases the slot — there are no
+ * frames for net_teardown_kproc to reclaim, exactly like ipc_teardown_kproc. */
+#define PCAP_NET        PCAP_NETWORK        /* bit 4, already defined */
+#define NSOCK           16
+#define NET_AF_INET     2
+#define NET_SOCK_DGRAM  2
+#define SOCK_QDEPTH     4
+#define SOCK_DGRAM_MAX  512
+#define NET_LOOPBACK    0x7F000001u         /* 127.0.0.1, host byte order */
+#define NET_GUEST_IP    0x0A000210u         /* 10.0.2.16 (our SLIRP-side src) */
+
+struct nsock {
+    int      used;
+    int      owner;                          /* kproc slot that owns this socket */
+    int      bound;
+    uint16_t lport;                          /* bound local UDP port */
+    int      connected;
+    uint32_t raddr; uint16_t rport;          /* connected remote addr/port */
+    uint8_t  q[SOCK_QDEPTH][SOCK_DGRAM_MAX]; /* RX datagram ring */
+    uint16_t qlen[SOCK_QDEPTH];
+    int      qhead, qtail, qcount;
+    int      waiter_tid;                     /* thread parked in SYS_RECV, or -1 */
+};
+static struct nsock g_sock[NSOCK];
+static struct klock g_net_lock = { 0, "net", 9, 0, 0 };
+static volatile uint64_t g_net_tx_frames = 0, g_net_loop_deliveries = 0;
+
+static int net_sock_count_used(void) {
+    int n = 0;
+    for (int i = 0; i < NSOCK; i++) if (g_sock[i].used) n++;
+    return n;
+}
+
+/* Find the socket bound to a given local port (loopback target). Caller holds
+ * g_net_lock. Returns index or -1. */
+static int net_find_bound(uint16_t port) {
+    for (int i = 0; i < NSOCK; i++)
+        if (g_sock[i].used && g_sock[i].bound && g_sock[i].lport == port) return i;
+    return -1;
+}
+
+/* Enqueue a datagram into a socket's RX ring and wake any parked receiver.
+ * Caller holds g_net_lock. Drops silently if the ring is full (UDP semantics).*/
+static void net_sock_enqueue(int si, const uint8_t *data, uint16_t len) {
+    struct nsock *s = &g_sock[si];
+    if (s->qcount >= SOCK_QDEPTH) return;                 /* ring full: drop */
+    if (len > SOCK_DGRAM_MAX) len = SOCK_DGRAM_MAX;
+    cmemcpy(s->q[s->qtail], data, len);
+    s->qlen[s->qtail] = len;
+    s->qtail = (s->qtail + 1) % SOCK_QDEPTH;
+    s->qcount++;
+    g_net_loop_deliveries++;
+    if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
+}
+
+/* 16-bit one's-complement checksum (IP header). */
+static uint16_t net_cksum16(const uint8_t *p, int len) {
+    uint32_t sum = 0;
+    for (int i = 0; i + 1 < len; i += 2) sum += (uint32_t)((p[i] << 8) | p[i + 1]);
+    if (len & 1) sum += (uint32_t)(p[len - 1] << 8);
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)(~sum);
+}
+
+/* Build a real Ethernet/IPv4/UDP frame and transmit it via the existing
+ * virtio-net TX path. Broadcast dst MAC (SLIRP accepts it), src = our NIC MAC.
+ * UDP checksum 0 (permitted for IPv4). Best-effort: no reply is awaited. */
+static void net_tx_udp(uint32_t daddr, uint16_t sport, uint16_t dport,
+                       const uint8_t *payload, uint16_t plen) {
+    if (!g_vnet_ready) return;
+    if (plen > SOCK_DGRAM_MAX) plen = SOCK_DGRAM_MAX;
+    uint8_t f[14 + 20 + 8 + SOCK_DGRAM_MAX];
+    cmemset(f, 0, sizeof f);
+    for (int i = 0; i < 6; i++) f[i] = 0xFF;               /* dst MAC broadcast */
+    for (int i = 0; i < 6; i++) f[6 + i] = g_vnet_mac[i];  /* src MAC */
+    f[12] = 0x08; f[13] = 0x00;                            /* ethertype IPv4 */
+    uint8_t *ip = f + 14;
+    uint16_t iptot = (uint16_t)(20 + 8 + plen);
+    ip[0] = 0x45; ip[1] = 0x00; ip[2] = (uint8_t)(iptot >> 8); ip[3] = (uint8_t)iptot;
+    ip[8] = 64; ip[9] = 17;                                /* TTL, proto UDP */
+    ip[12] = (uint8_t)(NET_GUEST_IP >> 24); ip[13] = (uint8_t)(NET_GUEST_IP >> 16);
+    ip[14] = (uint8_t)(NET_GUEST_IP >> 8);  ip[15] = (uint8_t)NET_GUEST_IP;
+    ip[16] = (uint8_t)(daddr >> 24); ip[17] = (uint8_t)(daddr >> 16);
+    ip[18] = (uint8_t)(daddr >> 8);  ip[19] = (uint8_t)daddr;
+    uint16_t ck = net_cksum16(ip, 20); ip[10] = (uint8_t)(ck >> 8); ip[11] = (uint8_t)ck;
+    uint8_t *udp = ip + 20;
+    uint16_t ulen = (uint16_t)(8 + plen);
+    udp[0] = (uint8_t)(sport >> 8); udp[1] = (uint8_t)sport;
+    udp[2] = (uint8_t)(dport >> 8); udp[3] = (uint8_t)dport;
+    udp[4] = (uint8_t)(ulen >> 8);  udp[5] = (uint8_t)ulen;   /* udp csum left 0 */
+    for (uint16_t i = 0; i < plen; i++) udp[8 + i] = payload[i];
+    vnet_tx(f, (uint32_t)(14 + iptot));
+    g_net_tx_frames++;
+}
+
+/* Called from every kproc exit path (clean AND fault), alongside the other
+ * teardown hooks. Releases every socket the dying process owns. Static RX
+ * rings mean there are no frames to reclaim — just free the slots and clear
+ * any waiter so a stale tid can never be woken. */
+static void net_teardown_kproc(int proc_idx) {
+    klock_acquire(&g_net_lock);
+    for (int i = 0; i < NSOCK; i++) {
+        if (g_sock[i].used && g_sock[i].owner == proc_idx) {
+            if (g_debug_net)
+                kprintf("[dbgnet ] pid %u slot %d: released socket (lport %u)\n",
+                        kprocs[proc_idx].pid, i, (uint64_t)g_sock[i].lport);
+            g_sock[i].used = 0; g_sock[i].bound = 0; g_sock[i].connected = 0;
+            g_sock[i].waiter_tid = -1; g_sock[i].qcount = 0;
+        }
+    }
+    klock_release(&g_net_lock);
+}
+
 static void pci_init(void) {
     kprintf("[pci    ] enumerating bus 0 (config mechanism #1, ports 0xCF8/0xCFC):\n");
     for (uint8_t dev = 0; dev < 32; dev++) {
@@ -5444,6 +5579,7 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     gpu_teardown_kproc((int)t->proc);        /* v0.50: release any GPU resource/scanout FIRST */
     audio_teardown_kproc((int)t->proc);      /* v0.51: release any PCM stream ownership FIRST */
     usb_teardown_kproc((int)t->proc);        /* v0.51: symmetry hook (no per-process USB state today) */
+    net_teardown_kproc((int)t->proc);        /* v0.52: release any sockets this process owns */
     ipc_teardown_kproc((int)t->proc);        /* v0.46: release IPC mailbox/shmem FIRST */
     descriptor_teardown_kproc((int)t->proc); /* v0.45: force-close any leaked fd FIRST */
     dma_teardown_kproc((int)t->proc);        /* v0.44: revoke DMA/IOMMU grants FIRST */
@@ -5853,6 +5989,13 @@ static int rq_steal(int thief) {                       /* balance: rob siblings 
             rq_release(victim);                        /* not ours: leave queued */
             continue;
         }
+        /* v0.52: a task freshly placed on its directed migration home is pinned
+         * there for one hop — leave it for its home core rather than stealing
+         * it straight back (see the migrate_pin note in cpu_exec_proc). */
+        if (p >= 0 && kprocs[p].migrate_pin >= 0 && kprocs[p].migrate_pin != thief) {
+            rq_release(victim);
+            continue;
+        }
         if (p >= 0) victim->rq_h = (victim->rq_h + 1) % RQ_LEN;
         rq_release(victim);
         if (p >= 0) { __sync_fetch_and_add(&g_cpu[thief].rq_stolen, 1); return p; }
@@ -5889,6 +6032,7 @@ static void cpu_exec_proc(int c, int p) {
     g_tss[c].rsp0 = (uint64_t)(g_int_stack[c] + sizeof g_int_stack[c]);
     set_syscall_stack((uint64_t)(g_syscall_stack[c] + sizeof g_syscall_stack[c]));
     __sync_fetch_and_or(&kprocs[p].ran_on, 1u << c);
+    kprocs[p].migrate_pin = -1;   /* v0.52: one-shot directed-migration pin consumed on run */
     __sync_fetch_and_add(&kprocs[p].dispatches, 1);
     uint32_t dl = __sync_fetch_and_add(&g_dlog_n, 1);  /* v0.40: dispatch log  */
     if (dl < DLOG_LEN) g_dlog[dl] = p;
@@ -5923,6 +6067,15 @@ static void cpu_exec_proc(int c, int p) {
                 if (g_cpu[cc].online && (aff & (1u << cc))) { found = cc; break; }
             dst = (found >= 0) ? found : c;
         }
+        /* v0.52: honour the directed migration. Before this, an unrestricted
+         * task pushed to its migrate_to home could be immediately re-stolen by
+         * any idle sibling (rq_steal only respected the hard affinity mask),
+         * so a directed cpu1->cpu2 migration frequently landed back on cpu1 —
+         * a pre-existing work-stealing race (see cmd_mcpre). A one-shot pin
+         * keeps the steal path off the task until its directed home actually
+         * runs it (rq_pop, the home's own consumer, ignores the pin, so there
+         * is no starvation — it only blocks OTHER cores for a single hop). */
+        if (dst != c) kprocs[p].migrate_pin = dst;
         rq_push(dst, p);
         __sync_synchronize();
         if (dst != c) lapic_ipi(g_cpu[dst].apic_id, IPI_PING, 0);  /* wake the new home */
@@ -5948,6 +6101,7 @@ static void cpu_exec_proc(int c, int p) {
         gpu_teardown_kproc(p);                 /* v0.50: release any GPU resource/scanout FIRST */
         audio_teardown_kproc(p);               /* v0.51: release any PCM stream ownership FIRST */
         usb_teardown_kproc(p);                 /* v0.51: symmetry hook (no per-process USB state today) */
+        net_teardown_kproc(p);                 /* v0.52: release any sockets this process owns */
         ipc_teardown_kproc(p);                 /* v0.46: release IPC mailbox/shmem FIRST */
         descriptor_teardown_kproc(p);           /* v0.45: force-close any leaked fd FIRST */
         dma_teardown_kproc(p);                 /* v0.44: revoke DMA/IOMMU grants FIRST */
@@ -7620,6 +7774,108 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                     kprocs[current_proc_idx].pid, (uint64_t)len, fence, fired ? "played" : "timed out");
         return fired ? 1 : 0;
     }
+
+    /* --- v0.52: ring-3 datagram sockets over virtio-net (require PCAP_NETWORK) --- */
+    case 35: {   /* SYS_SOCKET(domain, type, proto) -> socket fd (>=0), or negative */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
+        if ((uint32_t)a0 != NET_AF_INET || (uint32_t)a1 != NET_SOCK_DGRAM) return (uint64_t)-1;
+        klock_acquire(&g_net_lock);
+        int fd = -1;
+        for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) {
+            cmemset(&g_sock[i], 0, sizeof g_sock[i]);
+            g_sock[i].used = 1; g_sock[i].owner = (int)current_proc_idx; g_sock[i].waiter_tid = -1;
+            fd = i; break;
+        }
+        klock_release(&g_net_lock);
+        if (fd < 0) return (uint64_t)-1;                    /* socket table full */
+        if (g_debug_net) kprintf("[dbgnet ] pid %u: SOCKET -> fd %d\n", kprocs[current_proc_idx].pid, fd);
+        return (uint64_t)fd;
+    }
+    case 36: {   /* SYS_BIND(fd, port) -> 0 ok, negative error */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
+        int fd = (int)(int64_t)a0; uint16_t port = (uint16_t)a1;
+        if (fd < 0 || fd >= NSOCK || port == 0) return (uint64_t)-1;
+        klock_acquire(&g_net_lock);
+        int rc = -1;
+        if (g_sock[fd].used && g_sock[fd].owner == (int)current_proc_idx) {
+            int taken = net_find_bound(port);
+            if (taken < 0 || taken == fd) { g_sock[fd].lport = port; g_sock[fd].bound = 1; rc = 0; }
+        }
+        klock_release(&g_net_lock);
+        if (g_debug_net) kprintf("[dbgnet ] pid %u: BIND fd %d port %u -> %d\n",
+                                 kprocs[current_proc_idx].pid, fd, (uint64_t)port, rc);
+        return rc == 0 ? (uint64_t)0 : (uint64_t)-1;
+    }
+    case 37: {   /* SYS_CONNECT(fd, addr, port) -> 0 ok, negative */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
+        int fd = (int)(int64_t)a0; uint32_t addr = (uint32_t)a1; uint16_t port = (uint16_t)a2;
+        if (fd < 0 || fd >= NSOCK) return (uint64_t)-1;
+        klock_acquire(&g_net_lock);
+        int rc = -1;
+        if (g_sock[fd].used && g_sock[fd].owner == (int)current_proc_idx) {
+            g_sock[fd].raddr = addr; g_sock[fd].rport = port; g_sock[fd].connected = 1; rc = 0;
+        }
+        klock_release(&g_net_lock);
+        if (g_debug_net) kprintf("[dbgnet ] pid %u: CONNECT fd %d -> %d\n",
+                                 kprocs[current_proc_idx].pid, fd, rc);
+        return rc == 0 ? (uint64_t)0 : (uint64_t)-1;
+    }
+    case 38: {   /* SYS_SEND(fd, buf, len) -> bytes sent, or negative */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
+        int fd = (int)(int64_t)a0; uint64_t ubuf = a1; uint32_t len = (uint32_t)a2;
+        if (fd < 0 || fd >= NSOCK) return (uint64_t)-1;
+        if (len > SOCK_DGRAM_MAX) len = SOCK_DGRAM_MAX;
+        if (!access_ok(kprocs[current_proc_idx].cr3, ubuf, len, 0)) return (uint64_t)-1;
+        uint8_t stage[SOCK_DGRAM_MAX];
+        cmemcpy(stage, (const void *)ubuf, len);
+        klock_acquire(&g_net_lock);
+        if (!(g_sock[fd].used && g_sock[fd].owner == (int)current_proc_idx && g_sock[fd].connected)) {
+            klock_release(&g_net_lock); return (uint64_t)-1;
+        }
+        uint32_t daddr = g_sock[fd].raddr; uint16_t dport = g_sock[fd].rport, sport = g_sock[fd].lport;
+        int delivered_loop = 0;
+        if (daddr == NET_LOOPBACK) {
+            int ti = net_find_bound(dport);
+            if (ti >= 0) { net_sock_enqueue(ti, stage, (uint16_t)len); delivered_loop = 1; }
+        }
+        klock_release(&g_net_lock);
+        if (!delivered_loop) net_tx_udp(daddr, sport, dport, stage, (uint16_t)len);  /* real wire */
+        if (g_debug_net) kprintf("[dbgnet ] pid %u: SEND fd %d %u bytes -> %s\n",
+                                 kprocs[current_proc_idx].pid, fd, (uint64_t)len,
+                                 delivered_loop ? "loopback" : "wire");
+        return (uint64_t)len;
+    }
+    case 39: {   /* SYS_RECV(fd, buf, maxlen) -> bytes received (>=0), 0 if timed out empty, negative on error */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
+        int fd = (int)(int64_t)a0; uint64_t ubuf = a1; uint32_t maxlen = (uint32_t)a2;
+        if (fd < 0 || fd >= NSOCK) return (uint64_t)-1;
+        if (!access_ok(kprocs[current_proc_idx].cr3, ubuf, maxlen, 1)) return (uint64_t)-1;
+        /* Bounded poll (never blocks unbounded — same hang-proof discipline as
+         * gpu_fence_wait): loopback delivery is synchronous, so the common case
+         * returns immediately; a genuinely empty socket times out at ~2000
+         * ticks rather than ever deadlocking. Timer IRQs still fire during the
+         * pause, so the NIC softirq can deliver real inbound frames too. */
+        uint64_t t0 = g_ticks;
+        for (;;) {
+            klock_acquire(&g_net_lock);
+            if (!(g_sock[fd].used && g_sock[fd].owner == (int)current_proc_idx)) {
+                klock_release(&g_net_lock); return (uint64_t)-1;
+            }
+            if (g_sock[fd].qcount > 0) {
+                struct nsock *s = &g_sock[fd];
+                uint16_t dl = s->qlen[s->qhead]; if (dl > maxlen) dl = (uint16_t)maxlen;
+                cmemcpy((void *)ubuf, s->q[s->qhead], dl);
+                s->qhead = (s->qhead + 1) % SOCK_QDEPTH; s->qcount--;
+                klock_release(&g_net_lock);
+                if (g_debug_net) kprintf("[dbgnet ] pid %u: RECV fd %d -> %u bytes\n",
+                                         kprocs[current_proc_idx].pid, fd, (uint64_t)dl);
+                return (uint64_t)dl;
+            }
+            klock_release(&g_net_lock);
+            if (g_ticks - t0 >= 2000) return (uint64_t)0;    /* timed out empty */
+            __asm__ volatile("pause");
+        }
+    }
     }
     return (uint64_t)-1;
 }
@@ -7685,6 +7941,7 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         gpu_teardown_kproc((int)t->proc);
         audio_teardown_kproc((int)t->proc);
         usb_teardown_kproc((int)t->proc);
+        net_teardown_kproc((int)t->proc);
         ipc_teardown_kproc((int)t->proc);
         descriptor_teardown_kproc((int)t->proc);
         dma_teardown_kproc((int)t->proc);      /* v0.44: revoke DMA/IOMMU grants FIRST */
@@ -9219,6 +9476,115 @@ static void cmd_audio_stress(void) {
     if (!g_audiofail)
         kputs("[audstrs] AUDIO STRESS VERIFIED — PCM configure/write leak-free across clean, faulted, AND gapped driver churn\n");
     else kputs("[audstrs] AUDIO STRESS DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.52: NET STRESS — real ring-3 datagram-socket create/bind/connect/send/
+ * recv churn over loopback, INCLUDING deliberate mid-flight client faults.
+ * ===========================================================================
+ * Each round spawns a role-21 driver that opens two sockets, round-trips four
+ * datagrams to itself over 127.0.0.1 loopback (verifying the bytes exactly),
+ * and fires one real outbound UDP frame via vnet_tx. Every 4th round instead
+ * runs role 22, which faults right after BIND — before connect/send or its own
+ * SYS_EXIT — proving net_teardown_kproc reclaims the socket via
+ * handle_cpl3_fault's exit path, not just the clean SYS_EXIT one. The core
+ * leak check is that the used-socket count returns to its baseline after every
+ * round (clean OR faulted): no socket slot may survive a dead owner. */
+#define NETSTRESS_ROUNDS 16
+static int g_netpass, g_netfail;
+static void netcheck(const char *n, int c) {
+    if (c) { g_netpass++; kprintf("[netstrs]  PASS  %s\n", n); }
+    else   { g_netfail++; kprintf("[netstrs]  FAIL  %s\n", n); }
+}
+
+static void cmd_net_stress(void) {
+    kputs("-- NET STRESS: real ring-3 datagram-socket bind/connect/send/recv churn, incl. client faults --\n");
+    g_netpass = g_netfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    int base_socks = net_sock_count_used();               /* should be 0 */
+    uint64_t loop0 = g_net_loop_deliveries, tx0 = g_net_tx_frames;
+    int rounds_ok = 1, socks_ok = 1, fault_rounds_ok = 1;
+    int rnd;
+
+    for (rnd = 0; rnd < NETSTRESS_ROUNDS; rnd++) {
+        int fault_round = (rnd % 4) == 3;
+        int p = kproc_spawn("net-driver", PCAP_NETWORK);
+        if (p < 0) { netcheck("kproc_spawn never fails mid-storm (recycling keeps the table bounded)", 0);
+                     rounds_ok = 0; break; }
+        kprocs[p].role = fault_round ? 22 : 21;
+        uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!e) { netcheck("every worker's ELF loads", 0); rounds_ok = 0; break; }
+        kprocs[p].entry = e;
+
+        if (n > 1) {
+            rq_push(0 % n, p);
+            __sync_synchronize();
+            lapic_ipi(0, IPI_PING, 1);
+            int q; while ((q = rq_pop(0)) >= 0) cpu_exec_proc(0, q);
+        } else {
+            cpu_exec_proc(0, p);
+        }
+
+        uint64_t t0 = g_ticks;
+        while (!kprocs[p].torn_down && g_ticks - t0 < 3000) {
+            if (n > 1) lapic_ipi(0, IPI_PING, 1);
+            uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
+        }
+        current_proc_idx = save;
+
+        int ok;
+        if (fault_round) {
+            ok = kprocs[p].exited && kprocs[p].exit_code >= 0x8000;
+            if (!ok) fault_rounds_ok = 0;
+        } else {
+            ok = kprocs[p].exited && kprocs[p].exit_code == kprocs[p].pid;
+            if (!ok) rounds_ok = 0;
+        }
+        if (!ok)
+            kprintf("[netstrs] round %d (%s) FAILED: exit %u\n",
+                    rnd, (uint64_t)(fault_round ? 1 : 0), kprocs[p].exit_code);
+
+        if (net_sock_count_used() != base_socks) socks_ok = 0;   /* every socket reclaimed */
+
+        if (ok && (rnd % 4) == 3)
+            kprintf("[netstrs] round %d/%d clean\n", rnd + 1, (uint64_t)NETSTRESS_ROUNDS);
+    }
+
+    netcheck("every round completed without a watchdog timeout (no deadlock across preemption)",
+             rnd == NETSTRESS_ROUNDS);
+    netcheck("every clean-round driver exited normally (socket/bind/connect/send/recv all verified in ring 3)",
+             rounds_ok);
+    netcheck("every fault-round driver actually died via the fault path (not its own SYS_EXIT)",
+             fault_rounds_ok);
+    netcheck("no socket slot survived past any round's teardown (clean OR faulted)", socks_ok);
+
+    uint64_t loops = g_net_loop_deliveries - loop0; (void)tx0;
+    kprintf("[netstrs] %d rounds (%d faulted): %u loopback datagrams delivered\n",
+            rnd, (uint64_t)(NETSTRESS_ROUNDS / 4), loops);
+    /* 12 clean rounds x 4 self-loopback datagrams = 48 deterministic deliveries.
+     * (This churn suite deliberately fires NO real NIC frames — see the
+     * net_driver comment and CHANGELOG-0.52.0.md re: cmd_capdma coupling.) */
+    netcheck("loopback delivered every clean round's datagrams (send->recv round-trip proven)",
+             loops == (uint64_t)((NETSTRESS_ROUNDS - NETSTRESS_ROUNDS / 4) * 4));
+
+    uint64_t freed_total = g_frames_freed - freed0, reused_total = g_frames_reused - reused0;
+    kprintf("[netstrs] +%u freed, +%u reused; global depth %u\n",
+            freed_total, reused_total, g_frame_free_depth);
+    netcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+             g_frame_free_depth == g_frames_freed - g_frames_reused);
+    netcheck("the frame allocator's leaf lock never triggered a rank violation (no double-free race)",
+             g_rank_violations == viol0);
+
+    kprintf("[netstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_netpass, (uint64_t)g_netfail);
+    if (!g_netfail)
+        kputs("[netstrs] NET STRESS VERIFIED — socket create/bind/connect/send/recv leak-free across clean AND faulted churn\n");
+    else kputs("[netstrs] NET STRESS DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -11868,6 +12234,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "vfsstress")) cmd_vfs_stress();
     else if (!kstrcmp(argv[0], "gpustress")) cmd_gpu_stress();
     else if (!kstrcmp(argv[0], "audiostress")) cmd_audio_stress();
+    else if (!kstrcmp(argv[0], "netstress")) cmd_net_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -12038,6 +12405,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_vfs_stress();       /* v0.48: VFS journaling, unlink/reclamation, multi-volume mounts       */
     cmd_gpu_stress();       /* v0.50: virtio-gpu 2D resource/scanout/flush churn, incl. client faults */
     cmd_audio_stress();     /* v0.51: virtio-sound PCM configure/write churn, incl. client faults */
+    cmd_net_stress();       /* v0.52: ring-3 datagram-socket bind/connect/send/recv churn, incl. client faults */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();

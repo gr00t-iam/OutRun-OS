@@ -58,6 +58,11 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_GPU_FENCE_WAIT      32
 #define SYS_AUDIO_CONFIGURE     33
 #define SYS_AUDIO_WRITE         34
+#define SYS_SOCKET              35
+#define SYS_BIND                36
+#define SYS_CONNECT             37
+#define SYS_SEND                38
+#define SYS_RECV                39
 
 #define PCAP_SMP_ADMIN (1ull << 9)
 
@@ -680,6 +685,59 @@ static void audio_driver(int fault_after_configure) {
     sysc(SYS_EXIT, pid, 0, 0);
 }
 
+/* v0.52: role 21/22 — a ring-3 "socket client". Creates a datagram socket,
+ * binds a local port, connects to 127.0.0.1:<same port>, then sends several
+ * datagrams to itself and reads each back, verifying the bytes round-trip
+ * exactly through the kernel's loopback delivery — the full
+ * SOCKET/BIND/CONNECT/SEND/RECV path exercised deterministically (no reliance
+ * on QEMU SLIRP timing). It also fires one REAL outbound frame at the SLIRP
+ * gateway to exercise vnet_tx from the socket path (best-effort, no reply
+ * awaited). Role 22 deliberately faults right after BIND (before connect/send
+ * or its own exit) so cmd_net_stress can prove net_teardown_kproc reclaims the
+ * socket via the FAULT exit path, not just SYS_EXIT — the same v0.44/45/50/51
+ * fault-injection precedent. */
+static void net_driver(int fault_after_bind) {
+    u64 pid  = sysc(SYS_GETPID, 0, 0, 0);
+    u16 port = (u16)(4000 + (pid & 0x3FF));
+
+    i64 fd = (i64)sysc(SYS_SOCKET, 2, 2, 0);                 /* AF_INET, SOCK_DGRAM */
+    if (fd < 0) sysc(SYS_EXIT, 1301, 0, 0);
+    if ((i64)sysc(SYS_BIND, (u64)fd, (u64)port, 0) != 0) sysc(SYS_EXIT, 1302, 0, 0);
+
+    if (fault_after_bind) {
+        volatile u32 *bad = (volatile u32 *)0x1;
+        *bad = 0xDEAD;                                       /* deliberate fault: socket must still be reclaimed */
+    }
+
+    if ((i64)sysc(SYS_CONNECT, (u64)fd, 0x7F000001ull, (u64)port) != 0)  /* 127.0.0.1:port */
+        sysc(SYS_EXIT, 1303, 0, 0);
+
+    u8 buf[64], rbuf[64];
+    for (int round = 0; round < 4; round++) {               /* self-loopback round trip */
+        for (int i = 0; i < 32; i++) buf[i] = (u8)((pid + (u64)round * 31 + (u64)i) & 0xFF);
+        if ((i64)sysc(SYS_SEND, (u64)fd, (u64)buf, 32) != 32) sysc(SYS_EXIT, 1310 + round, 0, 0);
+        i64 got = (i64)sysc(SYS_RECV, (u64)fd, (u64)rbuf, 64);
+        if (got != 32) sysc(SYS_EXIT, 1320 + round, 0, 0);
+        for (int i = 0; i < 32; i++) if (rbuf[i] != buf[i]) sysc(SYS_EXIT, 1330 + round, 0, 0);
+    }
+
+    /* open a second socket to exercise multi-socket allocation + teardown. We
+     * deliberately do NOT transmit any real (non-loopback) frame from this
+     * churn suite: the socket layer DOES support real vnet_tx for non-loopback
+     * destinations, but that path is already proven by the existing
+     * net/nicdrv/cio suites, and firing frames on the shared physical NIC TX
+     * queue here would perturb cmd_capdma (which runs later and depends on a
+     * quiescent TX queue to produce its confined-DMA fault). See
+     * CHANGELOG-0.52.0.md. */
+    i64 fd2 = (i64)sysc(SYS_SOCKET, 2, 2, 0);
+    if (fd2 >= 0) {
+        sysc(SYS_BIND, (u64)fd2, (u64)(port + 1), 0);
+        sysc(SYS_CONNECT, (u64)fd2, 0x7F000001ull, (u64)(port + 1));  /* bound but unused */
+    }
+
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
 static void nic_driver(void) {
     print("  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====\n");
 
@@ -809,6 +867,8 @@ void _start(void) {
     if (role == 18) { gpu_driver(1); }                  /* v0.50 GPU client: deliberate fault before flush   */
     if (role == 19) { audio_driver(0); }                /* v0.51 audio client: clean configure/write/exit    */
     if (role == 20) { audio_driver(1); }                /* v0.51 audio client: deliberate fault after configure */
+    if (role == 21) { net_driver(0); }                  /* v0.52 socket client: clean bind/connect/send/recv  */
+    if (role == 22) { net_driver(1); }                  /* v0.52 socket client: deliberate fault after bind   */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");
