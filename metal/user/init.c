@@ -63,6 +63,9 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_CONNECT             37
 #define SYS_SEND                38
 #define SYS_RECV                39
+#define SYS_WIN_CREATE          40
+#define SYS_WIN_DAMAGE          41
+#define SYS_WIN_POLL            42
 
 #define PCAP_SMP_ADMIN (1ull << 9)
 
@@ -738,6 +741,39 @@ static void net_driver(int fault_after_bind) {
     sysc(SYS_EXIT, pid, 0, 0);
 }
 
+/* v0.53: role 23/24 — a ring-3 "WIMP app". Creates three top-level windows,
+ * draws a pattern into each window's 32x32 ARGB content thumbnail (mapped by
+ * the kernel at WIN_USER_V + id*4096), damages them to request recomposition,
+ * and polls for routed input events, then exits — so cmd_wimp_stress can prove
+ * the window manager creates/composites and, on teardown, destroys every
+ * window and reclaims every content grant. Role 24 deliberately faults right
+ * after creating its windows (before damage/poll or its own exit) to prove
+ * wimp_teardown_kproc reclaims via the FAULT exit path, not just SYS_EXIT. */
+static void wimp_driver(int fault_after_create) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    i64 ids[3];
+    for (int i = 0; i < 3; i++) {
+        i64 id = (i64)sysc(SYS_WIN_CREATE, ((u64)(180 + i * 20) << 16) | (u64)(120 + i * 10),
+                           (u64)(0x22E4FF + (u64)i * 0x203040), 0);
+        if (id < 0) sysc(SYS_EXIT, 1401 + i, 0, 0);
+        ids[i] = id;
+        volatile u32 *thumb = (volatile u32 *)(0x0000550000000000ull + (u64)id * 4096);
+        for (int k = 0; k < 32 * 32; k++)
+            thumb[k] = (u32)(((pid * 7 + (u64)i * 40 + (u64)k) & 0xFFFFFF) | 0x101010);
+        sysc(SYS_WIN_DAMAGE, (u64)id, 0, 0);
+    }
+
+    if (fault_after_create) {
+        volatile u32 *bad = (volatile u32 *)0x1;
+        *bad = 0xDEAD;                                       /* deliberate fault: windows must still be destroyed */
+    }
+
+    struct { int type, x, y, code; } ev;                    /* poll any routed events (none in headless) */
+    for (int i = 0; i < 3; i++) sysc(SYS_WIN_POLL, (u64)ids[i], (u64)&ev, 0);
+
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
 static void nic_driver(void) {
     print("  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====\n");
 
@@ -869,6 +905,8 @@ void _start(void) {
     if (role == 20) { audio_driver(1); }                /* v0.51 audio client: deliberate fault after configure */
     if (role == 21) { net_driver(0); }                  /* v0.52 socket client: clean bind/connect/send/recv  */
     if (role == 22) { net_driver(1); }                  /* v0.52 socket client: deliberate fault after bind   */
+    if (role == 23) { wimp_driver(0); }                 /* v0.53 WIMP app: clean window create/damage/poll    */
+    if (role == 24) { wimp_driver(1); }                 /* v0.53 WIMP app: deliberate fault after window create */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");
