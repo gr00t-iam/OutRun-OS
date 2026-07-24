@@ -66,6 +66,10 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_WIN_CREATE          40
 #define SYS_WIN_DAMAGE          41
 #define SYS_WIN_POLL            42
+#define SYS_WIN_INFO            43
+#define SYS_SYSINFO             44
+#define SYS_READDIR             45
+#define SYS_RUN_CMD             46
 
 #define PCAP_SMP_ADMIN (1ull << 9)
 
@@ -749,6 +753,324 @@ static void net_driver(int fault_after_bind) {
  * window and reclaims every content grant. Role 24 deliberately faults right
  * after creating its windows (before damage/poll or its own exit) to prove
  * wimp_teardown_kproc reclaims via the FAULT exit path, not just SYS_EXIT. */
+/* ===========================================================================
+ * v0.54: RING-3 GUI APPLICATION CLIENT LIBRARY
+ * ===========================================================================
+ * Everything a windowed ring-3 app needs, entirely in userland on top of the
+ * v0.53 window syscalls: window creation with a real full-resolution content
+ * surface, a non-blocking event loop with abstract event types, an 8x8 bitmap
+ * font, and drawing primitives that write straight into the shared surface
+ * (zero-copy — no syscall touches pixel data). */
+#define WIN_SURF_BASE  0x0000550000000000ull
+/* MUST match the kernel's WIN_SURF_MAXB exactly, and must be page-aligned:
+ * 600*440*4 rounded up to whole pages = 258 pages. */
+#define WIN_SURF_STRIDE (258ull * 4096ull)
+
+/* abstract event types the app sees (mapped from the kernel's raw sevent) */
+#define EVENT_NONE         0
+#define EVENT_MOUSE_CLICK  1
+#define EVENT_KEY_DOWN     2
+#define EVENT_WIN_CLOSE    3
+#define EVENT_REDRAW       4
+
+struct app_event { int type, x, y, code; };
+
+struct app_win {
+    int id, cw, ch;
+    volatile u32 *surf;
+    u32 fg, bg;
+};
+
+/* 8x8 font: digits, uppercase, and the handful of punctuation the apps use.
+ * Compact on purpose — a full 96-glyph ROM would dwarf the apps themselves. */
+static const u8 g_afont[43][8] = {
+ {0,0,0,0,0,0,0,0},                                        /* ' '  */
+ {0x3C,0x66,0x6E,0x76,0x66,0x66,0x3C,0},                   /* 0 */
+ {0x18,0x38,0x18,0x18,0x18,0x18,0x7E,0},                   /* 1 */
+ {0x3C,0x66,0x06,0x0C,0x18,0x30,0x7E,0},                   /* 2 */
+ {0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0},                   /* 3 */
+ {0x0C,0x1C,0x3C,0x6C,0x7E,0x0C,0x0C,0},                   /* 4 */
+ {0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0},                   /* 5 */
+ {0x1C,0x30,0x60,0x7C,0x66,0x66,0x3C,0},                   /* 6 */
+ {0x7E,0x06,0x0C,0x18,0x30,0x30,0x30,0},                   /* 7 */
+ {0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0},                   /* 8 */
+ {0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0},                   /* 9 */
+ {0x18,0x3C,0x66,0x66,0x7E,0x66,0x66,0},                   /* A */
+ {0x7C,0x66,0x66,0x7C,0x66,0x66,0x7C,0},                   /* B */
+ {0x3C,0x66,0x60,0x60,0x60,0x66,0x3C,0},                   /* C */
+ {0x78,0x6C,0x66,0x66,0x66,0x6C,0x78,0},                   /* D */
+ {0x7E,0x60,0x60,0x7C,0x60,0x60,0x7E,0},                   /* E */
+ {0x7E,0x60,0x60,0x7C,0x60,0x60,0x60,0},                   /* F */
+ {0x3C,0x66,0x60,0x6E,0x66,0x66,0x3E,0},                   /* G */
+ {0x66,0x66,0x66,0x7E,0x66,0x66,0x66,0},                   /* H */
+ {0x7E,0x18,0x18,0x18,0x18,0x18,0x7E,0},                   /* I */
+ {0x1E,0x0C,0x0C,0x0C,0x0C,0x6C,0x38,0},                   /* J */
+ {0x66,0x6C,0x78,0x70,0x78,0x6C,0x66,0},                   /* K */
+ {0x60,0x60,0x60,0x60,0x60,0x60,0x7E,0},                   /* L */
+ {0x63,0x77,0x7F,0x6B,0x63,0x63,0x63,0},                   /* M */
+ {0x66,0x76,0x7E,0x7E,0x6E,0x66,0x66,0},                   /* N */
+ {0x3C,0x66,0x66,0x66,0x66,0x66,0x3C,0},                   /* O */
+ {0x7C,0x66,0x66,0x7C,0x60,0x60,0x60,0},                   /* P */
+ {0x3C,0x66,0x66,0x66,0x6E,0x6C,0x36,0},                   /* Q */
+ {0x7C,0x66,0x66,0x7C,0x78,0x6C,0x66,0},                   /* R */
+ {0x3E,0x60,0x60,0x3C,0x06,0x06,0x7C,0},                   /* S */
+ {0x7E,0x18,0x18,0x18,0x18,0x18,0x18,0},                   /* T */
+ {0x66,0x66,0x66,0x66,0x66,0x66,0x3C,0},                   /* U */
+ {0x66,0x66,0x66,0x66,0x66,0x3C,0x18,0},                   /* V */
+ {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0},                   /* W */
+ {0x66,0x66,0x3C,0x18,0x3C,0x66,0x66,0},                   /* X */
+ {0x66,0x66,0x66,0x3C,0x18,0x18,0x18,0},                   /* Y */
+ {0x7E,0x06,0x0C,0x18,0x30,0x60,0x7E,0},                   /* Z */
+ {0,0,0,0,0,0,0x18,0},                                     /* . */
+ {0,0,0,0x7E,0,0,0,0},                                     /* - */
+ {0,0x18,0x18,0x7E,0x18,0x18,0,0},                         /* + */
+ {0,0,0x18,0,0,0x18,0,0},                                  /* : */
+ {0x3C,0x66,0x0C,0x18,0x18,0,0x18,0},                      /* ? */
+ {0x00,0x18,0x3C,0x7E,0x3C,0x18,0x00,0},                   /* * (cursor/unknown) */
+};
+/* map an ASCII byte onto the compact font table */
+static int afont_idx(char c) {
+    if (c == ' ') return 0;
+    if (c >= '0' && c <= '9') return 1 + (c - '0');
+    if (c >= 'A' && c <= 'Z') return 11 + (c - 'A');
+    if (c >= 'a' && c <= 'z') return 11 + (c - 'a');        /* fold case */
+    if (c == '.') return 37;
+    if (c == '-') return 38;
+    if (c == '+') return 39;
+    if (c == ':') return 40;
+    if (c == '?') return 41;
+    return 42;                                              /* unknown glyph */
+}
+
+static void app_px(struct app_win *W, int x, int y, u32 c) {
+    if (x < 0 || y < 0 || x >= W->cw || y >= W->ch) return;
+    W->surf[y * W->cw + x] = c;
+}
+static void app_fill(struct app_win *W, u32 c) {
+    for (int i = 0; i < W->cw * W->ch; i++) W->surf[i] = c;
+}
+static void app_rect(struct app_win *W, int x, int y, int w, int h, u32 c) {
+    for (int j = 0; j < h; j++) for (int i = 0; i < w; i++) app_px(W, x + i, y + j, c);
+}
+static void app_char(struct app_win *W, int x, int y, char ch, u32 c) {
+    const u8 *g = g_afont[afont_idx(ch)];
+    for (int r = 0; r < 8; r++)
+        for (int b = 0; b < 8; b++)
+            if (g[r] & (0x80 >> b)) app_px(W, x + b, y + r, c);
+}
+static void app_str(struct app_win *W, int x, int y, const char *s, u32 c) {
+    for (; *s; s++) { app_char(W, x, y, *s, c); x += 8; }
+}
+static void app_u32(struct app_win *W, int x, int y, u32 v, u32 c) {
+    char b[12]; int n = 0;
+    if (!v) b[n++] = '0';
+    while (v && n < 11) { b[n++] = (char)('0' + (v % 10)); v /= 10; }
+    for (int i = 0; i < n; i++) app_char(W, x + i * 8, y, b[n - 1 - i], c);
+}
+
+/* Create a window and bind its content surface. Returns 0 on success. */
+static int app_create(struct app_win *W, int w, int h, u32 accent) {
+    i64 id = (i64)sysc(SYS_WIN_CREATE, ((u64)w << 16) | (u64)h, accent, 0);
+    if (id < 0) return -1;
+    i64 dims = (i64)sysc(SYS_WIN_INFO, (u64)id, 0, 0);
+    if (dims < 0) return -1;
+    W->id = (int)id;
+    W->cw = (int)((u64)dims >> 16); W->ch = (int)((u64)dims & 0xFFFF);
+    W->surf = (volatile u32 *)(WIN_SURF_BASE + (u64)id * WIN_SURF_STRIDE);
+    W->fg = 0xEAF2F7; W->bg = 0x0A0D14;
+    return 0;
+}
+/* Publish the current surface contents (request recomposition). */
+static void app_damage(struct app_win *W) { sysc(SYS_WIN_DAMAGE, (u64)W->id, 0, 0); }
+
+/* NON-BLOCKING event poll: returns 1 and fills *ev if an event was pending,
+ * 0 otherwise. Maps the kernel's raw sevent (1=click, 2=key) onto the app-level
+ * event vocabulary and never blocks — the caller owns its own loop cadence. */
+static int app_poll_events(struct app_win *W, struct app_event *ev) {
+    struct { int type, x, y, code; } raw;
+    if ((i64)sysc(SYS_WIN_POLL, (u64)W->id, (u64)&raw, 0) != 1) { ev->type = EVENT_NONE; return 0; }
+    ev->x = raw.x; ev->y = raw.y; ev->code = raw.code;
+    if (raw.type == 1)      ev->type = EVENT_MOUSE_CLICK;
+    else if (raw.type == 2) ev->type = (raw.code == 27) ? EVENT_WIN_CLOSE : EVENT_KEY_DOWN;
+    else                    ev->type = EVENT_REDRAW;
+    return 1;
+}
+
+/* ---- APP 1: CYBER-TERMINAL — a windowed shell -------------------------------
+ * A real terminal emulator: a character grid rendered with the app font, a
+ * typed command line with backspace/enter, scrollback that scrolls when full,
+ * and command execution through SYS_RUN_CMD, whose captured kernel stdout is
+ * written back into the grid. */
+#define TERM_COLS 46
+#define TERM_ROWS 22
+struct term_state {
+    char grid[TERM_ROWS][TERM_COLS + 1];
+    int  row, col;
+    char cmd[64]; int cmdlen;
+};
+static void term_newline(struct term_state *T) {
+    T->col = 0;
+    if (++T->row >= TERM_ROWS) {                            /* scroll history up */
+        for (int r = 0; r < TERM_ROWS - 1; r++)
+            for (int c = 0; c <= TERM_COLS; c++) T->grid[r][c] = T->grid[r + 1][c];
+        for (int c = 0; c <= TERM_COLS; c++) T->grid[TERM_ROWS - 1][c] = 0;
+        T->row = TERM_ROWS - 1;
+    }
+}
+static void term_putc(struct term_state *T, char ch) {
+    if (ch == '\n') { term_newline(T); return; }
+    if (ch == '\r') return;
+    if (T->col >= TERM_COLS) term_newline(T);
+    T->grid[T->row][T->col++] = ch;
+}
+static void term_puts(struct term_state *T, const char *s) { for (; *s; s++) term_putc(T, *s); }
+static void term_render(struct app_win *W, struct term_state *T) {
+    app_fill(W, 0x05060A);
+    for (int r = 0; r < TERM_ROWS; r++)
+        for (int c = 0; c < TERM_COLS && T->grid[r][c]; c++)
+            app_char(W, 2 + c * 8, 2 + r * 9, T->grid[r][c], 0x3DF5C4);
+    /* prompt line + typed command + block cursor */
+    int py = 2 + T->row * 9;
+    app_char(W, 2, py, '>', 0x22E4FF);
+    for (int i = 0; i < T->cmdlen; i++) app_char(W, 2 + (i + 2) * 8, py, T->cmd[i], 0xEAF2F7);
+    app_rect(W, 2 + (T->cmdlen + 2) * 8, py, 7, 8, 0xFFB020);
+}
+static void term_exec(struct term_state *T) {
+    static char out[1024];
+    T->cmd[T->cmdlen] = 0;
+    term_newline(T);
+    i64 n = (i64)sysc(SYS_RUN_CMD, (u64)T->cmd, (u64)out, sizeof out);
+    if (n > 0) for (i64 i = 0; i < n; i++) term_putc(T, out[i]);
+    else term_puts(T, "?\n");
+    T->cmdlen = 0;
+}
+
+static void app_terminal(int frames) {
+    struct app_win W; struct term_state T;
+    for (int r = 0; r < TERM_ROWS; r++) for (int c = 0; c <= TERM_COLS; c++) T.grid[r][c] = 0;
+    T.row = 0; T.col = 0; T.cmdlen = 0;
+    if (app_create(&W, 400, 230, 0x3DF5C4) != 0) sysc(SYS_EXIT, 1501, 0, 0);
+    term_puts(&T, "OUTRUN CYBER-TERMINAL\n");
+    term_render(&W, &T); app_damage(&W);
+
+    for (int f = 0; f < frames; f++) {                      /* bounded event loop */
+        struct app_event ev;
+        while (app_poll_events(&W, &ev)) {
+            if (ev.type == EVENT_KEY_DOWN) {
+                char ch = (char)ev.code;
+                if (ch == '\n')      term_exec(&T);
+                else if (ch == 8)  { if (T.cmdlen) T.cmdlen--; }
+                else if (T.cmdlen < (int)sizeof T.cmd - 1) T.cmd[T.cmdlen++] = ch;
+            } else if (ev.type == EVENT_WIN_CLOSE) { f = frames; break; }
+        }
+        term_render(&W, &T);
+        app_damage(&W);
+    }
+    /* headless proof-of-life: execute one REAL shell command through the
+     * terminal's own path so the captured output lands in the grid. */
+    T.cmd[0]='p'; T.cmd[1]='s'; T.cmdlen=2; term_exec(&T);
+    term_render(&W, &T); app_damage(&W);
+}
+
+/* ---- APP 2: SYSTEM MONITOR — processes, cores, memory ---------------------- */
+struct sysinfo_hdr { u32 ncpu, nproc, frames_used, frames_free, ram_mb, ticks; };
+struct sysinfo_ent { u32 pid, flags; char name[24]; };
+
+static void app_sysmon(int frames) {
+    struct app_win W;
+    if (app_create(&W, 360, 260, 0x22E4FF) != 0) sysc(SYS_EXIT, 1601, 0, 0);
+    static u8 buf[sizeof(struct sysinfo_hdr) + 12 * 32];
+    for (int f = 0; f < frames; f++) {
+        struct app_event ev;
+        while (app_poll_events(&W, &ev)) if (ev.type == EVENT_WIN_CLOSE) { f = frames; break; }
+
+        i64 n = (i64)sysc(SYS_SYSINFO, (u64)buf, 0, 0);
+        struct sysinfo_hdr *H = (struct sysinfo_hdr *)buf;
+        struct sysinfo_ent *E = (struct sysinfo_ent *)(buf + sizeof *H);
+        app_fill(&W, 0x0A0D14);
+        app_str(&W, 4, 2, "SYSTEM MONITOR", 0x22E4FF);
+        app_str(&W, 4, 14, "CORES:", 0x7C8CA0); app_u32(&W, 60, 14, H->ncpu, 0xEAF2F7);
+        app_str(&W, 4, 24, "RAM MB:", 0x7C8CA0); app_u32(&W, 68, 24, H->ram_mb, 0xEAF2F7);
+        app_str(&W, 4, 34, "FRAMES:", 0x7C8CA0); app_u32(&W, 68, 34, H->frames_used, 0xFFB020);
+        app_str(&W, 4, 44, "FREE:", 0x7C8CA0);   app_u32(&W, 52, 44, H->frames_free, 0x3DF5C4);
+        /* per-core utilisation bars (kernel exposes core count; bar length is a
+         * simple tick-phase animation, labelled as activity not measured load) */
+        for (u32 c = 0; c < H->ncpu && c < 4; c++) {
+            app_rect(&W, 4, 58 + (int)c * 8, 100, 5, 0x121722);
+            app_rect(&W, 4, 58 + (int)c * 8, 20 + (int)((H->ticks + c * 17) % 60), 5, 0x22E4FF);
+        }
+        app_str(&W, 4, 96, "PROCESSES", 0x22E4FF);
+        for (i64 i = 0; i < n && i < 12; i++) {
+            int yy = 108 + (int)i * 10;
+            app_u32(&W, 4, yy, E[i].pid, E[i].flags ? 0x7C8CA0 : 0x3DF5C4);
+            app_str(&W, 44, yy, E[i].name, E[i].flags ? 0x7C8CA0 : 0xEAF2F7);
+        }
+        app_damage(&W);
+    }
+}
+
+/* ---- APP 3: FILE INSPECTOR — VFS browser + hex/bitmap view ----------------- */
+struct rd_ent { u32 len, used; char name[32]; };
+
+static void app_filer(int frames) {
+    struct app_win W;
+    if (app_create(&W, 380, 250, 0xFF2D9B) != 0) sysc(SYS_EXIT, 1701, 0, 0);
+    for (int f = 0; f < frames; f++) {
+        struct app_event ev;
+        while (app_poll_events(&W, &ev)) if (ev.type == EVENT_WIN_CLOSE) { f = frames; break; }
+
+        app_fill(&W, 0x0A0D14);
+        app_str(&W, 4, 2, "FILE INSPECTOR", 0xFF2D9B);
+        int row = 0;
+        struct rd_ent e;
+        for (int i = 0; i < 29 && row < 14; i++) {
+            if ((i64)sysc(SYS_READDIR, (u64)i, (u64)&e, 0) != 1) break;
+            if (!e.used) continue;
+            int yy = 16 + row * 10;
+            app_str(&W, 4, yy, e.name, 0xEAF2F7);
+            app_u32(&W, 240, yy, e.len, 0x7C8CA0);
+            row++;
+        }
+        if (!row) app_str(&W, 4, 16, "NO FILES", 0x7C8CA0);
+        /* content preview of the first file, as a raw byte-intensity bitmap —
+         * the same path an image viewer would use for raw framebuffer dumps */
+        i64 fd = (i64)sysc(SYS_OPEN, (u64)"README", 0, 0);
+        if (fd >= 0) {
+            static u8 fb[256];
+            i64 got = (i64)sysc(SYS_READ, (u64)fd, (u64)fb, sizeof fb);
+            app_str(&W, 4, 160, "PREVIEW:", 0x22E4FF);
+            for (i64 b = 0; b < got && b < 256; b++) {
+                int bx = 4 + (int)(b % 32) * 5, by = 174 + (int)(b / 32) * 5;
+                u32 v = (u32)fb[b];
+                app_rect(&W, bx, by, 4, 4, (v << 16) | (v << 8) | v);
+            }
+            sysc(SYS_CLOSE, (u64)fd, 0, 0);
+        }
+        app_damage(&W);
+    }
+}
+
+/* v0.54 role 25/26: a GUI app harness. `which` selects terminal/sysmon/filer so
+ * cmd_apps_stress can run three DIFFERENT real apps concurrently; role 26
+ * faults mid-frame while holding a live window surface. */
+static void app_harness(int which, int fault_mid_frame) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    if (fault_mid_frame) {
+        struct app_win W;
+        if (app_create(&W, 300, 200, 0xFFB020) == 0) {
+            app_fill(&W, 0x202020);
+            app_str(&W, 4, 4, "ABOUT TO FAULT", 0xFF2D9B);
+            app_damage(&W);
+        }
+        volatile u32 *bad = (volatile u32 *)0x1;
+        *bad = 0xDEAD;                                      /* crash holding a window */
+    }
+    if (which == 0)      app_terminal(3);
+    else if (which == 1) app_sysmon(3);
+    else                 app_filer(3);
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
 static void wimp_driver(int fault_after_create) {
     u64 pid = sysc(SYS_GETPID, 0, 0, 0);
     i64 ids[3];
@@ -757,9 +1079,14 @@ static void wimp_driver(int fault_after_create) {
                            (u64)(0x22E4FF + (u64)i * 0x203040), 0);
         if (id < 0) sysc(SYS_EXIT, 1401 + i, 0, 0);
         ids[i] = id;
-        volatile u32 *thumb = (volatile u32 *)(0x0000550000000000ull + (u64)id * 4096);
-        for (int k = 0; k < 32 * 32; k++)
-            thumb[k] = (u32)(((pid * 7 + (u64)i * 40 + (u64)k) & 0xFFFFFF) | 0x101010);
+        /* v0.54: content is now a full-resolution surface at the WIN_SURF stride;
+         * query its real dimensions and paint the whole thing. */
+        i64 dims = (i64)sysc(SYS_WIN_INFO, (u64)id, 0, 0);
+        if (dims < 0) sysc(SYS_EXIT, 1411 + i, 0, 0);
+        int cw = (int)((u64)dims >> 16), chh = (int)((u64)dims & 0xFFFF);
+        volatile u32 *surf = (volatile u32 *)(WIN_SURF_BASE + (u64)id * WIN_SURF_STRIDE);
+        for (int k = 0; k < cw * chh; k++)
+            surf[k] = (u32)(((pid * 7 + (u64)i * 40 + (u64)k) & 0xFFFFFF) | 0x101010);
         sysc(SYS_WIN_DAMAGE, (u64)id, 0, 0);
     }
 
@@ -907,6 +1234,10 @@ void _start(void) {
     if (role == 22) { net_driver(1); }                  /* v0.52 socket client: deliberate fault after bind   */
     if (role == 23) { wimp_driver(0); }                 /* v0.53 WIMP app: clean window create/damage/poll    */
     if (role == 24) { wimp_driver(1); }                 /* v0.53 WIMP app: deliberate fault after window create */
+    if (role == 25) { app_harness(0, 0); }              /* v0.54 GUI app: cyber-terminal                      */
+    if (role == 26) { app_harness(1, 0); }              /* v0.54 GUI app: system monitor                      */
+    if (role == 27) { app_harness(2, 0); }              /* v0.54 GUI app: file inspector                      */
+    if (role == 28) { app_harness(0, 1); }              /* v0.54 GUI app: faults while holding a window       */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");
