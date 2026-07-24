@@ -56,6 +56,8 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_GPU_SET_SCANOUT     30
 #define SYS_GPU_SUBMIT_FLUSH    31
 #define SYS_GPU_FENCE_WAIT      32
+#define SYS_AUDIO_CONFIGURE     33
+#define SYS_AUDIO_WRITE         34
 
 #define PCAP_SMP_ADMIN (1ull << 9)
 
@@ -648,6 +650,36 @@ static void gpu_driver(int fault_before_flush) {
     sysc(SYS_EXIT, pid, 0, 0);
 }
 
+/* v0.51: role 19/20 — a ring-3 "audio client". Configures a real virtio-
+ * sound PCM stream, then writes several buffers of a tone pattern directly
+ * into the mapped backing (zero-copy: no syscall touches the sample data,
+ * only ordinary memory writes), each write blocking until the device
+ * confirms it played — the same "direct draw + blocking confirm" shape as
+ * v0.50's GPU driver, applied to audio. Role 20 deliberately faults right
+ * after configuring (before any write or its own exit) so cmd_audio_stress
+ * can prove audio_teardown_kproc reclaims the stream via the FAULT exit
+ * path, not just SYS_EXIT — the same v0.44/45/50 fault-injection precedent.
+ */
+static void audio_driver(int fault_after_configure) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+
+    i64 vaddr = (i64)sysc(SYS_AUDIO_CONFIGURE, 48000, 2, 0);
+    if (vaddr <= 0) sysc(SYS_EXIT, 1201, 0, 0);
+
+    if (fault_after_configure) {
+        volatile u32 *bad = (volatile u32 *)0x1;
+        *bad = 0xDEAD;                                      /* deliberate fault: never reached past here */
+    }
+
+    volatile u16 *pcm = (volatile u16 *)vaddr;
+    for (int round = 0; round < 4; round++) {               /* v0.51: multi-buffer streaming */
+        for (int i = 0; i < 512; i++) pcm[i] = (u16)((pid + (u64)round * 97 + (u64)i) & 0xFFFF);
+        if ((i64)sysc(SYS_AUDIO_WRITE, 1024, 2000, 0) != 1) sysc(SYS_EXIT, 1202 + round, 0, 0);
+    }
+
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
 static void nic_driver(void) {
     print("  [drv:r3] ==== USERSPACE virtio-net DRIVER starting at ring 3 ====\n");
 
@@ -775,6 +807,8 @@ void _start(void) {
     if (role == 16) { smp_migrate_worker(); }           /* v0.49 SMP remap/unmap/migration worker */
     if (role == 17) { gpu_driver(0); }                  /* v0.50 GPU client: clean create/draw/scanout/flush */
     if (role == 18) { gpu_driver(1); }                  /* v0.50 GPU client: deliberate fault before flush   */
+    if (role == 19) { audio_driver(0); }                /* v0.51 audio client: clean configure/write/exit    */
+    if (role == 20) { audio_driver(1); }                /* v0.51 audio client: deliberate fault after configure */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");
