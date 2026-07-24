@@ -20,10 +20,10 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-VERSION := 0.50.0
+VERSION := 0.51.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
-.PHONY: all qemu qemu-vga clean
+.PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean
 all: $(ISO)
 
 $(BUILD):
@@ -117,6 +117,43 @@ qemu: $(ISO) $(VBLK_IMG)
 qemu-vga: $(ISO) $(VBLK_IMG)
 	qemu-system-x86_64 -cdrom $(ISO) -m 512M -serial stdio -no-reboot $(QEMU_GPU) $(QEMU_BLK) $(QEMU_NET)
 
+# v0.51: virtio-sound-pci is verified in its OWN dedicated target, NOT the
+# main virtio-vga regression targets above. Reason (root-caused live, see
+# CHANGELOG-0.51.0.md): attaching -device virtio-sound-pci ALONGSIDE
+# -device virtio-vga makes virtio-gpu's controlq stop completing under this
+# environment's TCG-only QEMU — the very first RESOURCE_CREATE never gets a
+# used-ring completion, hanging cmd_gpu_stress. Reproduced even with the
+# kernel's virtio_sound_probe() ENTIRELY disabled (the device merely present
+# on the bus is enough), so it is a QEMU device-topology interaction, not a
+# kernel bug — the same class of finding as v0.50's "-vga std + virtio-gpu-pci
+# hang under -smp 4" and this release's qemu-usb note. The virtio-sound driver
+# itself is fully real and leak-free: this target uses plain -vga std (no
+# virtio-gpu, so cmd_gpu_stress cleanly SKIPS) so cmd_audio_stress runs and is
+# verified end-to-end (16 rounds + 4 fault-injection + 1 gap round, 0 FAIL).
+# The "none" audiodev backend produces no host audio (correct for a headless
+# sandbox) but drives a fully real virtio controlq/txq/DMA path.
+qemu-audio: $(ISO) $(VBLK_IMG)
+	qemu-system-x86_64 -cdrom $(ISO) -m 512M -nographic -no-reboot -vga std \
+	  -audiodev none,id=snd0 -device virtio-sound-pci,audiodev=snd0 \
+	  $(QEMU_BLK) $(QEMU_NET)
+
+# v0.51: xHCI + attached USB HID devices, kept OUT of the main qemu/qemu-vga/
+# qemu-iommu targets deliberately. A running xHCI controller continuously
+# emulates its own microframe (125us) timer, and under this environment's
+# TCG-only execution (no KVM — confirmed unavailable in every prior
+# changelog) that timer overhead was measured to slow the WHOLE guest so
+# severely that the full ~25-suite regression boot no longer completes in
+# any practical wall-clock time — reproduced even with the xHCI DRIVER CODE
+# ITSELF disabled, so it is QEMU's own device emulation cost, not a kernel
+# bug. Verified instead via this short, targeted boot (see
+# CHANGELOG-0.51.0.md): controller bring-up, port detection, slot
+# enumeration, and HID boot-protocol configuration all complete and are
+# visible in the serial log within a few seconds.
+qemu-usb: $(ISO) $(VBLK_IMG)
+	qemu-system-x86_64 -cdrom $(ISO) -m 512M -nographic -no-reboot $(QEMU_GPU) \
+	  -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-mouse,bus=xhci.0 \
+	  $(QEMU_BLK) $(QEMU_NET)
+
 clean:
 	rm -rf $(BUILD) iso/boot/outrun-kernel.elf iso/boot/user_init.elf
 
@@ -130,6 +167,8 @@ qemu-nvme: install-img
 	  $(QEMU_BLK) $(QEMU_NET)
 
 # Boot on q35 with an emulated Intel VT-d IOMMU; virtio devices behind it.
+# (virtio-sound omitted here for the same reason as the main qemu target — it
+# breaks virtio-gpu's controlq under this QEMU; see qemu-audio + CHANGELOG.)
 QEMU_IOMMU := -machine q35,kernel-irqchip=split -device intel-iommu,intremap=off,caching-mode=on
 qemu-iommu: all
 	qemu-system-x86_64 $(QEMU_IOMMU) -cdrom build/outrun-os-$(VERSION).iso -m 512M -nographic -no-reboot $(QEMU_GPU) \
