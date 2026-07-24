@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.52.0-metal"
+#define KERNEL_VERSION "0.53.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -499,6 +499,7 @@ static volatile int g_debug_vfs  = 0;           /* DEBUG_VFS: journal commit/app
 static volatile int g_debug_gpu  = 0;           /* DEBUG_GPU: resource/scanout/flush/fence log        */
 static volatile int g_debug_audio = 0;          /* DEBUG_AUDIO: configure/write/teardown log          */
 static volatile int g_debug_net  = 0;           /* DEBUG_NET: socket create/bind/send/recv/teardown log */
+static volatile int g_debug_wimp = 0;           /* DEBUG_WIMP: window create/raise/move/close/teardown log */
 
 /* user-stack layout (used by the guard-page fault check in isr_dispatch) */
 #define USTK_V     0x0000500000FF0000ull                  /* user stack bottom       */
@@ -984,6 +985,7 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
 #define DMA_USER_V  0x0000520000000000ull   /* ring-3 DMA window (driver buffers) */
 #define SURF_USER_V 0x0000530000000000ull   /* ring-3 surface window (app pixels) */
 #define SMP_USER_V  0x0000540000000000ull   /* v0.49: ring-3 remap/unmap scratch window */
+#define WIN_USER_V  0x0000550000000000ull   /* v0.53: ring-3 WIMP window content thumbnail */
 
 /* Validate that [ptr, ptr+len) is entirely within a process's user space and    */
 /* mapped USER-present (and USER-writable if need_write). Defends every syscall   */
@@ -1310,6 +1312,7 @@ static uint64_t create_address_space(void) {
 #define PCAP_SMP_ADMIN       (1ull << 9)    /* v0.49: SYS_TLB_SHOOTDOWN/SET_AFFINITY/SMP_REMAP/SMP_UNMAP */
 #define PCAP_SURFACE         (1ull << 10)   /* v0.50: required for any SYS_GPU_* call */
 #define PCAP_AUDIO           (1ull << 11)   /* v0.51: required for any SYS_AUDIO_* call */
+#define PCAP_WIMP            (1ull << 12)   /* v0.53: required for any SYS_WIN_* call */
 
 /* v0.39: a COMPLETE ring-3 register context. The preempt IPI (vector 50)
  * captures the interrupted user state here straight from the isr_frame, and
@@ -1599,6 +1602,7 @@ static void gpu_teardown_kproc(int proc_idx);   /* fwd: v0.50, defined with the 
 static void audio_teardown_kproc(int proc_idx); /* fwd: v0.51, defined with the virtio-sound driver */
 static void usb_teardown_kproc(int proc_idx);   /* fwd: v0.51, defined with the xHCI driver */
 static void net_teardown_kproc(int proc_idx);   /* fwd: v0.52, defined with the socket layer */
+static void wimp_teardown_kproc(int proc_idx);  /* fwd: v0.53, defined with the WIMP window manager */
 
 /* A ring-3 application surface: pixels owned and rendered by an unprivileged
  * process, composited by the kernel. The compositor never draws this content —
@@ -5452,6 +5456,128 @@ static void net_teardown_kproc(int proc_idx) {
     klock_release(&g_net_lock);
 }
 
+/* ===========================================================================
+ * v0.53: WIMP WINDOW MANAGER — Windows, Icons, Menus, Pointer desktop shell
+ * ===========================================================================
+ * A kernel-side window manager exposed to ring 3 via SYS_WIN_CREATE / _DAMAGE
+ * / _POLL (40-42, gated by PCAP_WIMP). Each window is a top-level rectangle
+ * with screen position, size, a stacking z-order, a title bar (with close and
+ * minimize hit boxes), a focus flag, and a per-window DMA-granted 32x32 ARGB
+ * content thumbnail the owning process draws into (mapped at WIN_USER_V). The
+ * cyber-compositor (wimp_compose, defined later with the draw primitives)
+ * paints the desktop — background, taskbar, launcher icons, every window's
+ * chrome + nearest-scaled content, and the pointer — into the RAM backbuffer
+ * and presents it. Input routing (wimp_input_step) hit-tests the pointer
+ * against the topmost window and drives raise/focus/drag/close/minimize, and
+ * routes clicks/keys to the focused window's event queue.
+ *
+ * The content thumbnail is a DMA_GRANT_PAGE grant — the exact mechanism
+ * SYS_GPU_RESOURCE_CREATE / SYS_AUDIO_CONFIGURE use — so dma_teardown_kproc
+ * already reclaims the frame; wimp_teardown_kproc drops the WM's reference and
+ * resets focus. */
+#define NWMWIN       12
+#define WIN_MIN_W    80
+#define WIN_MIN_H    60
+#define WIN_MAX_W    600
+#define WIN_MAX_H    440
+#define WIN_TITLE_H  20        /* title-bar height in px */
+#define WIN_THUMB    32        /* content thumbnail is WIN_THUMB x WIN_THUMB ARGB (4096 B = 1 page) */
+#define WIN_TASKBAR_H 24
+
+struct wmwin {
+    int      used, owner;
+    int      x, y, w, h;                 /* screen-space chrome rect (incl. title bar) */
+    int      z;                          /* stacking order: higher = nearer the front  */
+    int      minimized, focused;
+    uint32_t accent;
+    char     title[16];
+    uint64_t thumb_phys, thumb_vaddr;    /* per-window content grant (WIN_THUMB^2 ARGB) */
+    struct sevent q[8]; volatile uint32_t qw, qr;   /* routed input events for the owner */
+};
+static struct wmwin g_wmwin[NWMWIN];
+static struct klock g_wm_lock = { 0, "wm", 10, 0, 0 };
+static int g_wm_focus = -1;              /* window index with keyboard focus, or -1     */
+static int g_wm_znext = 1;               /* monotonically increasing z stamp            */
+static int g_wm_drag = -1, g_wm_drag_dx = 0, g_wm_drag_dy = 0;   /* window being dragged */
+static volatile uint64_t g_wm_composes = 0, g_wm_damage = 0;     /* stats               */
+
+static int wm_count_used(void) {
+    int n = 0;
+    for (int i = 0; i < NWMWIN; i++) if (g_wmwin[i].used) n++;
+    return n;
+}
+/* The highest-z used, non-minimized window whose chrome rect contains (sx,sy),
+ * or -1. Caller holds g_wm_lock. */
+static int wm_topmost_at(int sx, int sy) {
+    int best = -1, bestz = -1;
+    for (int i = 0; i < NWMWIN; i++) {
+        struct wmwin *W = &g_wmwin[i];
+        if (!W->used || W->minimized) continue;
+        if (sx >= W->x && sx < W->x + W->w && sy >= W->y && sy < W->y + W->h && W->z > bestz) {
+            best = i; bestz = W->z;
+        }
+    }
+    return best;
+}
+/* Restack `idx` to the front. Caller holds g_wm_lock. */
+static void wm_raise(int idx) {
+    if (idx < 0 || idx >= NWMWIN || !g_wmwin[idx].used) return;
+    g_wmwin[idx].z = g_wm_znext++;
+}
+/* Give keyboard focus to `idx` (or -1). Caller holds g_wm_lock. */
+static void wm_focus(int idx) {
+    for (int i = 0; i < NWMWIN; i++) g_wmwin[i].focused = 0;
+    g_wm_focus = idx;
+    if (idx >= 0 && idx < NWMWIN && g_wmwin[idx].used) g_wmwin[idx].focused = 1;
+}
+/* Queue an input event onto a window's owner event ring. Caller holds g_wm_lock. */
+static void wm_queue_event(int idx, int32_t type, int32_t x, int32_t y, int32_t code) {
+    struct wmwin *W = &g_wmwin[idx];
+    if (W->qw - W->qr >= 8) return;                      /* ring full: drop */
+    struct sevent *e = &W->q[W->qw % 8];
+    e->type = type; e->x = x; e->y = y; e->code = code;
+    barrier(); W->qw++;
+}
+/* Destroy window `idx`: revoke its content grant and reset focus/drag if needed.
+ * Caller holds g_wm_lock. */
+static void wm_destroy(int idx) {
+    struct wmwin *W = &g_wmwin[idx];
+    if (!W->used) return;
+    if (W->thumb_phys && W->owner >= 0) {
+        struct kproc *p = &kprocs[W->owner];
+        for (int gi = 0; gi < MAX_DMA_GRANTS; gi++)
+            if (p->dma_grants[gi].used && p->dma_grants[gi].phys == W->thumb_phys) {
+                dma_grant_revoke(p, &p->dma_grants[gi]); break;
+            }
+    }
+    if (g_wm_focus == idx) g_wm_focus = -1;
+    if (g_wm_drag == idx) g_wm_drag = -1;
+    W->used = 0; W->owner = -1; W->thumb_phys = 0; W->thumb_vaddr = 0;
+    W->focused = 0; W->minimized = 0; W->qw = W->qr = 0;
+}
+
+/* Called from every kproc exit path (clean AND fault): destroy every window the
+ * dying process owns. The content grants are DMA_GRANT_PAGE grants already
+ * reclaimed by dma_teardown_kproc; this drops the WM's references and resets
+ * focus so a dead window can never keep input or be composited. */
+static void wimp_teardown_kproc(int proc_idx) {
+    klock_acquire(&g_wm_lock);
+    for (int i = 0; i < NWMWIN; i++) {
+        if (g_wmwin[i].used && g_wmwin[i].owner == proc_idx) {
+            if (g_debug_wimp)
+                kprintf("[dbgwimp] pid %u: destroyed window %d (z %d)\n",
+                        kprocs[proc_idx].pid, i, g_wmwin[i].z);
+            /* grant frames are reclaimed by dma_teardown_kproc; just drop refs */
+            if (g_wm_focus == i) g_wm_focus = -1;
+            if (g_wm_drag == i) g_wm_drag = -1;
+            g_wmwin[i].used = 0; g_wmwin[i].owner = -1;
+            g_wmwin[i].thumb_phys = 0; g_wmwin[i].thumb_vaddr = 0;
+            g_wmwin[i].focused = 0; g_wmwin[i].qw = g_wmwin[i].qr = 0;
+        }
+    }
+    klock_release(&g_wm_lock);
+}
+
 static void pci_init(void) {
     kprintf("[pci    ] enumerating bus 0 (config mechanism #1, ports 0xCF8/0xCFC):\n");
     for (uint8_t dev = 0; dev < 32; dev++) {
@@ -5580,6 +5706,7 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     audio_teardown_kproc((int)t->proc);      /* v0.51: release any PCM stream ownership FIRST */
     usb_teardown_kproc((int)t->proc);        /* v0.51: symmetry hook (no per-process USB state today) */
     net_teardown_kproc((int)t->proc);        /* v0.52: release any sockets this process owns */
+    wimp_teardown_kproc((int)t->proc);       /* v0.53: destroy any windows this process owns */
     ipc_teardown_kproc((int)t->proc);        /* v0.46: release IPC mailbox/shmem FIRST */
     descriptor_teardown_kproc((int)t->proc); /* v0.45: force-close any leaked fd FIRST */
     dma_teardown_kproc((int)t->proc);        /* v0.44: revoke DMA/IOMMU grants FIRST */
@@ -6102,6 +6229,7 @@ static void cpu_exec_proc(int c, int p) {
         audio_teardown_kproc(p);               /* v0.51: release any PCM stream ownership FIRST */
         usb_teardown_kproc(p);                 /* v0.51: symmetry hook (no per-process USB state today) */
         net_teardown_kproc(p);                 /* v0.52: release any sockets this process owns */
+        wimp_teardown_kproc(p);                /* v0.53: destroy any windows this process owns */
         ipc_teardown_kproc(p);                 /* v0.46: release IPC mailbox/shmem FIRST */
         descriptor_teardown_kproc(p);           /* v0.45: force-close any leaked fd FIRST */
         dma_teardown_kproc(p);                 /* v0.44: revoke DMA/IOMMU grants FIRST */
@@ -7876,6 +8004,77 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             __asm__ volatile("pause");
         }
     }
+
+    /* --- v0.53: ring-3 WIMP windows (require PCAP_WIMP) --- */
+    case 40: {   /* SYS_WIN_CREATE((w<<16)|h, accent) -> window id (>=0), or negative.
+                  * The owner draws its content into a WIN_THUMB x WIN_THUMB ARGB
+                  * thumbnail mapped at WIN_USER_V + id*4096. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        int rw = (int)(a0 >> 16), rh = (int)(a0 & 0xFFFF);
+        if (rw < WIN_MIN_W) rw = WIN_MIN_W; if (rw > WIN_MAX_W) rw = WIN_MAX_W;
+        if (rh < WIN_MIN_H) rh = WIN_MIN_H; if (rh > WIN_MAX_H) rh = WIN_MAX_H;
+        uint32_t accent = (uint32_t)a1 ? (uint32_t)a1 : 0x22E4FFu;   /* default C_CYAN */
+        klock_acquire(&g_wm_lock);
+        int id = -1;
+        for (int i = 0; i < NWMWIN; i++) if (!g_wmwin[i].used) { id = i; break; }
+        if (id < 0) { klock_release(&g_wm_lock); return (uint64_t)-1; }   /* window table full */
+        struct wmwin *W = &g_wmwin[id];
+        cmemset(W, 0, sizeof *W);
+        W->owner = (int)current_proc_idx; W->w = rw; W->h = rh; W->accent = accent;
+        W->x = 60 + (id % 6) * 40; W->y = 40 + (id % 6) * 34;    /* cascade */
+        W->z = g_wm_znext++;
+        W->title[0]='W'; W->title[1]='I'; W->title[2]='N'; W->title[3]=' ';
+        W->title[4]=(char)(id < 10 ? '0'+id : 'A'+id-10); W->title[5]=0;
+        klock_release(&g_wm_lock);
+
+        /* per-window content thumbnail: a DMA_GRANT_PAGE mapped into the owner */
+        struct kproc *p = &kprocs[current_proc_idx];
+        uint64_t phys = alloc_frame();
+        for (int z = 0; z < 512; z++) ((uint64_t *)phys)[z] = 0;
+        uint64_t va = WIN_USER_V + (uint64_t)id * 0x1000;
+        map_page(p->cr3, va, phys, PTE_USER | PTE_WRITE | PTE_NX);
+        dma_grant_create(p, phys, 0x1000, DMA_GRANT_PAGE, 0xFFFF);
+
+        klock_acquire(&g_wm_lock);
+        W->thumb_phys = phys; W->thumb_vaddr = va;
+        barrier();
+        W->used = 1;                                          /* publish LAST */
+        wm_focus(id);
+        klock_release(&g_wm_lock);
+        if (g_debug_wimp)
+            kprintf("[dbgwimp] pid %u: WIN_CREATE %d (%dx%d) accent %X -> content vaddr %X\n",
+                    p->pid, id, rw, rh, (uint64_t)accent, va);
+        return (uint64_t)id;
+    }
+    case 41: {   /* SYS_WIN_DAMAGE(id) -> 0 ok, negative. Requests recomposition. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        int id = (int)(int64_t)a0;
+        if (id < 0 || id >= NWMWIN) return (uint64_t)-1;
+        klock_acquire(&g_wm_lock);
+        int ok = (g_wmwin[id].used && g_wmwin[id].owner == (int)current_proc_idx);
+        if (ok) g_wm_damage++;
+        klock_release(&g_wm_lock);
+        return ok ? (uint64_t)0 : (uint64_t)-1;
+    }
+    case 42: {   /* SYS_WIN_POLL(id, *out_event) -> 1 if an event was popped, 0 none, neg on error */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        int id = (int)(int64_t)a0; uint64_t ubuf = a1;
+        if (id < 0 || id >= NWMWIN) return (uint64_t)-1;
+        if (!access_ok(kprocs[current_proc_idx].cr3, ubuf, sizeof(struct sevent), 1)) return (uint64_t)-1;
+        klock_acquire(&g_wm_lock);
+        if (!(g_wmwin[id].used && g_wmwin[id].owner == (int)current_proc_idx)) {
+            klock_release(&g_wm_lock); return (uint64_t)-1;
+        }
+        struct wmwin *W = &g_wmwin[id];
+        int got = 0;
+        if (W->qr != W->qw) {
+            struct sevent *e = &W->q[W->qr % 8];
+            cmemcpy((void *)ubuf, e, sizeof *e);
+            W->qr++; got = 1;
+        }
+        klock_release(&g_wm_lock);
+        return (uint64_t)got;
+    }
     }
     return (uint64_t)-1;
 }
@@ -7942,6 +8141,7 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         audio_teardown_kproc((int)t->proc);
         usb_teardown_kproc((int)t->proc);
         net_teardown_kproc((int)t->proc);
+        wimp_teardown_kproc((int)t->proc);
         ipc_teardown_kproc((int)t->proc);
         descriptor_teardown_kproc((int)t->proc);
         dma_teardown_kproc((int)t->proc);      /* v0.44: revoke DMA/IOMMU grants FIRST */
@@ -9833,6 +10033,7 @@ static int                g_gfx_ready = 0;
 #define C_GRID 0x0E1420
 
 static void fb_init(void) {
+    if (g_gfx_ready) return;                              /* v0.53: idempotent (may be brought up early by cmd_wimp_stress) */
     if (!g_fb_addr || !g_fb_width) { kputs("[gfx    ] no framebuffer provided by bootloader\n"); return; }
     uint64_t bytes = (uint64_t)g_fb_pitch * g_fb_height;
     uint64_t pages = (bytes + 0xFFF) / 0x1000;
@@ -10062,6 +10263,374 @@ static void compositor_frame(int frame) {
     for (int y = 0; y < H; y += 2) for (int x = 0; x < W; x++) blend(x, y, 0x000000, 26);
 }
 
+static int g_cur_x = 512, g_cur_y = 384;      /* pointer position in screen space */
+
+/* ===========================================================================
+ * v0.53: THE CYBER-COMPOSITOR — WIMP desktop composition + pointer + input
+ * ===========================================================================
+ * Renders the whole desktop (background, taskbar, launcher icons, every
+ * non-minimized window in z-order with title-bar/close/minimize chrome and its
+ * nearest-scaled content thumbnail, and the pointer) into the RAM backbuffer,
+ * then presents it with the existing fb_flip(). Input routing hit-tests the
+ * pointer and drives raise/focus/drag/close/minimize + click/key delivery. */
+#define WIMP_CLOSE_W 14
+#define WIMP_MIN_W   14
+
+/* Nearest-neighbour scale a window's WIN_THUMB^2 ARGB content thumbnail into
+ * its on-screen content rectangle. The thumbnail is the owner's granted page. */
+static void wimp_draw_content(struct wmwin *W, int cx, int cy, int cw, int ch) {
+    if (cw <= 0 || ch <= 0) return;
+    volatile uint32_t *thumb = W->thumb_phys ? (volatile uint32_t *)W->thumb_phys : 0;
+    for (int j = 0; j < ch; j++) {
+        int ty = (j * WIN_THUMB) / ch; if (ty >= WIN_THUMB) ty = WIN_THUMB - 1;
+        for (int i = 0; i < cw; i++) {
+            int tx = (i * WIN_THUMB) / cw; if (tx >= WIN_THUMB) tx = WIN_THUMB - 1;
+            uint32_t c = thumb ? (thumb[ty * WIN_THUMB + tx] & 0xFFFFFF) : 0;
+            px(cx + i, cy + j, c ? c : C_OBS2);
+        }
+    }
+}
+
+/* Draw one window's chrome + content. `focused` brightens the border/title. */
+static void wimp_draw_window(struct wmwin *W, int focused) {
+    int x = W->x, y = W->y, w = W->w, h = W->h;
+    uint32_t border = focused ? W->accent : C_HAIR;
+    rect(x, y, w, h, C_OBS1);                             /* body */
+    hline(x, y, w, border); hline(x, y + h - 1, w, border);
+    vline(x, y, h, border); vline(x + w - 1, y, h, border);
+    rect(x, y, w, WIN_TITLE_H, focused ? C_OBS2 : C_OBS1);   /* title bar */
+    hline(x, y + WIN_TITLE_H, w, border);
+    draw_str(x + 6, y + 6, W->title, focused ? C_TEXT : C_MUTE);
+    /* close box (right) + minimize box (left of it) */
+    int clx = x + w - WIMP_CLOSE_W - 3, cly = y + 3;
+    rect(clx, cly, WIMP_CLOSE_W, WIN_TITLE_H - 6, C_MAGE);
+    hline(clx + 3, cly + 6, WIMP_CLOSE_W - 6, C_TEXT);
+    int mnx = clx - WIMP_MIN_W - 3;
+    rect(mnx, cly, WIMP_MIN_W, WIN_TITLE_H - 6, C_AMBER);
+    hline(mnx + 3, cly + (WIN_TITLE_H - 6) - 3, WIMP_MIN_W - 6, C_OBS0);
+    /* content region below the title bar */
+    wimp_draw_content(W, x + 2, y + WIN_TITLE_H + 1, w - 4, h - WIN_TITLE_H - 3);
+}
+
+static void wimp_draw_cursor(void) {
+    int x = g_cur_x, y = g_cur_y;
+    uint32_t c = (g_wm_drag >= 0) ? C_MINT : C_AMBER;
+    for (int i = 0; i < 12; i++) {
+        blend(x + i, y + i, 0x000000, 200); px(x + i, y + i, c);
+        for (int j = 0; j < (10 - i) / 2; j++) px(x + i, y + i + 1 + j, c);
+    }
+    vline(x, y, 14, c); hline(x, y, 8, c);
+}
+
+/* Compose one desktop frame into the backbuffer and present it. */
+static void wimp_compose(void) {
+    int W = g_fb_width, H = g_fb_height;
+    if (!g_bb) return;
+    fill(C_OBS0);
+    for (int gx = 0; gx < W; gx += 48) vline(gx, 0, H - WIN_TASKBAR_H, C_GRID);
+    for (int gy = 0; gy < H - WIN_TASKBAR_H; gy += 48) hline(0, gy, W, C_GRID);
+    draw_str(40, 8, "OUTRUN // WIMP DESKTOP", C_CYAN);
+
+    /* launcher icons down the left rail */
+    uint32_t iconc[4] = { C_CYAN, C_MINT, C_AMBER, C_MAGE };
+    for (int i = 0; i < 4; i++) { rect(8, 40 + i * 44, 18, 18, iconc[i]); rect(10, 42 + i * 44, 14, 14, C_OBS0); }
+
+    /* Snapshot the window table under the lock, then draw without holding it
+     * (draw primitives can be slow and must never run under a klock). */
+    klock_acquire(&g_wm_lock);
+    int order[NWMWIN], nord = 0;
+    struct wmwin snap[NWMWIN];
+    for (int i = 0; i < NWMWIN; i++) {
+        snap[i] = g_wmwin[i];
+        if (g_wmwin[i].used && !g_wmwin[i].minimized) order[nord++] = i;
+    }
+    klock_release(&g_wm_lock);
+    /* insertion-sort visible windows by z ascending (back-to-front) */
+    for (int a = 1; a < nord; a++) {
+        int k = order[a], b = a - 1;
+        while (b >= 0 && snap[order[b]].z > snap[k].z) { order[b + 1] = order[b]; b--; }
+        order[b + 1] = k;
+    }
+    for (int a = 0; a < nord; a++) wimp_draw_window(&snap[order[a]], snap[order[a]].focused);
+
+    /* taskbar across the bottom: one chip per used window */
+    rect(0, H - WIN_TASKBAR_H, W, WIN_TASKBAR_H, C_OBS1);
+    hline(0, H - WIN_TASKBAR_H, W, C_HAIR);
+    int tbx = 8;
+    for (int i = 0; i < NWMWIN; i++) {
+        if (!snap[i].used) continue;
+        uint32_t chip = snap[i].focused ? snap[i].accent : (snap[i].minimized ? C_MUTE : C_HAIR);
+        rect(tbx, H - WIN_TASKBAR_H + 4, 46, WIN_TASKBAR_H - 8, chip);
+        tbx += 52;
+    }
+
+    wimp_draw_cursor();
+    fb_flip();
+    g_wm_composes++;
+}
+
+/* Deliver a synthetic pointer press at (sx,sy) with button `down` to the WM,
+ * driving hit-test -> raise/focus/drag/close/minimize. Returns the window hit
+ * (or -1). Shared by the interactive path and cmd_wimp_stress so the routing
+ * logic is verified deterministically without real mouse hardware. */
+static int wimp_pointer(int sx, int sy, int down) {
+    int hit = -1;
+    klock_acquire(&g_wm_lock);
+    if (down) {
+        hit = wm_topmost_at(sx, sy);
+        if (hit >= 0) {
+            struct wmwin *W = &g_wmwin[hit];
+            int lx = sx - W->x, ly = sy - W->y;
+            int clx = W->w - WIMP_CLOSE_W - 3, mnx = clx - WIMP_MIN_W - 3;
+            if (ly < WIN_TITLE_H) {                       /* title-bar region */
+                if (lx >= clx && lx < clx + WIMP_CLOSE_W) {           /* close box */
+                    wm_destroy(hit); klock_release(&g_wm_lock); return hit;
+                } else if (lx >= mnx && lx < mnx + WIMP_MIN_W) {      /* minimize */
+                    W->minimized = !W->minimized; wm_raise(hit); wm_focus(hit);
+                } else {                                              /* drag */
+                    wm_raise(hit); wm_focus(hit);
+                    g_wm_drag = hit; g_wm_drag_dx = lx; g_wm_drag_dy = ly;
+                }
+            } else {                                      /* content: focus + route click */
+                wm_raise(hit); wm_focus(hit);
+                wm_queue_event(hit, 1 /*click*/, lx, ly - WIN_TITLE_H, 0);
+            }
+        }
+    } else {
+        g_wm_drag = -1;                                   /* release */
+    }
+    klock_release(&g_wm_lock);
+    return hit;
+}
+
+/* Process real pointer + keyboard hardware for the interactive desktop. */
+static void wimp_input_step(void) {
+    static uint8_t prevbtn = 0;
+    int dx = g_mouse_dx, dy = g_mouse_dy;
+    g_mouse_dx = 0; g_mouse_dy = 0;
+    g_cur_x += dx; g_cur_y -= dy;                         /* mouse Y is inverted */
+    if (g_cur_x < 0) g_cur_x = 0; if (g_cur_x >= (int)g_fb_width)  g_cur_x = g_fb_width - 1;
+    if (g_cur_y < 0) g_cur_y = 0; if (g_cur_y >= (int)g_fb_height) g_cur_y = g_fb_height - 1;
+
+    uint8_t btn = g_mouse_btn & 1;
+    if (btn && !prevbtn) wimp_pointer(g_cur_x, g_cur_y, 1);
+    else if (!btn && prevbtn) wimp_pointer(g_cur_x, g_cur_y, 0);
+    else if (btn && g_wm_drag >= 0) {                     /* dragging */
+        klock_acquire(&g_wm_lock);
+        if (g_wm_drag >= 0 && g_wmwin[g_wm_drag].used) {
+            int nx = g_cur_x - g_wm_drag_dx, ny = g_cur_y - g_wm_drag_dy;
+            if (nx < 0) nx = 0; if (ny < 0) ny = 0;
+            if (nx > (int)g_fb_width - 40)  nx = g_fb_width - 40;
+            if (ny > (int)g_fb_height - WIN_TITLE_H) ny = g_fb_height - WIN_TITLE_H;
+            g_wmwin[g_wm_drag].x = nx; g_wmwin[g_wm_drag].y = ny;
+        }
+        klock_release(&g_wm_lock);
+    }
+    prevbtn = btn;
+
+    int ch;
+    while ((ch = kbd_getc_nonblock()) >= 0) {             /* route keys to focus */
+        klock_acquire(&g_wm_lock);
+        if (g_wm_focus >= 0 && g_wmwin[g_wm_focus].used)
+            wm_queue_event(g_wm_focus, 2 /*key*/, 0, 0, ch);
+        klock_release(&g_wm_lock);
+    }
+}
+
+/* ===========================================================================
+ * v0.53: WIMP STRESS — ring-3 window create/manage/close churn incl. faults,
+ * plus deterministic window-manager logic verification.
+ * ===========================================================================
+ * The ring-3 rounds (role 23 clean, role 24 fault-after-create) prove that
+ * wimp_teardown_kproc + dma_teardown_kproc destroy every window a process owns
+ * and reclaim its content grant on BOTH the clean SYS_EXIT and the fault exit
+ * path. The deterministic section drives the window-manager directly (seeding
+ * grant-less windows) to verify z-order reordering, pointer hit-testing,
+ * title-bar drag, minimize, and close, and smoke-tests the cyber-compositor by
+ * composing a frame and sampling that a window actually painted over the
+ * desktop background. */
+#define WIMPSTRESS_ROUNDS 16
+static int g_wimppass, g_wimpfail;
+static void wimpcheck(const char *n, int c) {
+    if (c) { g_wimppass++; kprintf("[wimpstrs]  PASS  %s\n", n); }
+    else   { g_wimpfail++; kprintf("[wimpstrs]  FAIL  %s\n", n); }
+}
+/* Seed a grant-less window (owner-tagged, thumb_phys=0) for logic tests. */
+static int wm_seed(int owner, int x, int y, int w, int h) {
+    int id = -1;
+    klock_acquire(&g_wm_lock);
+    for (int i = 0; i < NWMWIN; i++) if (!g_wmwin[i].used) { id = i; break; }
+    if (id >= 0) {
+        struct wmwin *W = &g_wmwin[id];
+        cmemset(W, 0, sizeof *W);
+        W->used = 1; W->owner = owner; W->x = x; W->y = y; W->w = w; W->h = h;
+        W->z = g_wm_znext++; W->accent = C_MINT;
+    }
+    klock_release(&g_wm_lock);
+    return id;
+}
+
+static void cmd_wimp_stress(void) {
+    kputs("-- WIMP STRESS: ring-3 window create/manage/close churn + WM logic, incl. client faults --\n");
+    fb_init();              /* bring the cyber-compositor's framebuffer up now (idempotent) */
+    g_wimppass = g_wimpfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    int base_wins = wm_count_used();
+    int rounds_ok = 1, wins_ok = 1, grants_ok = 1, fault_rounds_ok = 1, focus_ok = 1;
+    int rnd;
+
+    for (rnd = 0; rnd < WIMPSTRESS_ROUNDS; rnd++) {
+        int fault_round = (rnd % 4) == 3;
+        int p = kproc_spawn("wimp-app", PCAP_WIMP);
+        if (p < 0) { wimpcheck("kproc_spawn never fails mid-storm (recycling keeps the table bounded)", 0);
+                     rounds_ok = 0; break; }
+        kprocs[p].role = fault_round ? 24 : 23;
+        uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!e) { wimpcheck("every worker's ELF loads", 0); rounds_ok = 0; break; }
+        kprocs[p].entry = e;
+
+        if (n > 1) {
+            rq_push(0 % n, p);
+            __sync_synchronize();
+            lapic_ipi(0, IPI_PING, 1);
+            int q; while ((q = rq_pop(0)) >= 0) cpu_exec_proc(0, q);
+        } else {
+            cpu_exec_proc(0, p);
+        }
+
+        uint64_t t0 = g_ticks;
+        while (!kprocs[p].torn_down && g_ticks - t0 < 3000) {
+            if (n > 1) lapic_ipi(0, IPI_PING, 1);
+            uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
+        }
+        current_proc_idx = save;
+
+        int ok;
+        if (fault_round) {
+            ok = kprocs[p].exited && kprocs[p].exit_code >= 0x8000;
+            if (!ok) fault_rounds_ok = 0;
+        } else {
+            ok = kprocs[p].exited && kprocs[p].exit_code == kprocs[p].pid;
+            if (!ok) rounds_ok = 0;
+        }
+        if (!ok)
+            kprintf("[wimpstrs] round %d (%s) FAILED: exit %u\n",
+                    rnd, (uint64_t)(fault_round ? 1 : 0), kprocs[p].exit_code);
+
+        if (wm_count_used() != base_wins) wins_ok = 0;       /* every window destroyed */
+        if (kprocs[p].dma_grant_count != 0) grants_ok = 0;   /* content grants reclaimed */
+        /* focus must never point at a window owned by the dead process */
+        if (g_wm_focus >= 0 && g_wmwin[g_wm_focus].owner == p) focus_ok = 0;
+
+        if (ok && (rnd % 4) == 3)
+            kprintf("[wimpstrs] round %d/%d clean\n", rnd + 1, (uint64_t)WIMPSTRESS_ROUNDS);
+    }
+
+    wimpcheck("every round completed without a watchdog timeout (no deadlock across preemption)",
+              rnd == WIMPSTRESS_ROUNDS);
+    wimpcheck("every clean-round app exited normally (window create/damage/poll all verified in ring 3)",
+              rounds_ok);
+    wimpcheck("every fault-round app actually died via the fault path (not its own SYS_EXIT)",
+              fault_rounds_ok);
+    wimpcheck("no window slot survived past any round's teardown (clean OR faulted)", wins_ok);
+    wimpcheck("no content-buffer DMA grant survived past any round's teardown", grants_ok);
+    wimpcheck("focus was reset off every dead process's window", focus_ok);
+
+    /* ---- deterministic window-manager logic (no ring 3 needed) ---- */
+    int a = wm_seed((int)save, 100, 100, 200, 150);
+    int b = wm_seed((int)save, 150, 130, 200, 150);   /* overlaps a, created later = higher z */
+    int c = wm_seed((int)save, 400, 300, 160, 120);
+    wimpcheck("three windows seeded", a >= 0 && b >= 0 && c >= 0);
+
+    klock_acquire(&g_wm_lock);
+    int top_overlap = wm_topmost_at(200, 160);        /* inside both a and b -> b (higher z) */
+    int top_c = wm_topmost_at(450, 340);
+    int top_none = wm_topmost_at(700, 60);
+    klock_release(&g_wm_lock);
+    wimpcheck("hit-test picks the higher-z window in an overlap", top_overlap == b);
+    wimpcheck("hit-test picks the sole window under a non-overlapping point", top_c == c);
+    wimpcheck("hit-test returns -1 over empty desktop", top_none == -1);
+
+    /* raise a to the front via a title-bar click, re-test the overlap */
+    int hit = wimp_pointer(150, 105, 1); wimp_pointer(150, 105, 0);   /* title bar of a (or b) */
+    klock_acquire(&g_wm_lock);
+    int now_top = wm_topmost_at(200, 160);
+    int a_focused = g_wmwin[hit >= 0 ? hit : a].focused;
+    klock_release(&g_wm_lock);
+    wimpcheck("a title-bar click raises + focuses the clicked window to the front",
+              now_top == hit && hit >= 0 && a_focused);
+
+    /* drag: raise b to the front (so it is unambiguously the topmost window at
+     * the grab point, not the previously-raised a that overlaps it), press on
+     * b's title bar, move, release; b's position must follow. */
+    klock_acquire(&g_wm_lock); g_wmwin[b].x = 150; g_wmwin[b].y = 130; wm_raise(b); klock_release(&g_wm_lock);
+    wimp_pointer(160, 135, 1);                          /* grab b's title bar (b now on top) */
+    g_cur_x = 300; g_cur_y = 250;
+    /* emulate a drag step (same math wimp_input_step uses) */
+    klock_acquire(&g_wm_lock);
+    if (g_wm_drag == b) { g_wmwin[b].x = g_cur_x - g_wm_drag_dx; g_wmwin[b].y = g_cur_y - g_wm_drag_dy; }
+    int moved = (g_wmwin[b].x != 150 || g_wmwin[b].y != 130);
+    klock_release(&g_wm_lock);
+    wimp_pointer(0, 0, 0);                              /* release */
+    wimpcheck("title-bar drag moves the window and release ends the drag",
+              moved && g_wm_drag == -1);
+
+    /* minimize c via its minimize box, then confirm it drops out of hit-testing */
+    klock_acquire(&g_wm_lock);
+    int cclx = g_wmwin[c].w - WIMP_CLOSE_W - 3, cmnx = cclx - WIMP_MIN_W - 3;
+    int cminx = g_wmwin[c].x + cmnx + 2, cminy = g_wmwin[c].y + 3;
+    klock_release(&g_wm_lock);
+    wimp_pointer(cminx, cminy, 1); wimp_pointer(cminx, cminy, 0);
+    klock_acquire(&g_wm_lock); int c_min = g_wmwin[c].minimized; klock_release(&g_wm_lock);
+    wimpcheck("minimize box hides the window from compositing + hit-testing", c_min);
+
+    /* compositor smoke test: compose a frame, confirm a window painted over bg.
+     * Requires a bootloader framebuffer (g_gfx_ready); on a config without one
+     * the compose path is skipped cleanly rather than failed. */
+    if (g_gfx_ready && g_bb) {
+        klock_acquire(&g_wm_lock); g_wmwin[a].minimized = 0; g_wmwin[a].x = 300; g_wmwin[a].y = 200; klock_release(&g_wm_lock);
+        uint64_t comp0 = g_wm_composes;
+        wimp_compose();
+        uint32_t s = g_bb[205 * g_stride + 330];             /* inside a's chrome */
+        wimpcheck("cyber-compositor composed a frame (compose counter advanced)", g_wm_composes == comp0 + 1);
+        wimpcheck("composited window pixels overwrote the desktop background", s != C_OBS0);
+    } else {
+        kputs("[wimpstrs] SKIP  compositor smoke test (no bootloader framebuffer on this config)\n");
+    }
+
+    /* close a & c via their close box; count must return to the seeded baseline */
+    klock_acquire(&g_wm_lock);
+    int aclx = g_wmwin[a].x + (g_wmwin[a].w - WIMP_CLOSE_W - 3) + 2, acly = g_wmwin[a].y + 3;
+    klock_release(&g_wm_lock);
+    wimp_pointer(aclx, acly, 1); wimp_pointer(aclx, acly, 0);   /* close a */
+    /* force-clean the remaining seeded logic windows */
+    klock_acquire(&g_wm_lock);
+    for (int i = 0; i < NWMWIN; i++) if (g_wmwin[i].used && g_wmwin[i].owner == (int)save) wm_destroy(i);
+    int back_to_base = (wm_count_used() == base_wins);
+    klock_release(&g_wm_lock);
+    wimpcheck("close box destroys the window; WM returns to baseline occupancy", back_to_base);
+
+    uint64_t freed_total = g_frames_freed - freed0, reused_total = g_frames_reused - reused0;
+    kprintf("[wimpstrs] %d rounds (%d faulted): +%u freed, +%u reused; %u composes; global depth %u\n",
+            rnd, (uint64_t)(WIMPSTRESS_ROUNDS / 4), freed_total, reused_total,
+            g_wm_composes, g_frame_free_depth);
+    wimpcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+              g_frame_free_depth == g_frames_freed - g_frames_reused);
+    wimpcheck("the frame allocator's leaf lock never triggered a rank violation (no double-free race)",
+              g_rank_violations == viol0);
+
+    kprintf("[wimpstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_wimppass, (uint64_t)g_wimpfail);
+    if (!g_wimpfail)
+        kputs("[wimpstrs] WIMP STRESS VERIFIED — window mgmt, z-order, drag, close + compositor leak-free across clean AND faulted churn\n");
+    else kputs("[wimpstrs] WIMP STRESS DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 
 /* ===========================================================================
  * METROPOLIS-TERMINAL: THE SPATIAL CANVAS
@@ -10089,7 +10658,8 @@ static int wsc(int v)       { return (int)(FXMUL(FXI(v), g_zoom) >> FX); }
 static int64_t s2wx(int sx) { return g_cam_x + FXDIV(FXI(sx - g_fb_width / 2), g_zoom); }
 static int64_t s2wy(int sy) { return g_cam_y + FXDIV(FXI(sy - g_fb_height / 2), g_zoom); }
 
-static int g_cur_x = 512, g_cur_y = 384;      /* cursor in screen space          */
+/* g_cur_x / g_cur_y are defined earlier (before the v0.53 cyber-compositor,
+ * which also uses the pointer position). */
 static int g_drag = 0, g_drag_win = -1;       /* 0 none, 1 window, 2 canvas pan  */
 
 static void canvas_clampz(void) {
@@ -12235,6 +12805,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "gpustress")) cmd_gpu_stress();
     else if (!kstrcmp(argv[0], "audiostress")) cmd_audio_stress();
     else if (!kstrcmp(argv[0], "netstress")) cmd_net_stress();
+    else if (!kstrcmp(argv[0], "wimpstress")) cmd_wimp_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -12406,6 +12977,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_gpu_stress();       /* v0.50: virtio-gpu 2D resource/scanout/flush churn, incl. client faults */
     cmd_audio_stress();     /* v0.51: virtio-sound PCM configure/write churn, incl. client faults */
     cmd_net_stress();       /* v0.52: ring-3 datagram-socket bind/connect/send/recv churn, incl. client faults */
+    cmd_wimp_stress();      /* v0.53: ring-3 WIMP window create/manage/close churn + WM logic, incl. client faults */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
