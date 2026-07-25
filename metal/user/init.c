@@ -1029,7 +1029,12 @@ static void app_sysmon(int frames) {
 }
 
 /* ---- APP 3: FILE INSPECTOR — VFS browser + hex/bitmap view ----------------- */
-struct rd_ent { u32 len, used; char name[32]; };
+/* Mirrors the kernel's SYS_READDIR output record exactly (kernel64.c case 45 is
+ * the master). v0.56 widened it from 32 to 64 name bytes for hierarchical paths,
+ * so this MUST move in lockstep — a stale 40-byte struct here would have the
+ * kernel write 72 bytes into it. */
+#define VFS_NAME_MAX 64
+struct rd_ent { u32 len, used; char name[VFS_NAME_MAX]; };
 
 static void app_filer(int frames) {
     struct app_win W;

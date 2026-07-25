@@ -3545,16 +3545,18 @@ static int     g_cas_legacy  = 0;      /* v0.48: mounted a pre-journal (version 
 #define SB ((struct cas_superblock *)g_sbblk)
 
 /* --- VFS directory: names -> content, layered on CAS ---------------------- */
-#define VFS_MAXFILES   29                     /* v0.43: +4 for smp_stress; v0.46: +2 fixed, */
-                                               /* reused, non-growing names ("ipc-payload", */
-                                               /* "ipc-peer") for cmd_ipc_stress; v0.47: +1  */
-                                               /* fixed name ("vfio-devid") for cmd_vfio_stress; */
-                                               /* v0.48: +2 fixed names ("vfs-stress",       */
-                                               /* "vfs-crash-test") for cmd_vfs_stress        */
+/* v0.56: 64 slots. An SDK layout needs far more names than the suites' 29
+ * (/usr/include has seven headers alone, plus /usr/lib, /bin/occ and test
+ * sources). Growing this changes VFS_DIR_BLOCKS and therefore the on-disk
+ * layout — which is exactly why it is bundled with the version-4 format break
+ * below rather than deferred into a second, separate break later. */
+#define VFS_MAXFILES   64
 /* v0.56: VFS_MAX_CHUNKS is now the count of DIRECT chunk hashes stored inline
- * in the dirent — the unchanged fast path for every small file, and the reason
- * the on-disk dirent layout (and therefore the journal and cross-reboot
- * recovery) is not broken by this change. Beyond 8 KiB a file grows through a
+ * in the dirent — the unchanged fast path for every small file. (Stage A added
+ * this without touching the on-disk layout at all; Stage B then widened `name`
+ * for hierarchical paths, which DOES shift the later fields, so the volume
+ * version is now 4 and older volumes are reformatted.) Beyond 8 KiB a file
+ * grows through a
  * classic Unix-style INDIRECT CHUNK MAP: one single-indirect block of 64 chunk
  * hashes, then one double-indirect block of 64 single-indirect blocks.
  *
@@ -3583,8 +3585,21 @@ static int     g_cas_legacy  = 0;      /* v0.48: mounted a pre-journal (version 
  * CHANGELOG-0.48.0.md for how this was found and confirmed with a direct read
  * of the pre-fix code. */
 #define VFS_DIR_BLOCKS ((VFS_MAXFILES * 256 + CAS_BS - 1) / CAS_BS)
+/* v0.56 Stage B: names are now PATHS. The VFS keeps its flat dirent table, but a
+ * name may contain '/' and is long enough for real SDK layouts
+ * ("/usr/include/outrun_abi.h" is 26 chars). This is a flat namespace with
+ * HIERARCHICAL NAMES — deliberately not an inode tree: there is no mkdir, no
+ * rename-a-subtree, and no per-directory metadata. Directory *listing* is
+ * prefix matching (see SYS_READDIR), which is all a toolchain actually needs to
+ * resolve #include paths and find /bin and /usr/lib.
+ *
+ * The 32 extra bytes come out of reserved[], so sizeof(struct dirent) stays 256
+ * and VFS_DIR_BLOCKS is unchanged — but every field AFTER name shifts by 32, so
+ * the volume signature is bumped below to force a reformat rather than let an
+ * older volume be misparsed. */
+#define VFS_NAME_MAX 64
 struct dirent {
-    char     name[32];
+    char     name[VFS_NAME_MAX];
     uint32_t used;
     uint32_t len;
     uint32_t nchunks;
@@ -3598,7 +3613,7 @@ struct dirent {
      * restore all keep working unchanged, and a v0.55 volume still mounts. */
     uint64_t ind1_hash;                       /* -> 64 chunk hashes              */
     uint64_t ind2_hash;                       /* -> 64 single-indirect blocks    */
-    uint8_t  reserved[56];                    /* pad dirent to exactly 256 bytes  */
+    uint8_t  reserved[24];                    /* pad dirent to exactly 256 bytes  */
 } __attribute__((packed));
 /* Compile-time guard: if this ever trips, the on-disk layout has been broken. */
 _Static_assert(sizeof(struct dirent) == 256, "dirent must stay exactly 256 bytes");
@@ -3777,7 +3792,13 @@ static void cas_format(void) {
     cmemcpy(SB->magic, mg, 8);
     /* v0.48: version 3 — adds the two journal regions below. A version-2       */
     /* volume never had them; cas_mount() gates all journal use on this bump.    */
-    SB->version = 3; SB->block_size = CAS_BS; SB->total_blocks = total;
+    /* v0.56: version 4 — the dirent's `name` field widened from 32 to 64 bytes
+     * for hierarchical paths, which shifts every field after it. A version-3
+     * volume's directory blocks therefore cannot be parsed by this kernel at
+     * all, so cas_mount refuses anything below 4 and the volume is reformatted.
+     * That is the honest outcome: silently misreading a directory would corrupt
+     * it on the next flush. */
+    SB->version = 4; SB->block_size = CAS_BS; SB->total_blocks = total;
     SB->bitmap_start  = 1;
     SB->bitmap_blocks = (total / 8 + CAS_BS - 1) / CAS_BS;
     SB->index_start   = SB->bitmap_start + SB->bitmap_blocks;
@@ -3815,14 +3836,18 @@ static void vfs_journal_apply(void);   /* fwd: v0.48, defined in the VFS section
 static int cas_mount(void) {
     virtio_read_block(0, g_sbblk);
     const char mg[8] = { 'O','R','U','N','C','A','S','1' };
-    if (cmemcmp(SB->magic, mg, 8) != 0 || (SB->version != 2 && SB->version != 3)) return 0;
+    /* v0.56: only version 4 mounts. Versions 2 and 3 predate the widened dirent
+     * name, so their directory records have a different shape — reading one
+     * would yield garbage names and lengths, and the first vfs_flush would then
+     * write that garbage back. Refusing the mount makes cas_format run instead. */
+    if (cmemcmp(SB->magic, mg, 8) != 0 || SB->version != 4) return 0;
     /* v0.48: a version-2 volume predates both the dir_blocks fix and the        */
     /* journal regions — its on-disk bytes past dir_blocks/8 are DATA blocks,    */
     /* not journal headers, so trusting SB->vjournal_start/cjournal_start here   */
     /* would read (and later write!) garbage. Mount it read/write-compatible in  */
     /* a legacy mode instead: same 8-block dir clamp this kernel always used,    */
     /* journaling simply inactive until the volume is reformatted.               */
-    g_cas_legacy = (SB->version == 2);
+    g_cas_legacy = 0;                  /* v0.56: pre-v4 volumes no longer mount at all */
     if (!g_cas_legacy) {
         cas_journal_recover();
         virtio_read_block(0, g_sbblk);      /* recovery may have rewritten the superblock */
@@ -3862,7 +3887,7 @@ static void vfs_flush(void) {
 }
 static int vfs_find(const char *name) {
     for (int i = 0; i < VFS_MAXFILES; i++)
-        if (DENTS[i].used && streq_n(DENTS[i].name, name, 32)) return i;
+        if (DENTS[i].used && streq_n(DENTS[i].name, name, VFS_NAME_MAX)) return i;
     return -1;
 }
 static void ts_emit(int type, const char *who, const char *text);  /* Time-Stream (Phase 5) */
@@ -4013,7 +4038,8 @@ static int vfs_write_by_dirent(int di, const void *data, uint32_t len) {
     if (di < 0 || di >= VFS_MAXFILES) return -1;
     klock_acquire(&g_vfs_lock);
     if (!DENTS[di].used) { klock_release(&g_vfs_lock); return -1; }
-    char name[32]; kstrcpy_n(name, DENTS[di].name, 32);    /* copy under lock  */
+    char name[VFS_NAME_MAX];
+    kstrcpy_n(name, DENTS[di].name, VFS_NAME_MAX);          /* copy under lock  */
     int r = vfs_write_locked(di, name, data, len);
     klock_release(&g_vfs_lock);
     return r;
@@ -4047,7 +4073,7 @@ static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
 
 #define TMP_MAXFILES 4                 /* small, ephemeral, RAM-only scratch area */
 #define TMP_MAXBYTES 512
-struct tmpfile { char name[32]; int used; uint32_t len; uint8_t data[TMP_MAXBYTES]; };
+struct tmpfile { char name[VFS_NAME_MAX]; int used; uint32_t len; uint8_t data[TMP_MAXBYTES]; };
 static struct tmpfile g_tmpfiles[TMP_MAXFILES];
 
 static int path_has_prefix(const char *name, const char *prefix) {
@@ -4139,10 +4165,10 @@ static int vfs_open_for(const char *name, int owner) {
         klock_acquire(&g_vfs_lock);
         int ti = -1;
         for (int i = 0; i < TMP_MAXFILES; i++)
-            if (g_tmpfiles[i].used && streq_n(g_tmpfiles[i].name, rest, 32)) { ti = i; break; }
+            if (g_tmpfiles[i].used && streq_n(g_tmpfiles[i].name, rest, VFS_NAME_MAX)) { ti = i; break; }
         if (ti < 0) for (int i = 0; i < TMP_MAXFILES; i++) if (!g_tmpfiles[i].used) {
             ti = i; g_tmpfiles[i].used = 1; g_tmpfiles[i].len = 0;
-            kstrcpy_n(g_tmpfiles[i].name, rest, 32); break;
+            kstrcpy_n(g_tmpfiles[i].name, rest, VFS_NAME_MAX); break;
         }
         klock_release(&g_vfs_lock);
         if (ti < 0) return -1;
@@ -8808,17 +8834,32 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (nfill) cmemcpy((void *)(ubuf + sizeof hdr), ent, (uint64_t)nfill * 32);
         return (uint64_t)nfill;
     }
-    case 45: {   /* SYS_READDIR(index, *out) -> 1 if an entry was written, 0 past end, neg on error.
-                  * out = { u32 len, u32 used, char name[32] } (40 bytes). */
+    case 45: {   /* SYS_READDIR(index, *out, prefix) -> 1 entry written, 0 past end, neg error.
+                  * out = { u32 len, u32 used, char name[VFS_NAME_MAX] } (72 bytes).
+                  *
+                  * v0.56: `prefix` (a2) is an optional ring-3 string. When non-NULL,
+                  * only entries whose PATH starts with it are reported — which is how
+                  * a flat dirent table serves directory listings now that names are
+                  * paths: readdir("/usr/include/") enumerates exactly that directory.
+                  * A filtered-out slot returns `used == 0` rather than ending the walk,
+                  * so a caller still scans the whole table by index and cannot be
+                  * tricked into stopping early by table ordering. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
         int idx = (int)(int64_t)a0; uint64_t ubuf = a1;
         if (idx < 0 || idx >= VFS_MAXFILES) return (uint64_t)0;
-        if (!access_ok(kprocs[current_proc_idx].cr3, ubuf, 40, 1)) return (uint64_t)-1;
-        struct { uint32_t len, used; char name[32]; } e;
+        struct { uint32_t len, used; char name[VFS_NAME_MAX]; } e;
+        if (!access_ok(kprocs[current_proc_idx].cr3, ubuf, sizeof e, 1)) return (uint64_t)-1;
+        char pfx[VFS_NAME_MAX];
+        pfx[0] = 0;
+        if (a2 && copy_user_str(kprocs[current_proc_idx].cr3, a2, pfx, sizeof pfx) < 0)
+            return (uint64_t)-14;
         cmemset(&e, 0, sizeof e);
         struct dirent *d = &DENTS[idx];
-        e.used = d->used; e.len = d->len;
-        for (int k = 0; k < 31; k++) e.name[k] = d->name[k];
+        int show = d->used && (!pfx[0] || path_has_prefix(d->name, pfx));
+        if (show) {
+            e.used = d->used; e.len = d->len;
+            for (int k = 0; k < VFS_NAME_MAX - 1; k++) e.name[k] = d->name[k];
+        }
         cmemcpy((void *)ubuf, &e, sizeof e);
         return (uint64_t)1;
     }
@@ -9494,7 +9535,7 @@ static void cmd_cio(void) {
     for (int i = 0; i < VFS_MAXFILES; i++) {
         if (!DENTS[i].used) continue;
         for (int j = i + 1; j < VFS_MAXFILES; j++)
-            if (DENTS[j].used && streq_n(DENTS[i].name, DENTS[j].name, 32)) dup++;
+            if (DENTS[j].used && streq_n(DENTS[i].name, DENTS[j].name, VFS_NAME_MAX)) dup++;
         for (uint32_t c = 0; c < DENTS[i].nchunks; c++) {
             uint32_t len;
             klock_acquire(&g_cas_lock);
@@ -10506,6 +10547,56 @@ static void cmd_vfs_stress(void) {
          * BEFORE the dirent is touched, so a rejected write is also atomic. */
         int rej = vfs_write_file("vfs-stress", bigw, VFS_MAX_FILE_BYTES + 1);
         vfscheck("a write past the file ceiling is refused, not silently truncated", rej < 0);
+    }
+
+    /* ===== v0.56 Stage B: HIERARCHICAL PATH NAMES ==========================
+     * Names are paths now. The checks below are chosen so a half-done widening
+     * cannot pass: the third one uses two names that are IDENTICAL for their
+     * first 32 bytes and differ only afterwards, which the old 32-byte compare
+     * would have conflated into a single file. */
+    {
+        static const char *p1 = "/usr/include/stdio.h";
+        static const char *p2 = "/usr/include/stdlib.h";
+        static const char *p3 = "/usr/lib/crt0.o";
+        /* 33rd byte onward is the only difference between these two: */
+        static const char *l1 = "/usr/include/outrun/very/long/aaa.h";
+        static const char *l2 = "/usr/include/outrun/very/long/bbb.h";
+        vfs_write_file(p1, "STDIO", 6);
+        vfs_write_file(p2, "STDLIB", 7);
+        vfs_write_file(p3, "CRT0", 5);
+        vfs_write_file(l1, "AAA", 4);
+        vfs_write_file(l2, "BBBB", 5);
+
+        char rb[16];
+        int i1 = vfs_find(p1);
+        int64_t n1 = (i1 >= 0) ? vfs_read_file(i1, rb, sizeof rb) : -1;
+        vfscheck("a slash-separated PATH is a valid VFS name and resolves by full path",
+                 i1 >= 0 && n1 == 6 && rb[0] == 'S' && rb[4] == 'O');
+
+        /* Prefix listing: exactly the two /usr/include/*.h at the top level plus
+         * the two long ones underneath it — four entries, and NOT /usr/lib. */
+        int under_inc = 0, under_lib = 0;
+        for (int i = 0; i < VFS_MAXFILES; i++) {
+            if (!DENTS[i].used) continue;
+            if (path_has_prefix(DENTS[i].name, "/usr/include/")) under_inc++;
+            if (path_has_prefix(DENTS[i].name, "/usr/lib/"))     under_lib++;
+        }
+        kprintf("[vfsstrs] path listing: %d under /usr/include/, %d under /usr/lib/\n",
+                (uint64_t)under_inc, (uint64_t)under_lib);
+        vfscheck("prefix listing partitions the flat table into directories (4 include, 1 lib)",
+                 under_inc == 4 && under_lib == 1);
+
+        /* THE widening check: same first 32 bytes, different tails. */
+        int ia = vfs_find(l1), ib = vfs_find(l2);
+        int64_t na = (ia >= 0) ? vfs_read_file(ia, rb, sizeof rb) : -1;
+        int64_t nb = (ib >= 0) ? vfs_read_file(ib, rb, sizeof rb) : -1;
+        vfscheck("paths identical for 32 bytes but differing later are DISTINCT files",
+                 ia >= 0 && ib >= 0 && ia != ib && na == 4 && nb == 5);
+
+        vfs_unlink(p1); vfs_unlink(p2); vfs_unlink(p3);
+        vfs_unlink(l1); vfs_unlink(l2);
+        vfscheck("every path-named file unlinks cleanly, leaving no dirent behind",
+                 vfs_find(p1) < 0 && vfs_find(l1) < 0 && vfs_find(l2) < 0);
     }
 
     static const uint8_t seed[16] = "VFS-SEED-PATTERN";
