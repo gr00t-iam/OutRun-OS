@@ -83,6 +83,7 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_WAITPID             56
 #define SYS_SIGUNMASK           57
 #define SYS_BRK                 58
+#define SYS_EXECVE_PATH         59
 /* Mirrors the kernel's HEAP_USER_V (kernel64.c is the master). */
 #define HEAP_USER_V_LO 0x0000570000000000ull
 
@@ -1303,8 +1304,15 @@ static void oyield(void)              { sysc(SYS_YIELD, 0, 0, 0); }
  * child resumes at this very instruction with everything else identical. No
  * userland continuation trampoline is involved. */
 static i64 ofork(void)                { return (i64)sysc(SYS_FORK, 0, 0, 0); }
-static i64 oexecve(const char **argv, const char **envp, u64 role) {
+/* v0.55's exec: re-run THIS SAME boot image under a different role. It predates
+ * being able to load anything else and every v0.55 suite still uses it. */
+static i64 oexec_role(const char **argv, const char **envp, u64 role) {
     return (i64)sysc(SYS_EXECVE, (u64)argv, (u64)envp, role);
+}
+/* v0.56: the real POSIX-shaped exec — replace this image with an ARBITRARY ELF
+ * loaded from the VFS by path. Returns only on failure. */
+static i64 oexecve(const char *path, const char **argv, const char **envp) {
+    return (i64)sysc(SYS_EXECVE_PATH, (u64)path, (u64)argv, (u64)envp);
 }
 /* Non-blocking: -11 = still running, -10 = not our child. See the changelog —
  * this kernel has no ring-3 sleep/wake queue yet, so waiters poll + yield. */
@@ -1769,7 +1777,7 @@ static void posix_thread_worker(void) {
 static void posix_exec_parent(void) {
     static const char *argv[] = { "posix-exec", "MARKER-55", 0 };
     static const char *envp[] = { "OUTRUN_EXEC=yes", "STAGE=exec", 0 };
-    oexecve(argv, envp, 33);                         /* becomes role 33; never returns */
+    oexec_role(argv, envp, 33);                      /* becomes role 33; never returns */
     sysc(SYS_EXIT, 921, 0, 0);                       /* execve failed */
 }
 static void posix_exec_child(void) {
@@ -1893,6 +1901,19 @@ static void posix_heap_worker(void) {
     sysc(SYS_EXIT, 980, 0, 0);
 }
 
+/* --- role 36: execve BY PATH ----------------------------------------------
+ * Replaces this image with /bin/init loaded out of the VFS. The exec'd copy is
+ * the same program, so it must be told what to do through argv rather than
+ * through its role — which is exactly the point: it proves the path-loaded
+ * image received a real argv and envp built by the kernel on its new stack.
+ * The child (see main() below) exits 970. */
+static void posix_execpath_worker(void) {
+    static const char *argv[] = { "/bin/init", "exec-child", 0 };
+    static const char *envp[] = { "EXECD_BY=path", 0 };
+    oexecve("/bin/init", argv, envp);          /* never returns on success */
+    sysc(SYS_EXIT, 971, 0, 0);                 /* execve failed */
+}
+
 int main(int argc, const char **argv, const char **envp);
 
 /* ---- crt0 -----------------------------------------------------------------
@@ -1928,7 +1949,19 @@ int crt0_main(int argc, const char **argv, const char **envp) {
 }
 
 int main(int argc, const char **argv, const char **envp) {
-    (void)argc; (void)argv; (void)envp;
+    (void)envp;
+    /* v0.56: an image exec'd BY PATH is this same program, so it cannot be
+     * distinguished by role — argv is how it learns what it is. Checked before
+     * the role dispatch precisely so the path-loaded copy takes this branch
+     * instead of re-running whatever role its kproc still carries (which would
+     * exec itself forever). */
+    if (argc >= 2 && argv && argv[1] && ostrneq(argv[1], "exec-child", 11)) {
+        if (!ostrneq(argv[0], "/bin/init", 10))            sysc(SYS_EXIT, 972, 0, 0);
+        const char *v = ogetenv("EXECD_BY");
+        if (!v || !ostrneq(v, "path", 5))                  sysc(SYS_EXIT, 973, 0, 0);
+        oputs("  [posix ] /bin/init re-exec'd FROM THE VFS BY PATH, argv+envp intact\n");
+        sysc(SYS_EXIT, 970, 0, 0);
+    }
     u64 role = sysc(SYS_ROLE, 0, 0, 0);
     if (role == 1) { nic_driver();  sysc(SYS_EXIT, 0, 0, 0); }
     if (role == 2) { surface_app(); sysc(SYS_EXIT, 0, 0, 0); }
@@ -1965,6 +1998,7 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 33) { posix_exec_child(); }             /* v0.55 the exec'd image: verifies argc/argv/envp    */
     if (role == 34) { posix_fd_worker(); }              /* v0.55 std fd table + inheritance across fork       */
     if (role == 35) { posix_heap_worker(); }            /* v0.56 ring-3 heap: sbrk/malloc/free/realloc        */
+    if (role == 36) { posix_execpath_worker(); }        /* v0.56 execve /bin/init BY PATH from the VFS        */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");

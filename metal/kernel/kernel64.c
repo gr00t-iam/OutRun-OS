@@ -7408,6 +7408,9 @@ static uint64_t elf_load(int proc_idx, uint64_t img, uint64_t img_size);   /* fw
 static uint64_t uargs_build(uint64_t cr3, int argc, const char argv[][UARG_LEN],
                             int envc, const char envp[][UARG_LEN]);
 static int      vm_clone_user(uint64_t src_cr3, uint64_t dst_cr3);
+/* v0.56: the ELF staging buffer, shared with exec_from_cas (defined with the
+ * loader further down). SYS_EXECVE reads a whole image out of CAS into it. */
+extern uint8_t  g_execbuf[VFS_MAX_FILE_BYTES];
 static volatile uint64_t g_execs = 0, g_forks = 0, g_threads_made = 0;
 static int g_mcpass, g_mcfail;
 static void mccheck(const char *n, int c) {
@@ -8932,6 +8935,83 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     /* =======================================================================
      * v0.55: POSIX PROCESS / SIGNAL / THREAD CALLS
      * ======================================================================= */
+    case 59: {   /* SYS_EXECVE(path, argv, envp) -> negative on failure, NEVER returns
+                  * on success. THE real POSIX-shaped exec: it loads an ARBITRARY
+                  * ELF out of the VFS by path, which is what makes a compiler's
+                  * output runnable and therefore what makes self-hosting possible
+                  * at all. (Case 48 remains the v0.55 "re-exec this same boot
+                  * image under a new role" primitive; it predates being able to
+                  * load anything else and every v0.55 suite still uses it.)
+                  *
+                  * Ordering matters throughout: the path, argv and envp all live
+                  * in the address space this call is about to destroy, so every
+                  * byte is copied out BEFORE anything is torn down, and the new
+                  * image is built in a FRESH space so a failure leaves the caller
+                  * alive and running. */
+        int p = (int)current_proc_idx;
+        uint64_t ucr3 = kprocs[p].cr3;
+        if (!rust_cap_check(kprocs[p].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+
+        char path[VFS_NAME_MAX];
+        if (copy_user_str(ucr3, a0, path, sizeof path) < 0) return (uint64_t)-14;
+
+        static char kargv[UARG_N][UARG_LEN], kenvp[UARG_N][UARG_LEN];
+        int argc = 0, envc = 0;
+        for (int vec = 0; vec < 2; vec++) {
+            uint64_t ptr = vec ? a2 : a1;
+            if (!ptr) continue;
+            for (int i = 0; i < UARG_N; i++) {
+                if (!access_ok(ucr3, ptr + (uint64_t)i * 8, 8, 0)) return (uint64_t)-14;
+                uint64_t sp = ((const uint64_t *)ptr)[i];
+                if (!sp) break;
+                if (copy_user_str(ucr3, sp, vec ? kenvp[envc] : kargv[argc], UARG_LEN) < 0)
+                    return (uint64_t)-14;
+                if (vec) envc++; else argc++;
+            }
+        }
+        /* POSIX convention: argv[0] defaults to the program path. */
+        if (!argc) { kstrcpy_n(kargv[0], path, UARG_LEN); argc = 1; }
+
+        /* Pull the image out of CAS into the kernel's staging buffer while the
+         * caller's address space is still intact. */
+        int di = vfs_find(path);
+        if (di < 0) return (uint64_t)-2;                    /* ENOENT */
+        int64_t nimg = vfs_read_file(di, g_execbuf, sizeof g_execbuf);
+        if (nimg <= 0) return (uint64_t)-5;                 /* EIO   */
+
+        uint64_t newcr3 = create_address_space();
+        if (!newcr3) return (uint64_t)-12;
+        uint64_t save = kprocs[p].cr3;
+        kprocs[p].cr3 = newcr3;                             /* elf_load targets this */
+        /* elf_load enforces W^X on the way in: a segment that is both writable
+         * and executable is refused, so a compiler cannot emit an image that
+         * escapes the policy the rest of the system obeys. */
+        uint64_t entry = elf_load(p, (uint64_t)g_execbuf, (uint64_t)nimg);
+        if (!entry) { kprocs[p].cr3 = save; page_free_tree(newcr3); return (uint64_t)-8; }
+        uint64_t sp = uargs_build(newcr3, argc, (const char (*)[UARG_LEN])kargv,
+                                          envc, (const char (*)[UARG_LEN])kenvp);
+
+        /* Point of no return: switch onto the new image, THEN dismantle the old
+         * space — in that order, because we are executing on it right now. This
+         * syscall's own kernel stack lives in the shared kernel range that
+         * create_address_space aliases into every process, so it survives. */
+        kprocs[p].entry = entry;
+        kprocs[p].pstate = 0;
+        kprocs[p].sigframe_sp = 0;
+        kprocs[p].sig_mask = 0;
+        kprocs[p].heap_brk = HEAP_USER_V;                   /* the heap does NOT survive exec */
+        for (int sg = 0; sg < NSIG; sg++)
+            if (kprocs[p].sig_handler[sg] > 1) kprocs[p].sig_handler[sg] = 0;
+        write_cr3(newcr3);
+        if (cpu_idx() == 0 && curthr->uthread) curthr->cr3 = newcr3;
+        __sync_synchronize();
+        page_free_tree(save);
+        g_execs++;
+        kprintf("[exec   ] pid %u exec'd '%s' (%d bytes from CAS) -> entry %X\n",
+                kprocs[p].pid, path, nimg, entry);
+        enter_user_thread(entry, sp);                       /* never returns */
+        return 0;                                           /* unreachable */
+    }
     case 48: {   /* SYS_EXECVE(argv, envp, role) -> negative on failure, NEVER returns on success.
                   * Replaces this process's image in place: same pid, same kproc slot, same
                   * open descriptors, brand-new address space. */
@@ -8974,6 +9054,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         kprocs[p].pstate = 0;                          /* no stale captured context */
         kprocs[p].sigframe_sp = 0;
         kprocs[p].sig_mask = 0;
+        kprocs[p].heap_brk = HEAP_USER_V;              /* v0.56: the heap does not survive exec */
         /* POSIX: exec RESETS caught signals to default but keeps SIG_IGN.     */
         for (int sg = 0; sg < NSIG; sg++)
             if (kprocs[p].sig_handler[sg] > 1) kprocs[p].sig_handler[sg] = 0;
@@ -9592,9 +9673,14 @@ static void cmd_cio(void) {
         for (int j = i + 1; j < VFS_MAXFILES; j++)
             if (DENTS[j].used && streq_n(DENTS[i].name, DENTS[j].name, VFS_NAME_MAX)) dup++;
         for (uint32_t c = 0; c < DENTS[i].nchunks; c++) {
+            /* v0.56: must walk the INDIRECT map, not the inline array. Reading
+             * DENTS[i].chunk_hash[c] directly is only valid for c < 16; past
+             * that it runs off the end of the direct hashes into other dirent
+             * fields. Caught live the moment /bin/init (52 chunks) existed. */
+            uint64_t ch = vfs_chunk_hash_at(&DENTS[i], c);
             uint32_t len;
             klock_acquire(&g_cas_lock);
-            int64_t b = cas_index_find(DENTS[i].chunk_hash[c], &len);
+            int64_t b = ch ? cas_index_find(ch, &len) : -1;
             klock_release(&g_cas_lock);
             if (b < 0) unresolved++;
         }
@@ -11267,7 +11353,7 @@ static int uthread_spawn_elf(const char *label, uint64_t caps, uint64_t role, in
 
 /* sys_exec: load an ELF whose segments come straight from CAS storage (by     */
 /* VFS name -> content hashes -> blocks) instead of the in-memory GRUB module. */
-static uint8_t g_execbuf[VFS_MAX_FILE_BYTES] __attribute__((aligned(16)));
+uint8_t g_execbuf[VFS_MAX_FILE_BYTES] __attribute__((aligned(16)));
 static int exec_from_cas(const char *name, int proc_idx) {
     int di = vfs_find(name);
     if (di < 0) { kprintf("[exec   ] '%s' not found in VFS\n", name); return -1; }
@@ -11292,6 +11378,13 @@ static void cmd_vfs(void) {
     for (int i = 0; i < 1399; i++) big[i] = (char)('A' + (i % 26));
     big[1399] = 0;
 
+    /* v0.56: publish the ring-3 image into the VFS as /bin/init. This is the
+     * first executable that lives in the filesystem rather than only as a GRUB
+     * module, and exec'ing it by path exercises the whole new substrate at
+     * once: it is ~25 KiB, so it needs Stage A's indirect chunk map to be
+     * stored at all, and "/bin/init" needs Stage B's widened path names. */
+    vfs_write_file("/bin/init", (const void *)g_user_elf,
+                   (uint32_t)(g_user_elf_end - g_user_elf));
     vfs_write_file("motd", motd, cstrlen(motd) + 1);
     vfs_write_file("readme", big, 1400);
     uint64_t motd_hash_v1 = DENTS[vfs_find("motd")].file_hash;
@@ -12197,9 +12290,9 @@ static void pxcheck(const char *n, int c) {
  * of the table afterwards therefore misattributes results (observed live: a
  * forked child's failure was reported against the execve worker's label). */
 struct px_round {
-    uint32_t pid[6];                       /* worker pids as spawned            */
-    uint64_t code[6];                      /* latched exit codes                */
-    int      got[6];
+    uint32_t pid[7];                       /* worker pids as spawned            */
+    uint64_t code[7];                      /* latched exit codes                */
+    int      got[7];
     uint32_t cpid[PX_MAXCHILD];            /* pids of everything they forked    */
     int      cparent[PX_MAXCHILD];         /* the forking worker's index        */
     uint64_t ccode[PX_MAXCHILD], cframes[PX_MAXCHILD];
@@ -12316,21 +12409,22 @@ static void cmd_posix_stress(void) {
     uint32_t inr3_0 = g_inr3_max;
 
     /* role -> the exit code that means "every ring-3 assertion in me passed" */
-    static const uint64_t want[6] = { 700, 800, 900, 950, 960, 980 };
-    static const int      roles[6] = {  29,  30,  31,  32,  34,  35 };
-    static const char    *labels[6] = { "fork/waitpid/SIGCHLD", "signals + frame integrity",
+    static const uint64_t want[7] = { 700, 800, 900, 950, 960, 980, 970 };
+    static const int      roles[7] = {  29,  30,  31,  32,  34,  35,  36 };
+    static const char    *labels[7] = { "fork/waitpid/SIGCHLD", "signals + frame integrity",
                                         "pthreads + mutex", "execve argv/envp", "std fd table",
-                                        "ring-3 heap (sbrk/malloc)" };
+                                        "ring-3 heap (sbrk/malloc)",
+                                        "execve BY PATH from the VFS" };
     int rounds_ok = 1, codes_ok = 1, child_ok = 1, reclaim_ok = 1, ppid_ok = 1;
     int nchild_total = 0, rnd;
 
     for (rnd = 0; rnd < POSIXSTRESS_ROUNDS; rnd++) {
         struct px_round R;
-        int procs[6], nproc = 0;
-        for (int i = 0; i < 6; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+        int procs[7], nproc = 0;
+        for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
         R.nchild = 0;
 
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < 7; i++) {
             int p = kproc_spawn("posix-w", PCAP_FILESYSTEM);
             if (p < 0) { pxcheck("kproc_spawn never fails mid-storm", 0); rounds_ok = 0; break; }
             kprocs[p].role = roles[i];
@@ -12346,7 +12440,7 @@ static void cmd_posix_stress(void) {
             R.pid[nproc] = kprocs[p].pid;
             procs[nproc++] = p;
         }
-        if (nproc < 6) break;
+        if (nproc < 7) break;
 
         for (int i = 0; i < nproc; i++) {
             /* An affinity-pinned worker must be queued on a core in its mask,
@@ -12405,7 +12499,7 @@ static void cmd_posix_stress(void) {
         }
     }
 
-    pxcheck("every round ran all 6 POSIX workers to a terminal state (no watchdog timeout)",
+    pxcheck("every round ran all 7 POSIX workers to a terminal state (no watchdog timeout)",
             rnd == POSIXSTRESS_ROUNDS && rounds_ok);
     pxcheck("every worker's ring-3 assertions passed (exit code == its success sentinel)", codes_ok);
     pxcheck("fork() produced real children: distinct pid AND distinct cr3 from the parent", ppid_ok);
