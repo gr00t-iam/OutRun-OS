@@ -1017,6 +1017,8 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
 #define SMP_USER_V  0x0000540000000000ull   /* v0.49: ring-3 remap/unmap scratch window */
 #define WIN_USER_V  0x0000550000000000ull   /* v0.53: ring-3 WIMP window content thumbnail */
 #define THR_USER_V  0x0000560000000000ull   /* v0.55: per-POSIX-thread ring-3 stacks       */
+#define HEAP_USER_V 0x0000570000000000ull   /* v0.56: ring-3 heap (SYS_BRK grows it upward) */
+#define HEAP_MAX_BYTES (4u * 1024u * 1024u) /* per-process heap ceiling: 4 MiB              */
 /* Everything at or above DMA_USER_V is a WINDOW the kernel grants explicitly
  * (device DMA, shared pixels, per-thread stacks); only the region below it is
  * ordinary anonymous process image + main stack. fork() clones exactly that
@@ -1479,6 +1481,11 @@ struct kproc {
     /* v0.55: argv/envp image handed to the ring-3 crt on the initial stack.    */
     int      argc;
     int      exit_authoritative;   /* v0.55: exit_code came from exit(), not pthread_exit() */
+    /* v0.56: current program break. HEAP_USER_V means "no heap mapped yet"; the
+     * heap grows upward from there in whole pages. Nothing else in the kernel
+     * needs to know about it — the pages are ordinary USER mappings, so
+     * page_free_tree reclaims them at exit exactly like the stack. */
+    uint64_t heap_brk;
     /* v0.49: leaf spinlock serializing this ONE process's own VMA/page-table
      * mutations (map_page + smp_slot_phys bookkeeping) against itself. In
      * this kernel's one-thread-per-kproc execution model only the single
@@ -1538,6 +1545,7 @@ static void kproc_reset(struct kproc *p) {
     p->sig_pending = 0; p->sig_mask = 0; p->sigframe_sp = 0;
     p->alarm_deadline = 0; p->ppid_slot = -1;
     p->nthreads = 1; p->ustack_next = 0; p->argc = 0; p->exit_authoritative = 0;
+    p->heap_brk = HEAP_USER_V;
     p->finish_seq = 0;
     p->dispatches = 0;
     p->frames_freed = 0;
@@ -9087,6 +9095,53 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (kprocs[p].alarm_deadline) __sync_fetch_and_add(&g_alarms_armed, 1);
         return rem;
     }
+    case 58: {   /* SYS_BRK(new_end) -> the resulting program break, or the CURRENT
+                  * break unchanged if the request could not be satisfied.
+                  *
+                  * a0 == 0 queries without moving it, which is what sbrk(0) needs.
+                  * The heap is an ordinary anonymous USER mapping in its own vaddr
+                  * window: RW+NX, so it can never be executed (W^X holds for the
+                  * heap as it does for everything else), and page_free_tree
+                  * reclaims it at exit with no special case. Growth is page-
+                  * granular; shrinking unmaps AND frees, so a process that
+                  * releases memory really gives the frames back rather than
+                  * holding them until it dies. */
+        int p = (int)current_proc_idx;
+        uint64_t cur = kprocs[p].heap_brk;
+        if (!a0) return cur;
+        if (a0 < HEAP_USER_V || a0 > HEAP_USER_V + HEAP_MAX_BYTES) return cur;
+        uint64_t want = (a0 + 0xFFFull) & ~0xFFFull;       /* page-granular break */
+        if (want > cur) {
+            for (uint64_t v = cur; v < want; v += 0x1000) {
+                uint64_t f = alloc_frame();
+                if (!f) {                                   /* out of memory: keep
+                                                             * what we mapped and
+                                                             * report it honestly */
+                    kprocs[p].heap_brk = v;
+                    return v;
+                }
+                map_page(kprocs[p].cr3, v, f, PTE_USER | PTE_WRITE | PTE_NX);
+            }
+        } else if (want < cur) {
+            for (uint64_t v = want; v < cur; v += 0x1000) {
+                uint64_t pte = walk_pte(kprocs[p].cr3, v);
+                unmap_page(kprocs[p].cr3, v);
+                /* Shoot down BEFORE the frame goes back on the free list — the
+                 * kernel's existing rule (see tlb_shootdown_range): a core still
+                 * holding a stale TLB entry could otherwise write through it
+                 * into a frame that has already been handed to someone else.
+                 * A threaded process really can be running this address space on
+                 * another core right now. */
+                tlb_shootdown(v);
+                if (pte & PTE_PRESENT) free_frame(pte & ADDR_MASK);
+            }
+        }
+        kprocs[p].heap_brk = want;
+        if (g_debug_posix)
+            kprintf("[dbgposix] brk pid %u -> %X (%u KiB mapped)\n",
+                    kprocs[p].pid, want, (want - HEAP_USER_V) / 1024);
+        return want;
+    }
     case 57: {   /* SYS_SIGUNMASK(signo) -> 0 ok, negative.
                   * sig_deliver BLOCKS the signal it delivers, so a handler cannot
                   * recurse on its own fault. A handler that leaves by longjmp
@@ -12142,9 +12197,9 @@ static void pxcheck(const char *n, int c) {
  * of the table afterwards therefore misattributes results (observed live: a
  * forked child's failure was reported against the execve worker's label). */
 struct px_round {
-    uint32_t pid[5];                       /* worker pids as spawned            */
-    uint64_t code[5];                      /* latched exit codes                */
-    int      got[5];
+    uint32_t pid[6];                       /* worker pids as spawned            */
+    uint64_t code[6];                      /* latched exit codes                */
+    int      got[6];
     uint32_t cpid[PX_MAXCHILD];            /* pids of everything they forked    */
     int      cparent[PX_MAXCHILD];         /* the forking worker's index        */
     uint64_t ccode[PX_MAXCHILD], cframes[PX_MAXCHILD];
@@ -12261,20 +12316,21 @@ static void cmd_posix_stress(void) {
     uint32_t inr3_0 = g_inr3_max;
 
     /* role -> the exit code that means "every ring-3 assertion in me passed" */
-    static const uint64_t want[5] = { 700, 800, 900, 950, 960 };
-    static const int      roles[5] = {  29,  30,  31,  32,  34 };
-    static const char    *labels[5] = { "fork/waitpid/SIGCHLD", "signals + frame integrity",
-                                        "pthreads + mutex", "execve argv/envp", "std fd table" };
+    static const uint64_t want[6] = { 700, 800, 900, 950, 960, 980 };
+    static const int      roles[6] = {  29,  30,  31,  32,  34,  35 };
+    static const char    *labels[6] = { "fork/waitpid/SIGCHLD", "signals + frame integrity",
+                                        "pthreads + mutex", "execve argv/envp", "std fd table",
+                                        "ring-3 heap (sbrk/malloc)" };
     int rounds_ok = 1, codes_ok = 1, child_ok = 1, reclaim_ok = 1, ppid_ok = 1;
     int nchild_total = 0, rnd;
 
     for (rnd = 0; rnd < POSIXSTRESS_ROUNDS; rnd++) {
         struct px_round R;
-        int procs[5], nproc = 0;
-        for (int i = 0; i < 5; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+        int procs[6], nproc = 0;
+        for (int i = 0; i < 6; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
         R.nchild = 0;
 
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 6; i++) {
             int p = kproc_spawn("posix-w", PCAP_FILESYSTEM);
             if (p < 0) { pxcheck("kproc_spawn never fails mid-storm", 0); rounds_ok = 0; break; }
             kprocs[p].role = roles[i];
@@ -12290,7 +12346,7 @@ static void cmd_posix_stress(void) {
             R.pid[nproc] = kprocs[p].pid;
             procs[nproc++] = p;
         }
-        if (nproc < 5) break;
+        if (nproc < 6) break;
 
         for (int i = 0; i < nproc; i++) {
             /* An affinity-pinned worker must be queued on a core in its mask,
@@ -12349,7 +12405,7 @@ static void cmd_posix_stress(void) {
         }
     }
 
-    pxcheck("every round ran all 5 POSIX workers to a terminal state (no watchdog timeout)",
+    pxcheck("every round ran all 6 POSIX workers to a terminal state (no watchdog timeout)",
             rnd == POSIXSTRESS_ROUNDS && rounds_ok);
     pxcheck("every worker's ring-3 assertions passed (exit code == its success sentinel)", codes_ok);
     pxcheck("fork() produced real children: distinct pid AND distinct cr3 from the parent", ppid_ok);
