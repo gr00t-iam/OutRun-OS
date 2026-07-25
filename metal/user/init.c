@@ -70,6 +70,25 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_SYSINFO             44
 #define SYS_READDIR             45
 #define SYS_RUN_CMD             46
+/* v0.55: POSIX process / signal / thread calls */
+#define SYS_FORK                47
+#define SYS_EXECVE              48
+#define SYS_SIGACTION           49
+#define SYS_KILL                50
+#define SYS_SIGRETURN           51
+#define SYS_THREAD_CREATE       52
+#define SYS_THREAD_EXIT         53
+#define SYS_ALARM               54
+#define SYS_GETPPID             55
+#define SYS_WAITPID             56
+#define SYS_SIGUNMASK           57
+
+#define SIGINT   2
+#define SIGKILL  9
+#define SIGSEGV 11
+#define SIGALRM 14
+#define SIGCHLD 17
+#define NSIG    32
 
 #define PCAP_SMP_ADMIN (1ull << 9)
 
@@ -1182,6 +1201,284 @@ static void nic_driver(void) {
 }
 
 
+/* ============================================================================
+ * v0.55: RING-3 POSIX RUNTIME  (crt0 + minimal libc + signals + pthreads)
+ * ============================================================================
+ * Everything below is ordinary unprivileged code. It talks to the kernel only
+ * through `syscall`, exactly like the rest of this file — there is no magic
+ * shared page and no kernel helper injected into the address space.
+ * ==========================================================================*/
+
+/* ---- setjmp / longjmp ------------------------------------------------------
+ * Needed for real signal recovery: a SIGSEGV handler cannot simply RETURN,
+ * because the kernel resumes the FAULTING instruction, which faults again
+ * forever. The POSIX idiom is to longjmp out of the handler, and that needs a
+ * genuine register-file save/restore, so it is written in assembly.          */
+struct ojmp { u64 rbx, rbp, r12, r13, r14, r15, rsp, rip; };
+extern int  osetjmp(struct ojmp *j) __attribute__((returns_twice));
+extern void olongjmp(struct ojmp *j, int v) __attribute__((noreturn));
+__asm__(
+    ".text\n"
+    ".globl osetjmp\n"
+    "osetjmp:\n"
+    "  mov %rbx,   0(%rdi)\n"
+    "  mov %rbp,   8(%rdi)\n"
+    "  mov %r12,  16(%rdi)\n"
+    "  mov %r13,  24(%rdi)\n"
+    "  mov %r14,  32(%rdi)\n"
+    "  mov %r15,  40(%rdi)\n"
+    "  lea 8(%rsp), %rax\n"          /* RSP as it will be after our RET       */
+    "  mov %rax,  48(%rdi)\n"
+    "  mov (%rsp), %rax\n"           /* our return address = resume point     */
+    "  mov %rax,  56(%rdi)\n"
+    "  xor %eax, %eax\n"
+    "  ret\n"
+    ".globl olongjmp\n"
+    "olongjmp:\n"
+    "  mov  0(%rdi), %rbx\n"
+    "  mov  8(%rdi), %rbp\n"
+    "  mov 16(%rdi), %r12\n"
+    "  mov 24(%rdi), %r13\n"
+    "  mov 32(%rdi), %r14\n"
+    "  mov 40(%rdi), %r15\n"
+    "  mov 48(%rdi), %rsp\n"
+    "  mov %esi, %eax\n"
+    "  test %eax, %eax\n"
+    "  jnz 1f\n"
+    "  mov $1, %eax\n"
+    "1:\n"
+    "  jmp *56(%rdi)\n"
+);
+
+/* ---- signal trampoline ----------------------------------------------------
+ * The kernel enters the handler with RIP = handler and RSP pointing AT the
+ * signal frame it just spilled, RDI = signo. A plain C function would `ret`
+ * into that frame's first quadword, so ring 3 needs its own trampoline: call
+ * the user's handler, then SYS_SIGRETURN, which pops the frame back into the
+ * live context and never returns. `call` pushes BELOW the frame (the kernel
+ * left a 128-byte gap and the stack continues downwards), so the frame the
+ * kernel is going to restore is never touched.                              */
+static void (*g_sighandler[NSIG])(int);
+void sig_dispatch(int signo);                       /* called from the trampoline */
+extern void sig_trampoline(void);
+__asm__(
+    ".text\n"
+    ".globl sig_trampoline\n"
+    "sig_trampoline:\n"
+    "  call sig_dispatch\n"          /* RDI already = signo; RSP 16-aligned   */
+    "  mov $51, %rax\n"              /* SYS_SIGRETURN                          */
+    "  xor %edi, %edi\n"
+    "  xor %esi, %esi\n"
+    "  xor %edx, %edx\n"
+    "  syscall\n"
+    "1: jmp 1b\n"                    /* unreachable: sigreturn never returns   */
+);
+void sig_dispatch(int signo) {
+    if (signo > 0 && signo < NSIG && g_sighandler[signo]) g_sighandler[signo](signo);
+}
+
+static int osigaction(int signo, void (*fn)(int)) {
+    if (signo <= 0 || signo >= NSIG) return -1;
+    g_sighandler[signo] = fn;
+    return (int)(i64)sysc(SYS_SIGACTION, (u64)signo,
+                          fn ? (u64)(void *)sig_trampoline : 0, 0);
+}
+static int okill(u32 pid, int signo)  { return (int)(i64)sysc(SYS_KILL, pid, (u64)signo, 0); }
+static u64 oalarm(u64 ticks)          { return sysc(SYS_ALARM, ticks, 0, 0); }
+static void osigunmask(int signo)     { sysc(SYS_SIGUNMASK, (u64)signo, 0, 0); }
+static u32 ogetpid(void)              { return (u32)sysc(SYS_GETPID, 0, 0, 0); }
+static u32 ogetppid(void)             { return (u32)sysc(SYS_GETPPID, 0, 0, 0); }
+static void oyield(void)              { sysc(SYS_YIELD, 0, 0, 0); }
+
+/* fork() is a plain syscall here: the kernel duplicates the caller's ENTIRE
+ * register file into the child's saved context with RAX forced to 0, so the
+ * child resumes at this very instruction with everything else identical. No
+ * userland continuation trampoline is involved. */
+static i64 ofork(void)                { return (i64)sysc(SYS_FORK, 0, 0, 0); }
+static i64 oexecve(const char **argv, const char **envp, u64 role) {
+    return (i64)sysc(SYS_EXECVE, (u64)argv, (u64)envp, role);
+}
+/* Non-blocking: -11 = still running, -10 = not our child. See the changelog —
+ * this kernel has no ring-3 sleep/wake queue yet, so waiters poll + yield. */
+static i64 owaitpid_poll(u32 pid)     { return (i64)sysc(SYS_WAITPID, pid, 0, 0); }
+static i64 owaitpid(u32 pid, int spins) {
+    for (int i = 0; i < spins; i++) {
+        i64 r = owaitpid_poll(pid);
+        if (r != -11) return r;
+        oyield();
+    }
+    return -11;
+}
+
+/* ---- standard file descriptors --------------------------------------------
+ * A userland fd table layered over the kernel's descriptors. fds 0/1/2 are
+ * reserved for stdin/stdout/stderr and bound to the console; open() hands out
+ * 3 and up, mapping each to the kernel fd underneath. The table is ordinary
+ * process memory, so fork() inherits it byte for byte (the child keeps writing
+ * to the same stdout and to any file the parent had open), while execve()
+ * builds a fresh image whose crt0 re-initialises it to the default three —
+ * which is the correct POSIX result here, since 0/1/2 are always the console. */
+static u64 ostrlen(const char *s);
+#define OFD_MAX      12
+#define OFD_CONSOLE  (-2)
+#define STDIN_FILENO  0
+#define STDOUT_FILENO 1
+#define STDERR_FILENO 2
+static int g_ofd[OFD_MAX];
+
+static void stdio_init(void) {
+    for (int i = 0; i < OFD_MAX; i++) g_ofd[i] = -1;
+    g_ofd[STDIN_FILENO] = g_ofd[STDOUT_FILENO] = g_ofd[STDERR_FILENO] = OFD_CONSOLE;
+}
+static int oopen(const char *path) {
+    i64 k = (i64)sysc(SYS_OPEN, (u64)path, 0, 0);
+    if (k < 0) return (int)k;
+    for (int i = 3; i < OFD_MAX; i++) if (g_ofd[i] == -1) { g_ofd[i] = (int)k; return i; }
+    sysc(SYS_CLOSE, (u64)k, 0, 0);
+    return -24;                                          /* EMFILE */
+}
+static i64 owrite(int fd, const char *buf, u64 n) {
+    if (fd < 0 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;          /* EBADF */
+    if (g_ofd[fd] == OFD_CONSOLE) {
+        char line[192];
+        u64 i = 0;
+        while (i < n && i < sizeof line - 1) { line[i] = buf[i]; i++; }
+        line[i] = 0;
+        sysc(SYS_WRITE, (u64)line, 0, 0);
+        return (i64)i;
+    }
+    return (i64)sysc(SYS_WRITE_FILE, (u64)g_ofd[fd], (u64)buf, n);
+}
+static void oputs(const char *s) { owrite(STDOUT_FILENO, s, ostrlen(s)); }
+static i64 oread(int fd, char *buf, u64 n) {
+    if (fd < 0 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;
+    if (g_ofd[fd] == OFD_CONSOLE) return 0;              /* no ring-3 tty input yet */
+    return (i64)sysc(SYS_READ, (u64)g_ofd[fd], (u64)buf, n);
+}
+static int oclose(int fd) {
+    if (fd < 3 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;  /* std three are not closable */
+    sysc(SYS_CLOSE, (u64)g_ofd[fd], 0, 0);
+    g_ofd[fd] = -1;
+    return 0;
+}
+
+/* ---- argc / argv / envp ---------------------------------------------------*/
+static int          g_argc;
+static const char **g_argv;
+static const char **g_envp;
+
+static u64 ostrlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
+static int ostrneq(const char *a, const char *b, int n) {
+    for (int i = 0; i < n; i++) { if (a[i] != b[i]) return 0; if (!a[i]) return 1; }
+    return 1;
+}
+static const char *ogetenv(const char *key) {
+    int kl = 0; while (key[kl]) kl++;
+    for (int i = 0; g_envp && g_envp[i]; i++)
+        if (ostrneq(g_envp[i], key, kl) && g_envp[i][kl] == '=') return g_envp[i] + kl + 1;
+    return 0;
+}
+
+/* ---- POSIX threads -------------------------------------------------------
+ * SYS_THREAD_CREATE gives us a kernel thread sharing this address space with
+ * its own ring-3 stack, entered with RSP pointing at the single argument the
+ * kernel placed there. Everything else — the control blocks, the join
+ * protocol, the mutexes — is userland, built on ordinary atomics over shared
+ * memory, which is what makes it a real shim rather than a kernel service.  */
+#define PTHREAD_MAX 8
+#define THR_USER_V     0x0000560000000000ull      /* mirrors the kernel's window */
+#define THR_STK_STRIDE 0x8000ull
+typedef int pthread_t;
+struct pthr {
+    void *(*fn)(void *);
+    void *arg;
+    void *ret;
+    volatile int state;                            /* 0 free, 1 running, 2 done */
+};
+static struct pthr g_pthr[PTHREAD_MAX];
+
+void pthread_body(struct pthr *t);                 /* called from the trampoline */
+extern void pthread_tramp(void);
+__asm__(
+    ".text\n"
+    ".globl pthread_tramp\n"
+    "pthread_tramp:\n"
+    "  mov (%rsp), %rdi\n"           /* the kernel put our struct pthr * here */
+    "  and $-16, %rsp\n"
+    "  call pthread_body\n"
+    "  xor %edi, %edi\n"
+    "  mov $53, %rax\n"              /* SYS_THREAD_EXIT(0) if the body returns */
+    "  xor %esi, %esi\n"
+    "  xor %edx, %edx\n"
+    "  syscall\n"
+    "1: jmp 1b\n"
+);
+void pthread_body(struct pthr *t) {
+    t->ret = t->fn(t->arg);
+    __sync_synchronize();
+    t->state = 2;
+}
+
+/* Which thread am I? Derived from the stack pointer: the kernel gives thread
+ * slot N the stack window THR_USER_V + N*STRIDE, so the answer is arithmetic on
+ * RSP — no TLS register and no kernel query needed. -1 means the process's
+ * original (main) thread, whose stack is the ordinary one at USTK_V.         */
+static int pthread_self_slot(void) {
+    u64 sp;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
+    if (sp < THR_USER_V) return -1;
+    return (int)((sp - THR_USER_V) / THR_STK_STRIDE);
+}
+
+/* Slots are handed out monotonically and never recycled inside a process, so a
+ * userland index always equals the kernel's stack-window index — which is what
+ * makes pthread_self_slot() above valid. The two allocators are independent, so
+ * we CHECK the agreement instead of assuming it: a mismatch fails the create
+ * loudly rather than silently returning the wrong control block. */
+static volatile int g_pthr_n = 0;
+static int pthread_create(pthread_t *out, void *(*fn)(void *), void *arg) {
+    int i = __sync_fetch_and_add(&g_pthr_n, 1);
+    if (i >= PTHREAD_MAX) { __sync_fetch_and_sub(&g_pthr_n, 1); return -11; }  /* EAGAIN */
+    g_pthr[i].fn = fn; g_pthr[i].arg = arg; g_pthr[i].ret = 0; g_pthr[i].state = 1;
+    __sync_synchronize();
+    i64 k = (i64)sysc(SYS_THREAD_CREATE, (u64)(void *)pthread_tramp, (u64)&g_pthr[i], 0);
+    if (k < 0)   { g_pthr[i].state = 0; __sync_fetch_and_sub(&g_pthr_n, 1); return (int)k; }
+    if (k != i)  { g_pthr[i].state = 0; return -1; }   /* allocators desynced: refuse */
+    if (out) *out = (pthread_t)i;
+    return 0;
+}
+static int pthread_join(pthread_t t, void **ret) {
+    if (t < 0 || t >= PTHREAD_MAX) return -1;
+    for (int spin = 0; spin < 200000; spin++) {
+        if (g_pthr[t].state >= 2) {
+            if (ret) *ret = g_pthr[t].ret;
+            g_pthr[t].state = 3;                  /* joined; the slot is NOT recycled */
+            return 0;
+        }
+        oyield();
+    }
+    return -11;                                   /* join timed out */
+}
+static void pthread_exit(void *ret) {
+    int i = pthread_self_slot();
+    if (i >= 0 && i < PTHREAD_MAX) {
+        g_pthr[i].ret = ret;
+        __sync_synchronize();
+        g_pthr[i].state = 2;
+    }
+    sysc(SYS_THREAD_EXIT, 0, 0, 0);
+    for (;;) { }
+}
+
+typedef struct { volatile int v; } pthread_mutex_t;
+static int pthread_mutex_init(pthread_mutex_t *m)    { m->v = 0; __sync_synchronize(); return 0; }
+static int pthread_mutex_trylock(pthread_mutex_t *m) { return __sync_bool_compare_and_swap(&m->v, 0, 1) ? 0 : -1; }
+static int pthread_mutex_lock(pthread_mutex_t *m) {
+    while (!__sync_bool_compare_and_swap(&m->v, 0, 1)) oyield();
+    return 0;
+}
+static int pthread_mutex_unlock(pthread_mutex_t *m)   { __sync_synchronize(); m->v = 0; return 0; }
+
 /* Load sentinels into callee-saved regs, cross the SYSCALL boundary, and check  */
 /* they survive — proving the kernel preserves (and does not leak into) them.    */
 static int reg_preservation_ok(void) {
@@ -1208,7 +1505,265 @@ static int reg_preservation_ok(void) {
     return (int)ok;
 }
 
-void _start(void) {
+/* ============================================================================
+ * v0.55: POSIX VERIFICATION ROLES (29-34) — the ring-3 half of `posixstrs`
+ * ==========================================================================*/
+
+/* --- role 29: fork / waitpid / SIGCHLD --------------------------------------*/
+static volatile int g_chld_hits = 0;
+static void on_sigchld(int s) { (void)s; g_chld_hits++; }
+
+static void posix_fork_worker(void) {
+    u32 mypid = ogetpid();
+    osigaction(SIGCHLD, on_sigchld);
+    i64 r = ofork();
+    if (r < 0) sysc(SYS_EXIT, 701, 0, 0);
+    if (r == 0) {                                     /* ---- CHILD ---- */
+        /* Prove this really is a child of a real fork: a new pid, our parent's
+         * pid visible through getppid, and the inherited stdout still working. */
+        if (ogetpid() == mypid)   sysc(SYS_EXIT, 43, 0, 0);
+        if (ogetppid() != mypid)  sysc(SYS_EXIT, 44, 0, 0);
+        oputs("  [posix ] forked child alive at ring 3 (inherited stdout)\n");
+        sysc(SYS_EXIT, 42, 0, 0);
+    }
+    /* ---- PARENT ---- */
+    u32 child = (u32)r;
+    i64 code = owaitpid(child, 30000);
+    if (code == -11) sysc(SYS_EXIT, 702, 0, 0);       /* child never finished */
+    if (code != 42)  sysc(SYS_EXIT, 703, 0, 0);       /* wrong exit status    */
+    /* SIGCHLD is posted by the kernel when the child's space is reclaimed; give
+     * the delivery boundary a few syscalls to hand it to our handler.        */
+    for (int i = 0; i < 64 && !g_chld_hits; i++) oyield();
+    if (!g_chld_hits) sysc(SYS_EXIT, 704, 0, 0);
+    sysc(SYS_EXIT, 700, 0, 0);
+}
+
+/* --- role 30: signals ------------------------------------------------------*/
+static volatile int g_segv_hits = 0, g_int_hits = 0, g_alrm_hits = 0;
+static struct ojmp  g_segv_jb;
+
+/* A catchable SIGSEGV cannot simply return: the kernel resumes the faulting
+ * instruction, which would fault forever. Unblock the signal and longjmp out —
+ * the textbook POSIX recovery, and the reason SYS_SIGUNMASK exists.          */
+static void on_sigsegv(int s) {
+    (void)s;
+    g_segv_hits++;
+    osigunmask(SIGSEGV);
+    olongjmp(&g_segv_jb, 1);
+}
+static void on_sigint(int s)  { (void)s; g_int_hits++; }
+static void on_sigalrm(int s) { (void)s; g_alrm_hits++; }
+
+/* SYS_KILL on ourselves, with sentinels in every callee-saved register. The
+ * signal is delivered on the way OUT of that syscall, so by the time the next
+ * instruction runs the handler has been entered, has returned, and
+ * SYS_SIGRETURN has restored the frame. If ANY register — or the syscall's own
+ * return value in RAX — comes back wrong, the frame round-trip is broken.   */
+static int sigint_frame_ok(u32 pid) {
+    u64 ok;
+    __asm__ volatile(
+        "push %%rbx\n push %%r12\n push %%r13\n push %%r14\n push %%r15\n"
+        "movabs $0x1111111111111111, %%rbx\n"
+        "movabs $0x2222222222222222, %%r12\n"
+        "movabs $0x3333333333333333, %%r13\n"
+        "movabs $0x4444444444444444, %%r14\n"
+        "movabs $0x5555555555555555, %%r15\n"
+        "mov $50, %%rax\n"                          /* SYS_KILL(pid, SIGINT)  */
+        "syscall\n"
+        "test %%rax, %%rax\n jnz 1f\n"              /* kill() must still read 0 */
+        "movabs $0x1111111111111111, %%rcx\n cmp %%rcx, %%rbx\n jne 1f\n"
+        "movabs $0x2222222222222222, %%rcx\n cmp %%rcx, %%r12\n jne 1f\n"
+        "movabs $0x3333333333333333, %%rcx\n cmp %%rcx, %%r13\n jne 1f\n"
+        "movabs $0x4444444444444444, %%rcx\n cmp %%rcx, %%r14\n jne 1f\n"
+        "movabs $0x5555555555555555, %%rcx\n cmp %%rcx, %%r15\n jne 1f\n"
+        "mov $1, %%rax\n jmp 2f\n"
+        "1: xor %%rax, %%rax\n"
+        "2:\n"
+        "pop %%r15\n pop %%r14\n pop %%r13\n pop %%r12\n pop %%rbx\n"
+        : "=a"(ok) : "D"((u64)pid), "S"((u64)SIGINT), "d"(0ull)
+        : "rcx", "r11", "memory");
+    return (int)ok;
+}
+
+static void posix_signal_worker(void) {
+    osigaction(SIGSEGV, on_sigsegv);
+    osigaction(SIGINT,  on_sigint);
+    osigaction(SIGALRM, on_sigalrm);
+
+    /* Two wild writes in a row. The second one matters as much as the first:
+     * it only reaches the handler if SYS_SIGUNMASK really cleared the block
+     * sig_deliver installed, so this catches a one-shot-only implementation. */
+    for (int round = 0; round < 2; round++) {
+        if (osetjmp(&g_segv_jb) == 0) {
+            volatile u32 *wild = (volatile u32 *)0x0000500000004000ull;  /* unmapped, in range */
+            *wild = 0xDEADBEEF;                       /* -> SIGSEGV -> handler -> longjmp */
+            sysc(SYS_EXIT, 801, 0, 0);                /* fell through: never delivered   */
+        }
+        if (g_segv_hits != round + 1) sysc(SYS_EXIT, 802, 0, 0);
+    }
+
+    if (!sigint_frame_ok(ogetpid())) sysc(SYS_EXIT, 803, 0, 0);
+    if (g_int_hits < 1)              sysc(SYS_EXIT, 804, 0, 0);
+
+    oalarm(2);                                        /* fires ~2 timer ticks out */
+    for (int i = 0; i < 20000 && !g_alrm_hits; i++) oyield();
+    if (!g_alrm_hits) sysc(SYS_EXIT, 805, 0, 0);
+
+    sysc(SYS_EXIT, 800, 0, 0);
+}
+
+/* --- role 31: pthreads + mutex --------------------------------------------*/
+#define PW_THREADS 4
+#define PW_BUMPS   200
+static pthread_mutex_t g_pw_mutex;
+static volatile u64    g_pw_counter = 0;   /* guarded by g_pw_mutex           */
+static volatile u64    g_pw_racy    = 0;   /* deliberately unguarded, for contrast */
+static volatile int    g_pw_ran[PW_THREADS];
+
+static void *pw_body(void *arg) {
+    int id = (int)(u64)arg;
+    if (id >= 0 && id < PW_THREADS) g_pw_ran[id] = 1;
+    for (int i = 0; i < PW_BUMPS; i++) {
+        pthread_mutex_lock(&g_pw_mutex);
+        u64 v = g_pw_counter;               /* read-modify-write across a yield  */
+        g_pw_counter = v + 1;               /* point: the CS must be atomic      */
+        pthread_mutex_unlock(&g_pw_mutex);
+        g_pw_racy++;
+        if ((i & 31) == 0) oyield();        /* invite interleaving               */
+    }
+    return (void *)(u64)(id + 1);
+}
+
+static void posix_thread_worker(void) {
+    pthread_mutex_init(&g_pw_mutex);
+    /* A fresh mutex must be acquirable exactly once until released. */
+    if (pthread_mutex_trylock(&g_pw_mutex) != 0) sysc(SYS_EXIT, 905, 0, 0);
+    if (pthread_mutex_trylock(&g_pw_mutex) == 0) sysc(SYS_EXIT, 906, 0, 0);
+    pthread_mutex_unlock(&g_pw_mutex);
+
+    pthread_t t[PW_THREADS];
+    for (int i = 0; i < PW_THREADS; i++)
+        if (pthread_create(&t[i], pw_body, (void *)(u64)i) != 0) sysc(SYS_EXIT, 901, 0, 0);
+    for (int i = 0; i < PW_THREADS; i++) {
+        void *ret = 0;
+        if (pthread_join(t[i], &ret) != 0)          sysc(SYS_EXIT, 902, 0, 0);
+        if ((u64)ret != (u64)(i + 1))               sysc(SYS_EXIT, 907, 0, 0);
+    }
+    for (int i = 0; i < PW_THREADS; i++) if (!g_pw_ran[i]) sysc(SYS_EXIT, 904, 0, 0);
+    if (g_pw_counter != (u64)PW_THREADS * PW_BUMPS)  sysc(SYS_EXIT, 903, 0, 0);
+    sysc(SYS_EXIT, 900, 0, 0);
+}
+
+/* --- roles 32/33: execve with argv + envp ---------------------------------*/
+static void posix_exec_parent(void) {
+    static const char *argv[] = { "posix-exec", "MARKER-55", 0 };
+    static const char *envp[] = { "OUTRUN_EXEC=yes", "STAGE=exec", 0 };
+    oexecve(argv, envp, 33);                         /* becomes role 33; never returns */
+    sysc(SYS_EXIT, 921, 0, 0);                       /* execve failed */
+}
+static void posix_exec_child(void) {
+    /* This is the SAME kproc/pid as role 32, running a freshly loaded image.
+     * Its argc/argv/envp came through the kernel's SysV start block. */
+    if (g_argc != 2)                                  sysc(SYS_EXIT, 951, 0, 0);
+    if (!ostrneq(g_argv[1], "MARKER-55", 10))         sysc(SYS_EXIT, 952, 0, 0);
+    const char *v = ogetenv("OUTRUN_EXEC");
+    if (!v || !ostrneq(v, "yes", 4))                  sysc(SYS_EXIT, 953, 0, 0);
+    /* POSIX: execve REPLACES the environment wholesale. The kernel's default
+     * block (PATH/OUTRUN/HOME, which role 34 verifies it does receive) must
+     * therefore be gone here — anything else would be a merge, not an exec. */
+    if (ogetenv("OUTRUN"))                            sysc(SYS_EXIT, 954, 0, 0);
+    if (ogetenv("HOME"))                              sysc(SYS_EXIT, 956, 0, 0);
+    /* exec must have RESET caught dispositions to default (POSIX). */
+    if (g_sighandler[SIGSEGV])                        sysc(SYS_EXIT, 955, 0, 0);
+    sysc(SYS_EXIT, 950, 0, 0);
+}
+
+/* --- role 34: std fd table across fork -----------------------------------*/
+static void posix_fd_worker(void) {
+    /* The kernel's default SysV start block must have reached us: argv[0] is
+     * this image's name and the default environment is present. (Role 33 proves
+     * the complementary case — that execve replaces it.) */
+    if (g_argc < 1 || !g_argv || !g_argv[0] || !g_argv[0][0]) sysc(SYS_EXIT, 970, 0, 0);
+    if (!ogetenv("OUTRUN") || !ogetenv("PATH"))               sysc(SYS_EXIT, 971, 0, 0);
+    /* stdout must be usable the instant crt0 hands control over, and open()
+     * must never hand back 0/1/2 — the whole point of reserving them. */
+    if (owrite(STDOUT_FILENO, "  [posix ] stdout via fd 1\n",
+               ostrlen("  [posix ] stdout via fd 1\n")) <= 0) sysc(SYS_EXIT, 962, 0, 0);
+    if (owrite(STDERR_FILENO, "  [posix ] stderr via fd 2\n",
+               ostrlen("  [posix ] stderr via fd 2\n")) <= 0) sysc(SYS_EXIT, 962, 0, 0);
+    if (oread(STDIN_FILENO, (char *)0, 0) != 0) sysc(SYS_EXIT, 968, 0, 0);  /* stdin: clean EOF */
+
+    int fd = oopen("motd");
+    if (fd >= 0 && fd < 3) sysc(SYS_EXIT, 961, 0, 0);   /* collided with the std three */
+    if (fd >= 3) {
+        char buf[64];
+        if (oread(fd, buf, sizeof buf - 1) <= 0) sysc(SYS_EXIT, 964, 0, 0);
+    }
+
+    i64 r = ofork();
+    if (r == 0) {                                       /* ---- CHILD ---- */
+        /* The userland table is ordinary process memory, so fork inherits it
+         * byte for byte: the child sees the same fd numbers bound the same way,
+         * and the console-backed std three work immediately. The KERNEL
+         * descriptor underneath is deliberately NOT duplicated (each kernel fd
+         * has exactly one owning kproc, which is what lets the teardown hooks
+         * guarantee no leaks) — so a read through an inherited FILE fd must be
+         * DENIED cleanly rather than silently reading another process's file.
+         * That containment is the property asserted here. */
+        if (g_ofd[STDOUT_FILENO] != OFD_CONSOLE) sysc(SYS_EXIT, 963, 0, 0);
+        if (g_ofd[STDERR_FILENO] != OFD_CONSOLE) sysc(SYS_EXIT, 963, 0, 0);
+        oputs("  [posix ] child wrote through the inherited stdout mapping\n");
+        if (fd >= 3) {
+            char b2[64];
+            if (g_ofd[fd] < 0) sysc(SYS_EXIT, 963, 0, 0);        /* table not inherited */
+            if (oread(fd, b2, sizeof b2 - 1) >= 0) sysc(SYS_EXIT, 969, 0, 0);  /* must be denied */
+        }
+        sysc(SYS_EXIT, 42, 0, 0);
+    }
+    if (r < 0) sysc(SYS_EXIT, 965, 0, 0);
+    if (owaitpid((u32)r, 30000) != 42) sysc(SYS_EXIT, 963, 0, 0);
+
+    if (fd >= 3 && oclose(fd) != 0)   sysc(SYS_EXIT, 966, 0, 0);
+    if (oclose(STDOUT_FILENO) == 0)   sysc(SYS_EXIT, 967, 0, 0);  /* stdout is not closable */
+    sysc(SYS_EXIT, 960, 0, 0);
+}
+
+int main(int argc, const char **argv, const char **envp);
+
+/* ---- crt0 -----------------------------------------------------------------
+ * The real ELF entry point. The kernel enters ring 3 with RSP pointing at the
+ * SysV process-start block, so this is the textbook x86-64 crt0: pull argc,
+ * argv and envp off the stack, align, call into C, and turn main's return
+ * value into SYS_EXIT. Written in assembly because a C function cannot make
+ * guarantees about RSP on entry.                                            */
+__asm__(
+    ".text\n"
+    ".globl _start\n"
+    "_start:\n"
+    "  xor %rbp, %rbp\n"
+    "  mov (%rsp), %rdi\n"           /* argc                                  */
+    "  lea 8(%rsp), %rsi\n"          /* argv                                  */
+    "  mov %rdi, %rax\n"
+    "  lea 16(%rsp,%rax,8), %rdx\n"  /* envp = argv + argc + 1                */
+    "  and $-16, %rsp\n"
+    "  call crt0_main\n"
+    "  mov %rax, %rdi\n"             /* exit status = main's return value      */
+    "  mov $2, %rax\n"               /* SYS_EXIT                               */
+    "  xor %esi, %esi\n"
+    "  xor %edx, %edx\n"
+    "  syscall\n"
+    "1: jmp 1b\n"
+);
+
+int crt0_main(int argc, const char **argv, const char **envp);
+int crt0_main(int argc, const char **argv, const char **envp) {
+    g_argc = argc; g_argv = argv; g_envp = envp;
+    stdio_init();                                    /* stdin/stdout/stderr = 0/1/2 */
+    return main(argc, argv, envp);
+}
+
+int main(int argc, const char **argv, const char **envp) {
+    (void)argc; (void)argv; (void)envp;
     u64 role = sysc(SYS_ROLE, 0, 0, 0);
     if (role == 1) { nic_driver();  sysc(SYS_EXIT, 0, 0, 0); }
     if (role == 2) { surface_app(); sysc(SYS_EXIT, 0, 0, 0); }
@@ -1238,6 +1793,12 @@ void _start(void) {
     if (role == 26) { app_harness(1, 0); }              /* v0.54 GUI app: system monitor                      */
     if (role == 27) { app_harness(2, 0); }              /* v0.54 GUI app: file inspector                      */
     if (role == 28) { app_harness(0, 1); }              /* v0.54 GUI app: faults while holding a window       */
+    if (role == 29) { posix_fork_worker(); }            /* v0.55 fork / waitpid / SIGCHLD                     */
+    if (role == 30) { posix_signal_worker(); }          /* v0.55 SIGSEGV recovery, SIGINT frame, SIGALRM      */
+    if (role == 31) { posix_thread_worker(); }          /* v0.55 pthread_create/join/exit + mutex             */
+    if (role == 32) { posix_exec_parent(); }            /* v0.55 execve into role 33 with argv/envp           */
+    if (role == 33) { posix_exec_child(); }             /* v0.55 the exec'd image: verifies argc/argv/envp    */
+    if (role == 34) { posix_fd_worker(); }              /* v0.55 std fd table + inheritance across fork       */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");
@@ -1282,6 +1843,5 @@ void _start(void) {
             }
     }
 
-    sysc(SYS_EXIT, 0, 0, 0);
-    for (;;) { }
+    return 0;                       /* crt0 turns this into SYS_EXIT(0) */
 }

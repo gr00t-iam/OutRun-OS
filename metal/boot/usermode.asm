@@ -45,11 +45,12 @@ global syscall_entry
 global enter_user_mode
 global enter_user_thread
 global enter_user_resume
+global enter_user_ctx
 global resume_kernel
 global set_syscall_stack
 global user_blob_start
 global user_blob_end
-extern syscall_dispatch
+extern syscall_trap
 extern dbg_syscall_exit              ; DEBUG_SYSCALL_EXIT: no-op unless armed (kernel64.c)
 
 section .text
@@ -58,6 +59,12 @@ section .text
 ; GS-relative on every core: N cores can be in here at once, each on its own
 ; cpu_local and its own kernel stack. SFMASK keeps IF off across the two-insn
 ; scratch window, and no other core can touch %gs-addressed state but ours.
+; v0.55: the block below is now the COMPLETE ring-3 register file, not just the
+; caller-saved subset, and its address is handed to C as a 5th argument
+; (`struct sysframe *`). POSIX signals need it: delivering a signal on the way
+; out of a syscall means spilling the interrupted context onto the user stack,
+; and a context missing RBX/RBP/R12-R15 would be restored as garbage by
+; SYS_SIGRETURN. Six extra pushes per syscall buys an honest full context.
 syscall_entry:
     mov [gs:CPUL_USER_RSP], rsp  ; SYSCALL does NOT switch RSP — park user RSP
     mov rsp, [gs:CPUL_SYSCALL_RSP] ; switch to THIS CPU's/thread's kernel stack
@@ -74,13 +81,21 @@ syscall_entry:
     push r8
     push r9
     push r10
-    sub rsp, 8                   ; 9 pushes above -> re-align to 16 for SysV call
+    push rbx                     ; v0.55: callee-saved half — the C dispatcher
+    push rbp                     ;   preserves these for the KERNEL's sake, but
+    push r12                     ;   a signal frame must record the RING-3
+    push r13                     ;   values, so they are captured here.
+    push r14
+    push r15
+    sub rsp, 8                   ; 15 pushes above -> re-align to 16 for SysV call
     ; marshal user (RAX=num, RDI=a0, RSI=a1, RDX=a2) -> SysV(rdi,rsi,rdx,rcx)
+    ; plus a 5th arg (r8) = &sysframe, this block's base.
     mov rcx, rdx                 ; a2 -> 4th C arg
     mov rdx, rsi                 ; a1 -> 3rd C arg
     mov rsi, rdi                 ; a0 -> 2nd C arg
     mov rdi, rax                 ; num -> 1st C arg
-    call syscall_dispatch        ; return value in RAX (SYS_EXIT never returns)
+    mov r8, rsp                  ; 5th C arg: struct sysframe *
+    call syscall_trap            ; return value in RAX (SYS_EXIT never returns)
     add rsp, 8
     ; DEBUG_SYSCALL_EXIT hook: fires for EVERY return value (success or error
     ; alike — this is the one shared epilogue), strictly before any saved
@@ -89,11 +104,17 @@ syscall_entry:
     ; the `add rsp,8` above), THEN push rax so the call's caller-saved
     ; clobbers (rax/rcx/rdx/rsi/rdi/r8-r11) touch nothing the pop sequence
     ; below still needs — those all still live in memory, untouched.
-    mov rdi, [rsp+56]            ; saved user RIP (the pushed RCX slot)
-    mov rsi, [rsp+64]            ; saved user RSP (the parked CPUL_USER_RSP)
+    mov rdi, [rsp+104]           ; saved user RIP (the pushed RCX slot)
+    mov rsi, [rsp+112]           ; saved user RSP (the parked CPUL_USER_RSP)
     push rax                     ; preserve the syscall return value
     call dbg_syscall_exit        ; dbg_syscall_exit(rip, rsp); returns immediately unless armed
     pop rax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
     pop r10
     pop r9
     pop r8
@@ -167,6 +188,38 @@ enter_user_resume:
     push qword [rdi+136]         ; RFLAGS = captured flags (IF was live)
     push qword 0x2B              ; CS     = user code64
     push qword [rdi+120]         ; RIP    = the interrupted instruction
+    mov r15, [rdi+0]
+    mov r14, [rdi+8]
+    mov r13, [rdi+16]
+    mov r12, [rdi+24]
+    mov r11, [rdi+32]
+    mov r10, [rdi+40]
+    mov r9,  [rdi+48]
+    mov r8,  [rdi+56]
+    mov rbp, [rdi+64]
+    mov rsi, [rdi+80]
+    mov rdx, [rdi+88]
+    mov rcx, [rdi+96]
+    mov rbx, [rdi+104]
+    mov rax, [rdi+112]
+    mov rdi, [rdi+72]            ; rdi last — it was the pointer
+    iretq
+
+; ---- void enter_user_ctx(struct uctx *u /*rdi*/) — noreturn ---------------
+; v0.55: enter_user_resume's twin for callers that are ALREADY inside a ring-3
+; excursion — SYS_SIGRETURN and signal delivery on the syscall-return path.
+; Identical restore, but it deliberately does NOT write this core's kernel
+; resume point: doing so would repoint resume_kernel at the syscall frame we
+; are abandoning, breaking the AP/synchronous unwind that is already in flight.
+enter_user_ctx:
+    mov ax, 0x23                 ; user data selectors (before rax is restored)
+    mov ds, ax
+    mov es, ax
+    push qword 0x23              ; SS     = user data
+    push qword [rdi+128]         ; RSP
+    push qword [rdi+136]         ; RFLAGS
+    push qword 0x2B              ; CS     = user code64
+    push qword [rdi+120]         ; RIP
     mov r15, [rdi+0]
     mov r14, [rdi+8]
     mov r13, [rdi+16]

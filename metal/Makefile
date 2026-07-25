@@ -20,7 +20,7 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-VERSION := 0.54.0
+VERSION := 0.55.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean
@@ -45,8 +45,11 @@ $(BUILD)/usermode.o: boot/usermode.asm | $(BUILD)
 $(BUILD)/switch.o: boot/switch.asm | $(BUILD)
 	$(NASM) $< -o $@
 
+# EXTRA lets a fast-iteration build add -D flags without editing this file, e.g.
+#   make EXTRA=-DPOSIX_ITER   -> boot straight into cmd_posix_stress (see kernel64.c)
+EXTRA   ?=
 $(BUILD)/kernel64.o: kernel/kernel64.c | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(EXTRA) -c $< -o $@
 
 # ---- polyglot: Rust (no_core) + C++ (freestanding) linked into the kernel ---
 RUSTFLAGS := --edition 2021 --target x86_64-unknown-none -C panic=abort \
