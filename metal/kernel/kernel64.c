@@ -4167,7 +4167,7 @@ static int ofile_claim(int owner, int volume, int dirent) {
     klock_release(&g_ofile_lock);
     return -1;
 }
-static int vfs_open_for(const char *name, int owner) {
+static int vfs_open_for(const char *name, int owner, int creat) {
     if (path_has_prefix(name, "tmp/")) {
         const char *rest = name + 4;
         klock_acquire(&g_vfs_lock);
@@ -4187,11 +4187,27 @@ static int vfs_open_for(const char *name, int owner) {
 
     klock_acquire(&g_vfs_lock);
     int di = vfs_find(name);
+    /* v0.56: O_CREAT for ROOT. A toolchain has to be able to AUTHOR files — a
+     * compiler that can only overwrite names the kernel pre-seeded is not a
+     * toolchain — but creation must be REQUESTED, never implicit: making plain
+     * open() create was tried first and broke six suites at once, because every
+     * "prove this name is gone" check silently created the name it was checking
+     * for. The new dirent is claimed under the same lock that found it missing,
+     * so two cores opening the same new path cannot both claim a slot. */
+    if (di < 0 && creat) {
+        for (int i = 0; i < VFS_MAXFILES; i++) if (!DENTS[i].used) {
+            cmemset(&DENTS[i], 0, 256);
+            kstrcpy_n(DENTS[i].name, name, VFS_NAME_MAX);
+            DENTS[i].used = 1; DENTS[i].len = 0; DENTS[i].nchunks = 0;
+            di = i; break;
+        }
+    }
     klock_release(&g_vfs_lock);                /* released BEFORE the fd claim  */
     if (di < 0) return -1;
     return ofile_claim(owner, VOL_ROOT, di);
 }
-static int vfs_open(const char *name) { return vfs_open_for(name, (int)current_proc_idx); }
+static int vfs_open(const char *name) { return vfs_open_for(name, (int)current_proc_idx, 0); }
+static int vfs_open_creat(const char *name) { return vfs_open_for(name, (int)current_proc_idx, 1); }
 
 /* ===========================================================================
  * v0.48: SYS_VFS_UNLINK — zero the dirent, journal-commit the directory
@@ -8018,7 +8034,9 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         char name[64];
         if (copy_user_str(kprocs[current_proc_idx].cr3, a0, name, sizeof name) < 0) return (uint64_t)-14;
         fs_witness_enter();
-        int fd = vfs_open(name);
+        /* v0.56: a1 is now a flags word; bit 0 is O_CREAT. Every pre-v0.56
+         * caller passes 0, so plain open keeps failing on a missing name. */
+        int fd = (a1 & 1) ? vfs_open_creat(name) : vfs_open(name);
         fs_witness_leave();
         return (uint64_t)(int64_t)fd;
     }
@@ -9609,7 +9627,14 @@ static void cmd_cio(void) {
     int all;
     for (;;) {
         all = 1;
-        for (int i = 0; i < NW; i++) if (!kprocs[w[i]].exited) all = 0;
+        /* v0.56: wait for torn_down, NOT exited. `exited` flips true as soon as
+         * the ring-3 excursion returns, while descriptor_teardown_kproc and the
+         * rest of the teardown chain run AFTER it; torn_down is set last,
+         * strictly after all of it. Sampling the fd table on `exited` therefore
+         * races a teardown still in flight and reports a leak that is really
+         * just work in progress — observed intermittently once the ring-3 image
+         * grew and shifted every timing window in the boot. */
+        for (int i = 0; i < NW; i++) if (!kprocs[w[i]].torn_down) all = 0;
         if (all || g_ticks - t0 > 6000) break;
         __asm__ volatile("pause");
     }
@@ -9821,7 +9846,7 @@ static void cmd_smp_stress(void) {
     uint64_t t0 = g_ticks;                             /* join + watchdog (deadlock proxy) */
     for (;;) {
         int all = 1;
-        for (int i = 0; i < STRESS_N; i++) if (!kprocs[procs[i]].exited) all = 0;
+        for (int i = 0; i < STRESS_N; i++) if (!kprocs[procs[i]].torn_down) all = 0;
         if (all || g_ticks - t0 > 4000) break;
         if (n > 1) lapic_ipi(0, IPI_PING, 1);
         uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
@@ -10036,7 +10061,7 @@ static void cmd_dma_stress(void) {
     uint64_t t0 = g_ticks;
     for (;;) {
         int all = 1;
-        for (int i = 0; i < DMASTRESS_N; i++) if (!kprocs[procs[i]].exited) all = 0;
+        for (int i = 0; i < DMASTRESS_N; i++) if (!kprocs[procs[i]].torn_down) all = 0;
         if (all || g_ticks - t0 > 4000) break;
         if (n > 1) lapic_ipi(0, IPI_PING, 1);
         uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
@@ -11385,6 +11410,11 @@ static void cmd_vfs(void) {
      * stored at all, and "/bin/init" needs Stage B's widened path names. */
     vfs_write_file("/bin/init", (const void *)g_user_elf,
                    (uint32_t)(g_user_elf_end - g_user_elf));
+    /* /bin/occ is the SAME image under a second name: the compiler is a role of
+     * the one ring-3 binary, dispatched by argv[0] the way a multi-call binary
+     * works. CAS dedup means the second name costs one dirent and no blocks. */
+    vfs_write_file("/bin/occ", (const void *)g_user_elf,
+                   (uint32_t)(g_user_elf_end - g_user_elf));
     vfs_write_file("motd", motd, cstrlen(motd) + 1);
     vfs_write_file("readme", big, 1400);
     uint64_t motd_hash_v1 = DENTS[vfs_find("motd")].file_hash;
@@ -12551,6 +12581,129 @@ static void cmd_posix_stress(void) {
     if (!g_pxfail)
         kputs("[posixstrs] POSIX STRESS VERIFIED — fork/exec/waitpid, signal frames and pthread mutexes leak-free\n");
     else kputs("[posixstrs] POSIX STRESS DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.56: TOOLCHAIN STRESS — native self-hosting, end to end
+ * ===========================================================================
+ * One ring-3 worker per round does the whole loop with no host toolchain in
+ * sight: it AUTHORS a C source file into the VFS, forks and execs the native
+ * compiler as a separate process, and then forks and execs the ELF that
+ * compiler produced, checking the answer it computes.
+ *
+ * The kernel half then verifies from outside what ring 3 cannot honestly claim
+ * about itself: that a genuinely new executable appeared in the filesystem,
+ * that it is a well-formed 3-segment ELF, and — the one that matters most —
+ * that its segments obey W^X, because a compiler able to emit a
+ * writable+executable image would quietly undo a policy the whole system rests
+ * on. That check reads the produced file's own program headers rather than
+ * trusting elf_load to have rejected it.                                    */
+#define TOOLCHAIN_ROUNDS 2
+static int g_tcpass, g_tcfail;
+static void tccheck(const char *n, int c) {
+    if (c) { g_tcpass++; kprintf("[toolstrs]  PASS  %s\n", n); }
+    else   { g_tcfail++; kprintf("[toolstrs]  FAIL  %s\n", n); }
+}
+
+static void cmd_selfhost_test(void) {
+    kputs("-- TOOLCHAIN STRESS: author -> compile -> run, natively in ring 3 --\n");
+    g_tcpass = g_tcfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    if (!g_cas_mounted) { tccheck("CAS mounted before the toolchain can run", 0);
+        kprintf("[toolstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_tcpass, (uint64_t)g_tcfail);
+        return; }
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    /* wx_ok and elf_ok start at 0 and are only RAISED by an actual successful
+     * audit of a real produced binary. Starting them at 1 made them pass
+     * vacuously in the very first run, when no file had been produced at all —
+     * a check that reports success for work that never happened is worse than
+     * no check. `audited` counts the rounds that genuinely got that far. */
+    int rounds_ok = 1, produced_ok = 1, audited = 0;
+    int wx_ok = 0, elf_ok = 0;
+    int rnd;
+
+    for (rnd = 0; rnd < TOOLCHAIN_ROUNDS; rnd++) {
+        /* remove any previous output so "it appeared" means something */
+        if (vfs_find("/bin/t.elf") >= 0) vfs_unlink("/bin/t.elf");
+
+        int p = kproc_spawn("selfhost", PCAP_FILESYSTEM);
+        if (p < 0) { tccheck("kproc_spawn never fails mid-storm", 0); rounds_ok = 0; break; }
+        kprocs[p].role = 38;
+        uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!e) { tccheck("the driver's ELF loads", 0); rounds_ok = 0; break; }
+        kprocs[p].entry = e;
+        uint32_t drv_pid = kprocs[p].pid;
+
+        struct px_round R;
+        for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+        R.nchild = 0; R.pid[0] = drv_pid;
+        int procs[1]; procs[0] = p;
+        rq_push(0, p);
+        __sync_synchronize();
+        if (n > 1) lapic_ipi(0, IPI_PING, 1);
+        /* Generous: this round runs a real compiler and two more processes. */
+        if (!posix_drain(procs, 1, &R, 12000)) {
+            kprintf("[toolstrs] round %d WATCHDOG: the toolchain did not finish\n", rnd);
+            rounds_ok = 0; current_proc_idx = save; break;
+        }
+        current_proc_idx = save;
+        if (R.code[0] != 940) {
+            kprintf("[toolstrs] round %d driver FAILED: exit %u (want 940)\n", rnd, R.code[0]);
+            rounds_ok = 0;
+        }
+
+        /* A new executable really exists in the filesystem. */
+        int oi = vfs_find("/bin/t.elf");
+        if (oi < 0 || DENTS[oi].len < 64) { produced_ok = 0; continue; }
+        kprintf("[toolstrs] round %d: occ emitted /bin/t.elf, %u bytes, %u chunk(s)\n",
+                rnd, (uint64_t)DENTS[oi].len, (uint64_t)DENTS[oi].nchunks);
+
+        /* Read it back and audit its OWN program headers. */
+        static uint8_t img[16384];
+        int64_t got = vfs_read_file(oi, img, sizeof img);
+        struct elf64_hdr *eh = (struct elf64_hdr *)img;
+        int hdr_ok = got > 64 && eh->ident[0] == 0x7F && eh->ident[1] == 'E' &&
+                     eh->ident[2] == 'L' && eh->ident[3] == 'F' &&
+                     eh->machine == 0x3E && eh->phnum == 3;
+        if (!hdr_ok) { continue; }
+        int rx = 0, ro = 0, rw = 0, wx_bad = 0;
+        for (int i = 0; i < eh->phnum; i++) {
+            struct elf64_phdr *ph = (struct elf64_phdr *)(img + eh->phoff + (uint64_t)i * eh->phentsize);
+            if (ph->type != 1) continue;
+            if ((ph->flags & 0x3) == 0x3) wx_bad = 1;     /* writable AND executable */
+            if (ph->flags == 5) rx++;
+            if (ph->flags == 4) ro++;
+            if (ph->flags == 6) rw++;
+        }
+        audited++;
+        elf_ok = (rx == 1 && ro == 1 && rw == 1);
+        wx_ok  = !wx_bad;
+    }
+
+    tccheck("every round authored, compiled and ran a program (driver exited 940)",
+            rnd == TOOLCHAIN_ROUNDS && rounds_ok);
+    tccheck("the compiler produced a new executable in the VFS", produced_ok);
+    tccheck("its output is a well-formed 3-segment x86-64 ELF (R+X, R, R+W)",
+            audited == TOOLCHAIN_ROUNDS && elf_ok);
+    tccheck("NO segment it emits is both writable and executable (W^X holds for compiler output)",
+            audited == TOOLCHAIN_ROUNDS && wx_ok);
+
+    uint64_t freed_total = g_frames_freed - freed0, reused_total = g_frames_reused - reused0;
+    kprintf("[toolstrs] +%u freed, +%u reused; global depth %u\n",
+            freed_total, reused_total, g_frame_free_depth);
+    tccheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    tccheck("no lock-rank violation across the toolchain paths", g_rank_violations == viol0);
+
+    kprintf("[toolstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_tcpass, (uint64_t)g_tcfail);
+    if (!g_tcfail)
+        kputs("[toolstrs] SELF-HOSTING VERIFIED — OutRun compiled and ran a program with no host toolchain\n");
+    else kputs("[toolstrs] SELF-HOSTING DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -14730,6 +14883,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "wimpstress")) cmd_wimp_stress();
     else if (!kstrcmp(argv[0], "appsstress")) cmd_apps_stress();
     else if (!kstrcmp(argv[0], "posixstress")) cmd_posix_stress();
+    else if (!kstrcmp(argv[0], "toolchainstress")) cmd_selfhost_test();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -14911,6 +15065,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_wimp_stress();      /* v0.53: ring-3 WIMP window create/manage/close churn + WM logic, incl. client faults */
     cmd_apps_stress();      /* v0.54: concurrent ring-3 GUI apps (terminal/sysmon/filer), incl. app crashes */
     cmd_posix_stress();     /* v0.55: fork/exec chains, signal frames, pthread mutexes under SMP */
+    cmd_selfhost_test();    /* v0.56: author -> compile -> run, natively (no host toolchain)     */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();

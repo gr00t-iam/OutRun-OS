@@ -1346,13 +1346,19 @@ static void stdio_init(void) {
     for (int i = 0; i < OFD_MAX; i++) g_ofd[i] = -1;
     g_ofd[STDIN_FILENO] = g_ofd[STDOUT_FILENO] = g_ofd[STDERR_FILENO] = OFD_CONSOLE;
 }
-static int oopen(const char *path) {
-    i64 k = (i64)sysc(SYS_OPEN, (u64)path, 0, 0);
+/* v0.56: O_CREAT is bit 0 of the flags word. Creation is explicit — plain
+ * oopen() still fails on a missing name, which is what every pre-existing
+ * "prove this file is gone" check depends on. */
+#define O_CREAT 1
+static int oopen_flags(const char *path, u64 flags) {
+    i64 k = (i64)sysc(SYS_OPEN, (u64)path, flags, 0);
     if (k < 0) return (int)k;
     for (int i = 3; i < OFD_MAX; i++) if (g_ofd[i] == -1) { g_ofd[i] = (int)k; return i; }
     sysc(SYS_CLOSE, (u64)k, 0, 0);
     return -24;                                          /* EMFILE */
 }
+static int oopen(const char *path)  { return oopen_flags(path, 0); }
+static int ocreat(const char *path) { return oopen_flags(path, O_CREAT); }
 static i64 owrite(int fd, const char *buf, u64 n) {
     if (fd < 0 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;          /* EBADF */
     if (g_ofd[fd] == OFD_CONSOLE) {
@@ -1901,6 +1907,25 @@ static void posix_heap_worker(void) {
     sysc(SYS_EXIT, 980, 0, 0);
 }
 
+/* ============================================================================
+ * v0.56 Stage E: the native compiler is part of this image (see user/occ.c).
+ * Included rather than linked because the Makefile builds exactly one ring-3
+ * translation unit; occ uses this file's heap, fd table and string helpers.
+ * ==========================================================================*/
+#include "occ.c"
+
+/* --- role 37: run occ ------------------------------------------------------
+ * argv is the command line: occ <source.c> <output.elf>. Diagnostics go to
+ * stderr, so a compile error lands in the Cyber-Terminal like any other
+ * program's output. Exit status is 0 on success. */
+static void occ_main(int argc, const char **argv) {
+    const char *src = (argc >= 2) ? argv[1] : "/src/hello.c";
+    const char *out = (argc >= 3) ? argv[2] : "/bin/a.out";
+    int r = occ_compile(src, out);
+    if (r == 0) oputs("  [occ   ] compiled OK\n");
+    sysc(SYS_EXIT, r == 0 ? 0 : (u64)(900 + (-r)), 0, 0);
+}
+
 /* --- role 36: execve BY PATH ----------------------------------------------
  * Replaces this image with /bin/init loaded out of the VFS. The exec'd copy is
  * the same program, so it must be told what to do through argv rather than
@@ -1912,6 +1937,60 @@ static void posix_execpath_worker(void) {
     static const char *envp[] = { "EXECD_BY=path", 0 };
     oexecve("/bin/init", argv, envp);          /* never returns on success */
     sysc(SYS_EXIT, 971, 0, 0);                 /* execve failed */
+}
+
+/* --- role 38: SELF-HOSTING ------------------------------------------------
+ * The whole point of the milestone in one worker: author a C source file from
+ * ring 3, compile it with the native compiler running as a separate process,
+ * then run the binary that compiler produced. Nothing here touches a host
+ * toolchain, and the only thing linking the three steps is the filesystem.
+ *
+ * Exit 940 = the produced binary ran and returned the right answer. */
+#define SELF_SRC \
+  "int fib(int n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }\n" \
+  "int main() {\n" \
+  "  int s; int i;\n" \
+  "  s = 0;\n" \
+  "  for (i = 0; i < 8; i = i + 1) { s = s + i; }\n" \
+  "  __syscall(0, \"  [a.out ] compiled by occ, running natively at ring 3\\n\", 0, 0);\n" \
+  "  return s + fib(10);\n" \
+  "}\n"
+
+static void posix_selfhost_worker(void) {
+    static const char *csrc = SELF_SRC;
+    /* 1. author the source into the VFS */
+    int fd = ocreat("/src/t.c");
+    if (fd < 0)                                   sysc(SYS_EXIT, 941, 0, 0);
+    if (owrite(fd, csrc, ostrlen(csrc) + 1) <= 0) sysc(SYS_EXIT, 942, 0, 0);
+    oclose(fd);
+
+    /* 2. compile it, in a separate process running the real compiler */
+    i64 pid = ofork();
+    if (pid == 0) {
+        static const char *av[] = { "/bin/occ", "/src/t.c", "/bin/t.elf", 0 };
+        static const char *ev[] = { "STAGE=compile", 0 };
+        oexecve("/bin/occ", av, ev);
+        sysc(SYS_EXIT, 199, 0, 0);                /* exec failed */
+    }
+    if (pid < 0)                                  sysc(SYS_EXIT, 943, 0, 0);
+    i64 cst = owaitpid((u32)pid, 60000);
+    if (cst != 0)                                 sysc(SYS_EXIT, 944, 0, 0);
+
+    /* 3. run what the compiler produced */
+    pid = ofork();
+    if (pid == 0) {
+        static const char *av2[] = { "/bin/t.elf", 0 };
+        static const char *ev2[] = { 0 };
+        oexecve("/bin/t.elf", av2, ev2);
+        sysc(SYS_EXIT, 198, 0, 0);
+    }
+    if (pid < 0)                                  sysc(SYS_EXIT, 945, 0, 0);
+    i64 rst = owaitpid((u32)pid, 60000);
+    /* 0+1+..+7 = 28, fib(10) = 55, so main() returns 83 */
+    if (rst != 83)                                sysc(SYS_EXIT, 946, 0, 0);
+
+    oputs("  [self  ] authored, compiled and RAN a program without a host toolchain\n");
+    sysc(SYS_EXIT, 940, 0, 0);
 }
 
 int main(int argc, const char **argv, const char **envp);
@@ -1955,6 +2034,12 @@ int main(int argc, const char **argv, const char **envp) {
      * the role dispatch precisely so the path-loaded copy takes this branch
      * instead of re-running whatever role its kproc still carries (which would
      * exec itself forever). */
+    /* v0.56: a path-exec'd image is dispatched by ARGV[0], the way a real system
+     * dispatches a multi-call binary. /bin/occ and /bin/init are the same ELF;
+     * what differs is the name it was invoked under. */
+    if (argc >= 1 && argv && argv[0] && ostrneq(argv[0], "/bin/occ", 9)) {
+        occ_main(argc, argv);
+    }
     if (argc >= 2 && argv && argv[1] && ostrneq(argv[1], "exec-child", 11)) {
         if (!ostrneq(argv[0], "/bin/init", 10))            sysc(SYS_EXIT, 972, 0, 0);
         const char *v = ogetenv("EXECD_BY");
@@ -1999,6 +2084,8 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 34) { posix_fd_worker(); }              /* v0.55 std fd table + inheritance across fork       */
     if (role == 35) { posix_heap_worker(); }            /* v0.56 ring-3 heap: sbrk/malloc/free/realloc        */
     if (role == 36) { posix_execpath_worker(); }        /* v0.56 execve /bin/init BY PATH from the VFS        */
+    if (role == 37) { occ_main(argc, argv); }           /* v0.56 the native C compiler                        */
+    if (role == 38) { posix_selfhost_worker(); }        /* v0.56 author -> compile -> run, natively           */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");
