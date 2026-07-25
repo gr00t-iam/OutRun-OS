@@ -3551,7 +3551,30 @@ static int     g_cas_legacy  = 0;      /* v0.48: mounted a pre-journal (version 
                                                /* fixed name ("vfio-devid") for cmd_vfio_stress; */
                                                /* v0.48: +2 fixed names ("vfs-stress",       */
                                                /* "vfs-crash-test") for cmd_vfs_stress        */
-#define VFS_MAX_CHUNKS 16                     /* 16 * 512 = 8 KiB max file       */
+/* v0.56: VFS_MAX_CHUNKS is now the count of DIRECT chunk hashes stored inline
+ * in the dirent — the unchanged fast path for every small file, and the reason
+ * the on-disk dirent layout (and therefore the journal and cross-reboot
+ * recovery) is not broken by this change. Beyond 8 KiB a file grows through a
+ * classic Unix-style INDIRECT CHUNK MAP: one single-indirect block of 64 chunk
+ * hashes, then one double-indirect block of 64 single-indirect blocks.
+ *
+ * Indirect blocks are themselves ordinary 512-byte CAS objects, put and got
+ * with cas_put/cas_get like any content — so they inherit dedup, the metadata
+ * journal, and the existing lock ranks for free rather than needing a second
+ * storage mechanism.
+ *
+ *   direct                     16 chunks       8 KiB
+ *   + single-indirect          64 chunks      32 KiB
+ *   + double-indirect    64*64 chunks       2 MiB   (ceiling of the format)
+ *
+ * The practical ceiling is set by VFS_MAX_FILE_BYTES below, which sizes the
+ * kernel's staging buffers; the format itself reaches ~2 MiB. A native
+ * toolchain needs this: /bin/occ alone is far past 8 KiB. */
+#define VFS_MAX_CHUNKS 16                     /* DIRECT chunk hashes, inline in dirent */
+#define VFS_IND_PER_BLK (CAS_BS / 8)          /* 64 hashes per indirect block          */
+#define VFS_CHUNKS_L1   (VFS_MAX_CHUNKS + VFS_IND_PER_BLK)                  /* 80  */
+#define VFS_CHUNKS_MAX  (VFS_CHUNKS_L1 + VFS_IND_PER_BLK * VFS_IND_PER_BLK) /* 4176 */
+#define VFS_MAX_FILE_BYTES (256u * 1024u)     /* staging-buffer ceiling: 512 chunks    */
 /* v0.48: the ACTUAL number of 512B blocks needed to hold VFS_MAXFILES 256-byte
  * dirents — cas_format()/vfs_flush()/cas_mount() used to hardcode "8", which
  * was only ever correct for the original VFS_MAXFILES==16 (8*512/256==16).
@@ -3567,9 +3590,18 @@ struct dirent {
     uint32_t nchunks;
     uint32_t _pad;
     uint64_t file_hash;                       /* hash of whole content (identity) */
-    uint64_t chunk_hash[VFS_MAX_CHUNKS];      /* per-512B-block content hashes    */
-    uint8_t  reserved[72];                    /* pad dirent to exactly 256 bytes  */
+    uint64_t chunk_hash[VFS_MAX_CHUNKS];      /* DIRECT per-512B-block hashes     */
+    /* v0.56: indirect chunk map. Both are CAS hashes of 512-byte blocks holding
+     * 64 uint64 hashes each; 0 means "this level is unused". Carved out of the
+     * old reserved[] so the dirent stays EXACTLY 256 bytes — the on-disk
+     * directory layout, VFS_DIR_BLOCKS, the journal record and cas_mount's
+     * restore all keep working unchanged, and a v0.55 volume still mounts. */
+    uint64_t ind1_hash;                       /* -> 64 chunk hashes              */
+    uint64_t ind2_hash;                       /* -> 64 single-indirect blocks    */
+    uint8_t  reserved[56];                    /* pad dirent to exactly 256 bytes  */
 } __attribute__((packed));
+/* Compile-time guard: if this ever trips, the on-disk layout has been broken. */
+_Static_assert(sizeof(struct dirent) == 256, "dirent must stay exactly 256 bytes");
 static uint8_t g_dir[VFS_MAXFILES * 256] __attribute__((aligned(512)));
 #define DENTS ((struct dirent *)g_dir)
 
@@ -3890,18 +3922,73 @@ static void vfs_journal_apply(void) {
  * writers creating the same (or a new) name can no longer both claim a slot.
  * The internal body assumes the lock is HELD; the two entry points below own
  * the acquire so name-based and dirent-based callers share one code path.    */
+/* v0.56: resolve chunk `i` of a file to its CAS hash, walking the indirect map
+ * when the index runs past the inline direct hashes. Callers hold g_vfs_lock;
+ * cas_get is rank 3, strictly above it, so the ordering is unchanged. Returns 0
+ * for a missing/absent chunk, which reads treat as end-of-data. */
+static uint64_t vfs_chunk_hash_at(const struct dirent *d, uint32_t i) {
+    if (i < VFS_MAX_CHUNKS) return d->chunk_hash[i];
+    uint64_t blk[VFS_IND_PER_BLK];
+    if (i < VFS_CHUNKS_L1) {                               /* single-indirect     */
+        if (!d->ind1_hash) return 0;
+        if (cas_get(d->ind1_hash, blk, sizeof blk) < 0) return 0;
+        return blk[i - VFS_MAX_CHUNKS];
+    }
+    uint32_t j = i - VFS_CHUNKS_L1;                        /* double-indirect     */
+    if (j >= VFS_IND_PER_BLK * VFS_IND_PER_BLK || !d->ind2_hash) return 0;
+    if (cas_get(d->ind2_hash, blk, sizeof blk) < 0) return 0;
+    uint64_t l1 = blk[j / VFS_IND_PER_BLK];
+    if (!l1) return 0;
+    if (cas_get(l1, blk, sizeof blk) < 0) return 0;
+    return blk[j % VFS_IND_PER_BLK];
+}
+
 static int vfs_write_locked(int idx, const char *name, const void *data, uint32_t len) {
+    /* v0.56: refuse an oversized write instead of silently truncating it. The
+     * old code clamped nchunks to 16 but still recorded the FULL len, so a
+     * >8 KiB write produced a dirent whose length disagreed with its content —
+     * data loss reported as success. Now the caller gets -1. */
+    if (len > VFS_MAX_FILE_BYTES) {
+        kprintf("[vfs    ] reject '%s': %u bytes exceeds the %u-byte file ceiling\n",
+                name, (uint64_t)len, (uint64_t)VFS_MAX_FILE_BYTES);
+        return -1;
+    }
     struct dirent *d = &DENTS[idx];
     cmemset(d, 0, 256);
-    kstrcpy_n(d->name, name, 32);
+    kstrcpy_n(d->name, name, (int)sizeof d->name);
     d->used = 1; d->len = len;
     uint32_t nch = (len + 511) / 512;
-    if (nch > VFS_MAX_CHUNKS) nch = VFS_MAX_CHUNKS;
     d->nchunks = nch;
     const uint8_t *p = data;
+    /* Every chunk's hash first; the indirect blocks are then built FROM this
+     * array, which keeps the CAS traffic in one direction (content, then map). */
+    static uint64_t ch[VFS_MAX_FILE_BYTES / 512];
     for (uint32_t i = 0; i < nch; i++) {
         uint32_t cl = len - i * 512; if (cl > 512) cl = 512;
-        d->chunk_hash[i] = cas_put(p + i * 512, cl);       /* CAS stores each block */
+        ch[i] = cas_put(p + i * 512, cl);                  /* CAS stores each block */
+    }
+    for (uint32_t i = 0; i < nch && i < VFS_MAX_CHUNKS; i++) d->chunk_hash[i] = ch[i];
+    if (nch > VFS_MAX_CHUNKS) {                            /* single-indirect     */
+        uint64_t blk[VFS_IND_PER_BLK];
+        for (uint32_t k = 0; k < VFS_IND_PER_BLK; k++) {
+            uint32_t src = VFS_MAX_CHUNKS + k;
+            blk[k] = (src < nch) ? ch[src] : 0;
+        }
+        d->ind1_hash = cas_put(blk, sizeof blk);
+    }
+    if (nch > VFS_CHUNKS_L1) {                             /* double-indirect     */
+        uint64_t l1[VFS_IND_PER_BLK], top[VFS_IND_PER_BLK];
+        uint32_t rem = nch - VFS_CHUNKS_L1;
+        uint32_t nl1 = (rem + VFS_IND_PER_BLK - 1) / VFS_IND_PER_BLK;
+        for (uint32_t g = 0; g < VFS_IND_PER_BLK; g++) {
+            if (g >= nl1) { top[g] = 0; continue; }
+            for (uint32_t k = 0; k < VFS_IND_PER_BLK; k++) {
+                uint32_t src = VFS_CHUNKS_L1 + g * VFS_IND_PER_BLK + k;
+                l1[k] = (src < nch) ? ch[src] : 0;
+            }
+            top[g] = cas_put(l1, sizeof l1);
+        }
+        d->ind2_hash = cas_put(top, sizeof top);
     }
     d->file_hash = len ? rust_cas_hash((uint64_t)data, len) : 0;
     vfs_journal_commit();          /* v0.48: journal-commit; see comment above */
@@ -3937,7 +4024,9 @@ static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
     uint32_t got = 0;
     uint8_t tmp[512];
     for (uint32_t i = 0; i < d->nchunks; i++) {
-        cas_get(d->chunk_hash[i], tmp, 512);   /* rank 2 -> 3: strictly upward  */
+        uint64_t h = vfs_chunk_hash_at(d, i);   /* v0.56: walks the indirect map */
+        if (!h) break;                          /* absent chunk: stop, don't lie  */
+        cas_get(h, tmp, 512);                  /* rank 2 -> 3: strictly upward  */
         uint32_t cl = d->len - i * 512; if (cl > 512) cl = 512;
         for (uint32_t j = 0; j < cl && got < max; j++) ((uint8_t *)buf)[got++] = tmp[j];
     }
@@ -10379,6 +10468,46 @@ static void cmd_vfs_stress(void) {
                            kprintf("[vfsstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_vfspass, (uint64_t)g_vfsfail);
                            return; }
 
+    /* ===== v0.56: LARGE-FILE CHUNK MAP =====================================
+     * Every tier of the new indirect map, round-tripped through real CAS blocks
+     * on the real virtio-blk device. The sizes land one tier past each boundary
+     * so a broken level cannot hide: 8 KiB is direct-only, 36 KiB needs the
+     * single-indirect block, and 100 KiB needs the double-indirect block (200
+     * chunks, well past the 80 reachable without it).
+     *
+     * These reuse the suite's OWN existing name "vfs-stress" rather than adding
+     * dirents: VFS_MAXFILES feeds VFS_DIR_BLOCKS, so a new name would change the
+     * on-disk directory region size and stop existing volumes from mounting.
+     * The suite re-seeds that name immediately below, so borrowing it is free. */
+    {
+        static uint8_t bigw[100u * 1024], bigr[100u * 1024];
+        static const uint32_t sizes[3]  = { 8u * 1024, 36u * 1024, 100u * 1024 };
+        static const char *checks[3] = {
+            "large-file chunk map: DIRECT tier (8 KiB) round-trips byte-for-byte",
+            "large-file chunk map: SINGLE-indirect tier (36 KiB) round-trips byte-for-byte",
+            "large-file chunk map: DOUBLE-indirect tier (100 KiB) round-trips byte-for-byte",
+        };
+        for (int t = 0; t < 3; t++) {
+            uint32_t sz = sizes[t];
+            for (uint32_t i = 0; i < sz; i++)          /* differs per 512B block too */
+                bigw[i] = (uint8_t)((i * 31u + (i / 512u) * 7u + (uint32_t)t) & 0xFF);
+            for (uint32_t i = 0; i < sz; i++) bigr[i] = 0;
+            int wi = vfs_write_file("vfs-stress", bigw, sz);
+            int64_t got = (wi >= 0) ? vfs_read_file(wi, bigr, sz) : -1;
+            int same = (got == (int64_t)sz);
+            for (uint32_t i = 0; i < sz && same; i++) if (bigr[i] != bigw[i]) same = 0;
+            kprintf("[vfsstrs] chunk map tier %d: wrote %u, read back %d, %u chunk(s)\n",
+                    t, (uint64_t)sz, got, (uint64_t)(wi >= 0 ? DENTS[wi].nchunks : 0));
+            vfscheck(checks[t], same);
+        }
+        /* Past the ceiling: must be REFUSED. This used to be silent data loss —
+         * nchunks was clamped to 16 while len recorded the full size, so the
+         * dirent claimed content it did not store. The size check now runs
+         * BEFORE the dirent is touched, so a rejected write is also atomic. */
+        int rej = vfs_write_file("vfs-stress", bigw, VFS_MAX_FILE_BYTES + 1);
+        vfscheck("a write past the file ceiling is refused, not silently truncated", rej < 0);
+    }
+
     static const uint8_t seed[16] = "VFS-SEED-PATTERN";
     /* baseline is measured AFTER round 0 (the round that FIRST creates
      * tmp/scratch and first re-seeds+unlinks vfs-stress) — round 0 is
@@ -10992,7 +11121,7 @@ static int uthread_spawn_elf(const char *label, uint64_t caps, uint64_t role, in
 
 /* sys_exec: load an ELF whose segments come straight from CAS storage (by     */
 /* VFS name -> content hashes -> blocks) instead of the in-memory GRUB module. */
-static uint8_t g_execbuf[VFS_MAX_CHUNKS * 512] __attribute__((aligned(16)));
+static uint8_t g_execbuf[VFS_MAX_FILE_BYTES] __attribute__((aligned(16)));
 static int exec_from_cas(const char *name, int proc_idx) {
     int di = vfs_find(name);
     if (di < 0) { kprintf("[exec   ] '%s' not found in VFS\n", name); return -1; }
