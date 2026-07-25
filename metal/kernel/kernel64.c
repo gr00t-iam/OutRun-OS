@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.54.0-metal"
+#define KERNEL_VERSION "0.55.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -510,14 +510,26 @@ static volatile int g_debug_gpu  = 0;           /* DEBUG_GPU: resource/scanout/f
 static volatile int g_debug_audio = 0;          /* DEBUG_AUDIO: configure/write/teardown log          */
 static volatile int g_debug_net  = 0;           /* DEBUG_NET: socket create/bind/send/recv/teardown log */
 static volatile int g_debug_wimp = 0;           /* DEBUG_WIMP: window create/raise/move/close/teardown log */
+static volatile int g_debug_posix = 0;          /* DEBUG_POSIX: fork/exec/signal/thread log            */
 
 /* user-stack layout (used by the guard-page fault check in isr_dispatch) */
 #define USTK_V     0x0000500000FF0000ull                  /* user stack bottom       */
 #define USTK_PAGES 4                                       /* 16 KiB ring-3 stack     */
-#define USTK_TOP   (USTK_V + USTK_PAGES * 0x1000ull)       /* initial RSP             */
+#define USTK_TOP   (USTK_V + USTK_PAGES * 0x1000ull)       /* stack top (block lives here) */
 #define USTK_GUARD (USTK_V - 0x1000ull)                    /* unmapped guard page     */
+/* v0.55: the top 1 KiB of the ring-3 stack holds the SysV process-start block
+ * (argc, argv[], NULL, envp[], NULL, then the string bytes). A process enters
+ * with RSP pointing AT that block — exactly the layout crt0 expects — and grows
+ * its stack downwards from there, so the block is always above RSP and can
+ * never be clobbered by ordinary pushes.                                     */
+#define UARGS_V    (USTK_TOP - 0x400ull)                   /* argv/envp block base    */
+#define UARGS_MAX  0x400ull                                /* its size (1 KiB)        */
+#define USTK_INIT  UARGS_V                                 /* initial ring-3 RSP      */
+#define UARG_N     8                                       /* max argv AND max envp   */
+#define UARG_LEN   48                                      /* max bytes per string    */
 
 static void handle_cpl3_fault(struct isr_frame *f);      /* defined after process globals */
+static int  posix_try_fault_signal(struct isr_frame *f);  /* v0.55: catchable SIGSEGV (signal core) */
 static void sweep_tick(void);                            /* incremental PTE integrity audit */
 static void smp_ipi_dispatch(uint64_t vec);              /* v0.35: LAPIC IPI handlers      */
 static void smp_preempt_ipi(struct isr_frame *f);        /* v0.39: vector 50 (may not return) */
@@ -556,6 +568,14 @@ void isr_dispatch(struct isr_frame *f) {
                     dbg_pid_of(current_proc_idx), read_cr3(), cr2, f->rip, f->rsp,
                     f->error, (uint64_t)(f->cs & 3));
         }
+        /* v0.55: a ring-3 fault is a SIGNAL first. If the process installed a
+         * SIGSEGV handler, spill the trap context onto its user stack and iretq
+         * straight into the handler — the faulting thread SURVIVES and can
+         * recover, which is the whole point of catchable SIGSEGV. This must run
+         * BEFORE handle_cpl3_fault, which both switches off the faulting address
+         * space (so the user stack would no longer be writable) and never
+         * returns. If no handler is installed we fall through and die as before. */
+        if ((f->cs & 3) == 3 && posix_try_fault_signal(f)) return;
         /* A fault from ring 3 must never take down the kernel — terminate the    */
         /* offending task (guard-page hit = stack overflow).                      */
         if ((f->cs & 3) == 3) handle_cpl3_fault(f);      /* noreturn: unwinds to kernel */
@@ -996,6 +1016,16 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
 #define SURF_USER_V 0x0000530000000000ull   /* ring-3 surface window (app pixels) */
 #define SMP_USER_V  0x0000540000000000ull   /* v0.49: ring-3 remap/unmap scratch window */
 #define WIN_USER_V  0x0000550000000000ull   /* v0.53: ring-3 WIMP window content thumbnail */
+#define THR_USER_V  0x0000560000000000ull   /* v0.55: per-POSIX-thread ring-3 stacks       */
+/* Everything at or above DMA_USER_V is a WINDOW the kernel grants explicitly
+ * (device DMA, shared pixels, per-thread stacks); only the region below it is
+ * ordinary anonymous process image + main stack. fork() clones exactly that
+ * region and nothing else — an MMIO alias or a shared surface must never be
+ * silently duplicated into a child. */
+#define UPRIVATE_VMAX DMA_USER_V
+#define THR_STK_PAGES 4                     /* 16 KiB per thread                          */
+#define THR_STK_STRIDE 0x8000ull            /* 8 pages: 4 mapped + 4 unmapped guard       */
+#define THR_MAX       8                     /* per-process POSIX thread ceiling            */
 
 /* Validate that [ptr, ptr+len) is entirely within a process's user space and    */
 /* mapped USER-present (and USER-writable if need_write). Defends every syscall   */
@@ -1324,6 +1354,15 @@ static uint64_t create_address_space(void) {
 #define PCAP_AUDIO           (1ull << 11)   /* v0.51: required for any SYS_AUDIO_* call */
 #define PCAP_WIMP            (1ull << 12)   /* v0.53: required for any SYS_WIN_* call */
 
+/* v0.55: POSIX signal numbers actually supported by this kernel. Values match
+ * Linux/POSIX so ring-3 code can use the familiar constants. */
+#define SIGINT   2
+#define SIGKILL  9
+#define SIGSEGV 11
+#define SIGALRM 14
+#define SIGCHLD 17
+#define NSIG    32
+
 /* v0.39: a COMPLETE ring-3 register context. The preempt IPI (vector 50)
  * captures the interrupted user state here straight from the isr_frame, and
  * enter_user_resume rebuilds it — on whichever core the context lands on
@@ -1332,6 +1371,21 @@ struct uctx {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;     /* offs 0..56          */
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;        /* offs 64..112        */
     uint64_t rip, rsp, rflags;                         /* offs 120,128,136    */
+};
+
+/* v0.55: the SYSCALL entry's saved ring-3 register block, as laid out by the
+ * push sequence in boot/usermode.asm (that file is the master — keep in step).
+ * syscall_entry hands its address to syscall_trap as a 5th argument, which is
+ * what makes a COMPLETE interrupted context available on the syscall path:
+ * POSIX signal delivery and SYS_SIGRETURN both need one, and a context missing
+ * the callee-saved half would be restored as garbage. */
+struct sysframe {
+    uint64_t pad;                                      /* 16-byte realign slot */
+    uint64_t r15, r14, r13, r12, rbp, rbx;             /* offs 8..48           */
+    uint64_t r10, r9, r8, rdx, rsi, rdi;               /* offs 56..96          */
+    uint64_t rflags;                                   /* offs 104 (pushed R11) */
+    uint64_t rip;                                      /* offs 112 (pushed RCX) */
+    uint64_t rsp;                                      /* offs 120 (parked user RSP) */
 };
 
 /* v0.44: one outstanding DMA/passthrough grant. DMA_GRANT_MMIO records a
@@ -1405,6 +1459,26 @@ struct kproc {
      * remap knows what to shoot down and free once the new mapping is live. */
 #define SMP_SLOTS 2
     uint64_t smp_slot_phys[SMP_SLOTS];
+    /* ===================== v0.55: POSIX process state ===================== */
+    /* Signal disposition. handler[s]: 0 = default, 1 = ignore, else a ring-3
+     * function pointer. `pending` is a bitmask of raised-but-undelivered
+     * signals; `mask` blocks delivery while a handler runs (POSIX-ish, no
+     * nesting). `sigframe_sp` remembers where the interrupted context was
+     * spilled on the user stack so SYS_SIGRETURN can restore it exactly. */
+    uint64_t sig_handler[NSIG];
+    volatile uint32_t sig_pending;
+    volatile uint32_t sig_mask;
+    uint64_t sigframe_sp;
+    volatile uint64_t alarm_deadline;      /* g_ticks value at which SIGALRM fires (0 = off) */
+    int      ppid_slot;           /* parent kproc slot, for SIGCHLD (-1 = none)     */
+    /* Thread group. Several uthreads may share ONE kproc (= one address space);
+     * the address space may only be torn down when the LAST of them exits, so
+     * every exit path decrements this and only the 0-transition tears down. */
+    volatile int nthreads;
+    uint64_t ustack_next;         /* bump allocator for per-thread ring-3 stacks    */
+    /* v0.55: argv/envp image handed to the ring-3 crt on the initial stack.    */
+    int      argc;
+    int      exit_authoritative;   /* v0.55: exit_code came from exit(), not pthread_exit() */
     /* v0.49: leaf spinlock serializing this ONE process's own VMA/page-table
      * mutations (map_page + smp_slot_phys bookkeeping) against itself. In
      * this kernel's one-thread-per-kproc execution model only the single
@@ -1458,6 +1532,12 @@ static void kproc_reset(struct kproc *p) {
     p->migrate_pin = -1;
     p->uctx = (struct uctx){0};
     p->ran_on = 0;
+    /* v0.55: POSIX state — default dispositions, nothing pending/blocked,
+     * one thread in the group, per-thread stacks start below the main stack. */
+    for (int sg = 0; sg < NSIG; sg++) p->sig_handler[sg] = 0;
+    p->sig_pending = 0; p->sig_mask = 0; p->sigframe_sp = 0;
+    p->alarm_deadline = 0; p->ppid_slot = -1;
+    p->nthreads = 1; p->ustack_next = 0; p->argc = 0; p->exit_authoritative = 0;
     p->finish_seq = 0;
     p->dispatches = 0;
     p->frames_freed = 0;
@@ -1847,7 +1927,8 @@ static void pci_probe_virtio(uint8_t bus, uint8_t dev, uint8_t fn) {
  * =========================================================================== */
 extern void switch_context(uint64_t *save_rsp, uint64_t new_rsp);
 
-enum { T_FREE = 0, T_RUNNABLE, T_RUNNING, T_BLOCKED };
+enum { T_FREE = 0, T_RUNNABLE, T_RUNNING, T_BLOCKED,
+       T_CLAIMED };   /* v0.55: reserved-but-not-yet-built (never scheduled) */
 
 struct pcb {
     uint64_t rsp;               /* saved stack pointer (rest of state is on it) */
@@ -1865,6 +1946,11 @@ struct pcb {
     int      uthread;           /* 1 = owns a ring-3 process (never resume_kernel) */
     uint64_t rsp0;              /* TSS.rsp0 while this thread runs (0 = kernel default) */
     uint64_t ksrsp;             /* SYSCALL kernel stack top     (0 = kernel default) */
+    /* v0.55: this thread's OWN ring-3 stack top. Before POSIX threads every
+     * uthread entered at the single fixed USTK_INIT, which is fine when a kproc
+     * owns exactly one thread but corrupts instantly once several threads share
+     * one address space. 0 = use USTK_INIT (the classic single-threaded case). */
+    uint64_t ustack;
     /* v0.41: klock ranks THIS THREAD holds. Per-thread on the BSP because a
      * lock holder can park (vblk wait) and another BSP thread runs meanwhile
      * — a per-CPU stack would see the parked holder's ranks as its own.      */
@@ -1953,9 +2039,27 @@ static void thread_trampoline(void) {
     for (;;) __asm__ volatile("hlt");
 }
 
-static int thread_create(const char *name, void (*entry)(void *), void *arg) {
+/* v0.55: `start_suspended` leaves the finished PCB in T_CLAIMED — reserved, but
+ * NOT runnable — so a caller with more fields to install (uthread_create) can
+ * finish building the thread and publish T_RUNNABLE itself. Without it, a
+ * cross-core creator races the BSP scheduler: thread_create used to publish
+ * T_RUNNABLE while cr3/proc/rsp0/ksrsp/ustack were still unset, which was safe
+ * only because uthread_create held `cli` — and `cli` masks the CREATING core,
+ * not the BSP that does the scheduling. The moment SYS_THREAD_CREATE became
+ * callable from an AP, the BSP could pick up a half-built thread and enter ring
+ * 3 with the kernel's CR3 and no user stack. (Found live: an SMP hang in the
+ * pthread suite, reproducible only when host contention widened the window
+ * between thread_create returning and the fields being written.) */
+static int thread_create_ex(const char *name, void (*entry)(void *), void *arg,
+                            int start_suspended) {
     for (int i = 0; i < MAX_THREADS; i++) {
-        if (g_threads[i].state != T_FREE || i == g_cur) continue;
+        if (i == g_cur) continue;
+        /* v0.55: reserve the slot ATOMICALLY. SYS_THREAD_CREATE can be issued
+         * from ANY core now, so a plain "is it free? ... ok, take it" would let
+         * two cores build two threads on top of one PCB — the same TOCTOU shape
+         * as the v0.54 window-slot race. T_CLAIMED is not runnable, so the
+         * scheduler skips the slot until state is published as T_RUNNABLE below. */
+        if (!__sync_bool_compare_and_swap(&g_threads[i].state, T_FREE, T_CLAIMED)) continue;
         struct pcb *t = &g_threads[i];
         t->id = i; t->name = name; t->entry = entry; t->arg = arg;
         t->cr3 = kernel_cr3; t->stack = g_tstacks[i]; t->wait_tag = 0;
@@ -1973,10 +2077,22 @@ static int thread_create(const char *name, void (*entry)(void *), void *arg) {
         *--sp = 0;                            /* r15                            */
         *--sp = 0x202;                        /* rflags: IF set                 */
         t->rsp = (uint64_t)sp;
-        t->state = T_RUNNABLE;
+        __sync_synchronize();                 /* the PCB is complete before it is runnable */
+        if (!start_suspended) t->state = T_RUNNABLE;
         return i;
     }
     return -1;
+}
+
+static int thread_create(const char *name, void (*entry)(void *), void *arg) {
+    return thread_create_ex(name, entry, arg, 0);
+}
+
+/* Publish a suspended thread: the caller has finished building it. */
+static void thread_release(int tid) {
+    if (tid < 0 || tid >= MAX_THREADS) return;
+    __sync_synchronize();
+    g_threads[tid].state = T_RUNNABLE;
 }
 
 static void idle_fn(void *a) {
@@ -5610,6 +5726,229 @@ static void wimp_teardown_kproc(int proc_idx) {
     klock_release(&g_wm_lock);
 }
 
+/* ===========================================================================
+ * v0.55: POSIX SIGNALS
+ * ===========================================================================
+ * Disposition lives per kproc (see struct kproc). Raising a signal only sets a
+ * pending bit; DELIVERY happens at a point where we hold a complete ring-3
+ * context we can legally rewrite — either a trap frame (the SIGSEGV path) or a
+ * preempted uctx (the scheduler path). Delivery spills the interrupted context
+ * onto the process's own user stack as a `struct sigframe`, then vectors RIP at
+ * the handler with RDI = signo; the ring-3 trampoline finishes by calling
+ * SYS_SIGRETURN, which pops that frame back into the live context. This is the
+ * classic signal-frame-on-the-user-stack design, not a simulation of one. */
+struct sigframe {
+    uint64_t magic;                     /* guards against a corrupted restore   */
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    uint64_t rip, rsp, rflags;
+    uint32_t signo, saved_mask;
+};
+#define SIGFRAME_MAGIC 0x5347465231ull   /* "SGFR1" */
+static volatile uint64_t g_sig_raised = 0, g_sig_delivered = 0, g_sig_returned = 0;
+
+/* Post a signal to a process. Returns 0 on success, negative if the target is
+ * gone. SIGKILL is never blockable and never handled in ring 3. */
+static int sig_raise(int slot, int signo) {
+    if (slot < 0 || slot >= n_kproc || !kprocs[slot].used || kprocs[slot].exited) return -1;
+    if (signo <= 0 || signo >= NSIG) return -1;
+    __sync_fetch_and_or(&kprocs[slot].sig_pending, 1u << signo);
+    g_sig_raised++;
+    if (g_debug_posix)
+        kprintf("[dbgposix] raise sig %d -> pid %u (pending %x)\n",
+                signo, kprocs[slot].pid, (uint64_t)kprocs[slot].sig_pending);
+    return 0;
+}
+
+/* Pick the lowest-numbered deliverable signal, or 0. Caller must hold nothing. */
+static int sig_next(int slot) {
+    uint32_t p = kprocs[slot].sig_pending & ~kprocs[slot].sig_mask;
+    if (!p) return 0;
+    for (int sg = 1; sg < NSIG; sg++) if (p & (1u << sg)) return sg;
+    return 0;
+}
+
+/* Build a signal frame on the process's user stack and rewrite (rip,rsp) so
+ * ring 3 resumes inside the handler. `regs` is the interrupted context. The
+ * frame is written through the process's OWN mapping, so this must run with
+ * that address space live (true on both call sites). Returns 1 if the context
+ * was redirected, 0 if the signal was handled without redirecting (default
+ * action / ignore), and -1 if the process must die. */
+static int sig_deliver(int slot, int signo, struct uctx *regs) {
+    struct kproc *k = &kprocs[slot];
+    uint64_t h = k->sig_handler[signo];
+    __sync_fetch_and_and(&k->sig_pending, ~(1u << signo));
+
+    if (signo == SIGKILL || (h == 0 && (signo == SIGSEGV || signo == SIGINT || signo == SIGKILL)))
+        return -1;                        /* default action for these = terminate */
+    if (h == 0 || h == 1) return 0;       /* default-ignore (CHLD/ALRM) or SIG_IGN */
+
+    /* Spill the interrupted context 128 bytes below the current user RSP (a red
+     * zone gap), 16-byte aligned, then hand the handler its own frame. */
+    uint64_t sp = (regs->rsp - 128 - sizeof(struct sigframe)) & ~0xFull;
+    if (!access_ok(k->cr3, sp, sizeof(struct sigframe), 1)) return -1;  /* no stack: die */
+    struct sigframe *f = (struct sigframe *)sp;
+    f->magic = SIGFRAME_MAGIC;
+    f->r15=regs->r15; f->r14=regs->r14; f->r13=regs->r13; f->r12=regs->r12;
+    f->r11=regs->r11; f->r10=regs->r10; f->r9=regs->r9;   f->r8=regs->r8;
+    f->rbp=regs->rbp; f->rdi=regs->rdi; f->rsi=regs->rsi; f->rdx=regs->rdx;
+    f->rcx=regs->rcx; f->rbx=regs->rbx; f->rax=regs->rax;
+    f->rip=regs->rip; f->rsp=regs->rsp; f->rflags=regs->rflags;
+    f->signo = (uint32_t)signo; f->saved_mask = k->sig_mask;
+
+    k->sigframe_sp = sp;
+    k->sig_mask |= (1u << signo);         /* no recursive delivery of the same signal */
+    regs->rsp = sp;                       /* handler runs on the frame we just wrote */
+    regs->rip = h;
+    regs->rdi = (uint64_t)signo;          /* void handler(int signo) */
+    g_sig_delivered++;
+    if (g_debug_posix)
+        kprintf("[dbgposix] deliver sig %d -> pid %u handler %X (frame %X)\n",
+                signo, k->pid, h, sp);
+    return 1;
+}
+
+/* Restore the context saved by sig_deliver. Returns 1 on success. */
+static int sig_return(int slot, struct uctx *regs) {
+    struct kproc *k = &kprocs[slot];
+    uint64_t sp = k->sigframe_sp;
+    if (!sp || !access_ok(k->cr3, sp, sizeof(struct sigframe), 0)) return 0;
+    struct sigframe *f = (struct sigframe *)sp;
+    if (f->magic != SIGFRAME_MAGIC) return 0;
+    regs->r15=f->r15; regs->r14=f->r14; regs->r13=f->r13; regs->r12=f->r12;
+    regs->r11=f->r11; regs->r10=f->r10; regs->r9=f->r9;   regs->r8=f->r8;
+    regs->rbp=f->rbp; regs->rdi=f->rdi; regs->rsi=f->rsi; regs->rdx=f->rdx;
+    regs->rcx=f->rcx; regs->rbx=f->rbx; regs->rax=f->rax;
+    regs->rip=f->rip; regs->rsp=f->rsp; regs->rflags=f->rflags;
+    k->sig_mask = f->saved_mask;
+    k->sigframe_sp = 0;
+    g_sig_returned++;
+    if (g_debug_posix) kprintf("[dbgposix] sigreturn pid %u -> rip %X\n", k->pid, regs->rip);
+    return 1;
+}
+
+/* Fire SIGALRM for any process whose deadline has passed. Called from the
+ * scheduler boundary (never from the timer ISR itself, so no lock ordering
+ * hazard against a process mid-teardown). */
+static volatile int g_alarms_armed = 0;      /* fast-path gate: SYS_ALARM users only */
+static void sig_check_alarms(void) {
+    if (!g_alarms_armed) return;             /* hot path: no armed alarm anywhere */
+    for (int i = 0; i < n_kproc; i++) {
+        uint64_t dl = kprocs[i].alarm_deadline;
+        if (!kprocs[i].used || !dl) continue;
+        /* Disarm an exited process's alarm too, so the gate counter above can
+         * never be left permanently non-zero by a task that died holding one. */
+        int expired = kprocs[i].exited || g_ticks >= dl;
+        if (!expired) continue;
+        /* CLAIM the deadline atomically. This runs on every core at every
+         * syscall boundary, so two cores can see the same alarm expired at
+         * once; letting both decrement the gate counter drives it to zero
+         * while another process still has an alarm armed, and that alarm then
+         * never fires at all. (Found live: SIGALRM intermittently missing in
+         * exactly one round of the POSIX suite under SMP.) */
+        if (!__sync_bool_compare_and_swap(&kprocs[i].alarm_deadline, dl, 0)) continue;
+        __sync_fetch_and_sub(&g_alarms_armed, 1);
+        if (!kprocs[i].exited) sig_raise(i, SIGALRM);
+    }
+}
+
+/* v0.55: THREAD-GROUP REFCOUNT.
+ * Until now a kproc owned exactly one thread, so every exit path could safely
+ * dismantle the address space. SYS_THREAD_CREATE breaks that: several uthreads
+ * share one kproc and one CR3, and the space must be torn down by the LAST
+ * thread to leave and by nobody else — otherwise a sibling keeps executing out
+ * of freed page tables. Returns 1 for the last thread ("you own the teardown"),
+ * 0 while siblings remain. */
+static int posix_thread_leave(int p) {
+    if (p < 0 || p >= n_kproc) return 1;
+    int left = __sync_sub_and_fetch(&kprocs[p].nthreads, 1);
+    if (g_debug_posix)
+        kprintf("[dbgposix] thread leave pid %u -> %d thread(s) left\n",
+                kprocs[p].pid, (uint64_t)(int64_t)left);
+    return left <= 0;
+}
+
+/* v0.55: REAP LOG — a tiny wait-status table.
+ * A kproc slot is recycled the instant it is marked torn_down, and fork() is a
+ * prolific claimer of freed slots, so a process's exit status is only readable
+ * for as long as nobody needs a new slot. Anything wanting to observe an exit
+ * after the fact (the POSIX suite, and conceptually waitpid on a zombie) must
+ * therefore have the status captured AT THE SOURCE. Found live: an SMP round
+ * never terminated because a worker's slot was taken over by another worker's
+ * forked child before the suite could read the worker's exit code. */
+#define REAP_LOG 64
+static struct { volatile uint32_t pid; uint64_t code, frames; } g_reap[REAP_LOG];
+static volatile uint32_t g_reap_n = 0;
+static int posix_reap_lookup(uint32_t pid, uint64_t *code, uint64_t *frames) {
+    for (int i = 0; i < REAP_LOG; i++)
+        if (g_reap[i].pid == pid) {
+            if (code)   *code   = g_reap[i].code;
+            if (frames) *frames = g_reap[i].frames;
+            return 1;
+        }
+    return 0;
+}
+
+/* Called by the LAST thread of a process, immediately before the slot becomes
+ * recyclable: record the exit status, then tell the parent its child died —
+ * exactly as POSIX requires. A parent that already exited gets nothing. */
+static void posix_proc_reaped(int p) {
+    if (p < 0 || p >= n_kproc) return;
+    uint32_t i = __sync_fetch_and_add(&g_reap_n, 1) % REAP_LOG;
+    g_reap[i].code   = kprocs[p].exit_code;
+    g_reap[i].frames = kprocs[p].frames_freed;
+    __sync_synchronize();
+    g_reap[i].pid    = kprocs[p].pid;      /* published last: pid is the key */
+    int par = kprocs[p].ppid_slot;
+    if (par >= 0 && par < n_kproc && kprocs[par].used && !kprocs[par].exited)
+        sig_raise(par, SIGCHLD);
+}
+
+/* Ring-3 memory fault -> catchable SIGSEGV. Called from isr_dispatch while the
+ * FAULTING address space is still loaded in CR3 (so the user stack is writable)
+ * and before handle_cpl3_fault, which never returns. Returns 1 if the trap frame
+ * was rewritten to enter the handler — the caller then simply iretqs and the
+ * faulting thread lives — or 0 to fall through to the normal terminate path.
+ *
+ * Only #PF (14) and #GP (13) map to SIGSEGV; everything else keeps dying, since
+ * pretending an #UD or a divide error is a segmentation fault would be a lie. */
+static int posix_try_fault_signal(struct isr_frame *f) {
+    if (f->vector != 14 && f->vector != 13) return 0;
+    int slot = (int)current_proc_idx;
+    if (slot < 0 || slot >= n_kproc) return 0;
+    struct kproc *k = &kprocs[slot];
+    if (!k->used || k->exited || k->torn_down) return 0;
+    /* No handler (0) and SIG_IGN (1) both mean "die" for a genuine fault:
+     * ignoring it would re-execute the faulting instruction forever. */
+    if (k->sig_handler[SIGSEGV] <= 1) return 0;
+    /* Already inside the SIGSEGV handler? A fault there is unrecoverable —
+     * sig_mask holds SIGSEGV for exactly that window, so honour it and die. */
+    if (k->sig_mask & (1u << SIGSEGV)) return 0;
+
+    /* isr_frame's r15..rax run in the same order as uctx, but copy field by
+     * field rather than casting: the two structs are only coincidentally
+     * compatible and the trailing members differ. */
+    struct uctx r;
+    r.r15=f->r15; r.r14=f->r14; r.r13=f->r13; r.r12=f->r12;
+    r.r11=f->r11; r.r10=f->r10; r.r9=f->r9;   r.r8=f->r8;
+    r.rbp=f->rbp; r.rdi=f->rdi; r.rsi=f->rsi; r.rdx=f->rdx;
+    r.rcx=f->rcx; r.rbx=f->rbx; r.rax=f->rax;
+    r.rip=f->rip; r.rsp=f->rsp; r.rflags=f->rflags;
+
+    uint64_t fault_rip = f->rip;
+    if (sig_deliver(slot, SIGSEGV, &r) != 1) return 0;   /* -1/0 => terminate as before */
+
+    f->rip = r.rip;                      /* the handler                          */
+    f->rsp = r.rsp;                      /* the signal frame we just wrote       */
+    f->rdi = r.rdi;                      /* signo argument                       */
+    if (g_debug_posix) {
+        uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        kprintf("[dbgposix] SIGSEGV pid %u va %X faultrip %X -> handler %X sp %X\n",
+                k->pid, cr2, fault_rip, f->rip, f->rsp);
+    }
+    return 1;
+}
+
 static void pci_init(void) {
     kprintf("[pci    ] enumerating bus 0 (config mechanism #1, ports 0xCF8/0xCFC):\n");
     for (uint8_t dev = 0; dev < 32; dev++) {
@@ -5680,6 +6019,7 @@ extern void syscall_entry(void);
 extern uint64_t enter_user_mode(uint64_t entry, uint64_t ustack);
 extern void enter_user_thread(uint64_t entry, uint64_t ustack);   /* no resume point */
 extern uint64_t enter_user_resume(struct uctx *u);  /* v0.39: rebuild a preempted ctx */
+extern void enter_user_ctx(struct uctx *u);         /* v0.55: same, keeps the resume point */
 extern void resume_kernel(uint64_t retval);
 extern void set_syscall_stack(uint64_t top);
 extern char user_blob_start[], user_blob_end[];
@@ -5723,12 +6063,30 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     /* v0.41: take the surface lock BEFORE cli — a contended acquire may yield, */
     /* which must not happen once this thread has begun dying under cli.        */
     struct pcb *t0 = curthr;
+    /* v0.55: a NON-final thread of a multi-threaded process must reclaim
+     * nothing — its siblings are still executing in this very address space.
+     * Reap the thread slot and reschedule; the last one out does the work.    */
+    if (!posix_thread_leave((int)t0->proc)) {
+        __asm__ volatile("cli");
+        struct pcb *tn = curthr;
+        kprintf("[uthread] tid %d pid %u '%s' thread exited (code %u) — %d sibling(s) live\n",
+                (uint64_t)tn->id, kprocs[tn->proc].pid, tn->name, code,
+                (uint64_t)(int64_t)kprocs[tn->proc].nthreads);
+        tn->state = T_FREE;
+        sched_switch_to(pick_next());        /* does not return                 */
+        /* Reached only if sched_switch_to declined to switch (nextid == g_cur).
+         * Halt with interrupts ENABLED: a halt under cli would park this core
+         * forever, and on the BSP that stops g_ticks and makes every watchdog in
+         * the kernel unreachable — a total freeze instead of one stalled thread. */
+        for (;;) __asm__ volatile("sti; hlt");
+    }
     klock_acquire(&g_surf_lock);
     surfaces_reclaim((int)t0->proc);
     klock_release(&g_surf_lock);
     __asm__ volatile("cli");
     struct pcb *t = curthr;
-    kprocs[t->proc].exit_code = code;
+    /* pthread_exit() must NOT overwrite a status that exit() already set. */
+    if (!kprocs[t->proc].exit_authoritative) kprocs[t->proc].exit_code = code;
     kprocs[t->proc].exited = 1;
     write_cr3(kernel_cr3);                   /* off this space before tearing it down */
     /* v0.42: this is the BSP's OWN thread giving up its OWN address space —   */
@@ -5743,6 +6101,7 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     descriptor_teardown_kproc((int)t->proc); /* v0.45: force-close any leaked fd FIRST */
     dma_teardown_kproc((int)t->proc);        /* v0.44: revoke DMA/IOMMU grants FIRST */
     kprocs[t->proc].frames_freed = page_free_tree(kprocs[t->proc].cr3);
+    posix_proc_reaped((int)t->proc);    /* v0.55: record status + SIGCHLD FIRST — */
     kprocs[t->proc].torn_down = 1;      /* v0.45: NOW the slot is safe to recycle */
     kprintf("[uthread] tid %d pid %u '%s' exited (code %u) — thread reaped, %u frame(s) reclaimed\n",
             (uint64_t)t->id, kprocs[t->proc].pid, t->name, code, kprocs[t->proc].frames_freed);
@@ -5759,22 +6118,30 @@ static void uthread_tramp(void *arg) {
     kprintf("[uthread] tid %d --> RING 3 as pid %u '%s' (entry %X, cr3 %X)\n",
             (uint64_t)t->id, kprocs[t->proc].pid, t->name,
             (uint64_t)arg, kprocs[t->proc].cr3);
-    enter_user_thread((uint64_t)arg, USTK_TOP);
+    enter_user_thread((uint64_t)arg, t->ustack ? t->ustack : USTK_INIT);
     for (;;) __asm__ volatile("hlt");        /* unreachable                     */
 }
 
-static int uthread_create(const char *name, int proc_idx, uint64_t entry) {
-    __asm__ volatile("cli");                 /* fields below must be set before */
-    int tid = thread_create(name, uthread_tramp, (void *)entry);   /* first run */
-    if (tid >= 0) {
-        struct pcb *t = &g_threads[tid];
-        t->uthread = 1;
-        t->proc    = (uint64_t)proc_idx;
-        t->cr3     = kprocs[proc_idx].cr3;
-        t->rsp0    = (uint64_t)(t->stack + TSTACK_SZ);
-        t->ksrsp   = t->rsp0;
-    }
-    __asm__ volatile("sti");
+/* v0.55: `ustack` is this thread's OWN ring-3 stack top, or 0 for the classic
+ * single-threaded case (the process's main stack at USTK_INIT). It has to be
+ * installed inside the same interrupts-off window as cr3/proc: the moment the
+ * PCB becomes runnable the scheduler may pick it up, and a thread that entered
+ * ring 3 on the wrong stack has already corrupted a sibling. */
+static int uthread_create(const char *name, int proc_idx, uint64_t entry, uint64_t ustack) {
+    /* Created SUSPENDED so the ring-3 half of the PCB is installed before the
+     * scheduler can ever see the thread. This must not rely on `cli`: since
+     * v0.55 SYS_THREAD_CREATE can be issued from an AP, and masking interrupts
+     * there says nothing about what the BSP's scheduler is doing. */
+    int tid = thread_create_ex(name, uthread_tramp, (void *)entry, 1);
+    if (tid < 0) return tid;
+    struct pcb *t = &g_threads[tid];
+    t->uthread = 1;
+    t->proc    = (uint64_t)proc_idx;
+    t->cr3     = kprocs[proc_idx].cr3;
+    t->rsp0    = (uint64_t)(t->stack + TSTACK_SZ);
+    t->ksrsp   = t->rsp0;
+    t->ustack  = ustack;
+    thread_release(tid);                     /* NOW it is schedulable */
     return tid;
 }
 
@@ -6204,9 +6571,35 @@ static void cpu_exec_proc(int c, int p) {
     if (g_debug_smp_sched)
         kprintf("[dbgsmp ] cpu%u pick+switch pid %u cr3=%X\n",
                 (uint64_t)c, kprocs[p].pid, kprocs[p].cr3);
-    uint64_t code = kprocs[p].pstate
-                  ? enter_user_resume(&kprocs[p].uctx)
-                  : enter_user_mode(kprocs[p].entry, USTK_TOP);
+    /* v0.55: THE non-fault signal delivery boundary. We are past write_cr3, so
+     * the target's user stack is mapped and writable, and we hold its complete
+     * ring-3 context in kprocs[p].uctx whenever it was previously preempted —
+     * exactly what sig_deliver needs to spill a frame and vector RIP at the
+     * handler. A task that has never run has no context to rewrite, so only a
+     * fatal disposition acts here; anything catchable stays pending until its
+     * first preemption. At most one signal per dispatch, as POSIX expects.    */
+    uint64_t code;
+    int fatal_sig = 0, sg = sig_next(p);
+    if (sg) {
+        if (kprocs[p].pstate) {
+            int r = sig_deliver(p, sg, &kprocs[p].uctx);
+            if (r < 0) fatal_sig = sg;
+        } else if (sg == SIGKILL || (kprocs[p].sig_handler[sg] == 0 &&
+                                     (sg == SIGINT || sg == SIGSEGV))) {
+            __sync_fetch_and_and(&kprocs[p].sig_pending, ~(1u << sg));
+            fatal_sig = sg;
+        }
+    }
+    if (fatal_sig) {
+        code = 128 + (uint64_t)fatal_sig;    /* shell convention for "died on N" */
+        if (g_debug_posix)
+            kprintf("[dbgposix] pid %u killed by signal %d\n",
+                    kprocs[p].pid, (uint64_t)fatal_sig);
+    } else {
+        code = kprocs[p].pstate
+             ? enter_user_resume(&kprocs[p].uctx)
+             : enter_user_mode(kprocs[p].entry, USTK_INIT);
+    }
     write_cr3(kernel_cr3);
     __sync_fetch_and_sub(&g_inr3, 1);
     if (code == RET_PREEMPTED) {
@@ -6238,6 +6631,21 @@ static void cpu_exec_proc(int c, int p) {
         rq_push(dst, p);
         __sync_synchronize();
         if (dst != c) lapic_ipi(g_cpu[dst].apic_id, IPI_PING, 0);  /* wake the new home */
+    } else if (!posix_thread_leave(p)) {
+        /* v0.55: a sibling thread of this process is still live in this address
+         * space — reclaim NOTHING. The last thread out runs the teardown.
+         *
+         * But DO record the status: this excursion ended through SYS_EXIT (or a
+         * fault), and in POSIX `exit()` is the whole PROCESS's status while
+         * `pthread_exit()` is only a thread's. Discarding it here let the last
+         * *thread*'s SYS_THREAD_EXIT(0) become the process's exit code — a
+         * genuinely wrong status, found live in the pthread suite. */
+        kprocs[p].exit_code = code;
+        kprocs[p].exit_authoritative = 1;
+        __sync_fetch_and_add(&me->rq_ran, 1);
+        if (g_debug_posix)
+            kprintf("[dbgposix] pid %u exit()ed code %X with %d thread(s) still live\n",
+                    kprocs[p].pid, code, (uint64_t)(int64_t)kprocs[p].nthreads);
     } else {
         kprocs[p].exit_code = code;
         kprocs[p].finish_seq = __sync_add_and_fetch(&g_finish_seq, 1);
@@ -6266,7 +6674,8 @@ static void cpu_exec_proc(int c, int p) {
         descriptor_teardown_kproc(p);           /* v0.45: force-close any leaked fd FIRST */
         dma_teardown_kproc(p);                 /* v0.44: revoke DMA/IOMMU grants FIRST */
         kprocs[p].frames_freed = page_free_tree(kprocs[p].cr3);
-        kprocs[p].torn_down = 1;           /* v0.45: NOW the slot is safe to recycle */
+        posix_proc_reaped(p);              /* v0.55: record status + SIGCHLD FIRST —   */
+        kprocs[p].torn_down = 1;           /* v0.45: NOW the slot is safe to recycle   */
         __asm__ volatile("cli");
     }
     __asm__ volatile("sti");
@@ -6871,6 +7280,12 @@ static void __attribute__((no_stack_protector)) cmd_audit(void) {
  * — with the still-global syscall/resume state exercised by exactly one core
  * (serialized). Concurrent BSP+AP ring-3 is v0.39 (per-CPU syscall path).     */
 static uint64_t elf_load(int proc_idx, uint64_t img, uint64_t img_size);   /* fwd (defined below) */
+/* v0.55 fwd: the POSIX process calls live in the syscall switch, but the address
+ * space machinery they drive is defined further down with the ELF loader.     */
+static uint64_t uargs_build(uint64_t cr3, int argc, const char argv[][UARG_LEN],
+                            int envc, const char envp[][UARG_LEN]);
+static int      vm_clone_user(uint64_t src_cr3, uint64_t dst_cr3);
+static volatile uint64_t g_execs = 0, g_forks = 0, g_threads_made = 0;
 static int g_mcpass, g_mcfail;
 static void mccheck(const char *n, int c) {
     if (c) { g_mcpass++; kprintf("[mcsched]  PASS  %s\n", n); }
@@ -7268,6 +7683,164 @@ static int ofile_deref(int fd, int *out_vol) {
 }
 
 static void shell_exec(char *line);   /* fwd: v0.54 SYS_RUN_CMD runs the real shell dispatcher */
+
+/* ===========================================================================
+ * v0.55: fork()
+ * ===========================================================================
+ * SYS_FORK(flags) -> child pid in the parent, 0 in the child, negative on error.
+ *
+ * A genuine "returns twice" fork, made possible by the complete `sysframe` the
+ * SYSCALL entry now hands us: the child's saved ring-3 context is the PARENT's
+ * register file verbatim, with RAX forced to 0 and RIP/RSP pointing at the
+ * instruction right after the parent's `syscall`. The child is then queued as
+ * an ordinary preempted task, so the scheduler's existing executor resumes it
+ * with enter_user_resume — the same path a migrated task takes. No userland
+ * continuation trampoline, no special entry stub.
+ *
+ * The child gets: a cloned address space (eager copy, see vm_clone_user), the
+ * parent's capabilities and role, the parent's signal DISPOSITIONS (POSIX) but
+ * an empty pending set, and a ppid link so its exit raises SIGCHLD. It does NOT
+ * inherit DMA grants, window ownership, sockets or open descriptors — those are
+ * per-process kernel resources whose teardown hooks are keyed on the owning
+ * slot, and aliasing them into a second slot would break that invariant. This
+ * is a stated scope gap, not an oversight (see the changelog). */
+static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
+    (void)flags;
+    if (!sf) return (uint64_t)-1;                       /* no user context: kernel caller */
+    int par = (int)current_proc_idx;
+    if (par < 0 || par >= n_kproc || !kprocs[par].used) return (uint64_t)-1;
+    if (kprocs[par].nthreads > 1) return (uint64_t)-11; /* fork from a threaded process: refused, not lied about */
+
+    int ch = kproc_spawn(kprocs[par].name, kprocs[par].caps);
+    if (ch < 0) return (uint64_t)-11;                   /* EAGAIN: kproc table full */
+    int pages = vm_clone_user(kprocs[par].cr3, kprocs[ch].cr3);
+    if (pages < 0) {                                    /* out of frames: undo cleanly */
+        page_free_tree(kprocs[ch].cr3);
+        kprocs[ch].torn_down = 1; kprocs[ch].exited = 1; kprocs[ch].exit_code = (uint64_t)-12;
+        return (uint64_t)-12;
+    }
+    kprocs[ch].role      = kprocs[par].role;
+    kprocs[ch].ppid_slot = par;
+    kprocs[ch].entry     = kprocs[par].entry;
+    kprocs[ch].affinity  = kprocs[par].affinity;
+    for (int sg = 0; sg < NSIG; sg++) kprocs[ch].sig_handler[sg] = kprocs[par].sig_handler[sg];
+    kprocs[ch].sig_pending = 0;                         /* POSIX: pending set is NOT inherited */
+    kprocs[ch].sig_mask    = 0;
+    kprocs[ch].sigframe_sp = 0;
+
+    struct uctx *u = &kprocs[ch].uctx;
+    u->r15 = sf->r15; u->r14 = sf->r14; u->r13 = sf->r13; u->r12 = sf->r12;
+    u->r11 = sf->rflags; u->r10 = sf->r10; u->r9 = sf->r9; u->r8 = sf->r8;
+    u->rbp = sf->rbp; u->rdi = sf->rdi; u->rsi = sf->rsi; u->rdx = sf->rdx;
+    u->rcx = sf->rip;  u->rbx = sf->rbx;
+    u->rax = 0;                                         /* fork() == 0 in the child */
+    u->rip = sf->rip;  u->rsp = sf->rsp; u->rflags = sf->rflags;
+    kprocs[ch].pstate = 1;                              /* "context captured": resume, don't enter */
+    __sync_synchronize();
+
+    /* Queue the child. On SMP the idle siblings pull it autonomously; on a
+     * uniprocessor the caller's own driver loop drains cpu0 (posix_drain). */
+    rq_push(0, ch);
+    for (int cc = 1; cc < MAX_CPUS; cc++)               /* let an idle sibling steal it */
+        if (g_cpu[cc].online) lapic_ipi(g_cpu[cc].apic_id, IPI_PING, 0);
+    g_forks++;
+    if (g_debug_posix)
+        kprintf("[dbgposix] fork pid %u -> child pid %u (%d page(s) cloned, resume rip %X rsp %X)\n",
+                kprocs[par].pid, kprocs[ch].pid, (uint64_t)(int64_t)pages, sf->rip, sf->rsp);
+    return kprocs[ch].pid;
+}
+
+/* v0.55: make SYS_YIELD real for a QUEUED ring-3 task.
+ * Before this, yield from a task running under cpu_exec_proc did nothing useful
+ * (sched_yield switches BSP *kernel* threads; the queued task is not one), so a
+ * ring-3 process could not give a sibling a turn. On a uniprocessor that made
+ * any wait-for-another-process pattern — fork/waitpid above all — an infinite
+ * spin: the one core was inside the waiter's ring-3 code and never came back to
+ * dispatch the child.
+ *
+ * With a complete `sysframe` we can do the honest thing: capture this task's
+ * context exactly as the preempt IPI does, mark it preempted, and unwind to
+ * cpu_exec_proc with RET_PREEMPTED — which requeues it. Voluntary preemption
+ * through the very same machinery as involuntary preemption. Returns normally
+ * (falling through to the old sched_yield behaviour) for the BSP-thread case,
+ * which has a real scheduler to yield to. */
+static void sys_yield_ring3(struct sysframe *sf) {
+    if (!sf) return;
+    if (cpu_idx() == 0 && curthr->uthread) return;       /* BSP thread: sched_yield handles it */
+    int p = (int)current_proc_idx;
+    if (p < 0 || p >= n_kproc || !kprocs[p].used || kprocs[p].exited) return;
+    if ((sf->rip < USER_VMIN) || (sf->rip >= USER_VMAX)) return;  /* not a ring-3 caller */
+    struct uctx *u = &kprocs[p].uctx;
+    u->r15 = sf->r15; u->r14 = sf->r14; u->r13 = sf->r13; u->r12 = sf->r12;
+    u->r11 = sf->rflags; u->r10 = sf->r10; u->r9 = sf->r9; u->r8 = sf->r8;
+    u->rbp = sf->rbp; u->rdi = sf->rdi; u->rsi = sf->rsi; u->rdx = sf->rdx;
+    u->rcx = sf->rip;  u->rbx = sf->rbx;
+    u->rax = 0;                                          /* SYS_YIELD returns 0 */
+    u->rip = sf->rip;  u->rsp = sf->rsp; u->rflags = sf->rflags;
+    kprocs[p].pstate = 1;
+    __sync_synchronize();
+    write_cr3(kernel_cr3);
+    resume_kernel(RET_PREEMPTED);                        /* cpu_exec_proc requeues us */
+}
+
+/* SYS_SIGRETURN() — pop the frame sig_deliver pushed and resume the interrupted
+ * instruction. Like every real kernel's sigreturn this NEVER returns: it enters
+ * ring 3 through iretq so that RCX and RFLAGS are restored exactly, which
+ * SYSRET (which clobbers both) fundamentally cannot do. */
+static void sys_sigreturn(struct sysframe *sf) {
+    int slot = (int)current_proc_idx;
+    struct uctx u;
+    if (slot < 0 || slot >= n_kproc || !sig_return(slot, &u)) {
+        /* A corrupt or absent frame means ring 3 forged a sigreturn — the one
+         * safe response is to kill it, exactly as Linux does. */
+        kprintf("[posix  ] pid %u: bogus SYS_SIGRETURN (no valid frame) — terminated\n",
+                slot >= 0 && slot < n_kproc ? kprocs[slot].pid : 0);
+        if (cpu_idx() == 0 && curthr->uthread) uthread_exit(128 + SIGSEGV);
+        write_cr3(kernel_cr3);
+        resume_kernel(128 + SIGSEGV);
+        return;
+    }
+    (void)sf;
+    enter_user_ctx(&u);                                 /* never returns */
+}
+
+/* Signal delivery on the way OUT of a syscall — the deterministic boundary.
+ * `rv` is the value the syscall is about to return; it becomes the resumed
+ * context's RAX, so after the handler runs and calls SYS_SIGRETURN the
+ * interrupted code still observes its own syscall's result. Never returns if a
+ * signal was delivered (it enters the handler) or was fatal (it exits). */
+static void posix_sigcheck_on_return(struct sysframe *sf, uint64_t rv) {
+    if (!sf) return;
+    int slot = (int)current_proc_idx;
+    if (slot < 0 || slot >= n_kproc) return;
+    struct kproc *k = &kprocs[slot];
+    if (!k->used || k->exited || k->torn_down) return;
+    if ((sf->rip < USER_VMIN) || (sf->rip >= USER_VMAX)) return;   /* not a ring-3 caller */
+    sig_check_alarms();
+    int sg = sig_next(slot);
+    if (!sg) return;
+
+    struct uctx u;
+    u.r15 = sf->r15; u.r14 = sf->r14; u.r13 = sf->r13; u.r12 = sf->r12;
+    u.r11 = sf->rflags; u.r10 = sf->r10; u.r9 = sf->r9; u.r8 = sf->r8;
+    u.rbp = sf->rbp; u.rdi = sf->rdi; u.rsi = sf->rsi; u.rdx = sf->rdx;
+    u.rcx = sf->rip;  u.rbx = sf->rbx;
+    u.rax = rv;                                          /* the syscall's own result */
+    u.rip = sf->rip;  u.rsp = sf->rsp; u.rflags = sf->rflags;
+
+    int r = sig_deliver(slot, sg, &u);
+    if (r < 0) {                                         /* fatal disposition */
+        uint64_t code = 128 + (uint64_t)sg;
+        kprintf("[posix  ] pid %u terminated by signal %d at syscall boundary\n",
+                k->pid, (uint64_t)sg);
+        if (cpu_idx() == 0 && curthr->uthread) uthread_exit(code);
+        write_cr3(kernel_cr3);
+        resume_kernel(code);
+        return;
+    }
+    if (r != 1) return;                                  /* ignored: fall through to sysret */
+    enter_user_ctx(&u);                                  /* into the handler; never returns */
+}
 
 uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     switch (num) {
@@ -8217,8 +8790,242 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         klock_release(&g_wm_lock);
         return (uint64_t)got;
     }
+
+    /* =======================================================================
+     * v0.55: POSIX PROCESS / SIGNAL / THREAD CALLS
+     * ======================================================================= */
+    case 48: {   /* SYS_EXECVE(argv, envp, role) -> negative on failure, NEVER returns on success.
+                  * Replaces this process's image in place: same pid, same kproc slot, same
+                  * open descriptors, brand-new address space. */
+        int p = (int)current_proc_idx;
+        uint64_t ucr3 = kprocs[p].cr3;
+        /* The argument vectors live in the address space we are about to
+         * destroy, so copy every byte out FIRST. */
+        static char kargv[UARG_N][UARG_LEN], kenvp[UARG_N][UARG_LEN];
+        int argc = 0, envc = 0;
+        for (int vec = 0; vec < 2; vec++) {
+            uint64_t ptr = vec ? a1 : a0;
+            if (!ptr) continue;
+            for (int i = 0; i < UARG_N; i++) {
+                if (!access_ok(ucr3, ptr + (uint64_t)i * 8, 8, 0)) return (uint64_t)-14;
+                uint64_t sp = ((const uint64_t *)ptr)[i];
+                if (!sp) break;
+                if (copy_user_str(ucr3, sp, vec ? kenvp[envc] : kargv[argc], UARG_LEN) < 0)
+                    return (uint64_t)-14;
+                if (vec) envc++; else argc++;
+            }
+        }
+        if (!argc) { for (int i = 0; i < UARG_LEN - 1 && kprocs[p].name[i]; i++) kargv[0][i] = kprocs[p].name[i];
+                     kargv[0][UARG_LEN - 1] = 0; argc = 1; }
+        /* Build the replacement image in a FRESH space before destroying the
+         * old one: a failed exec must leave the caller running, not dead.    */
+        uint64_t newcr3 = create_address_space();
+        if (!newcr3) return (uint64_t)-12;
+        uint64_t save = kprocs[p].cr3;
+        kprocs[p].cr3 = newcr3;                       /* elf_load targets kprocs[p].cr3 */
+        uint64_t entry = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        if (!entry) { kprocs[p].cr3 = save; page_free_tree(newcr3); return (uint64_t)-8; }
+        uint64_t sp = uargs_build(newcr3, argc, (const char (*)[UARG_LEN])kargv,
+                                            envc, (const char (*)[UARG_LEN])kenvp);
+        /* Point of no return. Switch onto the new image, then dismantle the old
+         * space — in that order, because we are executing on it right now. The
+         * kernel half (this syscall's stack) lives in the shared kernel range
+         * that create_address_space aliases into every process, so it survives. */
+        kprocs[p].entry = entry;
+        if (a2 <= 64) kprocs[p].role = a2;
+        kprocs[p].pstate = 0;                          /* no stale captured context */
+        kprocs[p].sigframe_sp = 0;
+        kprocs[p].sig_mask = 0;
+        /* POSIX: exec RESETS caught signals to default but keeps SIG_IGN.     */
+        for (int sg = 0; sg < NSIG; sg++)
+            if (kprocs[p].sig_handler[sg] > 1) kprocs[p].sig_handler[sg] = 0;
+        write_cr3(newcr3);
+        if (cpu_idx() == 0 && curthr->uthread) curthr->cr3 = newcr3;
+        __sync_synchronize();
+        page_free_tree(save);                          /* the old image, now unreferenced */
+        g_execs++;
+        if (g_debug_posix)
+            kprintf("[dbgposix] execve pid %u argc %d envc %d -> entry %X sp %X role %u\n",
+                    kprocs[p].pid, (uint64_t)argc, (uint64_t)envc, entry, sp, kprocs[p].role);
+        enter_user_thread(entry, sp);                  /* never returns */
+        return 0;                                     /* unreachable */
+    }
+    case 49: {   /* SYS_SIGACTION(signo, handler) -> previous handler, or negative.
+                  * handler: 0 = SIG_DFL, 1 = SIG_IGN, else a ring-3 entry point. */
+        int p = (int)current_proc_idx;
+        int sg = (int)(int64_t)a0;
+        if (sg <= 0 || sg >= NSIG) return (uint64_t)-1;
+        if (sg == SIGKILL) return (uint64_t)-1;        /* never catchable, never ignorable */
+        if (a1 > 1 && (a1 < USER_VMIN || a1 >= USER_VMAX)) return (uint64_t)-1;
+        if (a1 > 1 && !access_ok(kprocs[p].cr3, a1, 1, 0)) return (uint64_t)-14;
+        uint64_t old = kprocs[p].sig_handler[sg];
+        kprocs[p].sig_handler[sg] = a1;
+        if (g_debug_posix)
+            kprintf("[dbgposix] sigaction pid %u sig %d handler %X (was %X)\n",
+                    kprocs[p].pid, (uint64_t)sg, a1, old);
+        return old;
+    }
+    case 50: {   /* SYS_KILL(pid, signo) -> 0 ok, negative. Permitted targets: SELF, or
+                  * a process whose parent is the caller — a real containment property,
+                  * not a stub: a ring-3 task cannot signal an unrelated process. */
+        int me = (int)current_proc_idx;
+        int sg = (int)(int64_t)a1;
+        int tgt = -1;
+        for (int i = 0; i < n_kproc; i++)
+            if (kprocs[i].used && !kprocs[i].exited && kprocs[i].pid == (uint32_t)a0) { tgt = i; break; }
+        if (tgt < 0) return (uint64_t)-3;                       /* ESRCH */
+        if (tgt != me && kprocs[tgt].ppid_slot != me) return (uint64_t)-13;  /* EPERM */
+        return (uint64_t)(int64_t)sig_raise(tgt, sg);
+    }
+    case 52: {   /* SYS_THREAD_CREATE(entry, arg) -> new thread's index in this process,
+                  * or negative. The new thread shares this process's ADDRESS SPACE (same
+                  * cr3, same globals, same heap) but gets its own ring-3 stack and its own
+                  * kernel stack — the definition of a POSIX thread. */
+        int p = (int)current_proc_idx;
+        if (a0 < USER_VMIN || a0 >= USER_VMAX) return (uint64_t)-1;
+        if (!access_ok(kprocs[p].cr3, a0, 1, 0)) return (uint64_t)-14;
+        /* A POSIX thread here IS a BSP scheduler thread (see the changelog's
+         * scope notes), so only the BSP may create one. This restriction is
+         * enforced rather than merely documented because of a REAL, reproducible
+         * SMP hang: when the creating process ran on an AP while its threads ran
+         * on the BSP, the process's main thread would occasionally never be
+         * dispatched again after its last thread exited, and the machine went
+         * idle with no core making progress. It reproduces only when the host is
+         * oversubscribed (two 4-vCPU TCG guests on 4 cores), and it was NOT root
+         * caused — so rather than ship a path that can wedge, the kernel refuses
+         * it and the suite pins thread-creating processes to cpu 0. Lifting this
+         * is the first task of the next milestone. */
+        if (cpu_idx() != 0) return (uint64_t)-11;      /* EAGAIN: create from the BSP */
+        int slot = kprocs[p].ustack_next;
+        if (slot >= THR_MAX) return (uint64_t)-11;     /* EAGAIN: per-process ceiling */
+        uint64_t base = THR_USER_V + (uint64_t)slot * THR_STK_STRIDE;
+        for (int i = 0; i < THR_STK_PAGES; i++) {
+            uint64_t f = alloc_frame();
+            if (!f) return (uint64_t)-12;
+            map_page(kprocs[p].cr3, base + (uint64_t)i * 0x1000, f, PTE_USER | PTE_WRITE | PTE_NX);
+        }
+        /* Hand the thread its argument through its own stack: enter_user_thread
+         * sets only RIP and RSP, so [rsp] is the ABI we have. The ring-3
+         * trampoline pops it. 16-byte aligned entry, as SysV requires.        */
+        uint64_t top = base + (uint64_t)THR_STK_PAGES * 0x1000;
+        uint64_t sp  = (top - 16) & ~0xFull;
+        uint64_t pte = walk_pte(kprocs[p].cr3, sp & ~0xFFFull);
+        if (!(pte & PTE_PRESENT)) return (uint64_t)-14;
+        *(uint64_t *)((pte & ADDR_MASK) + (sp & 0xFFF)) = a1;   /* [rsp] = arg */
+        __sync_fetch_and_add(&kprocs[p].nthreads, 1);
+        /* struct pcb::name is a BORROWED pointer, not a copy — a stack-local
+         * buffer here would dangle the instant this syscall returned (found
+         * live: thread names came back as whatever last used that stack). */
+        static const char *const thr_names[THR_MAX] = {
+            "pthr0", "pthr1", "pthr2", "pthr3", "pthr4", "pthr5", "pthr6", "pthr7"
+        };
+        /* Commit the slot BEFORE the thread becomes runnable: uthread_create
+         * publishes a schedulable PCB, and that thread may itself call
+         * SYS_THREAD_CREATE before this syscall finishes. Everything the new
+         * thread needs (its stack, its [rsp] argument, nthreads) is already in
+         * place above. A thread-table exhaustion below therefore burns this slot
+         * rather than risking a double allocation — the userland shim's index
+         * check turns that into a loud -1, never a silently wrong control block. */
+        kprocs[p].ustack_next = slot + 1;
+        int tid = uthread_create(thr_names[slot], p, a0, sp);
+        if (tid < 0) { __sync_fetch_and_sub(&kprocs[p].nthreads, 1); return (uint64_t)-11; }
+        g_threads_made++;
+        if (g_debug_posix)
+            kprintf("[dbgposix] thread_create pid %u slot %d tid %d entry %X sp %X (%d live)\n",
+                    kprocs[p].pid, (uint64_t)slot, (uint64_t)tid, a0, sp,
+                    (uint64_t)(int64_t)kprocs[p].nthreads);
+        return (uint64_t)slot;
+    }
+    case 53:     /* SYS_THREAD_EXIT(code) — leave this THREAD; siblings and the address
+                  * space survive unless this was the last one (posix_thread_leave). */
+        if (cpu_idx() == 0 && curthr->uthread) uthread_exit(a0);
+        /* Not a BSP scheduler thread: this is a queued-task excursion, so
+         * unwind it the same way SYS_EXIT does. Legal, but worth noticing. */
+        if (g_debug_posix)
+            kprintf("[dbgposix] SYS_THREAD_EXIT(%u) outside a uthread ctx (cpu%u pid %u)\n",
+                    a0, (uint64_t)cpu_idx(), kprocs[current_proc_idx].pid);
+        write_cr3(kernel_cr3);
+        resume_kernel(a0);
+        return 0;                                      /* unreachable */
+    case 54: {   /* SYS_ALARM(ticks) -> ticks remaining on the previous alarm (0 if none).
+                  * 0 cancels. Fires SIGALRM from the scheduler/syscall boundary. */
+        int p = (int)current_proc_idx;
+        uint64_t rem = 0;
+        if (kprocs[p].alarm_deadline) __sync_fetch_and_sub(&g_alarms_armed, 1);
+        if (kprocs[p].alarm_deadline > g_ticks) rem = kprocs[p].alarm_deadline - g_ticks;
+        kprocs[p].alarm_deadline = a0 ? g_ticks + a0 : 0;
+        if (kprocs[p].alarm_deadline) __sync_fetch_and_add(&g_alarms_armed, 1);
+        return rem;
+    }
+    case 57: {   /* SYS_SIGUNMASK(signo) -> 0 ok, negative.
+                  * sig_deliver BLOCKS the signal it delivers, so a handler cannot
+                  * recurse on its own fault. A handler that leaves by longjmp
+                  * instead of returning therefore never reaches SYS_SIGRETURN and
+                  * would stay blocked forever — the canonical
+                  * "recover from SIGSEGV with setjmp/longjmp" idiom. This is that
+                  * idiom's missing half: our narrow equivalent of
+                  * sigprocmask(SIG_UNBLOCK), which also drops the now-orphaned
+                  * frame so a forged SYS_SIGRETURN cannot replay it. */
+        int p = (int)current_proc_idx;
+        int sg = (int)(int64_t)a0;
+        if (sg <= 0 || sg >= NSIG) return (uint64_t)-1;
+        kprocs[p].sig_mask &= ~(1u << sg);
+        kprocs[p].sigframe_sp = 0;
+        return 0;
+    }
+    case 55:     /* SYS_GETPPID() -> parent pid, or 0 if this process has no live parent */
+        {
+            int par = kprocs[current_proc_idx].ppid_slot;
+            return (par >= 0 && par < n_kproc && kprocs[par].used) ? kprocs[par].pid : 0;
+        }
+    case 56: {   /* SYS_WAITPID(pid) -> child's exit code, -11 (EAGAIN) if still running,
+                  * -10 (ECHILD) if it is not a child of ours. Non-blocking by design:
+                  * this kernel has no sleep/wake queue for ring 3 yet, so a ring-3
+                  * waiter polls (which is what the pthread shim does too). */
+        int me = (int)current_proc_idx;
+        for (int i = 0; i < n_kproc; i++) {
+            if (!kprocs[i].used || kprocs[i].pid != (uint32_t)a0) continue;
+            if (kprocs[i].ppid_slot != me) return (uint64_t)-10;
+            if (!kprocs[i].exited) return (uint64_t)-11;
+            return kprocs[i].exit_code;
+        }
+        return (uint64_t)-10;
+    }
     }
     return (uint64_t)-1;
+}
+
+/* ===========================================================================
+ * v0.55: THE SYSCALL TRAP ENTRY (what boot/usermode.asm actually calls)
+ * ===========================================================================
+ * Two things need the caller's COMPLETE ring-3 context, which only exists here
+ * as `struct sysframe *`:
+ *   - SYS_FORK, so the child resumes with the parent's exact register file and
+ *     a return value of 0 — real fork semantics, no userland continuation trick.
+ *   - signal delivery on the way OUT of any syscall, which is the one boundary
+ *     that is hit deterministically on a uniprocessor (the scheduler boundary
+ *     needs a preemption, and short-lived tasks are never preempted).
+ * Everything else goes to syscall_dispatch unchanged — kernel-side callers of
+ * that function (capability probes in the self-tests) have no user context and
+ * legitimately pass none. */
+uint64_t syscall_trap(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
+                      struct sysframe *sf) {
+    uint64_t r;
+    if (num == 47) r = sys_fork(sf, a0);
+    else if (num == 51) { sys_sigreturn(sf); r = 0; }   /* never returns */
+    else if (num == 15) {
+        /* Deliver pending signals BEFORE yielding. sys_yield_ring3 unwinds
+         * through resume_kernel and never returns, so for a queued ring-3 task
+         * the normal syscall-return boundary below is unreachable — a process
+         * whose only syscall is SYS_YIELD (a poll loop) would never receive its
+         * SIGALRM. Found live: the signal worker's alarm never fired. */
+        posix_sigcheck_on_return(sf, 0);           /* may never return */
+        sys_yield_ring3(sf);                       /* may never return */
+        r = syscall_dispatch(15, 0, 0, 0);
+    }
+    else r = syscall_dispatch(num, a0, a1, a2);
+    posix_sigcheck_on_return(sf, r);                     /* may never return */
+    return r;
 }
 
 /* ---- Run the ring-3 program under a given process identity ----------------- */
@@ -8226,6 +9033,127 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
 static void map_user_stack(uint64_t cr3) {
     for (int i = 0; i < USTK_PAGES; i++)
         map_page(cr3, USTK_V + (uint64_t)i * 0x1000, alloc_frame(), PTE_USER | PTE_WRITE | PTE_NX);
+}
+
+/* ===========================================================================
+ * v0.55: SysV PROCESS-START BLOCK (argc / argv / envp)
+ * ===========================================================================
+ * Written into the top 1 KiB of the freshly mapped ring-3 stack, in the exact
+ * layout the System V x86-64 psABI specifies at process entry:
+ *
+ *      RSP -> [ argc ][ argv[0] .. argv[argc-1] ][ NULL ]
+ *                     [ envp[0] .. envp[envc-1] ][ NULL ][ string bytes... ]
+ *
+ * so crt0 reads its arguments the same way it would on any Unix. Pointers are
+ * absolute ring-3 vaddrs into the same block, which is why the block must live
+ * at a known vaddr: we write it through the kernel's identity map, but ring 3
+ * dereferences it through its own mapping.
+ *
+ * `argv`/`envp` are flattened kernel-side arrays (UARG_N x UARG_LEN), NOT user
+ * pointers — every caller has already copied the strings out of user space,
+ * because execve destroys the address space they came from.
+ * Returns the ring-3 RSP the process must start with. */
+static uint64_t uargs_build(uint64_t cr3, int argc, const char argv[][UARG_LEN],
+                            int envc, const char envp[][UARG_LEN]) {
+    if (argc < 0) argc = 0; if (argc > UARG_N) argc = UARG_N;
+    if (envc < 0) envc = 0; if (envc > UARG_N) envc = UARG_N;
+    /* The block sits inside the stack's top page, which map_user_stack mapped. */
+    uint64_t pte = walk_pte(cr3, UARGS_V & ~0xFFFull);
+    if (!(pte & PTE_PRESENT)) return USTK_INIT;              /* nothing to write into */
+    uint8_t *page = (uint8_t *)(pte & ADDR_MASK);
+    uint64_t base = UARGS_V & ~0xFFFull;                     /* vaddr of page[0]      */
+    uint64_t *q   = (uint64_t *)(page + (UARGS_V - base));   /* pointer array cursor  */
+    /* Strings go after the pointer array: 1 (argc) + argc+1 + envc+1 slots.  */
+    uint64_t ptr_slots = 1 + (uint64_t)argc + 1 + (uint64_t)envc + 1;
+    uint64_t str_off   = UARGS_V + ptr_slots * 8;
+    if (str_off + (uint64_t)(argc + envc) * UARG_LEN > USTK_TOP) return USTK_INIT;  /* refuse to overflow */
+    char *s = (char *)(page + (str_off - base));
+    uint64_t sv = str_off;                                   /* its ring-3 vaddr      */
+
+    *q++ = (uint64_t)argc;
+    for (int i = 0; i < argc; i++) {
+        *q++ = sv;
+        int n = 0;
+        while (n < UARG_LEN - 1 && argv[i][n]) { s[n] = argv[i][n]; n++; }
+        s[n] = 0;
+        s += UARG_LEN; sv += UARG_LEN;
+    }
+    *q++ = 0;                                                /* argv NULL terminator  */
+    for (int i = 0; i < envc; i++) {
+        *q++ = sv;
+        int n = 0;
+        while (n < UARG_LEN - 1 && envp[i][n]) { s[n] = envp[i][n]; n++; }
+        s[n] = 0;
+        s += UARG_LEN; sv += UARG_LEN;
+    }
+    *q++ = 0;                                                /* envp NULL terminator  */
+    return USTK_INIT;
+}
+
+/* The default block every freshly loaded image gets, so a process that was
+ * never execve'd still sees a well-formed argc/argv/envp instead of garbage. */
+static uint64_t uargs_default(uint64_t cr3, const char *name) {
+    char argv[UARG_N][UARG_LEN], envp[UARG_N][UARG_LEN];
+    int n = 0;
+    while (n < UARG_LEN - 1 && name && name[n]) { argv[0][n] = name[n]; n++; }
+    argv[0][n] = 0;
+    const char *e0 = "PATH=/", *e1 = "OUTRUN=" KERNEL_VERSION, *e2 = "HOME=/";
+    for (n = 0; n < UARG_LEN - 1 && e0[n]; n++) envp[0][n] = e0[n]; envp[0][n] = 0;
+    for (n = 0; n < UARG_LEN - 1 && e1[n]; n++) envp[1][n] = e1[n]; envp[1][n] = 0;
+    for (n = 0; n < UARG_LEN - 1 && e2[n]; n++) envp[2][n] = e2[n]; envp[2][n] = 0;
+    return uargs_build(cr3, 1, argv, 3, envp);
+}
+
+/* ===========================================================================
+ * v0.55: ADDRESS-SPACE CLONE for fork()
+ * ===========================================================================
+ * A clean eager copy, not copy-on-write: every USER-mapped page below
+ * UPRIVATE_VMAX gets a brand-new frame with identical contents and identical
+ * PTE flags. This is the honest choice for this kernel — COW needs a #PF
+ * handler that can distinguish a protection fault on a shared frame from a
+ * genuine access violation, plus per-frame refcounts; both are real work and
+ * neither exists yet (see the changelog's scope notes). An eager copy is
+ * slower but has exactly the same OBSERVABLE semantics, and it reuses the
+ * frame allocator and page_free_tree unchanged, so a forked child is torn
+ * down by the existing reclamation path with no special cases.
+ *
+ * Windows at/above UPRIVATE_VMAX (device DMA, shared window surfaces, the SMP
+ * scratch window, per-thread stacks) are deliberately NOT cloned: duplicating
+ * an MMIO alias would hand the child a device it never asked for, and aliasing
+ * a shared surface would corrupt the owner's window.
+ * Returns the number of pages copied, or -1 on allocation failure. */
+static int vm_clone_user(uint64_t src_cr3, uint64_t dst_cr3) {
+    uint64_t *pml4 = (uint64_t *)src_cr3;
+    int copied = 0;
+    for (uint64_t i4 = USER_VMIN >> 39; i4 < (UPRIVATE_VMAX >> 39); i4++) {
+        if (!(pml4[i4] & PTE_PRESENT) || !(pml4[i4] & PTE_USER)) continue;
+        uint64_t *pdpt = (uint64_t *)(pml4[i4] & ADDR_MASK);
+        for (uint64_t i3 = 0; i3 < 512; i3++) {
+            if (!(pdpt[i3] & PTE_PRESENT) || (pdpt[i3] & PTE_HUGE)) continue;
+            uint64_t *pd = (uint64_t *)(pdpt[i3] & ADDR_MASK);
+            for (uint64_t i2 = 0; i2 < 512; i2++) {
+                if (!(pd[i2] & PTE_PRESENT) || (pd[i2] & PTE_HUGE)) continue;
+                uint64_t *pt = (uint64_t *)(pd[i2] & ADDR_MASK);
+                for (uint64_t i1 = 0; i1 < 512; i1++) {
+                    uint64_t pte = pt[i1];
+                    if (!(pte & PTE_PRESENT) || !(pte & PTE_USER)) continue;
+                    if (pte & PTE_PCD) continue;         /* device/DMA alias: never clone */
+                    uint64_t va = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                    if (va >= UPRIVATE_VMAX) continue;
+                    uint64_t nf = alloc_frame();
+                    if (!nf) return -1;
+                    const uint8_t *s = (const uint8_t *)(pte & ADDR_MASK);
+                    uint8_t *d = (uint8_t *)nf;
+                    for (int b = 0; b < 0x1000; b++) d[b] = s[b];
+                    /* identical permissions: a read-only text page stays R+X in
+                     * the child, so the child obeys the same W^X policy.       */
+                    map_page(dst_cr3, va, nf, pte & (PTE_USER | PTE_WRITE | PTE_NX));
+                    copied++;
+                }
+            }
+        }
+    }
+    return copied;
 }
 
 /* Enter ring 3 in a process's OWN address space so a granted MMIO mapping is
@@ -8236,7 +9164,7 @@ static void enter_process(const char *label, int proc_idx, uint64_t entry) {
     kprintf("\n[kernel ] --> RING 3 as pid %u '%s' (entry %X, caps %X, cr3 %X)\n",
             kprocs[proc_idx].pid, label, entry, kprocs[proc_idx].caps, kprocs[proc_idx].cr3);
     write_cr3(kprocs[proc_idx].cr3);       /* the process's own page tables      */
-    enter_user_mode(entry, USTK_TOP);
+    enter_user_mode(entry, USTK_INIT);
     /* control returns here after SYS_EXIT or a fault unwind (resume_kernel).      */
     /* Both paths can land with IF cleared (SYSCALL SFMASK / interrupt gate), so   */
     /* restore interrupts for normal kernel execution.                            */
@@ -8264,6 +9192,23 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         /* On an AP, curthr is BSP scheduler state and means nothing — a ring-3 */
         /* fault there unwinds through the AP's own per-CPU resume context.     */
         struct pcb *t = curthr;
+        /* v0.55: POSIX says a fault kills the whole thread GROUP, not just the
+         * faulting thread. We cannot yank a sibling out of ring 3 from here, so
+         * post an unblockable SIGKILL to the process: every sibling self-exits
+         * at its next syscall boundary (see the SIGKILL check in do_syscall).
+         * The faulting thread itself only tears the address space down if it is
+         * the last one standing. */
+        if (kprocs[t->proc].nthreads > 1) {
+            __sync_fetch_and_or(&kprocs[t->proc].sig_pending, 1u << SIGKILL);
+            kprocs[t->proc].exit_code = 0x8000 + f->vector;
+            posix_thread_leave((int)t->proc);
+            kprintf("[uthread] faulting tid %d reaped; SIGKILL posted to %d sibling(s)\n",
+                    (uint64_t)t->id, (uint64_t)(int64_t)kprocs[t->proc].nthreads);
+            t->state = T_FREE;
+            sched_switch_to(pick_next());    /* does not return                 */
+            for (;;) __asm__ volatile("hlt");
+        }
+        posix_thread_leave((int)t->proc);     /* last thread: balance the count  */
         /* Synchronous fault on the dying task's behalf — thread context in     */
         /* effect, so the rank-5 acquire is legal here (never from a real IRQ). */
         klock_acquire(&g_surf_lock);
@@ -8288,6 +9233,7 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         descriptor_teardown_kproc((int)t->proc);
         dma_teardown_kproc((int)t->proc);      /* v0.44: revoke DMA/IOMMU grants FIRST */
         kprocs[t->proc].frames_freed = page_free_tree(kprocs[t->proc].cr3);
+        posix_proc_reaped((int)t->proc);    /* v0.55: record status + SIGCHLD FIRST — */
         kprocs[t->proc].torn_down = 1;      /* v0.45: NOW the slot is safe to recycle */
         kprintf("[uthread] faulting tid %d terminated — siblings and kernel unaffected, %u frame(s) reclaimed\n",
                 (uint64_t)t->id, kprocs[t->proc].frames_freed);
@@ -10012,6 +10958,8 @@ static uint64_t elf_load(int proc_idx, uint64_t img, uint64_t img_size) {
     }
     map_user_stack(cr3);
     if (!loaded) { kputs("[elf    ] reject: no PT_LOAD segments\n"); return 0; }
+    /* v0.55: every image starts with a well-formed SysV argc/argv/envp block. */
+    uargs_default(cr3, kprocs[proc_idx].name);
     return eh->entry;
 }
 
@@ -10034,7 +10982,7 @@ static int uthread_spawn_elf(const char *label, uint64_t caps, uint64_t role, in
     kprocs[p].role = role;
     uint64_t entry = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
     if (!entry) { kprintf("[uthread] ELF load failed for '%s'\n", label); return -1; }
-    int tid = uthread_create(label, p, entry);
+    int tid = uthread_create(label, p, entry, 0);
     if (tid < 0) { kprintf("[uthread] no free thread slot for '%s'\n", label); return -1; }
     if (out_tid) *out_tid = tid;
     kprintf("[uthread] spawned '%s': pid %u = tid %d (role %u) — scheduled, not entered\n",
@@ -10860,10 +11808,6 @@ static void cmd_apps_stress(void) {
                 if (wm_count_used() > base_wins + 1) concurrent_ok = 1;
             }
         }
-        /* Every app in this cycle owned its OWN window — true on any config,
-         * and the property "multi-app windowed desktop" actually rests on. */
-        if (g_wm_created - created0 < (uint64_t)nproc) windowed_ok = 0;
-
         uint64_t t0 = g_ticks;
         for (;;) {
             int pending = 0;
@@ -10873,6 +11817,14 @@ static void cmd_apps_stress(void) {
             uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
         }
         current_proc_idx = save;
+
+        /* Every app in this cycle owned its OWN window — true on any config, and
+         * the property "multi-app windowed desktop" actually rests on.
+         * v0.55: sampled AFTER the watchdog wait above, not the moment the BSP's
+         * drain queue empties. On SMP an AP can still be running an app at that
+         * point, so the earlier placement counted windows before they existed
+         * and failed intermittently — a race in the CHECK, not in the kernel. */
+        if (g_wm_created - created0 < (uint64_t)nproc) windowed_ok = 0;
 
         for (int i = 0; i < nproc; i++) {
             int p = procs[i];
@@ -10934,6 +11886,303 @@ static void cmd_apps_stress(void) {
     kputs("-- done --\n");
 }
 
+
+/* ===========================================================================
+ * v0.55: POSIX STRESS — fork/exec chains, signals, and pthreads under SMP
+ * ===========================================================================
+ * Five REAL ring-3 workers per round, all queued together so the scheduler
+ * interleaves them, each exercising a different half of the POSIX surface:
+ *
+ *   role 29  fork() -> child, waitpid() the child's status, receive SIGCHLD
+ *   role 30  catchable SIGSEGV recovered TWICE via setjmp/longjmp, a SIGINT
+ *            delivered on a syscall boundary with full register-frame integrity
+ *            checked afterwards, and a SIGALRM fired from the timer
+ *   role 31  4 pthreads x 200 mutex-guarded increments, joined, exact total
+ *   role 32  execve() into role 33, which verifies the argv/envp it received
+ *   role 34  the std fd table: 0/1/2 reserved, open() >= 3, inherited by fork
+ *
+ * Every worker encodes its verdict in its EXIT CODE (7xx/8xx/9xx families), so
+ * a failure names the exact ring-3 assertion that broke rather than just
+ * "the process died". The kernel half below then re-checks, from outside, the
+ * things ring 3 cannot honestly self-report: that forked children really got
+ * their own address space and had it fully reclaimed, that the signal counters
+ * advanced, that thread groups tore down exactly once, and that not a single
+ * frame or descriptor leaked across the whole storm.                         */
+#define POSIXSTRESS_ROUNDS 3
+static int g_pxpass, g_pxfail;
+static void pxcheck(const char *n, int c) {
+    if (c) { g_pxpass++; kprintf("[posixstrs]  PASS  %s\n", n); }
+    else   { g_pxfail++; kprintf("[posixstrs]  FAIL  %s\n", n); }
+}
+
+#define PX_MAXCHILD 12
+/* One round's observed outcome. Latching matters: kproc slots are RECYCLED the
+ * moment a task is torn down, so by the time a round finishes, a worker's slot
+ * may already belong to a child some OTHER worker forked. Reading exit codes out
+ * of the table afterwards therefore misattributes results (observed live: a
+ * forked child's failure was reported against the execve worker's label). */
+struct px_round {
+    uint32_t pid[5];                       /* worker pids as spawned            */
+    uint64_t code[5];                      /* latched exit codes                */
+    int      got[5];
+    uint32_t cpid[PX_MAXCHILD];            /* pids of everything they forked    */
+    int      cparent[PX_MAXCHILD];         /* the forking worker's index        */
+    uint64_t ccode[PX_MAXCHILD], cframes[PX_MAXCHILD];
+    int      cgot[PX_MAXCHILD], nchild;
+};
+
+/* Record any newly-terminal task, and discover children as they appear.
+ * Outcomes are read from the kernel's REAP LOG, keyed on pid, precisely because
+ * the kproc table itself is not a reliable place to look afterwards: a torn-down
+ * slot is recycled immediately, and fork() takes those slots. */
+static void px_sample(int *procs, int nproc, struct px_round *R) {
+    for (int i = 0; i < nproc; i++) {
+        if (R->got[i]) continue;
+        if (posix_reap_lookup(R->pid[i], &R->code[i], 0)) { R->got[i] = 1; continue; }
+        struct kproc *k = &kprocs[procs[i]];
+        if (k->pid == R->pid[i] && k->exited) { R->code[i] = k->exit_code; R->got[i] = 1; }
+    }
+    for (int i = 0; i < n_kproc; i++) {
+        struct kproc *k = &kprocs[i];
+        if (!k->used) continue;
+        int par = k->ppid_slot, pi = -1;
+        for (int j = 0; j < nproc; j++) if (par == procs[j]) pi = j;
+        if (pi < 0) continue;
+        /* ppid_slot is a SLOT index, and slots are recycled across rounds — a
+         * previous round's child can therefore point at a slot this round's
+         * workers now occupy. pids are monotonic, so a genuine child of this
+         * worker always has a higher pid than its parent; that disambiguates. */
+        if (k->pid <= R->pid[pi]) continue;
+        int slot = -1;
+        for (int c = 0; c < R->nchild; c++) if (R->cpid[c] == k->pid) { slot = c; break; }
+        if (slot < 0) {
+            if (R->nchild >= PX_MAXCHILD) continue;
+            slot = R->nchild++;
+            R->cpid[slot] = k->pid; R->cparent[slot] = pi;
+            R->ccode[slot] = 0; R->cframes[slot] = 0; R->cgot[slot] = 0;
+            /* Verified once, while both are still live: a child of fork() must
+             * be a DIFFERENT process in a DIFFERENT address space. */
+            if (k->pid == kprocs[par].pid || k->cr3 == kprocs[par].cr3) R->cgot[slot] = -1;
+        }
+    }
+    for (int c = 0; c < R->nchild; c++)
+        if (R->cgot[c] == 0 && posix_reap_lookup(R->cpid[c], &R->ccode[c], &R->cframes[c]))
+            R->cgot[c] = 1;
+}
+
+/* Drain cpu0's run queue, running whatever turns up — the workers themselves,
+ * anything they fork, and anything that voluntarily yielded (SYS_YIELD now
+ * requeues a ring-3 task). This is what makes fork+waitpid work on a
+ * uniprocessor: the waiter yields, we pick up its child, the child exits, and
+ * the waiter is dispatched again to observe the status. On SMP the idle APs
+ * pull from the same queue concurrently; rq_pop is atomic, so the two drainers
+ * simply share the work. Returns 0 if the watchdog expired. */
+static int posix_drain(int *procs, int nproc, struct px_round *R, uint64_t watchdog) {
+    uint64_t t0 = g_ticks, lastlog = g_ticks;
+    uint64_t spins = 0;
+    for (;;) {
+        px_sample(procs, nproc, R);
+        int pending = 0;
+        for (int i = 0; i < nproc; i++) if (!R->got[i]) pending = 1;
+        for (int c = 0; c < R->nchild && !pending; c++) if (R->cgot[c] == 0) pending = 1;
+        if (!pending) { px_sample(procs, nproc, R); return 1; }
+        /* The watchdog must be checked on EVERY pass, not only when the queue
+         * runs dry: a worker in a yield loop keeps requeueing itself, so a
+         * "dispatch, then continue" shape would spin here forever with the
+         * timeout unreachable (found live — an SMP round never terminated). */
+        if (g_ticks - t0 >= watchdog) return 0;
+        int q = rq_pop(0);
+        if (q >= 0) {
+            cpu_exec_proc(0, q);
+            /* Yield after EVERY dispatch, not only when the queue runs dry.
+             * Queued ring-3 tasks and BSP scheduler threads are two different
+             * schedulers, and POSIX threads live in the second one: a task in a
+             * yield loop requeues itself instantly, so the queue is never empty
+             * and this loop would monopolise the BSP forever — its own process's
+             * threads would never run and every pthread_join would time out.
+             * (Found live: exit 902 from every pthread worker, deterministically,
+             * once the worker was pinned to cpu 0.) */
+            sched_yield();
+            continue;
+        }
+        if (++spins & 1) sched_yield();
+        if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);
+        /* Progress breadcrumb: in a serial log a silent stall is
+         * indistinguishable from slow progress, and whether g_ticks is advancing
+         * is exactly the datum that separates a wedged core from a busy one. */
+        /* Count SPINS, not ticks: if the timer itself has stopped (a core parked
+         * with interrupts off) a tick-based breadcrumb is silent too, and that
+         * is precisely the case we need to tell apart from slow progress. */
+        if ((spins % 400000) == 0 || g_ticks - lastlog >= 200) {
+            lastlog = g_ticks;
+            kprintf("[posixstrs] .. waiting spins=%u ticks=%u (+%u) rq0=%d: ", spins, g_ticks, g_ticks - t0, (uint64_t)(int64_t)(g_cpu[0].rq_t - g_cpu[0].rq_h));
+            for (int i = 0; i < nproc; i++)
+                if (!R->got[i]) kprintf("pid %u(role %u,thr %d) ", R->pid[i],
+                                        kprocs[procs[i]].role,
+                                        (uint64_t)(int64_t)kprocs[procs[i]].nthreads);
+            for (int c = 0; c < R->nchild; c++)
+                if (R->cgot[c] == 0) kprintf("child %u ", R->cpid[c]);
+            kprintf("\n");
+        }
+        __asm__ volatile("pause");
+    }
+}
+
+static void cmd_posix_stress(void) {
+    kputs("-- POSIX STRESS: fork/exec chains, signal frames, pthread mutexes --\n");
+    g_pxpass = g_pxfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0  = g_rank_violations;
+    uint64_t fork0  = g_forks, exec0 = g_execs, thr0 = g_threads_made;
+    uint64_t sdel0  = g_sig_delivered, sret0 = g_sig_returned, srai0 = g_sig_raised;
+    uint32_t inr3_0 = g_inr3_max;
+
+    /* role -> the exit code that means "every ring-3 assertion in me passed" */
+    static const uint64_t want[5] = { 700, 800, 900, 950, 960 };
+    static const int      roles[5] = {  29,  30,  31,  32,  34 };
+    static const char    *labels[5] = { "fork/waitpid/SIGCHLD", "signals + frame integrity",
+                                        "pthreads + mutex", "execve argv/envp", "std fd table" };
+    int rounds_ok = 1, codes_ok = 1, child_ok = 1, reclaim_ok = 1, ppid_ok = 1;
+    int nchild_total = 0, rnd;
+
+    for (rnd = 0; rnd < POSIXSTRESS_ROUNDS; rnd++) {
+        struct px_round R;
+        int procs[5], nproc = 0;
+        for (int i = 0; i < 5; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+        R.nchild = 0;
+
+        for (int i = 0; i < 5; i++) {
+            int p = kproc_spawn("posix-w", PCAP_FILESYSTEM);
+            if (p < 0) { pxcheck("kproc_spawn never fails mid-storm", 0); rounds_ok = 0; break; }
+            kprocs[p].role = roles[i];
+            /* The pthread worker must run where its threads are scheduled: POSIX
+             * threads are BSP scheduler threads, and SYS_THREAD_CREATE therefore
+             * only succeeds on cpu 0. Affinity is the kernel's own mechanism for
+             * exactly this, so use it rather than hoping the scheduler cooperates. */
+            if (roles[i] == 31) kprocs[p].affinity = 1u;
+            uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+            current_proc_idx = save;
+            if (!e) { pxcheck("every worker's ELF loads", 0); rounds_ok = 0; break; }
+            kprocs[p].entry = e;
+            R.pid[nproc] = kprocs[p].pid;
+            procs[nproc++] = p;
+        }
+        if (nproc < 5) break;
+
+        for (int i = 0; i < nproc; i++) {
+            /* An affinity-pinned worker must be queued on a core in its mask,
+             * or rq_steal will keep handing it back and nothing will run it. */
+            rq_push(kprocs[procs[i]].affinity ? 0 : (i % n), procs[i]);
+            __sync_synchronize();
+            if (n > 1) lapic_ipi(0, IPI_PING, 1);
+        }
+        if (!posix_drain(procs, nproc, &R, 3000)) {
+            kprintf("[posixstrs] round %d WATCHDOG: not every task reached a terminal state\n", rnd);
+            for (int i = 0; i < nproc; i++)
+                kprintf("[posixstrs]   role %u pid %u latched=%d exited=%d torn=%d code %u\n",
+                        (uint64_t)roles[i], R.pid[i], (uint64_t)R.got[i],
+                        (uint64_t)kprocs[procs[i]].exited, (uint64_t)kprocs[procs[i]].torn_down,
+                        kprocs[procs[i]].exit_code);
+            rounds_ok = 0;
+            current_proc_idx = save;
+            break;
+        }
+        current_proc_idx = save;
+
+        for (int i = 0; i < nproc; i++) {
+            if (R.code[i] != want[i]) {
+                kprintf("[posixstrs] round %d '%s' (role %u pid %u) FAILED: exit %u (want %u)\n",
+                        rnd, labels[i], (uint64_t)roles[i], R.pid[i], R.code[i], want[i]);
+                codes_ok = 0;
+            }
+            /* The thread group must be fully accounted for: nthreads back to 0
+             * means every pthread left through the refcounted teardown. */
+            if (kprocs[procs[i]].pid == R.pid[i] && kprocs[procs[i]].nthreads > 0) {
+                kprintf("[posixstrs] round %d role %u left %d thread(s) accounted live\n",
+                        rnd, (uint64_t)roles[i], (uint64_t)(int64_t)kprocs[procs[i]].nthreads);
+                reclaim_ok = 0;
+            }
+        }
+
+        for (int c = 0; c < R.nchild; c++) {
+            nchild_total++;
+            if (R.cgot[c] < 0) ppid_ok = 0;               /* aliased pid or cr3 */
+            if (R.cgot[c] != 1 || R.ccode[c] != 42) {
+                kprintf("[posixstrs] round %d child pid %u (forked by role %u) FAILED: exit %u\n",
+                        rnd, R.cpid[c], (uint64_t)roles[R.cparent[c]], R.ccode[c]);
+                child_ok = 0;
+            }
+        }
+        /* Every child must have been torn all the way down — proven by the frame
+         * count recorded in the reap log at teardown time, which survives the
+         * slot being recycled. The parent link is then CONSUMED so the next
+         * round cannot re-count the same child. */
+        for (int c = 0; c < R.nchild; c++)
+            if (R.cgot[c] == 1 && R.cframes[c] == 0) reclaim_ok = 0;
+        for (int i = 0; i < n_kproc; i++) {
+            if (!kprocs[i].used) continue;
+            for (int c = 0; c < R.nchild; c++)
+                if (kprocs[i].pid == R.cpid[c]) kprocs[i].ppid_slot = -1;
+        }
+    }
+
+    pxcheck("every round ran all 5 POSIX workers to a terminal state (no watchdog timeout)",
+            rnd == POSIXSTRESS_ROUNDS && rounds_ok);
+    pxcheck("every worker's ring-3 assertions passed (exit code == its success sentinel)", codes_ok);
+    pxcheck("fork() produced real children: distinct pid AND distinct cr3 from the parent", ppid_ok);
+    pxcheck("every forked child ran its own image and exited 42", child_ok && nchild_total > 0);
+    pxcheck("every child's address space was fully reclaimed; no thread group left accounted live",
+            reclaim_ok);
+
+    kprintf("[posixstrs] this suite: %u fork(s), %u execve(s), %u thread(s), %d child kproc(s)\n",
+            g_forks - fork0, g_execs - exec0, g_threads_made - thr0, (uint64_t)nchild_total);
+    pxcheck("fork/exec/thread counters all advanced (the syscalls really ran)",
+            g_forks - fork0 >= (uint64_t)POSIXSTRESS_ROUNDS * 2 &&
+            g_execs - exec0 >= (uint64_t)POSIXSTRESS_ROUNDS &&
+            g_threads_made - thr0 >= (uint64_t)POSIXSTRESS_ROUNDS * 4);
+
+    kprintf("[posixstrs] signals: +%u raised, +%u delivered to ring 3, +%u sigreturns\n",
+            g_sig_raised - srai0, g_sig_delivered - sdel0, g_sig_returned - sret0);
+    /* Per round: 2 SIGSEGV + 1 SIGINT + 1 SIGALRM + 1 SIGCHLD delivered; only
+     * the SIGINT handler RETURNS (the SIGSEGV pair longjmps out, and SIGALRM /
+     * SIGCHLD handlers return too) — so sigreturns must advance as well. */
+    pxcheck("signal deliveries into ring 3 advanced (>= 5 per round)",
+            g_sig_delivered - sdel0 >= (uint64_t)POSIXSTRESS_ROUNDS * 5);
+    pxcheck("SYS_SIGRETURN restored real frames (>= 3 per round: SIGINT, SIGALRM, SIGCHLD)",
+            g_sig_returned - sret0 >= (uint64_t)POSIXSTRESS_ROUNDS * 3);
+
+    if (n > 1)
+        pxcheck("POSIX workers genuinely overlapped in ring 3 across cores (SMP)",
+                g_inr3_max >= 2 && g_inr3_max >= inr3_0);
+    else
+        kputs("[posixstrs] NOTE  uniprocessor: the workers are time-multiplexed through one core,\n"
+              "[posixstrs]       so simultaneous ring-3 residency is not assertable here. The\n"
+              "[posixstrs]       pthread mutex total and the fork/waitpid handshake above still\n"
+              "[posixstrs]       prove correctness of the primitives themselves.\n");
+
+    int fds_leaked = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    pxcheck("no descriptor leaked across the storm (incl. fds inherited by forked children)",
+            fds_leaked == 0);
+
+    uint64_t freed_total = g_frames_freed - freed0, reused_total = g_frames_reused - reused0;
+    kprintf("[posixstrs] +%u freed, +%u reused; global depth %u\n",
+            freed_total, reused_total, g_frame_free_depth);
+    pxcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    pxcheck("no lock-rank violation anywhere in the POSIX paths", g_rank_violations == viol0);
+
+    kprintf("[posixstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_pxpass, (uint64_t)g_pxfail);
+    if (!g_pxfail)
+        kputs("[posixstrs] POSIX STRESS VERIFIED — fork/exec/waitpid, signal frames and pthread mutexes leak-free\n");
+    else kputs("[posixstrs] POSIX STRESS DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
 
 /* ===========================================================================
  * METROPOLIS-TERMINAL: THE SPATIAL CANVAS
@@ -12733,7 +13982,7 @@ static void cmd_threads(void) {
     map_page(kprocs[sb].cr3, 0x500000000000ull, cf, PTE_USER);
     map_user_stack(kprocs[sb].cr3);
     g_guard_caught = 0;
-    int tsb = uthread_create("stack-bomb-t", sb, 0x500000000000ull);
+    int tsb = uthread_create("stack-bomb-t", sb, 0x500000000000ull, 0);
     threads_wait(&kprocs[sb].exited, 600);
     thcheck("faulting ring-3 thread hit the guard page and was terminated (not unwound)",
             kprocs[sb].exited && g_guard_caught &&
@@ -13110,6 +14359,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "netstress")) cmd_net_stress();
     else if (!kstrcmp(argv[0], "wimpstress")) cmd_wimp_stress();
     else if (!kstrcmp(argv[0], "appsstress")) cmd_apps_stress();
+    else if (!kstrcmp(argv[0], "posixstress")) cmd_posix_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -13260,6 +14510,13 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_invariants();
     usermode_init();        /* user GDT segments + TSS + SYSCALL MSRs (needed for ring 3) */
     smp_init();             /* v0.35: boot every core (needs the kernel GDT above) */
+#ifdef POSIX_ITER
+    /* Fast-iteration build (make EXTRA=-DPOSIX_ITER): run ONLY the milestone's
+     * own suite. Everything it needs — CAS/VFS, ring 3, SMP — is already up.
+     * Never defined in a release build; the full matrix below is the gate.   */
+    cmd_posix_stress();
+    shell_run();
+#endif
     cmd_stress();
     cmd_fuzz();
     cmd_sweep();
@@ -13283,6 +14540,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_net_stress();       /* v0.52: ring-3 datagram-socket bind/connect/send/recv churn, incl. client faults */
     cmd_wimp_stress();      /* v0.53: ring-3 WIMP window create/manage/close churn + WM logic, incl. client faults */
     cmd_apps_stress();      /* v0.54: concurrent ring-3 GUI apps (terminal/sysmon/filer), incl. app crashes */
+    cmd_posix_stress();     /* v0.55: fork/exec chains, signal frames, pthread mutexes under SMP */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
