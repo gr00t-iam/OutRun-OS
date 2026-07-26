@@ -1964,8 +1964,18 @@ static void posix_execpath_worker(void) {
  *     PPOK     =  5   v0.57: #ifdef took the taken branch (the other is 999,
  *                     so picking wrong is unmissable rather than off-by-one)
  *     GUARD_OK =  2   v0.57: #ifndef — the shape every header guard uses
+ *     n1.in.a+b =  7   v0.57: NESTED struct member reads through two levels
  *                ---
- *                136
+ *                143
+ *
+ * The struct block also returns 910-918 on specific failures rather than a
+ * wrong total, so a broken offset says WHICH property broke. The two that
+ * matter most:
+ *   n1.tag = 300 then n1.tag == 44  — a `char` member is stored ONE byte
+ *     wide (300 & 0xFF == 44). A qword store here would also flatten val,
+ *     which is why n1.val is re-checked immediately after.
+ *   u.word = 0; u.byte = 7; u.word == 7  — a union really overlays its
+ *     members at offset 0.
  *
  * Exit 940 = the produced binary ran and returned exactly that. */
 /* v0.57: the source now starts with REAL preprocessing. Every line above main()
@@ -1989,6 +1999,11 @@ static void posix_execpath_worker(void) {
   "#ifndef NOT_DEFINED\n" \
   "#define GUARD_OK 2\n" \
   "#endif\n" \
+  "struct Inner { int a; int b; };\n" \
+  "struct Outer { char tag; int val; struct Inner in; struct Outer *next; };\n" \
+  "union U { int word; char byte; };\n" \
+  "typedef struct Outer Node;\n" \
+  "int bump(Node *p) { p->val = p->val + 1; return p->val; }\n" \
   "int fib(int n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }\n" \
   "int main() {\n" \
   "  int s; int i; char *p;\n" \
@@ -2009,6 +2024,23 @@ static void posix_execpath_worker(void) {
   "  s = s + ADD(1, 2);\n" \
   "  s = s + PPOK;\n" \
   "  s = s + GUARD_OK;\n" \
+  "  { Node n1; Node n2; union U u;\n" \
+  "    n1.tag = 65; n1.val = 10; n1.in.a = 3; n1.in.b = 4; n1.next = &n2;\n" \
+  "    n2.tag = 66; n2.val = 20; n2.in.a = 0; n2.in.b = 0; n2.next = 0;\n" \
+  "    if (n1.tag != 65) { return 910; }\n" \
+  "    if (n1.in.a + n1.in.b != 7) { return 911; }\n" \
+  "    if (n1.next->val != 20) { return 912; }\n" \
+  "    if (bump(&n2) != 21) { return 913; }\n" \
+  "    if (n1.next->val != 21) { return 914; }\n" \
+  "    n1.next->in.b = 9;\n" \
+  "    if (n2.in.b != 9) { return 915; }\n" \
+  "    u.word = 0; u.byte = 7;\n" \
+  "    if (u.word != 7) { return 916; }\n" \
+  "    n1.tag = 300;\n" \
+  "    if (n1.tag != 44) { return 917; }\n" \
+  "    if (n1.val != 10) { return 918; }\n" \
+  "    s = s + n1.in.a + n1.in.b;\n" \
+  "  }\n" \
   "  __syscall(SYS_WRITE, \"  [a.out ] SYS_WRITE came from <outrun_abi.h>\\n\", 0, 0);\n" \
   "  puts(\"  [a.out ] compiled by occ against /usr/lib/libc.oc; main returns \");\n" \
   "  putdec(s); puts(\"\\n\");\n" \
@@ -2060,10 +2092,10 @@ static void posix_selfhost_worker(void) {
      * The value is PRINTED on failure: "the program returned the wrong answer"
      * is not actionable, but "it returned 100" points straight at which of the
      * five contributions above did not happen. */
-    if (rst != 136) {
+    if (rst != 143) {
         oputs("  [self  ] the compiled program returned ");
         sysc(SYS_WRITEHEX, (u64)rst, 0, 0);
-        oputs(" hex (want 88 hex = 136)\n");
+        oputs(" hex (want 8f hex = 143)\n");
         sysc(SYS_EXIT, 946, 0, 0);
     }
 

@@ -565,7 +565,8 @@ static int   occ_strlen_;
 
 static int occ_kw(const char *s) {
     static const char *kws[] = { "int", "char", "return", "if", "else", "while",
-                                 "for", "void", "__syscall", "__ldb", "__stb", 0 };
+                                 "for", "void", "__syscall", "__ldb", "__stb",
+                                 "struct", "union", "typedef", 0 };
     for (int i = 0; kws[i]; i++) if (ostrneq(s, kws[i], OCC_NAMELEN)) return 1;
     return 0;
 }
@@ -674,7 +675,7 @@ static void occ_next(void) {
         occ_tk = T_STR; return;
     }
     /* punctuation, longest match first so >= does not lex as > then = */
-    static const char *two[] = { "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", 0 };
+    static const char *two[] = { "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "->", 0 };
     for (int i = 0; two[i]; i++)
         if (c == two[i][0] && occ_src[occ_pos + 1] == two[i][1]) {
             occ_txt[0] = two[i][0]; occ_txt[1] = two[i][1]; occ_txt[2] = 0;
@@ -701,7 +702,8 @@ static void occ_emit32(u32 v) { for (int i = 0; i < 4; i++) occ_emit((u8)(v >> (
 static void occ_emit64(u64 v) { for (int i = 0; i < 8; i++) occ_emit((u8)(v >> (8 * i))); }
 
 /* ---- symbols -------------------------------------------------------------*/
-struct occ_sym { char name[OCC_NAMELEN]; int kind; i64 addr; int defined; };
+struct occ_sym { char name[OCC_NAMELEN]; int kind; i64 addr; int defined;
+                 int sidx, ptr, size; };   /* v0.57: type of a global variable */
 /* kind: 0 = function, 1 = global variable */
 static struct occ_sym occ_syms[OCC_MAXSYM];
 static int occ_nsym;
@@ -710,7 +712,69 @@ struct occ_fix { int at; int sym; };            /* patch a call rel32 later */
 static struct occ_fix occ_fixes[OCC_MAXFIX];
 static int occ_nfix;
 
-static struct occ_loc { char name[OCC_NAMELEN]; int off; } occ_locs[OCC_MAXLOC];
+/* ===========================================================================
+ * v0.57: TYPES — struct, union, typedef, and real memory layout
+ * ===========================================================================
+ * Until now occ had no type system whatsoever: `int` was 64-bit, every value
+ * was a register, every local was one 8-byte slot, and `occ_is_type()` was a
+ * three-way string compare that threw the answer away. Structs cannot be built
+ * on that, because a struct is precisely a thing whose parts live at known
+ * BYTE OFFSETS in memory.
+ *
+ * A type here is the triple (sidx, ptr, size):
+ *     sidx >= 0, ptr == 0   a struct or union BY VALUE; size is its layout size
+ *     sidx >= 0, ptr  > 0   a pointer to one; size 8
+ *     sidx == -1            a scalar: size 1 for `char`, 8 for `int`/pointers
+ *
+ * LAYOUT is the real thing, not a simplification: each member is aligned up to
+ * its own alignment, and the struct's total size is rounded up to the struct's
+ * alignment so arrays of it stay aligned. `struct { char a; int b; }` therefore
+ * puts a at 0, b at 8, and has size 16 — which is what the compilerstrs suite
+ * checks, and it could not check anything meaningful if every member were
+ * simply 8 bytes wide.
+ *
+ * A union places every member at offset 0 and takes the size of its largest.
+ *
+ * HONEST LIMITS: no bitfields, no anonymous members, no struct assignment or
+ * struct arguments (a struct-typed expression evaluates to its ADDRESS, the
+ * same rule C uses for arrays), and no forward references to a struct that has
+ * not been defined yet. Members may be scalars, pointers, or nested structs
+ * by value. */
+#define OCC_MAXSTRUCT  32
+#define OCC_MAXMEMBER  16
+#define OCC_MAXTYPEDEF 32
+
+struct occ_member { char name[OCC_NAMELEN]; int off, size, sidx, ptr; };
+struct occ_struct {
+    char name[OCC_NAMELEN];
+    struct occ_member m[OCC_MAXMEMBER];
+    int nm, size, align, is_union, used;
+};
+static struct occ_struct occ_structs[OCC_MAXSTRUCT];
+static int occ_nstruct;
+
+struct occ_td { char name[OCC_NAMELEN]; int sidx, ptr, size, used; };
+static struct occ_td occ_tds[OCC_MAXTYPEDEF];
+static int occ_ntd;
+
+static int occ_struct_find(const char *n) {
+    for (int i = 0; i < occ_nstruct; i++)
+        if (occ_structs[i].used && ostrneq(occ_structs[i].name, n, OCC_NAMELEN)) return i;
+    return -1;
+}
+static int occ_td_find(const char *n) {
+    for (int i = 0; i < occ_ntd; i++)
+        if (occ_tds[i].used && ostrneq(occ_tds[i].name, n, OCC_NAMELEN)) return i;
+    return -1;
+}
+/* Alignment of a type: a struct's own alignment, else its size (1 or 8). */
+static int occ_align_of(int sidx, int ptr, int size) {
+    if (sidx >= 0 && ptr == 0) return occ_structs[sidx].align;
+    (void)size;
+    return ptr ? 8 : (size == 1 ? 1 : 8);
+}
+
+static struct occ_loc { char name[OCC_NAMELEN]; int off; int sidx, ptr, size; } occ_locs[OCC_MAXLOC];
 static int occ_nloc, occ_frame;
 
 static int occ_sym_find(const char *n) {
@@ -724,6 +788,7 @@ static int occ_sym_get(const char *n, int kind) {
     i = occ_nsym++;
     for (int k = 0; k < OCC_NAMELEN; k++) occ_syms[i].name[k] = n[k] ? n[k] : 0;
     occ_syms[i].kind = kind; occ_syms[i].addr = 0; occ_syms[i].defined = 0;
+    occ_syms[i].sidx = -1; occ_syms[i].ptr = 0; occ_syms[i].size = 8;
     return i;
 }
 static int occ_loc_find(const char *n) {
@@ -747,6 +812,21 @@ static void occ_test_rax(void)      { occ_emit(0x48); occ_emit(0x85); occ_emit(0
 static void occ_lea_local(int off)  { /* lea rax,[rbp+off] */
     occ_emit(0x48); occ_emit(0x8D); occ_emit(0x85); occ_emit32((u32)off);
 }
+/* v0.57: byte/qword access and offset arithmetic, for struct members. */
+static void occ_add_rax_imm32(int v) {
+    if (!v) return;
+    occ_emit(0x48); occ_emit(0x05); occ_emit32((u32)v);      /* add rax, imm32   */
+}
+static void occ_load_rax_sized(int size) {
+    if (size == 1) { occ_emit(0x48); occ_emit(0x0F); occ_emit(0xB6); occ_emit(0x00); }  /* movzx rax,[rax] */
+    else           { occ_emit(0x48); occ_emit(0x8B); occ_emit(0x00); }                  /* mov rax,[rax]   */
+}
+/* value in rax, destination address in rdi */
+static void occ_store_sized(int size) {
+    if (size == 1) { occ_emit(0x88); occ_emit(0x07); }                                  /* mov [rdi],al    */
+    else           { occ_emit(0x48); occ_emit(0x89); occ_emit(0x07); }                  /* mov [rdi],rax   */
+}
+
 static void occ_setcc(u8 cc) {       /* setcc al ; movzx rax, al */
     occ_emit(0x0F); occ_emit(cc); occ_emit(0xC0);
     occ_emit(0x48); occ_emit(0x0F); occ_emit(0xB6); occ_emit(0xC0);
@@ -767,6 +847,60 @@ static void occ_expr(void);
  * occ_lvalue() leaves an ADDRESS in RAX; occ_primary() leaves a VALUE. Keeping
  * those two jobs separate is what makes `a = b`, `*p = v` and `a[i] = v` all
  * fall out of the same assignment path. */
+/* v0.57: the SIZE of the object the last occ_lvalue() addressed, so the
+ * assignment path can store 1 byte into a `char` member and 8 into an `int`
+ * one. Without this every store was a qword and a char member would flatten
+ * the seven bytes after it. */
+static int occ_lv_size;
+
+/* v0.57: walk a `.`/`->` chain, folding member offsets into the address already
+ * in RAX. Called by both the lvalue and rvalue paths so the two can never
+ * disagree about layout — which is exactly the sort of divergence that makes a
+ * struct read fine and written wrong.
+ *
+ *   `.`  the base is an ADDRESS already (a struct-typed variable evaluates to
+ *        its address, the rule C uses for arrays), so only the offset is added.
+ *   `->` the base is a POINTER VALUE, which is also just an address in RAX, so
+ *        the emitted code is identical. The difference is entirely in what the
+ *        type check permits, and reporting that difference is what turns a
+ *        misuse into a diagnostic instead of a wrong offset.
+ *
+ * Threads (sidx, ptr, size) in and out; the final size lands in occ_lv_size. */
+static void occ_member_chain(int *sidx, int *ptr, int *size) {
+    for (;;) {
+        int arrow = occ_is("->");
+        if (!arrow && !occ_is(".")) break;
+        occ_next();
+        if (occ_tk != T_IDENT) { occ_err("expected a member name after . or ->", occ_txt); return; }
+        char mn[OCC_NAMELEN];
+        for (int i = 0; i < OCC_NAMELEN; i++) mn[i] = occ_txt[i];
+
+        if (*sidx < 0) { occ_err("not a struct or union", mn); occ_next(); return; }
+        if (arrow && *ptr == 0) { occ_err("'->' on a non-pointer; use '.'", mn); occ_next(); return; }
+        if (!arrow && *ptr != 0) { occ_err("'.' on a pointer; use '->'", mn); occ_next(); return; }
+
+        struct occ_struct *st = &occ_structs[*sidx];
+        int mi = -1;
+        for (int i = 0; i < st->nm; i++) if (ostrneq(st->m[i].name, mn, OCC_NAMELEN)) { mi = i; break; }
+        if (mi < 0) { occ_err("no such member", mn); occ_next(); return; }
+
+        occ_add_rax_imm32(st->m[mi].off);
+        *sidx = st->m[mi].sidx;
+        *ptr  = st->m[mi].ptr;
+        *size = st->m[mi].size;
+        occ_next();
+
+        /* A pointer member must be LOADED before it can be stepped through
+         * again: `a->b->c` needs the value of b, not its address. */
+        if (*ptr > 0 && (occ_is("->") || occ_is("."))) {
+            occ_load_rax_sized(8);
+            /* the loaded value is the pointer itself, so one level is consumed
+             * by the load and the next `->` sees ptr == 1 again */
+        }
+    }
+    occ_lv_size = *size;
+}
+
 static int occ_lvalue(void) {     /* returns 1 if it emitted an address */
     if (occ_tk != T_IDENT) return 0;
     /* look ahead: a bare identifier not followed by '(' or '[' is a variable */
@@ -780,12 +914,17 @@ static int occ_lvalue(void) {     /* returns 1 if it emitted an address */
         for (int i = 0; i < OCC_NAMELEN; i++) occ_txt[i] = nm[i];
         return 0;
     }
+    int sidx = -1, ptr = 0, size = 8;
     int li = occ_loc_find(nm);
-    if (li >= 0) occ_lea_local(occ_locs[li].off);
-    else {
+    if (li >= 0) {
+        occ_lea_local(occ_locs[li].off);
+        sidx = occ_locs[li].sidx; ptr = occ_locs[li].ptr; size = occ_locs[li].size;
+    } else {
         int si = occ_sym_get(nm, 1);
         occ_mov_rax_imm(OCC_DATA_BASE + (u64)occ_syms[si].addr);
+        sidx = occ_syms[si].sidx; ptr = occ_syms[si].ptr; size = occ_syms[si].size;
     }
+    occ_lv_size = size;
     if (occ_accept("[")) {                   /* a[i] -> *(a + i*8) */
         occ_load_rax_ind();                  /* the array/pointer value        */
         occ_push_rax();
@@ -794,6 +933,14 @@ static int occ_lvalue(void) {     /* returns 1 if it emitted an address */
         occ_mov_rdi_rax(); occ_pop_rax();
         occ_emit(0x48); occ_emit(0x01); occ_emit(0xF8);                /* add rax,rdi */
         occ_expect("]");
+        occ_lv_size = 8;
+        return 1;
+    }
+    if (occ_is(".") || occ_is("->")) {
+        /* RAX holds the variable's ADDRESS. For `.` that is already what the
+         * chain wants. For `->` the POINTER VALUE is wanted, so load it. */
+        if (occ_is("->")) occ_load_rax_sized(8);
+        occ_member_chain(&sidx, &ptr, &size);
     }
     return 1;
 }
@@ -900,11 +1047,33 @@ static void occ_primary(void) {
             occ_emit32(0);
             return;
         }
+        int sidx = -1, ptr = 0, size = 8, isloc = 0;
         int li = occ_loc_find(nm);
-        if (li >= 0) { occ_lea_local(occ_locs[li].off); occ_load_rax_ind(); return; }
-        int si = occ_sym_get(nm, 1);
-        occ_mov_rax_imm(OCC_DATA_BASE + (u64)occ_syms[si].addr);
-        occ_load_rax_ind();
+        int si = -1;
+        if (li >= 0) {
+            occ_lea_local(occ_locs[li].off);
+            sidx = occ_locs[li].sidx; ptr = occ_locs[li].ptr; size = occ_locs[li].size;
+            isloc = 1;
+        } else {
+            si = occ_sym_get(nm, 1);
+            occ_mov_rax_imm(OCC_DATA_BASE + (u64)occ_syms[si].addr);
+            sidx = occ_syms[si].sidx; ptr = occ_syms[si].ptr; size = occ_syms[si].size;
+        }
+        (void)isloc;
+        /* RAX now holds the variable's ADDRESS. */
+        if (occ_is(".") || occ_is("->")) {
+            if (occ_is("->")) occ_load_rax_sized(8);       /* want the pointer VALUE */
+            occ_member_chain(&sidx, &ptr, &size);
+            /* A member that is itself a struct stays an ADDRESS — there is no
+             * way to hold a struct in a register, and C says the same. */
+            if (!(sidx >= 0 && ptr == 0)) occ_load_rax_sized(size);
+            return;
+        }
+        /* v0.57: a struct-typed variable evaluates to its ADDRESS, exactly as an
+         * array does in C. Loading it would put the first eight bytes of the
+         * struct in RAX and call it the value, which is meaningless. */
+        if (sidx >= 0 && ptr == 0) return;
+        occ_load_rax_sized(size);
         return;
     }
     occ_err("unexpected token", occ_txt);
@@ -1040,11 +1209,15 @@ static void occ_expr(void) {
         int deref = occ_accept("*");
         int ok = deref ? (occ_lvalue() ? 1 : (occ_primary(), 1)) : occ_lvalue();
         if (ok && occ_is("=")) {
+            /* v0.57: capture the size BEFORE the right-hand side is parsed —
+             * evaluating it can walk another member chain and overwrite
+             * occ_lv_size, which would silently store the wrong width. */
+            int dstsz = deref ? 8 : occ_lv_size;
             occ_next();
             occ_push_rax();                     /* the destination address */
             occ_expr();                         /* the value               */
             occ_pop_rdi();
-            occ_store_rdi_rax();
+            occ_store_sized(dstsz);
             return;
         }
         occ_pos = save_pos; occ_tk = save_tk; occ_val = save_val; occ_line = save_line;
@@ -1053,28 +1226,149 @@ static void occ_expr(void) {
     occ_binop(0);
 }
 
+/* ---- types: specifiers, struct/union definitions, typedef -----------------*/
+
+/* True if the current token can BEGIN a declaration. `struct`/`union` and any
+ * name introduced by typedef now count, which is what lets a local or a member
+ * be declared with a user-defined type. */
+static int occ_is_type(void) {
+    if (occ_is("int") || occ_is("char") || occ_is("void")) return 1;
+    if (occ_is("struct") || occ_is("union")) return 1;
+    if (occ_tk == T_IDENT && occ_td_find(occ_txt) >= 0) return 1;
+    return 0;
+}
+
+static void occ_struct_body(int si);
+
+/* Parse a type specifier plus any '*'s. Returns 1 on success and writes the
+ * triple through the out-parameters. Also DEFINES the struct if the specifier
+ * carries a `{ ... }` body, so `struct P { int x; } ;` and `struct P p;` are
+ * both handled by the one function. */
+static int occ_parse_type(int *sidx, int *ptr, int *size) {
+    *sidx = -1; *ptr = 0; *size = 8;
+
+    if (occ_is("struct") || occ_is("union")) {
+        int is_union = occ_is("union");
+        occ_next();
+        char nm[OCC_NAMELEN]; nm[0] = 0;
+        if (occ_tk == T_IDENT) { for (int i = 0; i < OCC_NAMELEN; i++) nm[i] = occ_txt[i]; occ_next(); }
+        int si = nm[0] ? occ_struct_find(nm) : -1;
+        if (occ_is("{")) {                       /* a definition */
+            if (si < 0) {
+                if (occ_nstruct >= OCC_MAXSTRUCT) { occ_err("too many struct types", nm); return 0; }
+                si = occ_nstruct++;
+                for (int i = 0; i < OCC_NAMELEN; i++) occ_structs[si].name[i] = nm[i];
+                occ_structs[si].used = 1;
+            }
+            occ_structs[si].is_union = is_union;
+            occ_struct_body(si);
+        } else if (si < 0) {
+            occ_err("unknown struct or union", nm[0] ? nm : "<anonymous>");
+            return 0;
+        }
+        *sidx = si;
+        *size = occ_structs[si].size;
+    } else if (occ_is("int") || occ_is("void")) {
+        occ_next(); *size = 8;
+    } else if (occ_is("char")) {
+        occ_next(); *size = 1;
+    } else if (occ_tk == T_IDENT) {
+        int ti = occ_td_find(occ_txt);
+        if (ti < 0) return 0;
+        *sidx = occ_tds[ti].sidx; *ptr = occ_tds[ti].ptr; *size = occ_tds[ti].size;
+        occ_next();
+    } else return 0;
+
+    /* Deliberately does NOT consume '*'. A pointer level belongs to the
+     * DECLARATOR, not the specifier: in `int *a, b;` only a is a pointer.
+     * Consuming here also double-counted, because every declarator loop that
+     * calls this already consumes its own stars — `struct P *p;` came out as
+     * pointer-to-pointer. */
+    return 1;
+}
+
+/* `{ member; member; ... }` — computes offsets, alignment and total size. */
+static void occ_struct_body(int si) {
+    occ_expect("{");
+    struct occ_struct *st = &occ_structs[si];
+    st->nm = 0; st->size = 0; st->align = 1;
+    int off = 0;
+    while (!occ_is("}") && occ_tk != T_EOF && !occ_errors) {
+        int msi, mptr, msz;
+        if (!occ_parse_type(&msi, &mptr, &msz)) { occ_err("expected a member type", occ_txt); occ_next(); continue; }
+        for (;;) {                                /* `int x, y;` */
+            int xptr = mptr, xsz = msz;
+            while (occ_accept("*")) { xptr++; xsz = 8; }
+            if (occ_tk != T_IDENT) { occ_err("expected a member name", occ_txt); break; }
+            if (st->nm >= OCC_MAXMEMBER) { occ_err("too many members in", st->name); }
+            else {
+                struct occ_member *mm = &st->m[st->nm];
+                for (int i = 0; i < OCC_NAMELEN; i++) mm->name[i] = occ_txt[i];
+                int a = occ_align_of(msi, xptr, xsz);
+                if (a < 1) a = 1;
+                if (st->is_union) { mm->off = 0; }
+                else { off = (off + a - 1) / a * a; mm->off = off; off += xsz; }
+                /* sidx is the member's TARGET struct in both cases: for a
+                 * by-value member it is the member's own type, and for a
+                 * pointer member it is what `->` will dereference to. `ptr`
+                 * distinguishes them. */
+                mm->size = xsz; mm->sidx = msi; mm->ptr = xptr;
+                if (a > st->align) st->align = a;
+                if (st->is_union && xsz > st->size) st->size = xsz;
+                st->nm++;
+            }
+            occ_next();
+            if (!occ_accept(",")) break;
+        }
+        occ_expect(";");
+    }
+    occ_expect("}");
+    if (!st->is_union) st->size = off;
+    /* Round the total up to the struct's own alignment so an array of it, and
+     * a following member of the same type, both stay aligned. */
+    if (st->align > 1) st->size = (st->size + st->align - 1) / st->align * st->align;
+    if (st->size == 0) st->size = 1;
+}
+
 /* ---- statements ----------------------------------------------------------*/
-static int occ_is_type(void) { return occ_is("int") || occ_is("char") || occ_is("void"); }
 
 static void occ_stmt(void) {
     if (occ_accept("{")) { while (!occ_is("}") && occ_tk != T_EOF) occ_stmt(); occ_expect("}"); return; }
 
     if (occ_is_type()) {                         /* local declaration */
-        occ_next();
-        while (occ_accept("*")) { }
-        if (occ_tk != T_IDENT) { occ_err("expected a declarator", 0); return; }
-        if (occ_nloc >= OCC_MAXLOC) occ_err("too many locals in one function", occ_txt);
-        else {
-            for (int i = 0; i < OCC_NAMELEN; i++) occ_locs[occ_nloc].name[i] = occ_txt[i];
-            occ_frame += 8;
-            occ_locs[occ_nloc].off = -occ_frame;
-            occ_nloc++;
-        }
-        int slot = occ_nloc - 1;
-        occ_next();
-        if (occ_accept("=")) {
-            occ_expr();
-            occ_emit(0x48); occ_emit(0x89); occ_emit(0x85); occ_emit32((u32)occ_locs[slot].off);
+        int sidx, ptr, size;
+        if (!occ_parse_type(&sidx, &ptr, &size)) { occ_err("expected a type", occ_txt); occ_next(); return; }
+        /* `struct P { int x; };` inside a function defines the type and
+         * declares nothing — allow it rather than demanding a declarator. */
+        if (occ_accept(";")) return;
+        for (;;) {
+            int xptr = ptr, xsz = size;
+            while (occ_accept("*")) { xptr++; xsz = 8; }
+            if (occ_tk != T_IDENT) { occ_err("expected a declarator", occ_txt); return; }
+            if (occ_nloc >= OCC_MAXLOC) occ_err("too many locals in one function", occ_txt);
+            else {
+                struct occ_loc *L = &occ_locs[occ_nloc];
+                for (int i = 0; i < OCC_NAMELEN; i++) L->name[i] = occ_txt[i];
+                /* v0.57: a struct local occupies its REAL size, rounded up to 8
+                 * so the frame stays qword-aligned. Every local was one 8-byte
+                 * slot before this, which is exactly why structs needed it. */
+                int slotsz = (xsz + 7) & ~7;
+                occ_frame += slotsz;
+                L->off  = -occ_frame;
+                L->sidx = (xptr ? sidx : sidx);
+                L->ptr  = xptr;
+                L->size = xsz;
+                occ_nloc++;
+            }
+            int slot = occ_nloc - 1;
+            occ_next();
+            if (occ_accept("=")) {
+                if (slot >= 0 && occ_locs[slot].sidx >= 0 && occ_locs[slot].ptr == 0)
+                    occ_err("cannot initialise a struct by assignment", occ_locs[slot].name);
+                occ_expr();
+                occ_emit(0x48); occ_emit(0x89); occ_emit(0x85); occ_emit32((u32)occ_locs[slot].off);
+            }
+            if (!occ_accept(",")) break;
         }
         occ_expect(";");
         return;
@@ -1139,9 +1433,37 @@ static void occ_stmt(void) {
 /* ---- top level -----------------------------------------------------------*/
 static void occ_toplevel(void) {
     while (occ_tk != T_EOF && !occ_errors) {
+        /* v0.57: typedef. The alias records the full triple, so a later
+         * `Pt p;` declares a struct with the right size and `Pt *q;` a
+         * pointer to it. */
+        if (occ_accept("typedef")) {
+            int tsidx, tptr, tsize;
+            if (!occ_parse_type(&tsidx, &tptr, &tsize)) {
+                occ_err("expected a type after typedef", occ_txt); occ_next(); continue;
+            }
+            while (occ_accept("*")) { tptr++; tsize = 8; }
+            if (occ_tk != T_IDENT) { occ_err("expected a typedef name", occ_txt); occ_next(); continue; }
+            if (occ_ntd >= OCC_MAXTYPEDEF) occ_err("too many typedefs", occ_txt);
+            else {
+                struct occ_td *T = &occ_tds[occ_ntd++];
+                for (int i = 0; i < OCC_NAMELEN; i++) T->name[i] = occ_txt[i];
+                T->sidx = tsidx; T->ptr = tptr; T->size = tsize; T->used = 1;
+            }
+            occ_next();
+            occ_expect(";");
+            continue;
+        }
+
         if (!occ_is_type()) { occ_err("expected a declaration", occ_txt); occ_next(); continue; }
-        occ_next();
-        while (occ_accept("*")) { }
+        int bsidx, bptr, bsize;
+        if (!occ_parse_type(&bsidx, &bptr, &bsize)) {
+            occ_err("expected a type", occ_txt); occ_next(); continue;
+        }
+        /* `struct P { int x; };` — a definition with no declarator. */
+        if (occ_accept(";")) continue;
+
+        int dptr = bptr, dsize = bsize;
+        while (occ_accept("*")) { dptr++; dsize = 8; }
         if (occ_tk != T_IDENT) { occ_err("expected a name", occ_txt); occ_next(); continue; }
         char nm[OCC_NAMELEN];
         for (int i = 0; i < OCC_NAMELEN; i++) nm[i] = occ_txt[i];
@@ -1154,12 +1476,27 @@ static void occ_toplevel(void) {
             /* parameters become the first locals */
             int np = 0;
             if (!occ_is(")")) for (;;) {
-                if (occ_is_type()) occ_next();
-                while (occ_accept("*")) { }
+                /* v0.57: parameters go through the real type parser so a
+                 * `struct P *p` parameter carries its target type and `p->x`
+                 * inside the body knows the layout. A parameter is always
+                 * passed in a register, so its slot stays one word wide even
+                 * when its type names a struct — only POINTERS to structs can
+                 * be parameters here, which the by-value check below enforces
+                 * instead of silently truncating. */
+                int psidx = -1, pptr = 0, psize = 8;
+                if (occ_is_type()) {
+                    if (!occ_parse_type(&psidx, &pptr, &psize)) { occ_err("bad parameter type", occ_txt); occ_next(); }
+                }
+                while (occ_accept("*")) { pptr++; psize = 8; }
                 if (occ_tk == T_IDENT) {
+                    if (psidx >= 0 && pptr == 0)
+                        occ_err("a struct cannot be passed by value; pass a pointer", occ_txt);
                     if (occ_nloc < OCC_MAXLOC) {
-                        for (int i = 0; i < OCC_NAMELEN; i++) occ_locs[occ_nloc].name[i] = occ_txt[i];
-                        occ_frame += 8; occ_locs[occ_nloc].off = -occ_frame; occ_nloc++;
+                        struct occ_loc *L = &occ_locs[occ_nloc];
+                        for (int i = 0; i < OCC_NAMELEN; i++) L->name[i] = occ_txt[i];
+                        occ_frame += 8; L->off = -occ_frame;
+                        L->sidx = psidx; L->ptr = pptr; L->size = psize;
+                        occ_nloc++;
                     }
                     np++;
                     occ_next();
@@ -1215,17 +1552,27 @@ static void occ_toplevel(void) {
 
         /* global variable (optionally with a constant initialiser) */
         int si = occ_sym_get(nm, 1);
+        /* v0.57: align the global to its type before placing it, or a struct
+         * whose alignment is 8 could start at an odd offset and every member
+         * offset computed from it would be misaligned. */
+        { int ga = occ_align_of(bsidx, dptr, dsize);
+          if (ga > 1) while (occ_dlen % ga) { if (occ_dlen < (int)OCC_MAXDATA) occ_data[occ_dlen++] = 0; else break; } }
         occ_syms[si].addr = occ_dlen;
         occ_syms[si].defined = 1;
+        occ_syms[si].sidx = bsidx; occ_syms[si].ptr = dptr; occ_syms[si].size = dsize;
         i64 init = 0;
         int cells = 1;
         if (occ_accept("[")) { if (occ_tk == T_NUM) { cells = (int)occ_val; occ_next(); } occ_expect("]"); }
         if (occ_accept("=")) { if (occ_tk == T_NUM) { init = occ_val; occ_next(); }
                                else { occ_err("global initialiser must be a constant", nm); occ_next(); } }
-        for (int c = 0; c < cells; c++) {
-            for (int i = 0; i < 8 && occ_dlen < (int)OCC_MAXDATA; i++)
-                occ_data[occ_dlen++] = (u8)((u64)(c ? 0 : init) >> (8 * i));
-        }
+        /* v0.57: reserve the type's REAL size per cell. An array of a 24-byte
+         * struct needs 24 bytes per element, not 8 — the old code assumed every
+         * global cell was one machine word, which is true only for scalars. */
+        { int cellsz = (dsize < 8) ? 8 : dsize;      /* scalars keep a full word */
+          if (bsidx >= 0 && dptr == 0) cellsz = occ_structs[bsidx].size;
+          for (int c = 0; c < cells; c++)
+              for (int i = 0; i < cellsz && occ_dlen < (int)OCC_MAXDATA; i++)
+                  occ_data[occ_dlen++] = (u8)((i < 8 && !c) ? ((u64)init >> (8 * i)) : 0); }
         occ_expect(";");
     }
 }
