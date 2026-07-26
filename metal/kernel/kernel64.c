@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.55.0-metal"
+#define KERNEL_VERSION "0.56.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -197,7 +197,18 @@ static void __attribute__((no_stack_protector)) kprintf(const char *fmt, ...) {
 struct pcb;                                  /* fwd: scheduler thread block   */
 struct tss64;                                /* fwd: per-CPU task state seg   */
 #define MAX_CPUS 8
-#define RQ_LEN   8                           /* v0.39: per-CPU run queue slots */
+/* v0.56: 8 -> 32. A ring of 8 holds SEVEN entries, and cmd_posix_stress queues
+ * seven workers — so on a UNIPROCESSOR, where every one of them goes to queue 0,
+ * the queue was exactly full before the suite had run a single instruction. The
+ * next push, fork()'s enqueue of its brand-new child, hit `full` and rq_push
+ * returned -1 to a caller that ignored it: the task was dropped on the floor,
+ * marked pstate=1 (resumable) but present in no queue, so no dispatcher could
+ * ever reach it again. Latent since v0.39 and only reachable when a queue fills;
+ * v0.56 doubled the ring-3 image and shifted the timing enough to hit it every
+ * single UP boot. A run queue that cannot hold what one suite spawns is a
+ * sizing bug, and silently discarding a runnable task is the more serious one —
+ * see rq_push_any below, which is now what every enqueue path uses. */
+#define RQ_LEN   32                          /* v0.39: per-CPU run queue slots */
 struct cpu_local {
     uint32_t idx;                            /* %gs:0   MUST stay offset 0    */
     uint32_t apic_id;                        /* %gs:4                         */
@@ -4106,13 +4117,25 @@ static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
     uint8_t tmp[512];
     for (uint32_t i = 0; i < d->nchunks; i++) {
         uint64_t h = vfs_chunk_hash_at(d, i);   /* v0.56: walks the indirect map */
-        if (!h) break;                          /* absent chunk: stop, don't lie  */
+        if (!h) {                               /* absent chunk: stop, don't lie  */
+            kprintf("[vfs    ] SHORT READ '%s': chunk %u of %u has no hash "
+                    "(dirent %d, len %u)\n",
+                    d->name, (uint64_t)i, (uint64_t)d->nchunks,
+                    (uint64_t)(int64_t)idx, (uint64_t)d->len);
+            break;
+        }
         /* v0.56: cas_get's return was DISCARDED here. On a miss the shared tmp[]
          * kept the PREVIOUS chunk's bytes and they were copied out as if they
          * were this chunk's — a read that returned the correct length and the
          * wrong content, with no error anywhere. Stop instead: a short read is
          * a signal the caller can act on; a plausible-looking wrong one is not. */
-        if (cas_get(h, tmp, 512) < 0) break;   /* rank 2 -> 3: strictly upward  */
+        if (cas_get(h, tmp, 512) < 0) {        /* rank 2 -> 3: strictly upward  */
+            kprintf("[vfs    ] SHORT READ '%s': chunk %u of %u hash %X is NOT in "
+                    "the CAS (dirent %d, len %u)\n",
+                    d->name, (uint64_t)i, (uint64_t)d->nchunks, h,
+                    (uint64_t)(int64_t)idx, (uint64_t)d->len);
+            break;
+        }
         uint32_t cl = d->len - i * 512; if (cl > 512) cl = 512;
         for (uint32_t j = 0; j < cl && got < max; j++) ((uint8_t *)buf)[got++] = tmp[j];
     }
@@ -6671,6 +6694,27 @@ static int rq_push(int cpu, int proc) {                /* producer: tail       *
     rq_release(c);
     return 0;
 }
+/* v0.56: the enqueue every caller should use. A runnable task must end up in
+ * SOME queue or it is lost forever — pstate=1 with no queue entry is
+ * unreachable by rq_pop, by rq_steal, and by every driver loop in the tree.
+ * Try the preferred core, then any other online core the task's affinity mask
+ * allows, and only if EVERY queue is full say so loudly instead of returning a
+ * -1 that history shows nobody checks. Returns the cpu it landed on, or -1. */
+static int rq_push(int cpu, int proc);
+static int rq_push_any(int cpu, int proc) {
+    if (rq_push(cpu, proc) == 0) return cpu;
+    uint32_t aff = kprocs[proc].affinity;
+    for (int c = 0; c < MAX_CPUS; c++) {
+        if (c == cpu || !g_cpu[c].online) continue;
+        if (aff && !(aff & (1u << c))) continue;
+        if (rq_push(c, proc) == 0) return c;
+    }
+    kprintf("[sched  ] RUN QUEUE FULL: pid %u could not be enqueued on cpu %d "
+            "or any sibling — task would be LOST\n",
+            kprocs[proc].pid, (uint64_t)(int64_t)cpu);
+    return -1;
+}
+
 static int rq_push_front(int cpu, int proc) {          /* priority: run NEXT   */
     struct cpu_local *c = &g_cpu[cpu];
     rq_acquire(c);
@@ -6819,7 +6863,10 @@ static void cpu_exec_proc(int c, int p) {
          * runs it (rq_pop, the home's own consumer, ignores the pin, so there
          * is no starvation — it only blocks OTHER cores for a single hop). */
         if (dst != c) kprocs[p].migrate_pin = dst;
-        rq_push(dst, p);
+        /* v0.56: rq_push_any, not rq_push. A preempted task carries the ONLY
+         * copy of its ring-3 context in kprocs[p].uctx; if the enqueue is
+         * dropped there is nothing left that knows the task exists. */
+        if (rq_push_any(dst, p) < 0) dst = c;
         __sync_synchronize();
         if (dst != c) lapic_ipi(g_cpu[dst].apic_id, IPI_PING, 0);  /* wake the new home */
     } else if (!posix_thread_leave(p)) {
@@ -7934,7 +7981,10 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
 
     /* Queue the child. On SMP the idle siblings pull it autonomously; on a
      * uniprocessor the caller's own driver loop drains cpu0 (posix_drain). */
-    rq_push(0, ch);
+    /* v0.56: rq_push_any. A dropped enqueue here loses a brand-new child that
+     * the parent is already waiting on — the exact failure that wedged every
+     * uniprocessor posixstress round (see RQ_LEN). */
+    rq_push_any(0, ch);
     for (int cc = 1; cc < MAX_CPUS; cc++)               /* let an idle sibling steal it */
         if (g_cpu[cc].online) lapic_ipi(g_cpu[cc].apic_id, IPI_PING, 0);
     g_forks++;
@@ -12842,9 +12892,19 @@ static int posix_drain(int *procs, int nproc, struct px_round *R, uint64_t watch
             lastlog = g_ticks;
             kprintf("[posixstrs] .. waiting spins=%u ticks=%u (+%u) rq0=%d: ", spins, g_ticks, g_ticks - t0, (uint64_t)(int64_t)(g_cpu[0].rq_t - g_cpu[0].rq_h));
             for (int i = 0; i < nproc; i++)
-                if (!R->got[i]) kprintf("pid %u(role %u,thr %d) ", R->pid[i],
-                                        kprocs[procs[i]].role,
-                                        (uint64_t)(int64_t)kprocs[procs[i]].nthreads);
+                if (!R->got[i]) {
+                    struct kproc *K = &kprocs[procs[i]];
+                    /* v0.56: pstate/rip/sig are the fields that separate "slow"
+                     * from "parked". A task that is neither in a run queue nor
+                     * pstate==1 (preempted, resumable) is unreachable by every
+                     * dispatcher there is, and the breadcrumb has to say so or
+                     * the log looks like ordinary slow progress forever. */
+                    kprintf("pid %u(role %u,thr %d pstate %d rip %X pend %X msk %X sfsp %X) ",
+                            R->pid[i], K->role, (uint64_t)(int64_t)K->nthreads,
+                            (uint64_t)(int64_t)K->pstate, K->uctx.rip,
+                            (uint64_t)K->sig_pending, (uint64_t)K->sig_mask,
+                            (uint64_t)(int64_t)K->sigframe_sp);
+                }
             for (int c = 0; c < R->nchild; c++)
                 if (R->cgot[c] == 0) kprintf("child %u ", R->cpid[c]);
             kprintf("\n");
@@ -12906,6 +12966,16 @@ static void cmd_posix_stress(void) {
             __sync_synchronize();
             if (n > 1) lapic_ipi(0, IPI_PING, 1);
         }
+        /* The 3000-tick budget is UNCHANGED from v0.55, and deliberately so.
+         * When the uniprocessor round started timing out here it looked like a
+         * budget problem — v0.56 doubled the ring-3 image, so every elf_load and
+         * every eager fork clone copies twice the pages — and raising it to 9000
+         * was tried first. It made no difference whatsoever: the breadcrumb kept
+         * printing the same pid, at the same rip, with pstate=1 and an empty run
+         * queue, for three times as long. That is what proved it was not slow but
+         * PARKED, and led to the real cause (RQ_LEN: fork's child enqueue was
+         * being silently dropped into a full queue). The budget is back where it
+         * was, because a watchdog raised to hide a hang stops being a watchdog. */
         if (!posix_drain(procs, nproc, &R, 3000)) {
             kprintf("[posixstrs] round %d WATCHDOG: not every task reached a terminal state\n", rnd);
             for (int i = 0; i < nproc; i++)
