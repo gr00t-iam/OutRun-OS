@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.55.0-metal"
+#define KERNEL_VERSION "0.56.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -197,7 +197,18 @@ static void __attribute__((no_stack_protector)) kprintf(const char *fmt, ...) {
 struct pcb;                                  /* fwd: scheduler thread block   */
 struct tss64;                                /* fwd: per-CPU task state seg   */
 #define MAX_CPUS 8
-#define RQ_LEN   8                           /* v0.39: per-CPU run queue slots */
+/* v0.56: 8 -> 32. A ring of 8 holds SEVEN entries, and cmd_posix_stress queues
+ * seven workers — so on a UNIPROCESSOR, where every one of them goes to queue 0,
+ * the queue was exactly full before the suite had run a single instruction. The
+ * next push, fork()'s enqueue of its brand-new child, hit `full` and rq_push
+ * returned -1 to a caller that ignored it: the task was dropped on the floor,
+ * marked pstate=1 (resumable) but present in no queue, so no dispatcher could
+ * ever reach it again. Latent since v0.39 and only reachable when a queue fills;
+ * v0.56 doubled the ring-3 image and shifted the timing enough to hit it every
+ * single UP boot. A run queue that cannot hold what one suite spawns is a
+ * sizing bug, and silently discarding a runnable task is the more serious one —
+ * see rq_push_any below, which is now what every enqueue path uses. */
+#define RQ_LEN   32                          /* v0.39: per-CPU run queue slots */
 struct cpu_local {
     uint32_t idx;                            /* %gs:0   MUST stay offset 0    */
     uint32_t apic_id;                        /* %gs:4                         */
@@ -1017,6 +1028,8 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
 #define SMP_USER_V  0x0000540000000000ull   /* v0.49: ring-3 remap/unmap scratch window */
 #define WIN_USER_V  0x0000550000000000ull   /* v0.53: ring-3 WIMP window content thumbnail */
 #define THR_USER_V  0x0000560000000000ull   /* v0.55: per-POSIX-thread ring-3 stacks       */
+#define HEAP_USER_V 0x0000570000000000ull   /* v0.56: ring-3 heap (SYS_BRK grows it upward) */
+#define HEAP_MAX_BYTES (4u * 1024u * 1024u) /* per-process heap ceiling: 4 MiB              */
 /* Everything at or above DMA_USER_V is a WINDOW the kernel grants explicitly
  * (device DMA, shared pixels, per-thread stacks); only the region below it is
  * ordinary anonymous process image + main stack. fork() clones exactly that
@@ -1479,6 +1492,11 @@ struct kproc {
     /* v0.55: argv/envp image handed to the ring-3 crt on the initial stack.    */
     int      argc;
     int      exit_authoritative;   /* v0.55: exit_code came from exit(), not pthread_exit() */
+    /* v0.56: current program break. HEAP_USER_V means "no heap mapped yet"; the
+     * heap grows upward from there in whole pages. Nothing else in the kernel
+     * needs to know about it — the pages are ordinary USER mappings, so
+     * page_free_tree reclaims them at exit exactly like the stack. */
+    uint64_t heap_brk;
     /* v0.49: leaf spinlock serializing this ONE process's own VMA/page-table
      * mutations (map_page + smp_slot_phys bookkeeping) against itself. In
      * this kernel's one-thread-per-kproc execution model only the single
@@ -1538,6 +1556,7 @@ static void kproc_reset(struct kproc *p) {
     p->sig_pending = 0; p->sig_mask = 0; p->sigframe_sp = 0;
     p->alarm_deadline = 0; p->ppid_slot = -1;
     p->nthreads = 1; p->ustack_next = 0; p->argc = 0; p->exit_authoritative = 0;
+    p->heap_brk = HEAP_USER_V;
     p->finish_seq = 0;
     p->dispatches = 0;
     p->frames_freed = 0;
@@ -3545,16 +3564,18 @@ static int     g_cas_legacy  = 0;      /* v0.48: mounted a pre-journal (version 
 #define SB ((struct cas_superblock *)g_sbblk)
 
 /* --- VFS directory: names -> content, layered on CAS ---------------------- */
-#define VFS_MAXFILES   29                     /* v0.43: +4 for smp_stress; v0.46: +2 fixed, */
-                                               /* reused, non-growing names ("ipc-payload", */
-                                               /* "ipc-peer") for cmd_ipc_stress; v0.47: +1  */
-                                               /* fixed name ("vfio-devid") for cmd_vfio_stress; */
-                                               /* v0.48: +2 fixed names ("vfs-stress",       */
-                                               /* "vfs-crash-test") for cmd_vfs_stress        */
+/* v0.56: 64 slots. An SDK layout needs far more names than the suites' 29
+ * (/usr/include has seven headers alone, plus /usr/lib, /bin/occ and test
+ * sources). Growing this changes VFS_DIR_BLOCKS and therefore the on-disk
+ * layout — which is exactly why it is bundled with the version-4 format break
+ * below rather than deferred into a second, separate break later. */
+#define VFS_MAXFILES   64
 /* v0.56: VFS_MAX_CHUNKS is now the count of DIRECT chunk hashes stored inline
- * in the dirent — the unchanged fast path for every small file, and the reason
- * the on-disk dirent layout (and therefore the journal and cross-reboot
- * recovery) is not broken by this change. Beyond 8 KiB a file grows through a
+ * in the dirent — the unchanged fast path for every small file. (Stage A added
+ * this without touching the on-disk layout at all; Stage B then widened `name`
+ * for hierarchical paths, which DOES shift the later fields, so the volume
+ * version is now 4 and older volumes are reformatted.) Beyond 8 KiB a file
+ * grows through a
  * classic Unix-style INDIRECT CHUNK MAP: one single-indirect block of 64 chunk
  * hashes, then one double-indirect block of 64 single-indirect blocks.
  *
@@ -3583,8 +3604,21 @@ static int     g_cas_legacy  = 0;      /* v0.48: mounted a pre-journal (version 
  * CHANGELOG-0.48.0.md for how this was found and confirmed with a direct read
  * of the pre-fix code. */
 #define VFS_DIR_BLOCKS ((VFS_MAXFILES * 256 + CAS_BS - 1) / CAS_BS)
+/* v0.56 Stage B: names are now PATHS. The VFS keeps its flat dirent table, but a
+ * name may contain '/' and is long enough for real SDK layouts
+ * ("/usr/include/outrun_abi.h" is 26 chars). This is a flat namespace with
+ * HIERARCHICAL NAMES — deliberately not an inode tree: there is no mkdir, no
+ * rename-a-subtree, and no per-directory metadata. Directory *listing* is
+ * prefix matching (see SYS_READDIR), which is all a toolchain actually needs to
+ * resolve #include paths and find /bin and /usr/lib.
+ *
+ * The 32 extra bytes come out of reserved[], so sizeof(struct dirent) stays 256
+ * and VFS_DIR_BLOCKS is unchanged — but every field AFTER name shifts by 32, so
+ * the volume signature is bumped below to force a reformat rather than let an
+ * older volume be misparsed. */
+#define VFS_NAME_MAX 64
 struct dirent {
-    char     name[32];
+    char     name[VFS_NAME_MAX];
     uint32_t used;
     uint32_t len;
     uint32_t nchunks;
@@ -3598,7 +3632,7 @@ struct dirent {
      * restore all keep working unchanged, and a v0.55 volume still mounts. */
     uint64_t ind1_hash;                       /* -> 64 chunk hashes              */
     uint64_t ind2_hash;                       /* -> 64 single-indirect blocks    */
-    uint8_t  reserved[56];                    /* pad dirent to exactly 256 bytes  */
+    uint8_t  reserved[24];                    /* pad dirent to exactly 256 bytes  */
 } __attribute__((packed));
 /* Compile-time guard: if this ever trips, the on-disk layout has been broken. */
 _Static_assert(sizeof(struct dirent) == 256, "dirent must stay exactly 256 bytes");
@@ -3618,6 +3652,14 @@ static int64_t bm_alloc(void) {
     for (uint64_t b = SB->data_start; b < SB->total_blocks; b++)
         if (!bm_get(b)) { bm_set(b); SB->used_blocks++; return (int64_t)b; }
     return -1;
+}
+/* v0.56: the exact inverse of bm_alloc, used when a put allocates a block and
+ * then discovers nothing will ever be able to reference it. Both halves have
+ * to move together — cio audits `used_blocks == popcount(bitmap)` every run. */
+static void bm_free(uint64_t b) {
+    if (!bm_get(b)) return;
+    g_bitmap[b >> 3] &= (uint8_t)~(1u << (b & 7));
+    if (SB->used_blocks) SB->used_blocks--;
 }
 
 /* Open-addressed (linear-probe) index; hash 0 marks an empty slot.            */
@@ -3750,7 +3792,30 @@ static uint64_t cas_put(const void *data, uint32_t len) {
             cas_flush_meta();
         }
     } else {
-        cas_flush_meta();          /* index full: bitmap/put_count still need to land */
+        /* v0.56: block `b` is now UNREACHABLE. Either the index is full (-1) or
+         * another put indexed this same hash while we were writing (-2); in
+         * neither case will any index slot ever point at it. The old code kept
+         * the block allocated and returned `h` REGARDLESS, which was silent
+         * data loss on the -1 path: the caller stored a hash that cas_get can
+         * never resolve, and vfs_read_file then copied out whatever stale bytes
+         * the shared bounce buffer happened to hold. Found live by re-running
+         * the suite matrix against an already-populated volume, where tiers 0
+         * and 1 of the chunk-map test "round-tripped" the right BYTE COUNT with
+         * the wrong CONTENT. Give the block back, and report the -1 case as the
+         * failure it is. */
+        int dup = (idx_sec == -2);
+        bm_free((uint64_t)b);
+        if (dup) SB->dedup_hits++;
+        cas_flush_meta();
+        klock_release(&g_cas_lock);
+        if (dup) {
+            kprintf("[cas    ] put len %d hash %X -> DEDUP (raced, block returned)\n",
+                    (uint64_t)len, h);
+            return h;
+        }
+        kprintf("[cas    ] put len %d hash %X -> FAILED: content index is full\n",
+                (uint64_t)len, h);
+        return 0;
     }
     klock_release(&g_cas_lock);
     kprintf("[cas    ] put len %d hash %X -> block %d (stored)\n", (uint64_t)len, h, (uint64_t)b);
@@ -3777,7 +3842,13 @@ static void cas_format(void) {
     cmemcpy(SB->magic, mg, 8);
     /* v0.48: version 3 — adds the two journal regions below. A version-2       */
     /* volume never had them; cas_mount() gates all journal use on this bump.    */
-    SB->version = 3; SB->block_size = CAS_BS; SB->total_blocks = total;
+    /* v0.56: version 4 — the dirent's `name` field widened from 32 to 64 bytes
+     * for hierarchical paths, which shifts every field after it. A version-3
+     * volume's directory blocks therefore cannot be parsed by this kernel at
+     * all, so cas_mount refuses anything below 4 and the volume is reformatted.
+     * That is the honest outcome: silently misreading a directory would corrupt
+     * it on the next flush. */
+    SB->version = 4; SB->block_size = CAS_BS; SB->total_blocks = total;
     SB->bitmap_start  = 1;
     SB->bitmap_blocks = (total / 8 + CAS_BS - 1) / CAS_BS;
     SB->index_start   = SB->bitmap_start + SB->bitmap_blocks;
@@ -3815,14 +3886,18 @@ static void vfs_journal_apply(void);   /* fwd: v0.48, defined in the VFS section
 static int cas_mount(void) {
     virtio_read_block(0, g_sbblk);
     const char mg[8] = { 'O','R','U','N','C','A','S','1' };
-    if (cmemcmp(SB->magic, mg, 8) != 0 || (SB->version != 2 && SB->version != 3)) return 0;
+    /* v0.56: only version 4 mounts. Versions 2 and 3 predate the widened dirent
+     * name, so their directory records have a different shape — reading one
+     * would yield garbage names and lengths, and the first vfs_flush would then
+     * write that garbage back. Refusing the mount makes cas_format run instead. */
+    if (cmemcmp(SB->magic, mg, 8) != 0 || SB->version != 4) return 0;
     /* v0.48: a version-2 volume predates both the dir_blocks fix and the        */
     /* journal regions — its on-disk bytes past dir_blocks/8 are DATA blocks,    */
     /* not journal headers, so trusting SB->vjournal_start/cjournal_start here   */
     /* would read (and later write!) garbage. Mount it read/write-compatible in  */
     /* a legacy mode instead: same 8-block dir clamp this kernel always used,    */
     /* journaling simply inactive until the volume is reformatted.               */
-    g_cas_legacy = (SB->version == 2);
+    g_cas_legacy = 0;                  /* v0.56: pre-v4 volumes no longer mount at all */
     if (!g_cas_legacy) {
         cas_journal_recover();
         virtio_read_block(0, g_sbblk);      /* recovery may have rewritten the superblock */
@@ -3862,7 +3937,7 @@ static void vfs_flush(void) {
 }
 static int vfs_find(const char *name) {
     for (int i = 0; i < VFS_MAXFILES; i++)
-        if (DENTS[i].used && streq_n(DENTS[i].name, name, 32)) return i;
+        if (DENTS[i].used && streq_n(DENTS[i].name, name, VFS_NAME_MAX)) return i;
     return -1;
 }
 static void ts_emit(int type, const char *who, const char *text);  /* Time-Stream (Phase 5) */
@@ -3954,6 +4029,11 @@ static int vfs_write_locked(int idx, const char *name, const void *data, uint32_
         return -1;
     }
     struct dirent *d = &DENTS[idx];
+    /* v0.56: snapshot for an ATOMIC rollback. cas_put can now genuinely fail
+     * (volume or content index full), and a half-written dirent whose chunk
+     * map has holes in it is worse than no write at all — the old file is
+     * already destroyed by the cmemset below. */
+    struct dirent prev = *d;
     cmemset(d, 0, 256);
     kstrcpy_n(d->name, name, (int)sizeof d->name);
     d->used = 1; d->len = len;
@@ -3963,9 +4043,11 @@ static int vfs_write_locked(int idx, const char *name, const void *data, uint32_
     /* Every chunk's hash first; the indirect blocks are then built FROM this
      * array, which keeps the CAS traffic in one direction (content, then map). */
     static uint64_t ch[VFS_MAX_FILE_BYTES / 512];
+    int put_failed = 0;
     for (uint32_t i = 0; i < nch; i++) {
         uint32_t cl = len - i * 512; if (cl > 512) cl = 512;
         ch[i] = cas_put(p + i * 512, cl);                  /* CAS stores each block */
+        if (!ch[i]) put_failed = 1;                        /* 0 == "could not store" */
     }
     for (uint32_t i = 0; i < nch && i < VFS_MAX_CHUNKS; i++) d->chunk_hash[i] = ch[i];
     if (nch > VFS_MAX_CHUNKS) {                            /* single-indirect     */
@@ -3975,6 +4057,7 @@ static int vfs_write_locked(int idx, const char *name, const void *data, uint32_
             blk[k] = (src < nch) ? ch[src] : 0;
         }
         d->ind1_hash = cas_put(blk, sizeof blk);
+        if (!d->ind1_hash) put_failed = 1;
     }
     if (nch > VFS_CHUNKS_L1) {                             /* double-indirect     */
         uint64_t l1[VFS_IND_PER_BLK], top[VFS_IND_PER_BLK];
@@ -3987,8 +4070,16 @@ static int vfs_write_locked(int idx, const char *name, const void *data, uint32_
                 l1[k] = (src < nch) ? ch[src] : 0;
             }
             top[g] = cas_put(l1, sizeof l1);
+            if (!top[g]) put_failed = 1;
         }
         d->ind2_hash = cas_put(top, sizeof top);
+        if (!d->ind2_hash) put_failed = 1;
+    }
+    if (put_failed) {
+        *d = prev;                     /* the previous file survives untouched */
+        kprintf("[vfs    ] reject '%s': the CAS could not store every chunk "
+                "(volume or content index full) — write rolled back\n", name);
+        return -1;
     }
     d->file_hash = len ? rust_cas_hash((uint64_t)data, len) : 0;
     vfs_journal_commit();          /* v0.48: journal-commit; see comment above */
@@ -4013,7 +4104,8 @@ static int vfs_write_by_dirent(int di, const void *data, uint32_t len) {
     if (di < 0 || di >= VFS_MAXFILES) return -1;
     klock_acquire(&g_vfs_lock);
     if (!DENTS[di].used) { klock_release(&g_vfs_lock); return -1; }
-    char name[32]; kstrcpy_n(name, DENTS[di].name, 32);    /* copy under lock  */
+    char name[VFS_NAME_MAX];
+    kstrcpy_n(name, DENTS[di].name, VFS_NAME_MAX);          /* copy under lock  */
     int r = vfs_write_locked(di, name, data, len);
     klock_release(&g_vfs_lock);
     return r;
@@ -4025,8 +4117,25 @@ static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
     uint8_t tmp[512];
     for (uint32_t i = 0; i < d->nchunks; i++) {
         uint64_t h = vfs_chunk_hash_at(d, i);   /* v0.56: walks the indirect map */
-        if (!h) break;                          /* absent chunk: stop, don't lie  */
-        cas_get(h, tmp, 512);                  /* rank 2 -> 3: strictly upward  */
+        if (!h) {                               /* absent chunk: stop, don't lie  */
+            kprintf("[vfs    ] SHORT READ '%s': chunk %u of %u has no hash "
+                    "(dirent %d, len %u)\n",
+                    d->name, (uint64_t)i, (uint64_t)d->nchunks,
+                    (uint64_t)(int64_t)idx, (uint64_t)d->len);
+            break;
+        }
+        /* v0.56: cas_get's return was DISCARDED here. On a miss the shared tmp[]
+         * kept the PREVIOUS chunk's bytes and they were copied out as if they
+         * were this chunk's — a read that returned the correct length and the
+         * wrong content, with no error anywhere. Stop instead: a short read is
+         * a signal the caller can act on; a plausible-looking wrong one is not. */
+        if (cas_get(h, tmp, 512) < 0) {        /* rank 2 -> 3: strictly upward  */
+            kprintf("[vfs    ] SHORT READ '%s': chunk %u of %u hash %X is NOT in "
+                    "the CAS (dirent %d, len %u)\n",
+                    d->name, (uint64_t)i, (uint64_t)d->nchunks, h,
+                    (uint64_t)(int64_t)idx, (uint64_t)d->len);
+            break;
+        }
         uint32_t cl = d->len - i * 512; if (cl > 512) cl = 512;
         for (uint32_t j = 0; j < cl && got < max; j++) ((uint8_t *)buf)[got++] = tmp[j];
     }
@@ -4047,7 +4156,7 @@ static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
 
 #define TMP_MAXFILES 4                 /* small, ephemeral, RAM-only scratch area */
 #define TMP_MAXBYTES 512
-struct tmpfile { char name[32]; int used; uint32_t len; uint8_t data[TMP_MAXBYTES]; };
+struct tmpfile { char name[VFS_NAME_MAX]; int used; uint32_t len; uint8_t data[TMP_MAXBYTES]; };
 static struct tmpfile g_tmpfiles[TMP_MAXFILES];
 
 static int path_has_prefix(const char *name, const char *prefix) {
@@ -4133,16 +4242,16 @@ static int ofile_claim(int owner, int volume, int dirent) {
     klock_release(&g_ofile_lock);
     return -1;
 }
-static int vfs_open_for(const char *name, int owner) {
+static int vfs_open_for(const char *name, int owner, int creat) {
     if (path_has_prefix(name, "tmp/")) {
         const char *rest = name + 4;
         klock_acquire(&g_vfs_lock);
         int ti = -1;
         for (int i = 0; i < TMP_MAXFILES; i++)
-            if (g_tmpfiles[i].used && streq_n(g_tmpfiles[i].name, rest, 32)) { ti = i; break; }
+            if (g_tmpfiles[i].used && streq_n(g_tmpfiles[i].name, rest, VFS_NAME_MAX)) { ti = i; break; }
         if (ti < 0) for (int i = 0; i < TMP_MAXFILES; i++) if (!g_tmpfiles[i].used) {
             ti = i; g_tmpfiles[i].used = 1; g_tmpfiles[i].len = 0;
-            kstrcpy_n(g_tmpfiles[i].name, rest, 32); break;
+            kstrcpy_n(g_tmpfiles[i].name, rest, VFS_NAME_MAX); break;
         }
         klock_release(&g_vfs_lock);
         if (ti < 0) return -1;
@@ -4153,11 +4262,27 @@ static int vfs_open_for(const char *name, int owner) {
 
     klock_acquire(&g_vfs_lock);
     int di = vfs_find(name);
+    /* v0.56: O_CREAT for ROOT. A toolchain has to be able to AUTHOR files — a
+     * compiler that can only overwrite names the kernel pre-seeded is not a
+     * toolchain — but creation must be REQUESTED, never implicit: making plain
+     * open() create was tried first and broke six suites at once, because every
+     * "prove this name is gone" check silently created the name it was checking
+     * for. The new dirent is claimed under the same lock that found it missing,
+     * so two cores opening the same new path cannot both claim a slot. */
+    if (di < 0 && creat && name[0]) {   /* never create an unnamed dirent */
+        for (int i = 0; i < VFS_MAXFILES; i++) if (!DENTS[i].used) {
+            cmemset(&DENTS[i], 0, 256);
+            kstrcpy_n(DENTS[i].name, name, VFS_NAME_MAX);
+            DENTS[i].used = 1; DENTS[i].len = 0; DENTS[i].nchunks = 0;
+            di = i; break;
+        }
+    }
     klock_release(&g_vfs_lock);                /* released BEFORE the fd claim  */
     if (di < 0) return -1;
     return ofile_claim(owner, VOL_ROOT, di);
 }
-static int vfs_open(const char *name) { return vfs_open_for(name, (int)current_proc_idx); }
+static int vfs_open(const char *name) { return vfs_open_for(name, (int)current_proc_idx, 0); }
+static int vfs_open_creat(const char *name) { return vfs_open_for(name, (int)current_proc_idx, 1); }
 
 /* ===========================================================================
  * v0.48: SYS_VFS_UNLINK — zero the dirent, journal-commit the directory
@@ -6569,6 +6694,27 @@ static int rq_push(int cpu, int proc) {                /* producer: tail       *
     rq_release(c);
     return 0;
 }
+/* v0.56: the enqueue every caller should use. A runnable task must end up in
+ * SOME queue or it is lost forever — pstate=1 with no queue entry is
+ * unreachable by rq_pop, by rq_steal, and by every driver loop in the tree.
+ * Try the preferred core, then any other online core the task's affinity mask
+ * allows, and only if EVERY queue is full say so loudly instead of returning a
+ * -1 that history shows nobody checks. Returns the cpu it landed on, or -1. */
+static int rq_push(int cpu, int proc);
+static int rq_push_any(int cpu, int proc) {
+    if (rq_push(cpu, proc) == 0) return cpu;
+    uint32_t aff = kprocs[proc].affinity;
+    for (int c = 0; c < MAX_CPUS; c++) {
+        if (c == cpu || !g_cpu[c].online) continue;
+        if (aff && !(aff & (1u << c))) continue;
+        if (rq_push(c, proc) == 0) return c;
+    }
+    kprintf("[sched  ] RUN QUEUE FULL: pid %u could not be enqueued on cpu %d "
+            "or any sibling — task would be LOST\n",
+            kprocs[proc].pid, (uint64_t)(int64_t)cpu);
+    return -1;
+}
+
 static int rq_push_front(int cpu, int proc) {          /* priority: run NEXT   */
     struct cpu_local *c = &g_cpu[cpu];
     rq_acquire(c);
@@ -6717,7 +6863,10 @@ static void cpu_exec_proc(int c, int p) {
          * runs it (rq_pop, the home's own consumer, ignores the pin, so there
          * is no starvation — it only blocks OTHER cores for a single hop). */
         if (dst != c) kprocs[p].migrate_pin = dst;
-        rq_push(dst, p);
+        /* v0.56: rq_push_any, not rq_push. A preempted task carries the ONLY
+         * copy of its ring-3 context in kprocs[p].uctx; if the enqueue is
+         * dropped there is nothing left that knows the task exists. */
+        if (rq_push_any(dst, p) < 0) dst = c;
         __sync_synchronize();
         if (dst != c) lapic_ipi(g_cpu[dst].apic_id, IPI_PING, 0);  /* wake the new home */
     } else if (!posix_thread_leave(p)) {
@@ -7374,6 +7523,9 @@ static uint64_t elf_load(int proc_idx, uint64_t img, uint64_t img_size);   /* fw
 static uint64_t uargs_build(uint64_t cr3, int argc, const char argv[][UARG_LEN],
                             int envc, const char envp[][UARG_LEN]);
 static int      vm_clone_user(uint64_t src_cr3, uint64_t dst_cr3);
+/* v0.56: the ELF staging buffer, shared with exec_from_cas (defined with the
+ * loader further down). SYS_EXECVE reads a whole image out of CAS into it. */
+extern uint8_t  g_execbuf[VFS_MAX_FILE_BYTES];
 static volatile uint64_t g_execs = 0, g_forks = 0, g_threads_made = 0;
 static int g_mcpass, g_mcfail;
 static void mccheck(const char *n, int c) {
@@ -7829,7 +7981,10 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
 
     /* Queue the child. On SMP the idle siblings pull it autonomously; on a
      * uniprocessor the caller's own driver loop drains cpu0 (posix_drain). */
-    rq_push(0, ch);
+    /* v0.56: rq_push_any. A dropped enqueue here loses a brand-new child that
+     * the parent is already waiting on — the exact failure that wedged every
+     * uniprocessor posixstress round (see RQ_LEN). */
+    rq_push_any(0, ch);
     for (int cc = 1; cc < MAX_CPUS; cc++)               /* let an idle sibling steal it */
         if (g_cpu[cc].online) lapic_ipi(g_cpu[cc].apic_id, IPI_PING, 0);
     g_forks++;
@@ -7981,7 +8136,18 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         char name[64];
         if (copy_user_str(kprocs[current_proc_idx].cr3, a0, name, sizeof name) < 0) return (uint64_t)-14;
         fs_witness_enter();
-        int fd = vfs_open(name);
+        /* v0.56: a1 is a flags word; bit 0 is O_CREAT and nothing else is defined
+         * yet. UNKNOWN BITS ARE REJECTED — an ABI that silently ignores flags it
+         * does not understand cannot ever add one safely, and here it was worse
+         * than that: cmd_fuzz throws random values at syscall arguments, so a
+         * random a1 with bit 0 set had the fuzzer CREATING garbage-named files
+         * and claiming descriptors it never closes. That poisoned the global
+         * descriptor table for every later suite that audits it (cio, dmastrs,
+         * kpstrs, ipcstrs, vfsstrs, posixstrs all failed identically and
+         * intermittently). The fuzzer was right; the flags word was not
+         * validated. */
+        if (a1 & ~1ull) return (uint64_t)-22;              /* EINVAL */
+        int fd = (a1 & 1) ? vfs_open_creat(name) : vfs_open(name);
         fs_witness_leave();
         return (uint64_t)(int64_t)fd;
     }
@@ -8808,17 +8974,32 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (nfill) cmemcpy((void *)(ubuf + sizeof hdr), ent, (uint64_t)nfill * 32);
         return (uint64_t)nfill;
     }
-    case 45: {   /* SYS_READDIR(index, *out) -> 1 if an entry was written, 0 past end, neg on error.
-                  * out = { u32 len, u32 used, char name[32] } (40 bytes). */
+    case 45: {   /* SYS_READDIR(index, *out, prefix) -> 1 entry written, 0 past end, neg error.
+                  * out = { u32 len, u32 used, char name[VFS_NAME_MAX] } (72 bytes).
+                  *
+                  * v0.56: `prefix` (a2) is an optional ring-3 string. When non-NULL,
+                  * only entries whose PATH starts with it are reported — which is how
+                  * a flat dirent table serves directory listings now that names are
+                  * paths: readdir("/usr/include/") enumerates exactly that directory.
+                  * A filtered-out slot returns `used == 0` rather than ending the walk,
+                  * so a caller still scans the whole table by index and cannot be
+                  * tricked into stopping early by table ordering. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
         int idx = (int)(int64_t)a0; uint64_t ubuf = a1;
         if (idx < 0 || idx >= VFS_MAXFILES) return (uint64_t)0;
-        if (!access_ok(kprocs[current_proc_idx].cr3, ubuf, 40, 1)) return (uint64_t)-1;
-        struct { uint32_t len, used; char name[32]; } e;
+        struct { uint32_t len, used; char name[VFS_NAME_MAX]; } e;
+        if (!access_ok(kprocs[current_proc_idx].cr3, ubuf, sizeof e, 1)) return (uint64_t)-1;
+        char pfx[VFS_NAME_MAX];
+        pfx[0] = 0;
+        if (a2 && copy_user_str(kprocs[current_proc_idx].cr3, a2, pfx, sizeof pfx) < 0)
+            return (uint64_t)-14;
         cmemset(&e, 0, sizeof e);
         struct dirent *d = &DENTS[idx];
-        e.used = d->used; e.len = d->len;
-        for (int k = 0; k < 31; k++) e.name[k] = d->name[k];
+        int show = d->used && (!pfx[0] || path_has_prefix(d->name, pfx));
+        if (show) {
+            e.used = d->used; e.len = d->len;
+            for (int k = 0; k < VFS_NAME_MAX - 1; k++) e.name[k] = d->name[k];
+        }
         cmemcpy((void *)ubuf, &e, sizeof e);
         return (uint64_t)1;
     }
@@ -8883,6 +9064,83 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     /* =======================================================================
      * v0.55: POSIX PROCESS / SIGNAL / THREAD CALLS
      * ======================================================================= */
+    case 59: {   /* SYS_EXECVE(path, argv, envp) -> negative on failure, NEVER returns
+                  * on success. THE real POSIX-shaped exec: it loads an ARBITRARY
+                  * ELF out of the VFS by path, which is what makes a compiler's
+                  * output runnable and therefore what makes self-hosting possible
+                  * at all. (Case 48 remains the v0.55 "re-exec this same boot
+                  * image under a new role" primitive; it predates being able to
+                  * load anything else and every v0.55 suite still uses it.)
+                  *
+                  * Ordering matters throughout: the path, argv and envp all live
+                  * in the address space this call is about to destroy, so every
+                  * byte is copied out BEFORE anything is torn down, and the new
+                  * image is built in a FRESH space so a failure leaves the caller
+                  * alive and running. */
+        int p = (int)current_proc_idx;
+        uint64_t ucr3 = kprocs[p].cr3;
+        if (!rust_cap_check(kprocs[p].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+
+        char path[VFS_NAME_MAX];
+        if (copy_user_str(ucr3, a0, path, sizeof path) < 0) return (uint64_t)-14;
+
+        static char kargv[UARG_N][UARG_LEN], kenvp[UARG_N][UARG_LEN];
+        int argc = 0, envc = 0;
+        for (int vec = 0; vec < 2; vec++) {
+            uint64_t ptr = vec ? a2 : a1;
+            if (!ptr) continue;
+            for (int i = 0; i < UARG_N; i++) {
+                if (!access_ok(ucr3, ptr + (uint64_t)i * 8, 8, 0)) return (uint64_t)-14;
+                uint64_t sp = ((const uint64_t *)ptr)[i];
+                if (!sp) break;
+                if (copy_user_str(ucr3, sp, vec ? kenvp[envc] : kargv[argc], UARG_LEN) < 0)
+                    return (uint64_t)-14;
+                if (vec) envc++; else argc++;
+            }
+        }
+        /* POSIX convention: argv[0] defaults to the program path. */
+        if (!argc) { kstrcpy_n(kargv[0], path, UARG_LEN); argc = 1; }
+
+        /* Pull the image out of CAS into the kernel's staging buffer while the
+         * caller's address space is still intact. */
+        int di = vfs_find(path);
+        if (di < 0) return (uint64_t)-2;                    /* ENOENT */
+        int64_t nimg = vfs_read_file(di, g_execbuf, sizeof g_execbuf);
+        if (nimg <= 0) return (uint64_t)-5;                 /* EIO   */
+
+        uint64_t newcr3 = create_address_space();
+        if (!newcr3) return (uint64_t)-12;
+        uint64_t save = kprocs[p].cr3;
+        kprocs[p].cr3 = newcr3;                             /* elf_load targets this */
+        /* elf_load enforces W^X on the way in: a segment that is both writable
+         * and executable is refused, so a compiler cannot emit an image that
+         * escapes the policy the rest of the system obeys. */
+        uint64_t entry = elf_load(p, (uint64_t)g_execbuf, (uint64_t)nimg);
+        if (!entry) { kprocs[p].cr3 = save; page_free_tree(newcr3); return (uint64_t)-8; }
+        uint64_t sp = uargs_build(newcr3, argc, (const char (*)[UARG_LEN])kargv,
+                                          envc, (const char (*)[UARG_LEN])kenvp);
+
+        /* Point of no return: switch onto the new image, THEN dismantle the old
+         * space — in that order, because we are executing on it right now. This
+         * syscall's own kernel stack lives in the shared kernel range that
+         * create_address_space aliases into every process, so it survives. */
+        kprocs[p].entry = entry;
+        kprocs[p].pstate = 0;
+        kprocs[p].sigframe_sp = 0;
+        kprocs[p].sig_mask = 0;
+        kprocs[p].heap_brk = HEAP_USER_V;                   /* the heap does NOT survive exec */
+        for (int sg = 0; sg < NSIG; sg++)
+            if (kprocs[p].sig_handler[sg] > 1) kprocs[p].sig_handler[sg] = 0;
+        write_cr3(newcr3);
+        if (cpu_idx() == 0 && curthr->uthread) curthr->cr3 = newcr3;
+        __sync_synchronize();
+        page_free_tree(save);
+        g_execs++;
+        kprintf("[exec   ] pid %u exec'd '%s' (%d bytes from CAS) -> entry %X\n",
+                kprocs[p].pid, path, nimg, entry);
+        enter_user_thread(entry, sp);                       /* never returns */
+        return 0;                                           /* unreachable */
+    }
     case 48: {   /* SYS_EXECVE(argv, envp, role) -> negative on failure, NEVER returns on success.
                   * Replaces this process's image in place: same pid, same kproc slot, same
                   * open descriptors, brand-new address space. */
@@ -8925,6 +9183,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         kprocs[p].pstate = 0;                          /* no stale captured context */
         kprocs[p].sigframe_sp = 0;
         kprocs[p].sig_mask = 0;
+        kprocs[p].heap_brk = HEAP_USER_V;              /* v0.56: the heap does not survive exec */
         /* POSIX: exec RESETS caught signals to default but keeps SIG_IGN.     */
         for (int sg = 0; sg < NSIG; sg++)
             if (kprocs[p].sig_handler[sg] > 1) kprocs[p].sig_handler[sg] = 0;
@@ -9045,6 +9304,53 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         kprocs[p].alarm_deadline = a0 ? g_ticks + a0 : 0;
         if (kprocs[p].alarm_deadline) __sync_fetch_and_add(&g_alarms_armed, 1);
         return rem;
+    }
+    case 58: {   /* SYS_BRK(new_end) -> the resulting program break, or the CURRENT
+                  * break unchanged if the request could not be satisfied.
+                  *
+                  * a0 == 0 queries without moving it, which is what sbrk(0) needs.
+                  * The heap is an ordinary anonymous USER mapping in its own vaddr
+                  * window: RW+NX, so it can never be executed (W^X holds for the
+                  * heap as it does for everything else), and page_free_tree
+                  * reclaims it at exit with no special case. Growth is page-
+                  * granular; shrinking unmaps AND frees, so a process that
+                  * releases memory really gives the frames back rather than
+                  * holding them until it dies. */
+        int p = (int)current_proc_idx;
+        uint64_t cur = kprocs[p].heap_brk;
+        if (!a0) return cur;
+        if (a0 < HEAP_USER_V || a0 > HEAP_USER_V + HEAP_MAX_BYTES) return cur;
+        uint64_t want = (a0 + 0xFFFull) & ~0xFFFull;       /* page-granular break */
+        if (want > cur) {
+            for (uint64_t v = cur; v < want; v += 0x1000) {
+                uint64_t f = alloc_frame();
+                if (!f) {                                   /* out of memory: keep
+                                                             * what we mapped and
+                                                             * report it honestly */
+                    kprocs[p].heap_brk = v;
+                    return v;
+                }
+                map_page(kprocs[p].cr3, v, f, PTE_USER | PTE_WRITE | PTE_NX);
+            }
+        } else if (want < cur) {
+            for (uint64_t v = want; v < cur; v += 0x1000) {
+                uint64_t pte = walk_pte(kprocs[p].cr3, v);
+                unmap_page(kprocs[p].cr3, v);
+                /* Shoot down BEFORE the frame goes back on the free list — the
+                 * kernel's existing rule (see tlb_shootdown_range): a core still
+                 * holding a stale TLB entry could otherwise write through it
+                 * into a frame that has already been handed to someone else.
+                 * A threaded process really can be running this address space on
+                 * another core right now. */
+                tlb_shootdown(v);
+                if (pte & PTE_PRESENT) free_frame(pte & ADDR_MASK);
+            }
+        }
+        kprocs[p].heap_brk = want;
+        if (g_debug_posix)
+            kprintf("[dbgposix] brk pid %u -> %X (%u KiB mapped)\n",
+                    kprocs[p].pid, want, (want - HEAP_USER_V) / 1024);
+        return want;
     }
     case 57: {   /* SYS_SIGUNMASK(signo) -> 0 ok, negative.
                   * sig_deliver BLOCKS the signal it delivers, so a handler cannot
@@ -9432,7 +9738,14 @@ static void cmd_cio(void) {
     int all;
     for (;;) {
         all = 1;
-        for (int i = 0; i < NW; i++) if (!kprocs[w[i]].exited) all = 0;
+        /* v0.56: wait for torn_down, NOT exited. `exited` flips true as soon as
+         * the ring-3 excursion returns, while descriptor_teardown_kproc and the
+         * rest of the teardown chain run AFTER it; torn_down is set last,
+         * strictly after all of it. Sampling the fd table on `exited` therefore
+         * races a teardown still in flight and reports a leak that is really
+         * just work in progress — observed intermittently once the ring-3 image
+         * grew and shifted every timing window in the boot. */
+        for (int i = 0; i < NW; i++) if (!kprocs[w[i]].torn_down) all = 0;
         if (all || g_ticks - t0 > 6000) break;
         __asm__ volatile("pause");
     }
@@ -9494,11 +9807,16 @@ static void cmd_cio(void) {
     for (int i = 0; i < VFS_MAXFILES; i++) {
         if (!DENTS[i].used) continue;
         for (int j = i + 1; j < VFS_MAXFILES; j++)
-            if (DENTS[j].used && streq_n(DENTS[i].name, DENTS[j].name, 32)) dup++;
+            if (DENTS[j].used && streq_n(DENTS[i].name, DENTS[j].name, VFS_NAME_MAX)) dup++;
         for (uint32_t c = 0; c < DENTS[i].nchunks; c++) {
+            /* v0.56: must walk the INDIRECT map, not the inline array. Reading
+             * DENTS[i].chunk_hash[c] directly is only valid for c < 16; past
+             * that it runs off the end of the direct hashes into other dirent
+             * fields. Caught live the moment /bin/init (52 chunks) existed. */
+            uint64_t ch = vfs_chunk_hash_at(&DENTS[i], c);
             uint32_t len;
             klock_acquire(&g_cas_lock);
-            int64_t b = cas_index_find(DENTS[i].chunk_hash[c], &len);
+            int64_t b = ch ? cas_index_find(ch, &len) : -1;
             klock_release(&g_cas_lock);
             if (b < 0) unresolved++;
         }
@@ -9639,7 +9957,7 @@ static void cmd_smp_stress(void) {
     uint64_t t0 = g_ticks;                             /* join + watchdog (deadlock proxy) */
     for (;;) {
         int all = 1;
-        for (int i = 0; i < STRESS_N; i++) if (!kprocs[procs[i]].exited) all = 0;
+        for (int i = 0; i < STRESS_N; i++) if (!kprocs[procs[i]].torn_down) all = 0;
         if (all || g_ticks - t0 > 4000) break;
         if (n > 1) lapic_ipi(0, IPI_PING, 1);
         uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
@@ -9854,7 +10172,7 @@ static void cmd_dma_stress(void) {
     uint64_t t0 = g_ticks;
     for (;;) {
         int all = 1;
-        for (int i = 0; i < DMASTRESS_N; i++) if (!kprocs[procs[i]].exited) all = 0;
+        for (int i = 0; i < DMASTRESS_N; i++) if (!kprocs[procs[i]].torn_down) all = 0;
         if (all || g_ticks - t0 > 4000) break;
         if (n > 1) lapic_ipi(0, IPI_PING, 1);
         uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
@@ -10495,9 +10813,34 @@ static void cmd_vfs_stress(void) {
             int wi = vfs_write_file("vfs-stress", bigw, sz);
             int64_t got = (wi >= 0) ? vfs_read_file(wi, bigr, sz) : -1;
             int same = (got == (int64_t)sz);
-            for (uint32_t i = 0; i < sz && same; i++) if (bigr[i] != bigw[i]) same = 0;
+            uint32_t bad = 0;
+            for (uint32_t i = 0; i < sz && same; i++)
+                if (bigr[i] != bigw[i]) { same = 0; bad = i; }
             kprintf("[vfsstrs] chunk map tier %d: wrote %u, read back %d, %u chunk(s)\n",
                     t, (uint64_t)sz, got, (uint64_t)(wi >= 0 ? DENTS[wi].nchunks : 0));
+            /* v0.56: a byte-for-byte failure used to report only that it failed,
+             * which is useless for a storage stack — WHICH byte, in WHICH chunk,
+             * and whether that chunk's content is even retrievable from the CAS
+             * are the three facts that separate "the map is wrong" from "the
+             * content is wrong" from "the read stopped early". Failure-path
+             * only, so a healthy run prints nothing extra. */
+            if (!same && wi >= 0) {
+                uint32_t c = bad / 512;
+                uint64_t h = vfs_chunk_hash_at(&DENTS[wi], c);
+                uint8_t probe[512];
+                int64_t cg = h ? cas_get(h, probe, sizeof probe) : -1;
+                kprintf("[vfsstrs]   MISMATCH at byte %u (chunk %u of %u): want %X got %X\n",
+                        (uint64_t)bad, (uint64_t)c, (uint64_t)DENTS[wi].nchunks,
+                        (uint64_t)bigw[bad], (uint64_t)bigr[bad]);
+                kprintf("[vfsstrs]   chunk %u hash %X, cas_get -> %d, its byte %u = %X\n",
+                        (uint64_t)c, h, cg,
+                        (uint64_t)(bad % 512), (uint64_t)(cg >= 0 ? probe[bad % 512] : 0));
+                kprintf("[vfsstrs]   volume: %u/%u blocks used, index %u slots, "
+                        "%u puts / %u dedup hits\n",
+                        (uint64_t)SB->used_blocks, (uint64_t)SB->total_blocks,
+                        (uint64_t)(SB->index_blocks * CAS_SLOTS_PER_BLOCK),
+                        (uint64_t)SB->put_count, (uint64_t)SB->dedup_hits);
+            }
             vfscheck(checks[t], same);
         }
         /* Past the ceiling: must be REFUSED. This used to be silent data loss —
@@ -10506,6 +10849,66 @@ static void cmd_vfs_stress(void) {
          * BEFORE the dirent is touched, so a rejected write is also atomic. */
         int rej = vfs_write_file("vfs-stress", bigw, VFS_MAX_FILE_BYTES + 1);
         vfscheck("a write past the file ceiling is refused, not silently truncated", rej < 0);
+    }
+
+    /* ===== v0.56 Stage B: HIERARCHICAL PATH NAMES ==========================
+     * Names are paths now. The checks below are chosen so a half-done widening
+     * cannot pass: the third one uses two names that are IDENTICAL for their
+     * first 32 bytes and differ only afterwards, which the old 32-byte compare
+     * would have conflated into a single file. */
+    {
+        /* v0.56 Stage F: these live under /vfstest/, NOT under /usr/. They used
+         * to be literally "/usr/include/stdio.h" and friends — plausible names
+         * for a path test, and harmless until Stage F installed a REAL SDK at
+         * exactly those paths. This suite writes 6 bytes over each name and
+         * then unlinks it, so it was silently DELETING /usr/include/stdio.h and
+         * /usr/include/stdlib.h out from under the toolchain, and inflating its
+         * own prefix count from 4 to 9. Caught the moment toolstrs started
+         * auditing that the SDK is still installed by the time it runs — which
+         * is the whole reason that check exists. A test fixture must not share
+         * a namespace with the thing it is testing around. */
+        static const char *p1 = "/vfstest/include/stdio.h";
+        static const char *p2 = "/vfstest/include/stdlib.h";
+        static const char *p3 = "/vfstest/lib/crt0.o";
+        /* 35th byte onward is the only difference between these two: */
+        static const char *l1 = "/vfstest/include/outrun/very/long/aaa.h";
+        static const char *l2 = "/vfstest/include/outrun/very/long/bbb.h";
+        vfs_write_file(p1, "STDIO", 6);
+        vfs_write_file(p2, "STDLIB", 7);
+        vfs_write_file(p3, "CRT0", 5);
+        vfs_write_file(l1, "AAA", 4);
+        vfs_write_file(l2, "BBBB", 5);
+
+        char rb[16];
+        int i1 = vfs_find(p1);
+        int64_t n1 = (i1 >= 0) ? vfs_read_file(i1, rb, sizeof rb) : -1;
+        vfscheck("a slash-separated PATH is a valid VFS name and resolves by full path",
+                 i1 >= 0 && n1 == 6 && rb[0] == 'S' && rb[4] == 'O');
+
+        /* Prefix listing: exactly the two /usr/include/*.h at the top level plus
+         * the two long ones underneath it — four entries, and NOT /usr/lib. */
+        int under_inc = 0, under_lib = 0;
+        for (int i = 0; i < VFS_MAXFILES; i++) {
+            if (!DENTS[i].used) continue;
+            if (path_has_prefix(DENTS[i].name, "/vfstest/include/")) under_inc++;
+            if (path_has_prefix(DENTS[i].name, "/vfstest/lib/"))     under_lib++;
+        }
+        kprintf("[vfsstrs] path listing: %d under /vfstest/include/, %d under /vfstest/lib/\n",
+                (uint64_t)under_inc, (uint64_t)under_lib);
+        vfscheck("prefix listing partitions the flat table into directories (4 include, 1 lib)",
+                 under_inc == 4 && under_lib == 1);
+
+        /* THE widening check: same first 32 bytes, different tails. */
+        int ia = vfs_find(l1), ib = vfs_find(l2);
+        int64_t na = (ia >= 0) ? vfs_read_file(ia, rb, sizeof rb) : -1;
+        int64_t nb = (ib >= 0) ? vfs_read_file(ib, rb, sizeof rb) : -1;
+        vfscheck("paths identical for 32 bytes but differing later are DISTINCT files",
+                 ia >= 0 && ib >= 0 && ia != ib && na == 4 && nb == 5);
+
+        vfs_unlink(p1); vfs_unlink(p2); vfs_unlink(p3);
+        vfs_unlink(l1); vfs_unlink(l2);
+        vfscheck("every path-named file unlinks cleanly, leaving no dirent behind",
+                 vfs_find(p1) < 0 && vfs_find(l1) < 0 && vfs_find(l2) < 0);
     }
 
     static const uint8_t seed[16] = "VFS-SEED-PATTERN";
@@ -11121,7 +11524,7 @@ static int uthread_spawn_elf(const char *label, uint64_t caps, uint64_t role, in
 
 /* sys_exec: load an ELF whose segments come straight from CAS storage (by     */
 /* VFS name -> content hashes -> blocks) instead of the in-memory GRUB module. */
-static uint8_t g_execbuf[VFS_MAX_FILE_BYTES] __attribute__((aligned(16)));
+uint8_t g_execbuf[VFS_MAX_FILE_BYTES] __attribute__((aligned(16)));
 static int exec_from_cas(const char *name, int proc_idx) {
     int di = vfs_find(name);
     if (di < 0) { kprintf("[exec   ] '%s' not found in VFS\n", name); return -1; }
@@ -11132,6 +11535,333 @@ static int exec_from_cas(const char *name, int proc_idx) {
     if (!entry) { kprintf("[exec   ] ELF load failed\n"); return -1; }
     enter_process(name, proc_idx, entry);
     return 0;
+}
+
+/* ===========================================================================
+ * v0.56 Stage F: THE SDK — headers in /usr/include, runtime in /usr/lib
+ * ===========================================================================
+ * These are real files in the real filesystem, written at boot and readable by
+ * any ring-3 process with PCAP_FILESYSTEM. Two of them are load-bearing rather
+ * than decorative, and it is worth being exact about which is which, because a
+ * "toolchain" whose SDK nothing reads is a directory of props:
+ *
+ *   /usr/lib/libc.oc   IS load-bearing. occ_compile() reads it and PREPENDS it
+ *                      to the user's translation unit, so every function in it
+ *                      is genuinely callable from compiled programs. Deleting
+ *                      it makes programs that call strlen() fail to compile,
+ *                      which is exactly the property a real /usr/lib has.
+ *
+ *   /usr/include/*.h   are NOT consumed by the compiler, and this file will not
+ *                      pretend otherwise: occ has no preprocessor, so it skips
+ *                      `#` lines entirely (see occ_next). They are the
+ *                      normative, human-readable declaration of the ABI and of
+ *                      what libc.oc provides, and toolstrs checks that what
+ *                      they DECLARE and what libc.oc DEFINES agree — so they
+ *                      cannot silently drift into fiction.
+ *
+ * WHAT IS DELIBERATELY ABSENT: crt0.o and libc.a. occ is a single-pass
+ * whole-program compiler with no assembler, no relocations and no linker; it
+ * generates its own entry stub directly into the output image. Shipping an
+ * ELF object and an ar archive that nothing on the system can consume would
+ * make the directory listing look more finished than the toolchain is.
+ * /usr/lib/README says so on the running system too, not just here.
+ *
+ * The `.oc` extension is honest as well: this is occ's C SUBSET (64-bit `int`,
+ * no structs, no varargs, no preprocessor), not C89. Naming it libc.c would
+ * invite a host compiler to be pointed at it. */
+static const char SDK_ABI_H[] =
+"/* outrun_abi.h — the OutRun OS system-call ABI. Normative.\n"
+" *\n"
+" * occ has no preprocessor: it SKIPS every '#' line, so including this header\n"
+" * costs nothing and defines nothing. It is here to be read. In occ source,\n"
+" * make system calls with the builtin:  __syscall(n, a0, a1, a2)\n"
+" *\n"
+" * Calling convention (identical to the kernel's syscall_entry):\n"
+" *   rax = number, rdi = a0, rsi = a1, rdx = a2  ->  rax = result\n"
+" *   rcx and r11 are clobbered by SYSCALL itself. Every other register,\n"
+" *   including rbx/rbp/r12-r15, is preserved across the boundary.\n"
+" * Negative results are errors (-13 EACCES capability, -14 EFAULT, -22 EINVAL).\n"
+" */\n"
+"#define SYS_WRITE            0   /* (const char *cstr) -> 0                  */\n"
+"#define SYS_EXIT             2   /* (int status) -> does not return          */\n"
+"#define SYS_OPEN             5   /* (const char *path, int flags) -> fd      */\n"
+"#define SYS_READ             6   /* (int fd, void *buf, int n) -> n read     */\n"
+"#define SYS_WRITE_FILE       7   /* (int fd, const void *buf, int n)         */\n"
+"#define SYS_CLOSE            8   /* (int fd) -> 0                            */\n"
+"#define SYS_YIELD           15   /* () -> 0, reschedules this task           */\n"
+"#define SYS_GETPID          16   /* () -> pid                                */\n"
+"#define SYS_VFS_UNLINK      23   /* (const char *path) -> 0                  */\n"
+"#define SYS_READDIR         45   /* (int i, void *out, const char *prefix)   */\n"
+"#define SYS_FORK            47   /* () -> child pid in the parent, 0 in the  */\n"
+"                                 /*       child. Returns TWICE.              */\n"
+"#define SYS_EXECVE          48   /* (entry, argv, envp)                      */\n"
+"#define SYS_SIGACTION       49   /* (int sig, handler, flags)                */\n"
+"#define SYS_KILL            50   /* (int pid, int sig)                       */\n"
+"#define SYS_GETPPID         55   /* () -> parent pid                         */\n"
+"#define SYS_WAITPID         56   /* (int pid, int timeout) -> exit status    */\n"
+"#define SYS_BRK             58   /* (new_brk) -> current brk (0 to query)    */\n"
+"#define SYS_EXECVE_PATH     59   /* (const char *path, argv, envp)           */\n"
+"\n"
+"#define O_CREAT 1                /* the ONLY defined SYS_OPEN flag. Any other\n"
+"                                  * bit is rejected with -22, on purpose.   */\n";
+
+static const char SDK_STDIO_H[] =
+"/* stdio.h — what /usr/lib/libc.oc actually provides.\n"
+" * There is no FILE, no printf and no varargs: occ has no varargs, so a\n"
+" * printf could not be written in this subset even if it were declared here.\n"
+" * putdec() is the honest substitute for %d. */\n"
+"int  putchar(int c);\n"
+"int  puts(char *s);              /* writes s, no newline appended            */\n"
+"int  putdec(int v);              /* decimal, with a leading '-' if negative  */\n"
+"int  puthex(int v);              /* 16 hex digits, no 0x prefix              */\n"
+"int  open(char *path);           /* existing file only                       */\n"
+"int  creat(char *path);          /* create if absent (SYS_OPEN | O_CREAT)    */\n"
+"int  read(int fd, char *buf, int n);\n"
+"int  write(int fd, char *buf, int n);\n"
+"int  close(int fd);\n";
+
+static const char SDK_STDLIB_H[] =
+"/* stdlib.h — occ's `int` is 64-BIT, so these all take and return machine\n"
+" * words. malloc() below is a BUMP allocator over SYS_BRK: free() is a no-op\n"
+" * and says so rather than pretending to reclaim. A compiled program that\n"
+" * needs real reclamation should use the kernel's heap through the full libc\n"
+" * in /bin/init instead. */\n"
+"char *malloc(int n);\n"
+"void  free(char *p);             /* no-op: bump allocator, no free list      */\n"
+"int   atoi(char *s);\n"
+"int   abs(int v);\n"
+"void  exit(int status);\n";
+
+static const char SDK_STRING_H[] =
+"/* string.h */\n"
+"int   strlen(char *s);\n"
+"int   strcmp(char *a, char *b);\n"
+"char *strcpy(char *d, char *s);\n"
+"char *memcpy(char *d, char *s, int n);\n"
+"char *memset(char *d, int c, int n);\n";
+
+static const char SDK_UNISTD_H[] =
+"/* unistd.h */\n"
+"int getpid(void);\n"
+"int getppid(void);\n"
+"int fork(void);                  /* returns twice: 0 in the child           */\n"
+"int waitpid(int pid, int timeout);\n"
+"int yield(void);\n"
+"int unlink(char *path);\n"
+"/* sbrk() grows the heap by at least `delta` and returns the OLD break, or 0.\n"
+" * The underlying SYS_BRK is PAGE-GRANULAR: it rounds the requested break up\n"
+" * to a page boundary and returns the resulting break, so the value it hands\n"
+" * back is normally larger than what was asked for. On failure it returns the\n"
+" * current break unchanged, which is why callers must test `>=` and never\n"
+" * `==`. libc.oc's sbrk() does exactly that; write your own the same way. */\n"
+"char *sbrk(int delta);\n";
+
+static const char SDK_SIGNAL_H[] =
+"/* signal.h — SCOPE NOTE, read this before using it from occ.\n"
+" *\n"
+" * The kernel's signal machinery is real and fully exercised (see the posixstrs\n"
+" * suite): catchable SIGSEGV from a trap frame, delivery at the syscall-return\n"
+" * boundary, delivery at the scheduler boundary, and SYS_SIGRETURN restoring an\n"
+" * interrupted context exactly via iretq.\n"
+" *\n"
+" * What an OCC-COMPILED program cannot do yet is INSTALL a handler: the return\n"
+" * path needs a signal trampoline, and occ has no way to take the address of a\n"
+" * function or to emit one. So from occ, kill() and the numbers below are\n"
+" * usable and sigaction() is not. From /bin/init's own C (built by the host\n"
+" * compiler) all of it is. This header states that rather than hiding it. */\n"
+"#define SIGINT   2\n"
+"#define SIGKILL  9\n"
+"#define SIGSEGV 11\n"
+"#define SIGALRM 14\n"
+"#define SIGTERM 15\n"
+"int kill(int pid, int sig);\n";
+
+static const char SDK_PTHREAD_H[] =
+"/* pthread.h — SCOPE NOTE.\n"
+" *\n"
+" * Threads are real: SYS_THREAD_CREATE (52) and SYS_THREAD_EXIT (53) create\n"
+" * genuine kernel-scheduled threads sharing one address space, with refcounted\n"
+" * thread-group teardown, and /bin/init's pthread shim is built on them.\n"
+" *\n"
+" * TWO honest limits apply here:\n"
+" *   1. SYS_THREAD_CREATE is BSP-ONLY and the kernel ENFORCES that. A process\n"
+" *      running on an application processor cannot create threads; the call is\n"
+" *      refused rather than hanging, which is what it used to do.\n"
+" *   2. It takes a function POINTER, and occ cannot produce one. So this API\n"
+" *      is reachable from /bin/init and not from occ-compiled source.\n"
+" *\n"
+" * Declared here because it is part of the ABI a program targeting this system\n"
+" * needs to know about, not because occ can call it today. */\n"
+"#define SYS_THREAD_CREATE 52\n"
+"#define SYS_THREAD_EXIT   53\n";
+
+/* The runtime. This IS compiled — occ prepends it to every translation unit,
+ * so it must stay inside occ's subset: 64-bit `int`, pointers to int/char, no
+ * structs, no varargs, no preprocessor, functions of at most six parameters. */
+static const char SDK_LIBC_OC[] =
+"/* libc.oc — the OutRun C runtime, written in occ's own subset.\n"
+" * occ_compile() prepends this file to the source it is given, so everything\n"
+" * defined here is in scope for every compiled program. It is SOURCE, not an\n"
+" * archive: occ has no linker.\n"
+" *\n"
+" * TWO SUBSET RULES GOVERN EVERYTHING BELOW, and breaking either one produces\n"
+" * code that compiles and is wrong, so they are stated up front:\n"
+" *\n"
+" *   1. occ has NO LOCAL ARRAYS. A local declaration is one 8-byte slot. Every\n"
+" *      scratch buffer here is therefore a GLOBAL, and its address is taken\n"
+" *      with &name. That makes these functions non-reentrant, which is stated\n"
+" *      honestly rather than hidden.\n"
+" *   2. p[i] means *(p + i*8) — a WORD, never a byte. Byte access goes through\n"
+" *      the __ldb/__stb intrinsics. Anything walking a C string must use them.\n"
+" */\n"
+"char lc_buf[8];        /* 64 bytes of scratch: putchar/putdec/puthex output */\n"
+"char lc_tmp[8];        /* 64 more: digit reversal                          */\n"
+"\n"
+"/* --- strings. Byte-addressed, so these work on real C strings. ---------- */\n"
+"int strlen(char *s) { int n; n = 0; while (__ldb(s, n)) { n = n + 1; } return n; }\n"
+"int strcmp(char *a, char *b) {\n"
+"  int i; i = 0;\n"
+"  while (__ldb(a, i) && __ldb(a, i) == __ldb(b, i)) { i = i + 1; }\n"
+"  return __ldb(a, i) - __ldb(b, i);\n"
+"}\n"
+"char *strcpy(char *d, char *s) {\n"
+"  int i; i = 0;\n"
+"  while (__ldb(s, i)) { __stb(d, i, __ldb(s, i)); i = i + 1; }\n"
+"  __stb(d, i, 0); return d;\n"
+"}\n"
+"char *memcpy(char *d, char *s, int n) {\n"
+"  int i; i = 0;\n"
+"  while (i < n) { __stb(d, i, __ldb(s, i)); i = i + 1; }\n"
+"  return d;\n"
+"}\n"
+"char *memset(char *d, int c, int n) {\n"
+"  int i; i = 0;\n"
+"  while (i < n) { __stb(d, i, c); i = i + 1; }\n"
+"  return d;\n"
+"}\n"
+"int abs(int v) { if (v < 0) { return 0 - v; } return v; }\n"
+"int atoi(char *s) {\n"
+"  int i; int v; int neg;\n"
+"  i = 0; v = 0; neg = 0;\n"
+"  if (__ldb(s, 0) == 45) { neg = 1; i = 1; }\n"
+"  while (__ldb(s, i) >= 48 && __ldb(s, i) <= 57) {\n"
+"    v = v * 10 + (__ldb(s, i) - 48); i = i + 1;\n"
+"  }\n"
+"  if (neg) { return 0 - v; }\n"
+"  return v;\n"
+"}\n"
+"/* --- I/O. SYS_WRITE takes a NUL-terminated string, so these build one. --- */\n"
+"int puts(char *s) { __syscall(0, s, 0, 0); return 0; }\n"
+"int putchar(int c) {\n"
+"  __stb(&lc_buf, 0, c); __stb(&lc_buf, 1, 0);\n"
+"  __syscall(0, &lc_buf, 0, 0);\n"
+"  return c;\n"
+"}\n"
+"int putdec(int v) {\n"
+"  int i; int k;\n"
+"  i = 0;\n"
+"  if (v < 0) { putchar(45); v = 0 - v; }\n"
+"  if (v == 0) { __stb(&lc_tmp, 0, 48); i = 1; }\n"
+"  while (v > 0) { __stb(&lc_tmp, i, 48 + v % 10); v = v / 10; i = i + 1; }\n"
+"  k = 0;\n"
+"  while (i > 0) { i = i - 1; __stb(&lc_buf, k, __ldb(&lc_tmp, i)); k = k + 1; }\n"
+"  __stb(&lc_buf, k, 0);\n"
+"  __syscall(0, &lc_buf, 0, 0);\n"
+"  return 0;\n"
+"}\n"
+"int puthex(int v) {\n"
+"  int i; int d;\n"
+"  i = 0;\n"
+"  while (i < 16) {\n"
+"    d = (v >> (60 - i * 4)) & 15;\n"
+"    if (d < 10) { __stb(&lc_buf, i, 48 + d); } else { __stb(&lc_buf, i, 87 + d); }\n"
+"    i = i + 1;\n"
+"  }\n"
+"  __stb(&lc_buf, 16, 0);\n"
+"  __syscall(0, &lc_buf, 0, 0);\n"
+"  return 0;\n"
+"}\n"
+"int open(char *path)  { return __syscall(5, path, 0, 0); }\n"
+"int creat(char *path) { return __syscall(5, path, 1, 0); }\n"
+"int read(int fd, char *buf, int n)  { return __syscall(6, fd, buf, n); }\n"
+"int write(int fd, char *buf, int n) { return __syscall(7, fd, buf, n); }\n"
+"int close(int fd) { return __syscall(8, fd, 0, 0); }\n"
+"int unlink(char *path) { return __syscall(23, path, 0, 0); }\n"
+"/* --- process ------------------------------------------------------------- */\n"
+"int getpid(void)  { return __syscall(16, 0, 0, 0); }\n"
+"int getppid(void) { return __syscall(55, 0, 0, 0); }\n"
+"int fork(void)    { return __syscall(47, 0, 0, 0); }\n"
+"int waitpid(int pid, int timeout) { return __syscall(56, pid, timeout, 0); }\n"
+"int yield(void)   { return __syscall(15, 0, 0, 0); }\n"
+"int kill(int pid, int sig) { return __syscall(50, pid, sig, 0); }\n"
+"int exit(int status) { __syscall(2, status, 0, 0); return 0; }\n"
+"/* --- heap. BUMP ONLY: free() cannot reclaim and does not pretend to. -----\n"
+" * SYS_BRK IS PAGE-GRANULAR. It rounds the requested break UP to the next page\n"
+" * and returns the RESULTING break, which is therefore usually larger than what\n"
+" * was asked for; on failure it returns the CURRENT break unchanged. So the\n"
+" * success test is `got >= cur + delta`, not `got == cur + delta`. Testing for\n"
+" * equality here made every malloc() return 0. */\n"
+"char *sbrk(int delta) {\n"
+"  int cur; int got;\n"
+"  cur = __syscall(58, 0, 0, 0);\n"
+"  if (cur <= 0) { return 0; }\n"
+"  if (delta == 0) { return cur; }\n"
+"  got = __syscall(58, cur + delta, 0, 0);\n"
+"  if (got < cur + delta) { return 0; }\n"
+"  return cur;\n"
+"}\n"
+"char *malloc(int n) { return sbrk((n + 15) / 16 * 16); }\n"
+"int free(char *p) { return 0; }\n";
+
+static const char SDK_LIB_README[] =
+"OutRun OS /usr/lib\n"
+"==================\n"
+"\n"
+"libc.oc   The C runtime, as SOURCE in occ's subset. occ prepends it to every\n"
+"          translation unit it compiles, so its functions are always in scope.\n"
+"          This is not a convenience: occ is a single-pass whole-program\n"
+"          compiler with no assembler, no relocations and no linker, so source\n"
+"          inclusion is the only linkage model it has.\n"
+"\n"
+"THERE IS NO crt0.o AND NO libc.a, and that is deliberate.\n"
+"\n"
+"  * crt0 is GENERATED, not linked. occ emits the entry stub (call main; take\n"
+"    the return value; SYS_EXIT) as the first bytes of .text, so the ELF entry\n"
+"    point is offset 0 of the image. There is no object file to ship.\n"
+"\n"
+"  * An ar archive would require a linker to consume it. Nothing on this system\n"
+"    can. Shipping one would make this directory look more finished than the\n"
+"    toolchain is, so it is not shipped.\n"
+"\n"
+"Reaching a real crt0.o and libc.a means giving occ relocations, a symbol\n"
+"table, and a linker. That is a milestone, not a file.\n";
+
+/* Publish the SDK into the VFS. Nine dirents, written once at boot. Every one
+ * of them is a real file the running system can open, read and compile
+ * against; toolstrs checks the important ones are present and non-empty, and
+ * that /usr/lib/libc.oc really is what makes strlen() resolve. */
+static void sdk_install(void) {
+    struct { const char *path; const char *body; } f[] = {
+        { "/usr/include/outrun_abi.h", SDK_ABI_H     },
+        { "/usr/include/stdio.h",      SDK_STDIO_H   },
+        { "/usr/include/stdlib.h",     SDK_STDLIB_H  },
+        { "/usr/include/string.h",     SDK_STRING_H  },
+        { "/usr/include/unistd.h",     SDK_UNISTD_H  },
+        { "/usr/include/signal.h",     SDK_SIGNAL_H  },
+        { "/usr/include/pthread.h",    SDK_PTHREAD_H },
+        { "/usr/lib/libc.oc",          SDK_LIBC_OC   },
+        { "/usr/lib/README",           SDK_LIB_README},
+    };
+    int n = (int)(sizeof f / sizeof f[0]), ok = 0;
+    uint32_t bytes = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t len = (uint32_t)cstrlen(f[i].body) + 1;   /* NUL included */
+        if (vfs_write_file(f[i].path, f[i].body, len) >= 0) { ok++; bytes += len; }
+        else kprintf("[sdk    ] FAILED to install %s\n", f[i].path);
+    }
+    kprintf("[sdk    ] installed %d/%d SDK files (%u bytes): 7 headers in "
+            "/usr/include, the runtime + README in /usr/lib\n",
+            (uint64_t)ok, (uint64_t)n, (uint64_t)bytes);
 }
 
 /* VFS demonstration: create named files (multi-block + dedup), read them back,*/
@@ -11146,6 +11876,22 @@ static void cmd_vfs(void) {
     for (int i = 0; i < 1399; i++) big[i] = (char)('A' + (i % 26));
     big[1399] = 0;
 
+    /* v0.56: publish the ring-3 image into the VFS as /bin/init. This is the
+     * first executable that lives in the filesystem rather than only as a GRUB
+     * module, and exec'ing it by path exercises the whole new substrate at
+     * once: it is ~25 KiB, so it needs Stage A's indirect chunk map to be
+     * stored at all, and "/bin/init" needs Stage B's widened path names. */
+    vfs_write_file("/bin/init", (const void *)g_user_elf,
+                   (uint32_t)(g_user_elf_end - g_user_elf));
+    /* /bin/occ is the SAME image under a second name: the compiler is a role of
+     * the one ring-3 binary, dispatched by argv[0] the way a multi-call binary
+     * works. CAS dedup means the second name costs one dirent and no blocks. */
+    vfs_write_file("/bin/occ", (const void *)g_user_elf,
+                   (uint32_t)(g_user_elf_end - g_user_elf));
+    /* v0.56 Stage F: and now the SDK those two binaries compile against. It is
+     * published HERE, immediately after /bin, because /usr/lib/libc.oc has to
+     * exist before the first occ run — toolstrs is the very next consumer. */
+    sdk_install();
     vfs_write_file("motd", motd, cstrlen(motd) + 1);
     vfs_write_file("readme", big, 1400);
     uint64_t motd_hash_v1 = DENTS[vfs_find("motd")].file_hash;
@@ -12051,9 +12797,9 @@ static void pxcheck(const char *n, int c) {
  * of the table afterwards therefore misattributes results (observed live: a
  * forked child's failure was reported against the execve worker's label). */
 struct px_round {
-    uint32_t pid[5];                       /* worker pids as spawned            */
-    uint64_t code[5];                      /* latched exit codes                */
-    int      got[5];
+    uint32_t pid[7];                       /* worker pids as spawned            */
+    uint64_t code[7];                      /* latched exit codes                */
+    int      got[7];
     uint32_t cpid[PX_MAXCHILD];            /* pids of everything they forked    */
     int      cparent[PX_MAXCHILD];         /* the forking worker's index        */
     uint64_t ccode[PX_MAXCHILD], cframes[PX_MAXCHILD];
@@ -12146,9 +12892,19 @@ static int posix_drain(int *procs, int nproc, struct px_round *R, uint64_t watch
             lastlog = g_ticks;
             kprintf("[posixstrs] .. waiting spins=%u ticks=%u (+%u) rq0=%d: ", spins, g_ticks, g_ticks - t0, (uint64_t)(int64_t)(g_cpu[0].rq_t - g_cpu[0].rq_h));
             for (int i = 0; i < nproc; i++)
-                if (!R->got[i]) kprintf("pid %u(role %u,thr %d) ", R->pid[i],
-                                        kprocs[procs[i]].role,
-                                        (uint64_t)(int64_t)kprocs[procs[i]].nthreads);
+                if (!R->got[i]) {
+                    struct kproc *K = &kprocs[procs[i]];
+                    /* v0.56: pstate/rip/sig are the fields that separate "slow"
+                     * from "parked". A task that is neither in a run queue nor
+                     * pstate==1 (preempted, resumable) is unreachable by every
+                     * dispatcher there is, and the breadcrumb has to say so or
+                     * the log looks like ordinary slow progress forever. */
+                    kprintf("pid %u(role %u,thr %d pstate %d rip %X pend %X msk %X sfsp %X) ",
+                            R->pid[i], K->role, (uint64_t)(int64_t)K->nthreads,
+                            (uint64_t)(int64_t)K->pstate, K->uctx.rip,
+                            (uint64_t)K->sig_pending, (uint64_t)K->sig_mask,
+                            (uint64_t)(int64_t)K->sigframe_sp);
+                }
             for (int c = 0; c < R->nchild; c++)
                 if (R->cgot[c] == 0) kprintf("child %u ", R->cpid[c]);
             kprintf("\n");
@@ -12170,20 +12926,22 @@ static void cmd_posix_stress(void) {
     uint32_t inr3_0 = g_inr3_max;
 
     /* role -> the exit code that means "every ring-3 assertion in me passed" */
-    static const uint64_t want[5] = { 700, 800, 900, 950, 960 };
-    static const int      roles[5] = {  29,  30,  31,  32,  34 };
-    static const char    *labels[5] = { "fork/waitpid/SIGCHLD", "signals + frame integrity",
-                                        "pthreads + mutex", "execve argv/envp", "std fd table" };
+    static const uint64_t want[7] = { 700, 800, 900, 950, 960, 980, 970 };
+    static const int      roles[7] = {  29,  30,  31,  32,  34,  35,  36 };
+    static const char    *labels[7] = { "fork/waitpid/SIGCHLD", "signals + frame integrity",
+                                        "pthreads + mutex", "execve argv/envp", "std fd table",
+                                        "ring-3 heap (sbrk/malloc)",
+                                        "execve BY PATH from the VFS" };
     int rounds_ok = 1, codes_ok = 1, child_ok = 1, reclaim_ok = 1, ppid_ok = 1;
     int nchild_total = 0, rnd;
 
     for (rnd = 0; rnd < POSIXSTRESS_ROUNDS; rnd++) {
         struct px_round R;
-        int procs[5], nproc = 0;
-        for (int i = 0; i < 5; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+        int procs[7], nproc = 0;
+        for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
         R.nchild = 0;
 
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 7; i++) {
             int p = kproc_spawn("posix-w", PCAP_FILESYSTEM);
             if (p < 0) { pxcheck("kproc_spawn never fails mid-storm", 0); rounds_ok = 0; break; }
             kprocs[p].role = roles[i];
@@ -12199,7 +12957,7 @@ static void cmd_posix_stress(void) {
             R.pid[nproc] = kprocs[p].pid;
             procs[nproc++] = p;
         }
-        if (nproc < 5) break;
+        if (nproc < 7) break;
 
         for (int i = 0; i < nproc; i++) {
             /* An affinity-pinned worker must be queued on a core in its mask,
@@ -12208,6 +12966,16 @@ static void cmd_posix_stress(void) {
             __sync_synchronize();
             if (n > 1) lapic_ipi(0, IPI_PING, 1);
         }
+        /* The 3000-tick budget is UNCHANGED from v0.55, and deliberately so.
+         * When the uniprocessor round started timing out here it looked like a
+         * budget problem — v0.56 doubled the ring-3 image, so every elf_load and
+         * every eager fork clone copies twice the pages — and raising it to 9000
+         * was tried first. It made no difference whatsoever: the breadcrumb kept
+         * printing the same pid, at the same rip, with pstate=1 and an empty run
+         * queue, for three times as long. That is what proved it was not slow but
+         * PARKED, and led to the real cause (RQ_LEN: fork's child enqueue was
+         * being silently dropped into a full queue). The budget is back where it
+         * was, because a watchdog raised to hide a hang stops being a watchdog. */
         if (!posix_drain(procs, nproc, &R, 3000)) {
             kprintf("[posixstrs] round %d WATCHDOG: not every task reached a terminal state\n", rnd);
             for (int i = 0; i < nproc; i++)
@@ -12258,7 +13026,7 @@ static void cmd_posix_stress(void) {
         }
     }
 
-    pxcheck("every round ran all 5 POSIX workers to a terminal state (no watchdog timeout)",
+    pxcheck("every round ran all 7 POSIX workers to a terminal state (no watchdog timeout)",
             rnd == POSIXSTRESS_ROUNDS && rounds_ok);
     pxcheck("every worker's ring-3 assertions passed (exit code == its success sentinel)", codes_ok);
     pxcheck("fork() produced real children: distinct pid AND distinct cr3 from the parent", ppid_ok);
@@ -12310,6 +13078,272 @@ static void cmd_posix_stress(void) {
     if (!g_pxfail)
         kputs("[posixstrs] POSIX STRESS VERIFIED — fork/exec/waitpid, signal frames and pthread mutexes leak-free\n");
     else kputs("[posixstrs] POSIX STRESS DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.56: TOOLCHAIN STRESS — native self-hosting, end to end
+ * ===========================================================================
+ * One ring-3 worker per round does the whole loop with no host toolchain in
+ * sight: it AUTHORS a C source file into the VFS, forks and execs the native
+ * compiler as a separate process, and then forks and execs the ELF that
+ * compiler produced, checking the answer it computes.
+ *
+ * The kernel half then verifies from outside what ring 3 cannot honestly claim
+ * about itself: that a genuinely new executable appeared in the filesystem,
+ * that it is a well-formed 3-segment ELF, and — the one that matters most —
+ * that its segments obey W^X, because a compiler able to emit a
+ * writable+executable image would quietly undo a policy the whole system rests
+ * on. That check reads the produced file's own program headers rather than
+ * trusting elf_load to have rejected it.                                    */
+#define TOOLCHAIN_ROUNDS 2
+static int g_tcpass, g_tcfail;
+static void tccheck(const char *n, int c) {
+    if (c) { g_tcpass++; kprintf("[toolstrs]  PASS  %s\n", n); }
+    else   { g_tcfail++; kprintf("[toolstrs]  FAIL  %s\n", n); }
+}
+
+/* ---------------------------------------------------------------------------
+ * v0.56 Stage F: `cc <source> <output>` — the compiler as a SHELL COMMAND, and
+ * therefore as a Cyber-Terminal command.
+ *
+ * This is the whole of "route compiler diagnostics to the Cyber-Terminal", and
+ * it needed no new plumbing, only the realisation that the plumbing already
+ * met in the middle: the terminal runs a real shell command through
+ * SYS_RUN_CMD, which ARMS the kernel console capture; occ writes its
+ * diagnostics with SYS_WRITE; SYS_WRITE goes through kputc; and kputc appends
+ * to that capture buffer. So a compile error typed into the terminal window
+ * comes back into that window, with the user's own line numbers, without occ
+ * knowing a terminal exists.
+ *
+ * The process is spawned under the NAME "/bin/occ" because uargs_default puts
+ * the kproc name in argv[0], and argv[0] is how the multi-call binary decides
+ * it is the compiler. The two paths are then written into argv[1] and argv[2]
+ * over that default block. */
+static void cmd_cc(int argc, char **argv) {
+    if (argc < 3) {
+        kputs("usage: cc <source.c> <output.elf>\n"
+              "       compiles with the native compiler; /usr/lib/libc.oc is\n"
+              "       prepended automatically. Diagnostics come back here.\n");
+        return;
+    }
+    if (!g_cas_mounted) { kputs("[cc     ] no filesystem mounted\n"); return; }
+    if (vfs_find(argv[1]) < 0) {
+        kprintf("[cc     ] no such source file: %s\n", argv[1]);
+        return;
+    }
+    uint64_t save = current_proc_idx;
+    int p = kproc_spawn("/bin/occ", PCAP_FILESYSTEM);
+    if (p < 0) { kputs("[cc     ] no free process slot\n"); return; }
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { kputs("[cc     ] could not load the compiler image\n"); return; }
+    kprocs[p].entry = e;
+
+    { char av[UARG_N][UARG_LEN], ev[UARG_N][UARG_LEN];
+      const char *a[3] = { "/bin/occ", argv[1], argv[2] };
+      for (int i = 0; i < 3; i++) {
+          int n = 0; while (n < UARG_LEN - 1 && a[i][n]) { av[i][n] = a[i][n]; n++; }
+          av[i][n] = 0;
+      }
+      const char *e0 = "PATH=/usr/lib", *e1 = "OUTRUN=" KERNEL_VERSION;
+      int n; for (n = 0; n < UARG_LEN - 1 && e0[n]; n++) ev[0][n] = e0[n]; ev[0][n] = 0;
+      for (n = 0; n < UARG_LEN - 1 && e1[n]; n++) ev[1][n] = e1[n]; ev[1][n] = 0;
+      uargs_build(kprocs[p].cr3, 3, (const char (*)[UARG_LEN])av,
+                                 2, (const char (*)[UARG_LEN])ev); }
+
+    kprintf("[cc     ] %s -> %s (pid %u)\n", argv[1], argv[2], kprocs[p].pid);
+    rq_push(0, p);
+    __sync_synchronize();
+    int n_on = g_ncpu_online; if (n_on > MAX_CPUS) n_on = MAX_CPUS;
+    if (n_on > 1) lapic_ipi(0, IPI_PING, 1);
+    int q; while ((q = rq_pop(0)) >= 0) cpu_exec_proc(0, q);
+    uint64_t t0 = g_ticks;
+    while (!kprocs[p].torn_down && g_ticks - t0 < 12000) {
+        if (n_on > 1) lapic_ipi(0, IPI_PING, 1);
+        uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
+    }
+    current_proc_idx = save;
+    if (!kprocs[p].torn_down) { kputs("[cc     ] TIMED OUT\n"); return; }
+
+    int oi = vfs_find(argv[2]);
+    if (kprocs[p].exit_code == 0 && oi >= 0)
+        kprintf("[cc     ] ok: %s is %u bytes\n", argv[2], (uint64_t)DENTS[oi].len);
+    else
+        kprintf("[cc     ] compile FAILED (exit %u)\n", kprocs[p].exit_code);
+}
+
+static void cmd_selfhost_test(void) {
+    kputs("-- TOOLCHAIN STRESS: author -> compile -> run, natively in ring 3 --\n");
+    g_tcpass = g_tcfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    if (!g_cas_mounted) { tccheck("CAS mounted before the toolchain can run", 0);
+        kprintf("[toolstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_tcpass, (uint64_t)g_tcfail);
+        return; }
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    /* wx_ok and elf_ok start at 0 and are only RAISED by an actual successful
+     * audit of a real produced binary. Starting them at 1 made them pass
+     * vacuously in the very first run, when no file had been produced at all —
+     * a check that reports success for work that never happened is worse than
+     * no check. `audited` counts the rounds that genuinely got that far. */
+    int rounds_ok = 1, produced_ok = 1, audited = 0;
+    int wx_ok = 0, elf_ok = 0;
+    int rnd;
+
+    /* ---- Stage F: the SDK is installed, and it is not empty ---------------
+     * Checked BEFORE any compile, because the compile below now depends on
+     * /usr/lib/libc.oc being readable — if this check fails, the round
+     * failures after it have a known cause instead of being a mystery. */
+    {
+        static const char *sdk[] = {
+            "/usr/include/outrun_abi.h", "/usr/include/stdio.h",
+            "/usr/include/stdlib.h",     "/usr/include/string.h",
+            "/usr/include/unistd.h",     "/usr/include/signal.h",
+            "/usr/include/pthread.h",    "/usr/lib/libc.oc",
+            "/usr/lib/README", 0
+        };
+        int present = 0, expected = 0;
+        for (int i = 0; sdk[i]; i++) {
+            expected++;
+            int di = vfs_find(sdk[i]);
+            if (di >= 0 && DENTS[di].len > 32) present++;
+            else kprintf("[toolstrs] MISSING or empty: %s\n", sdk[i]);
+        }
+        tccheck("the SDK is installed in the VFS (7 headers + runtime + README)",
+                present == expected);
+
+        /* Prefix listing, the way SYS_READDIR presents a directory: the flat
+         * namespace has to answer "what is under /usr/include/" correctly, or
+         * a toolchain cannot enumerate its own headers. */
+        int inc = 0, lib = 0;
+        for (int i = 0; i < VFS_MAXFILES; i++) {
+            if (!DENTS[i].used) continue;
+            if (path_has_prefix(DENTS[i].name, "/usr/include/")) inc++;
+            if (path_has_prefix(DENTS[i].name, "/usr/lib/"))     lib++;
+        }
+        kprintf("[toolstrs] SDK listing: %d under /usr/include/, %d under /usr/lib/\n",
+                inc, lib);
+        tccheck("readdir over the flat namespace enumerates /usr/include and /usr/lib",
+                inc == 7 && lib == 2);
+
+        /* The runtime is the load-bearing half, so check it really contains the
+         * definitions the compiled program below calls, rather than trusting
+         * that a file of the right name is the right file. */
+        static char lib_src[8192];
+        int li = vfs_find("/usr/lib/libc.oc");
+        int64_t ln = (li >= 0) ? vfs_read_file(li, lib_src, sizeof lib_src - 1) : -1;
+        if (ln > 0) lib_src[ln] = 0; else lib_src[0] = 0;
+        static const char *need[] = { "int strlen(", "int strcmp(", "char *strcpy(",
+                                      "int atoi(", "char *malloc(", "int putdec(",
+                                      "int puts(", 0 };
+        int found = 0, want = 0;
+        for (int i = 0; need[i]; i++) {
+            want++;
+            for (int k = 0; lib_src[k]; k++) {
+                int m = 1;
+                for (int j = 0; need[i][j]; j++)
+                    if (lib_src[k + j] != need[i][j]) { m = 0; break; }
+                if (m) { found++; break; }
+            }
+        }
+        kprintf("[toolstrs] /usr/lib/libc.oc: %d bytes, %d/%d required definitions\n",
+                (uint64_t)(ln > 0 ? ln : 0), found, want);
+        tccheck("/usr/lib/libc.oc defines every runtime symbol the SDK headers declare",
+                found == want);
+    }
+
+    for (rnd = 0; rnd < TOOLCHAIN_ROUNDS; rnd++) {
+        /* remove any previous output so "it appeared" means something */
+        if (vfs_find("/bin/t.elf") >= 0) vfs_unlink("/bin/t.elf");
+
+        int p = kproc_spawn("selfhost", PCAP_FILESYSTEM);
+        if (p < 0) { tccheck("kproc_spawn never fails mid-storm", 0); rounds_ok = 0; break; }
+        kprocs[p].role = 38;
+        uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+        current_proc_idx = save;
+        if (!e) { tccheck("the driver's ELF loads", 0); rounds_ok = 0; break; }
+        kprocs[p].entry = e;
+        uint32_t drv_pid = kprocs[p].pid;
+
+        struct px_round R;
+        for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+        R.nchild = 0; R.pid[0] = drv_pid;
+        int procs[1]; procs[0] = p;
+        rq_push(0, p);
+        __sync_synchronize();
+        if (n > 1) lapic_ipi(0, IPI_PING, 1);
+        /* Generous: this round runs a real compiler and two more processes. */
+        if (!posix_drain(procs, 1, &R, 12000)) {
+            kprintf("[toolstrs] round %d WATCHDOG: the toolchain did not finish\n", rnd);
+            rounds_ok = 0; current_proc_idx = save; break;
+        }
+        current_proc_idx = save;
+        if (R.code[0] != 940) {
+            const char *why =
+                R.code[0] == 941 ? "could not create /src/t.c" :
+                R.code[0] == 942 ? "could not write the source" :
+                R.code[0] == 943 ? "fork failed before the compile" :
+                R.code[0] == 944 ? "the compiler process exited nonzero" :
+                R.code[0] == 945 ? "fork failed before the run" :
+                R.code[0] == 946 ? "the compiled program returned the wrong answer" :
+                R.code[0] == 947 ? "TIMED OUT waiting for the compiler" :
+                R.code[0] == 948 ? "TIMED OUT waiting for the compiled program" :
+                                   "unknown";
+            kprintf("[toolstrs] round %d driver FAILED: exit %u (want 940) — %s\n",
+                    rnd, R.code[0], why);
+            rounds_ok = 0;
+        }
+
+        /* A new executable really exists in the filesystem. */
+        int oi = vfs_find("/bin/t.elf");
+        if (oi < 0 || DENTS[oi].len < 64) { produced_ok = 0; continue; }
+        kprintf("[toolstrs] round %d: occ emitted /bin/t.elf, %u bytes, %u chunk(s)\n",
+                rnd, (uint64_t)DENTS[oi].len, (uint64_t)DENTS[oi].nchunks);
+
+        /* Read it back and audit its OWN program headers. */
+        static uint8_t img[16384];
+        int64_t got = vfs_read_file(oi, img, sizeof img);
+        struct elf64_hdr *eh = (struct elf64_hdr *)img;
+        int hdr_ok = got > 64 && eh->ident[0] == 0x7F && eh->ident[1] == 'E' &&
+                     eh->ident[2] == 'L' && eh->ident[3] == 'F' &&
+                     eh->machine == 0x3E && eh->phnum == 3;
+        if (!hdr_ok) { continue; }
+        int rx = 0, ro = 0, rw = 0, wx_bad = 0;
+        for (int i = 0; i < eh->phnum; i++) {
+            struct elf64_phdr *ph = (struct elf64_phdr *)(img + eh->phoff + (uint64_t)i * eh->phentsize);
+            if (ph->type != 1) continue;
+            if ((ph->flags & 0x3) == 0x3) wx_bad = 1;     /* writable AND executable */
+            if (ph->flags == 5) rx++;
+            if (ph->flags == 4) ro++;
+            if (ph->flags == 6) rw++;
+        }
+        audited++;
+        elf_ok = (rx == 1 && ro == 1 && rw == 1);
+        wx_ok  = !wx_bad;
+    }
+
+    tccheck("every round authored, compiled and ran a program (driver exited 940)",
+            rnd == TOOLCHAIN_ROUNDS && rounds_ok);
+    tccheck("the compiler produced a new executable in the VFS", produced_ok);
+    tccheck("its output is a well-formed 3-segment x86-64 ELF (R+X, R, R+W)",
+            audited == TOOLCHAIN_ROUNDS && elf_ok);
+    tccheck("NO segment it emits is both writable and executable (W^X holds for compiler output)",
+            audited == TOOLCHAIN_ROUNDS && wx_ok);
+
+    uint64_t freed_total = g_frames_freed - freed0, reused_total = g_frames_reused - reused0;
+    kprintf("[toolstrs] +%u freed, +%u reused; global depth %u\n",
+            freed_total, reused_total, g_frame_free_depth);
+    tccheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    tccheck("no lock-rank violation across the toolchain paths", g_rank_violations == viol0);
+
+    kprintf("[toolstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_tcpass, (uint64_t)g_tcfail);
+    if (!g_tcfail)
+        kputs("[toolstrs] SELF-HOSTING VERIFIED — OutRun compiled and ran a program with no host toolchain\n");
+    else kputs("[toolstrs] SELF-HOSTING DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -14489,6 +15523,8 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "wimpstress")) cmd_wimp_stress();
     else if (!kstrcmp(argv[0], "appsstress")) cmd_apps_stress();
     else if (!kstrcmp(argv[0], "posixstress")) cmd_posix_stress();
+    else if (!kstrcmp(argv[0], "toolchainstress")) cmd_selfhost_test();
+    else if (!kstrcmp(argv[0], "cc")) cmd_cc(argc, argv);
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -14670,6 +15706,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_wimp_stress();      /* v0.53: ring-3 WIMP window create/manage/close churn + WM logic, incl. client faults */
     cmd_apps_stress();      /* v0.54: concurrent ring-3 GUI apps (terminal/sysmon/filer), incl. app crashes */
     cmd_posix_stress();     /* v0.55: fork/exec chains, signal frames, pthread mutexes under SMP */
+    cmd_selfhost_test();    /* v0.56: author -> compile -> run, natively (no host toolchain)     */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();

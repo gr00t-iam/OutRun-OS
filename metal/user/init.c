@@ -82,6 +82,10 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_GETPPID             55
 #define SYS_WAITPID             56
 #define SYS_SIGUNMASK           57
+#define SYS_BRK                 58
+#define SYS_EXECVE_PATH         59
+/* Mirrors the kernel's HEAP_USER_V (kernel64.c is the master). */
+#define HEAP_USER_V_LO 0x0000570000000000ull
 
 #define SIGINT   2
 #define SIGKILL  9
@@ -1029,7 +1033,12 @@ static void app_sysmon(int frames) {
 }
 
 /* ---- APP 3: FILE INSPECTOR — VFS browser + hex/bitmap view ----------------- */
-struct rd_ent { u32 len, used; char name[32]; };
+/* Mirrors the kernel's SYS_READDIR output record exactly (kernel64.c case 45 is
+ * the master). v0.56 widened it from 32 to 64 name bytes for hierarchical paths,
+ * so this MUST move in lockstep — a stale 40-byte struct here would have the
+ * kernel write 72 bytes into it. */
+#define VFS_NAME_MAX 64
+struct rd_ent { u32 len, used; char name[VFS_NAME_MAX]; };
 
 static void app_filer(int frames) {
     struct app_win W;
@@ -1295,8 +1304,15 @@ static void oyield(void)              { sysc(SYS_YIELD, 0, 0, 0); }
  * child resumes at this very instruction with everything else identical. No
  * userland continuation trampoline is involved. */
 static i64 ofork(void)                { return (i64)sysc(SYS_FORK, 0, 0, 0); }
-static i64 oexecve(const char **argv, const char **envp, u64 role) {
+/* v0.55's exec: re-run THIS SAME boot image under a different role. It predates
+ * being able to load anything else and every v0.55 suite still uses it. */
+static i64 oexec_role(const char **argv, const char **envp, u64 role) {
     return (i64)sysc(SYS_EXECVE, (u64)argv, (u64)envp, role);
+}
+/* v0.56: the real POSIX-shaped exec — replace this image with an ARBITRARY ELF
+ * loaded from the VFS by path. Returns only on failure. */
+static i64 oexecve(const char *path, const char **argv, const char **envp) {
+    return (i64)sysc(SYS_EXECVE_PATH, (u64)path, (u64)argv, (u64)envp);
 }
 /* Non-blocking: -11 = still running, -10 = not our child. See the changelog —
  * this kernel has no ring-3 sleep/wake queue yet, so waiters poll + yield. */
@@ -1330,13 +1346,19 @@ static void stdio_init(void) {
     for (int i = 0; i < OFD_MAX; i++) g_ofd[i] = -1;
     g_ofd[STDIN_FILENO] = g_ofd[STDOUT_FILENO] = g_ofd[STDERR_FILENO] = OFD_CONSOLE;
 }
-static int oopen(const char *path) {
-    i64 k = (i64)sysc(SYS_OPEN, (u64)path, 0, 0);
+/* v0.56: O_CREAT is bit 0 of the flags word. Creation is explicit — plain
+ * oopen() still fails on a missing name, which is what every pre-existing
+ * "prove this file is gone" check depends on. */
+#define O_CREAT 1
+static int oopen_flags(const char *path, u64 flags) {
+    i64 k = (i64)sysc(SYS_OPEN, (u64)path, flags, 0);
     if (k < 0) return (int)k;
     for (int i = 3; i < OFD_MAX; i++) if (g_ofd[i] == -1) { g_ofd[i] = (int)k; return i; }
     sysc(SYS_CLOSE, (u64)k, 0, 0);
     return -24;                                          /* EMFILE */
 }
+static int oopen(const char *path)  { return oopen_flags(path, 0); }
+static int ocreat(const char *path) { return oopen_flags(path, O_CREAT); }
 static i64 owrite(int fd, const char *buf, u64 n) {
     if (fd < 0 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;          /* EBADF */
     if (g_ofd[fd] == OFD_CONSOLE) {
@@ -1360,6 +1382,109 @@ static int oclose(int fd) {
     sysc(SYS_CLOSE, (u64)g_ofd[fd], 0, 0);
     g_ofd[fd] = -1;
     return 0;
+}
+
+/* ---- heap: sbrk + malloc/free/realloc --------------------------------------
+ * Ring 3 had no heap at all before v0.56 — every buffer in this file was a
+ * static or a stack array. The compiler needs real dynamic allocation (symbol
+ * tables, a token buffer, the output image), so here is the smallest allocator
+ * that is actually correct: a first-fit free list over a brk-grown arena, with
+ * boundary tags so free() can coalesce with its neighbours.
+ *
+ * Blocks are 16-byte aligned and carry an 8-byte header holding the payload
+ * size plus a "in use" bit. Coalescing is forward-only against the next block,
+ * which is enough to keep the compiler's alloc/free churn from fragmenting the
+ * arena while staying small enough to audit by eye.                          */
+static u64 obrk(u64 want) { return sysc(SYS_BRK, want, 0, 0); }
+
+#define OH_USED 1ull
+/* The header is padded to 16 bytes ON PURPOSE. Payload sizes are rounded up to
+ * 16, and the arena starts page-aligned, so a 16-byte header keeps EVERY block's
+ * payload 16-byte aligned by induction. An 8-byte header would have alternated
+ * between 8- and 16-aligned payloads (caught live: exit 984). */
+struct oblk { u64 size; u64 _pad; };  /* payload size | OH_USED; payload follows */
+static u8 *g_heap_lo, *g_heap_hi;     /* arena bounds: [lo, hi) of block space   */
+
+static void *osbrk(u64 inc) {
+    u64 cur = obrk(0);
+    if (!g_heap_lo) g_heap_lo = g_heap_hi = (u8 *)cur;
+    if (!inc) return g_heap_hi;
+    u64 got = obrk(cur + inc);
+    if (got < cur + inc) return 0;    /* kernel could not map it: honest failure */
+    u8 *old = g_heap_hi;
+    g_heap_hi = (u8 *)got;
+    return old;
+}
+
+static void *omalloc(u64 n) {
+    if (!n) return 0;
+    n = (n + 15) & ~15ull;                        /* 16-byte payload alignment   */
+    if (!g_heap_lo) osbrk(0);
+    /* first fit over the block chain */
+    for (u8 *p = g_heap_lo; p + sizeof(struct oblk) <= g_heap_hi; ) {
+        struct oblk *b = (struct oblk *)p;
+        u64 sz = b->size & ~OH_USED;
+        if (!sz) break;                            /* uninitialised tail          */
+        if (!(b->size & OH_USED) && sz >= n) {
+            /* split when the remainder can hold a header plus a 16-byte payload */
+            if (sz >= n + sizeof(struct oblk) + 16) {
+                struct oblk *nx = (struct oblk *)(p + sizeof(struct oblk) + n);
+                nx->size = sz - n - sizeof(struct oblk);
+                b->size = n;
+            }
+            b->size |= OH_USED;
+            return p + sizeof(struct oblk);
+        }
+        p += sizeof(struct oblk) + sz;
+    }
+    /* nothing reusable: extend the arena. Grow in 64 KiB steps so a compiler
+     * doing many small allocations does not make a syscall per allocation.   */
+    u64 need = sizeof(struct oblk) + n;
+    u64 step = need > 65536 ? need : 65536;
+    u8 *base = (u8 *)osbrk(step);
+    if (!base) return 0;
+    struct oblk *b = (struct oblk *)base;
+    b->size = n | OH_USED;
+    if (step >= need + sizeof(struct oblk) + 16) { /* park the remainder as free */
+        struct oblk *nx = (struct oblk *)(base + sizeof(struct oblk) + n);
+        nx->size = step - need - sizeof(struct oblk);
+    }
+    return base + sizeof(struct oblk);
+}
+
+static void ofree(void *q) {
+    if (!q) return;
+    struct oblk *b = (struct oblk *)((u8 *)q - sizeof(struct oblk));
+    b->size &= ~OH_USED;
+    /* forward coalesce: absorb the next block while it is also free */
+    for (;;) {
+        u8 *nxp = (u8 *)b + sizeof(struct oblk) + (b->size & ~OH_USED);
+        if (nxp + sizeof(struct oblk) > g_heap_hi) break;
+        struct oblk *nx = (struct oblk *)nxp;
+        if (nx->size & OH_USED) break;
+        u64 nsz = nx->size & ~OH_USED;
+        if (!nsz) break;
+        b->size = (b->size & ~OH_USED) + sizeof(struct oblk) + nsz;
+    }
+}
+
+static void *ocalloc(u64 cnt, u64 sz) {
+    u64 n = cnt * sz;
+    u8 *q = (u8 *)omalloc(n);
+    if (q) for (u64 i = 0; i < n; i++) q[i] = 0;
+    return q;
+}
+
+static void *orealloc(void *q, u64 n) {
+    if (!q) return omalloc(n);
+    struct oblk *b = (struct oblk *)((u8 *)q - sizeof(struct oblk));
+    u64 old = b->size & ~OH_USED;
+    if (old >= n) return q;
+    u8 *nq = (u8 *)omalloc(n);
+    if (!nq) return 0;
+    for (u64 i = 0; i < old; i++) nq[i] = ((u8 *)q)[i];
+    ofree(q);
+    return nq;
 }
 
 /* ---- argc / argv / envp ---------------------------------------------------*/
@@ -1658,7 +1783,7 @@ static void posix_thread_worker(void) {
 static void posix_exec_parent(void) {
     static const char *argv[] = { "posix-exec", "MARKER-55", 0 };
     static const char *envp[] = { "OUTRUN_EXEC=yes", "STAGE=exec", 0 };
-    oexecve(argv, envp, 33);                         /* becomes role 33; never returns */
+    oexec_role(argv, envp, 33);                      /* becomes role 33; never returns */
     sysc(SYS_EXIT, 921, 0, 0);                       /* execve failed */
 }
 static void posix_exec_child(void) {
@@ -1728,6 +1853,193 @@ static void posix_fd_worker(void) {
     sysc(SYS_EXIT, 960, 0, 0);
 }
 
+/* --- role 35: the ring-3 heap ---------------------------------------------
+ * Exit codes: 980 = every check passed. The individual failures are numbered so
+ * a boot log names the exact property that broke rather than just "the heap". */
+static void posix_heap_worker(void) {
+    /* sbrk(0) must report a break inside the heap window before anything is
+     * allocated, and must not move on its own. */
+    u64 b0 = obrk(0);
+    if (b0 != HEAP_USER_V_LO)            sysc(SYS_EXIT, 981, 0, 0);
+    if (obrk(0) != b0)                   sysc(SYS_EXIT, 982, 0, 0);
+
+    /* Allocations must be distinct, 16-byte aligned, and independently writable
+     * — the last part is what actually proves the pages are mapped RW. */
+    #define NB 24
+    u8 *v[NB];
+    for (int i = 0; i < NB; i++) {
+        v[i] = (u8 *)omalloc((u64)(i + 1) * 37);
+        if (!v[i])                       sysc(SYS_EXIT, 983, 0, 0);
+        if (((u64)v[i] & 15) != 0)       sysc(SYS_EXIT, 984, 0, 0);
+        for (u64 k = 0; k < (u64)(i + 1) * 37; k++) v[i][k] = (u8)(i + 1);
+    }
+    for (int i = 0; i < NB; i++)          /* no allocation overlapped another  */
+        for (u64 k = 0; k < (u64)(i + 1) * 37; k++)
+            if (v[i][k] != (u8)(i + 1))  sysc(SYS_EXIT, 985, 0, 0);
+
+    if (obrk(0) <= b0)                   sysc(SYS_EXIT, 986, 0, 0);  /* brk grew */
+
+    /* free + realloc: freed space must be reusable, and realloc must preserve
+     * contents when it relocates. */
+    for (int i = 0; i < NB; i += 2) ofree(v[i]);
+    u8 *big = (u8 *)omalloc(4096);
+    if (!big)                            sysc(SYS_EXIT, 987, 0, 0);
+    for (int k = 0; k < 4096; k++) big[k] = (u8)(k & 0xFF);
+    u8 *grown = (u8 *)orealloc(big, 16384);
+    if (!grown)                          sysc(SYS_EXIT, 988, 0, 0);
+    for (int k = 0; k < 4096; k++)
+        if (grown[k] != (u8)(k & 0xFF))  sysc(SYS_EXIT, 989, 0, 0);
+
+    /* Churn: many alloc/free cycles must not walk the break upward without
+     * bound — that is the difference between a free list and a leak. */
+    u64 before = obrk(0);
+    for (int r = 0; r < 400; r++) {
+        u8 *t = (u8 *)omalloc(512);
+        if (!t)                          sysc(SYS_EXIT, 990, 0, 0);
+        t[0] = 1; t[511] = 2;
+        ofree(t);
+    }
+    if (obrk(0) != before)               sysc(SYS_EXIT, 991, 0, 0);  /* reused! */
+
+    /* The kernel must refuse a break outside the window rather than map wild. */
+    if (obrk(1) != obrk(0))              sysc(SYS_EXIT, 992, 0, 0);
+
+    sysc(SYS_EXIT, 980, 0, 0);
+}
+
+/* ============================================================================
+ * v0.56 Stage E: the native compiler is part of this image (see user/occ.c).
+ * Included rather than linked because the Makefile builds exactly one ring-3
+ * translation unit; occ uses this file's heap, fd table and string helpers.
+ * ==========================================================================*/
+#include "occ.c"
+
+/* --- role 37: run occ ------------------------------------------------------
+ * argv is the command line: occ <source.c> <output.elf>. Diagnostics go to
+ * stderr, so a compile error lands in the Cyber-Terminal like any other
+ * program's output. Exit status is 0 on success. */
+static void occ_main(int argc, const char **argv) {
+    const char *src = (argc >= 2) ? argv[1] : "/src/hello.c";
+    const char *out = (argc >= 3) ? argv[2] : "/bin/a.out";
+    int r = occ_compile(src, out);
+    if (r == 0) oputs("  [occ   ] compiled OK\n");
+    sysc(SYS_EXIT, r == 0 ? 0 : (u64)(900 + (-r)), 0, 0);
+}
+
+/* --- role 36: execve BY PATH ----------------------------------------------
+ * Replaces this image with /bin/init loaded out of the VFS. The exec'd copy is
+ * the same program, so it must be told what to do through argv rather than
+ * through its role — which is exactly the point: it proves the path-loaded
+ * image received a real argv and envp built by the kernel on its new stack.
+ * The child (see main() below) exits 970. */
+static void posix_execpath_worker(void) {
+    static const char *argv[] = { "/bin/init", "exec-child", 0 };
+    static const char *envp[] = { "EXECD_BY=path", 0 };
+    oexecve("/bin/init", argv, envp);          /* never returns on success */
+    sysc(SYS_EXIT, 971, 0, 0);                 /* execve failed */
+}
+
+/* --- role 38: SELF-HOSTING ------------------------------------------------
+ * The whole point of the milestone in one worker: author a C source file from
+ * ring 3, compile it with the native compiler running as a separate process,
+ * then run the binary that compiler produced. Nothing here touches a host
+ * toolchain, and the only thing linking the three steps is the filesystem.
+ *
+ * v0.56 Stage F: the program it authors now CALLS THE SDK — strlen, strcmp,
+ * strcpy, atoi, malloc, putdec and puts all come from /usr/lib/libc.oc, which
+ * occ prepends to the translation unit. That is deliberate: it is the only
+ * check that can tell a real /usr/lib from a directory of props. Nothing in
+ * this source defines those names, so if the prelude were not being read the
+ * compile would fail with "undefined function" and this worker would exit 944
+ * rather than quietly passing.
+ *
+ * The expected answer is built from pieces that each prove a different thing:
+ *     0+1+..+7 = 28   the for loop and local arithmetic
+ *     fib(10)  = 55   recursion through the fixup table
+ *     strlen   =  6   byte addressing via __ldb (a[i] alone cannot do this)
+ *     atoi     = 11   byte addressing plus the digit loop
+ *     (1<<4)|3 = 19   the new shift and bitwise-or levels
+ *                ---
+ *                119
+ *
+ * Exit 940 = the produced binary ran and returned exactly that. */
+#define SELF_SRC \
+  "int fib(int n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }\n" \
+  "int main() {\n" \
+  "  int s; int i; char *p;\n" \
+  "  s = 0;\n" \
+  "  for (i = 0; i < 8; i = i + 1) { s = s + i; }\n" \
+  "  s = s + fib(10);\n" \
+  "  s = s + strlen(\"outrun\");\n" \
+  "  s = s + atoi(\"11\");\n" \
+  "  if (strcmp(\"abc\", \"abc\") != 0) { return 901; }\n" \
+  "  if (strcmp(\"abc\", \"abd\") == 0) { return 902; }\n" \
+  "  p = malloc(64);\n" \
+  "  if (p == 0) { return 903; }\n" \
+  "  strcpy(p, \"sdk\");\n" \
+  "  if (strlen(p) != 3) { return 904; }\n" \
+  "  if (__ldb(p, 0) != 115) { return 905; }\n" \
+  "  s = s + ((1 << 4) | 3);\n" \
+  "  puts(\"  [a.out ] compiled by occ against /usr/lib/libc.oc; main returns \");\n" \
+  "  putdec(s); puts(\"\\n\");\n" \
+  "  return s;\n" \
+  "}\n"
+
+static void posix_selfhost_worker(void) {
+    static const char *csrc = SELF_SRC;
+    /* 1. author the source into the VFS */
+    int fd = ocreat("/src/t.c");
+    if (fd < 0)                                   sysc(SYS_EXIT, 941, 0, 0);
+    if (owrite(fd, csrc, ostrlen(csrc) + 1) <= 0) sysc(SYS_EXIT, 942, 0, 0);
+    oclose(fd);
+
+    /* 2. compile it, in a separate process running the real compiler */
+    i64 pid = ofork();
+    if (pid == 0) {
+        static const char *av[] = { "/bin/occ", "/src/t.c", "/bin/t.elf", 0 };
+        static const char *ev[] = { "STAGE=compile", 0 };
+        oexecve("/bin/occ", av, ev);
+        sysc(SYS_EXIT, 199, 0, 0);                /* exec failed */
+    }
+    if (pid < 0)                                  sysc(SYS_EXIT, 943, 0, 0);
+    /* v0.56 Stage F: the budget went from 60000 to 250000 spins, and a timeout
+     * now has its OWN exit code. With the SDK prelude in front of it the
+     * compiler has ~4 KiB more source to get through and emits an image nine
+     * times larger, and under TCG that pushed it past the old budget — the
+     * parent gave up while the child was still working, then reported the
+     * generic "child failed" 944 even though the compile went on to succeed
+     * and print "compiled OK". A wait that times out and a child that fails
+     * are different events and must not share an exit code. */
+    i64 cst = owaitpid((u32)pid, 250000);
+    if (cst == -11)                               sysc(SYS_EXIT, 947, 0, 0);
+    if (cst != 0)                                 sysc(SYS_EXIT, 944, 0, 0);
+
+    /* 3. run what the compiler produced */
+    pid = ofork();
+    if (pid == 0) {
+        static const char *av2[] = { "/bin/t.elf", 0 };
+        static const char *ev2[] = { 0 };
+        oexecve("/bin/t.elf", av2, ev2);
+        sysc(SYS_EXIT, 198, 0, 0);
+    }
+    if (pid < 0)                                  sysc(SYS_EXIT, 945, 0, 0);
+    i64 rst = owaitpid((u32)pid, 250000);
+    if (rst == -11)                               sysc(SYS_EXIT, 948, 0, 0);
+    /* 28 + 55 + 6 + 11 + 19 — see the SELF_SRC comment for what each proves.
+     * The value is PRINTED on failure: "the program returned the wrong answer"
+     * is not actionable, but "it returned 100" points straight at which of the
+     * five contributions above did not happen. */
+    if (rst != 119) {
+        oputs("  [self  ] the compiled program returned ");
+        sysc(SYS_WRITEHEX, (u64)rst, 0, 0);
+        oputs(" hex (want 77 hex = 119)\n");
+        sysc(SYS_EXIT, 946, 0, 0);
+    }
+
+    oputs("  [self  ] authored, compiled and RAN a program without a host toolchain\n");
+    sysc(SYS_EXIT, 940, 0, 0);
+}
+
 int main(int argc, const char **argv, const char **envp);
 
 /* ---- crt0 -----------------------------------------------------------------
@@ -1763,7 +2075,25 @@ int crt0_main(int argc, const char **argv, const char **envp) {
 }
 
 int main(int argc, const char **argv, const char **envp) {
-    (void)argc; (void)argv; (void)envp;
+    (void)envp;
+    /* v0.56: an image exec'd BY PATH is this same program, so it cannot be
+     * distinguished by role — argv is how it learns what it is. Checked before
+     * the role dispatch precisely so the path-loaded copy takes this branch
+     * instead of re-running whatever role its kproc still carries (which would
+     * exec itself forever). */
+    /* v0.56: a path-exec'd image is dispatched by ARGV[0], the way a real system
+     * dispatches a multi-call binary. /bin/occ and /bin/init are the same ELF;
+     * what differs is the name it was invoked under. */
+    if (argc >= 1 && argv && argv[0] && ostrneq(argv[0], "/bin/occ", 9)) {
+        occ_main(argc, argv);
+    }
+    if (argc >= 2 && argv && argv[1] && ostrneq(argv[1], "exec-child", 11)) {
+        if (!ostrneq(argv[0], "/bin/init", 10))            sysc(SYS_EXIT, 972, 0, 0);
+        const char *v = ogetenv("EXECD_BY");
+        if (!v || !ostrneq(v, "path", 5))                  sysc(SYS_EXIT, 973, 0, 0);
+        oputs("  [posix ] /bin/init re-exec'd FROM THE VFS BY PATH, argv+envp intact\n");
+        sysc(SYS_EXIT, 970, 0, 0);
+    }
     u64 role = sysc(SYS_ROLE, 0, 0, 0);
     if (role == 1) { nic_driver();  sysc(SYS_EXIT, 0, 0, 0); }
     if (role == 2) { surface_app(); sysc(SYS_EXIT, 0, 0, 0); }
@@ -1799,6 +2129,10 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 32) { posix_exec_parent(); }            /* v0.55 execve into role 33 with argv/envp           */
     if (role == 33) { posix_exec_child(); }             /* v0.55 the exec'd image: verifies argc/argv/envp    */
     if (role == 34) { posix_fd_worker(); }              /* v0.55 std fd table + inheritance across fork       */
+    if (role == 35) { posix_heap_worker(); }            /* v0.56 ring-3 heap: sbrk/malloc/free/realloc        */
+    if (role == 36) { posix_execpath_worker(); }        /* v0.56 execve /bin/init BY PATH from the VFS        */
+    if (role == 37) { occ_main(argc, argv); }           /* v0.56 the native C compiler                        */
+    if (role == 38) { posix_selfhost_worker(); }        /* v0.56 author -> compile -> run, natively           */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");
