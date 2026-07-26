@@ -1918,10 +1918,46 @@ static void posix_heap_worker(void) {
  * argv is the command line: occ <source.c> <output.elf>. Diagnostics go to
  * stderr, so a compile error lands in the Cyber-Terminal like any other
  * program's output. Exit status is 0 on success. */
+#define OCC_MAXINPUT 8
+
+/* v0.57: the command line accepts SEVERAL sources.
+ *
+ *     occ a.c b.c c.c -o out.elf     explicit output
+ *     occ a.c out.elf                the legacy two-argument form
+ *
+ * The `-o` form is the real one. The positional form is kept because every
+ * existing caller uses it — including the self-hosting driver and the `cc`
+ * shell command — and silently changing what the last argument means would
+ * turn a working invocation into one that overwrites its own source. When no
+ * -o is given the LAST argument is the output, which is why a bare
+ * `occ a.c b.c` is rejected rather than guessed at: with no -o there is no way
+ * to tell a second input from an output path. */
 static void occ_main(int argc, const char **argv) {
-    const char *src = (argc >= 2) ? argv[1] : "/src/hello.c";
-    const char *out = (argc >= 3) ? argv[2] : "/bin/a.out";
-    int r = occ_compile(src, out);
+    const char *srcs[OCC_MAXINPUT];
+    int nsrc = 0;
+    const char *out = 0;
+
+    for (int i = 1; i < argc && argv[i]; i++) {
+        if (ostrneq(argv[i], "-o", 3)) {
+            if (i + 1 < argc && argv[i + 1]) out = argv[++i];
+            else { oputs("occ: -o needs a path\n"); sysc(SYS_EXIT, 902, 0, 0); }
+            continue;
+        }
+        if (nsrc < OCC_MAXINPUT) srcs[nsrc++] = argv[i];
+        else { oputs("occ: too many input files\n"); sysc(SYS_EXIT, 903, 0, 0); }
+    }
+
+    if (!out) {
+        /* legacy positional form: the last argument is the output */
+        if (nsrc < 2) {
+            oputs("usage: occ <source.c>... -o <output.elf>\n");
+            sysc(SYS_EXIT, 904, 0, 0);
+        }
+        out = srcs[--nsrc];
+    }
+    if (!nsrc) { oputs("occ: no input files\n"); sysc(SYS_EXIT, 905, 0, 0); }
+
+    int r = occ_compile(srcs, nsrc, out);
     if (r == 0) oputs("  [occ   ] compiled OK\n");
     sysc(SYS_EXIT, r == 0 ? 0 : (u64)(900 + (-r)), 0, 0);
 }
@@ -1958,12 +1994,78 @@ static void posix_execpath_worker(void) {
  *     fib(10)  = 55   recursion through the fixup table
  *     strlen   =  6   byte addressing via __ldb (a[i] alone cannot do this)
  *     atoi     = 11   byte addressing plus the digit loop
- *     (1<<4)|3 = 19   the new shift and bitwise-or levels
+ *     (1<<4)|3 = 19   the shift and bitwise-or levels
+ *     BONUS    =  7   v0.57: an object-like #define
+ *     ADD(1,2) =  3   v0.57: a function-like #define with arguments
+ *     PPOK     =  5   v0.57: #ifdef took the taken branch (the other is 999,
+ *                     so picking wrong is unmissable rather than off-by-one)
+ *     GUARD_OK =  2   v0.57: #ifndef — the shape every header guard uses
+ *     n1.in.a+b =  7   v0.57: NESTED struct member reads through two levels
+ *     helper2(2) = 4   v0.57: a CROSS-UNIT call into /src/lib2.c, which itself
+ *                     calls fib() back in this file — 2 + fib(3) = 4
  *                ---
- *                119
+ *                147
+ *
+ * The struct block also returns 910-918 on specific failures rather than a
+ * wrong total, so a broken offset says WHICH property broke. The two that
+ * matter most:
+ *   n1.tag = 300 then n1.tag == 44  — a `char` member is stored ONE byte
+ *     wide (300 & 0xFF == 44). A qword store here would also flatten val,
+ *     which is why n1.val is re-checked immediately after.
+ *   u.word = 0; u.byte = 7; u.word == 7  — a union really overlays its
+ *     members at offset 0.
  *
  * Exit 940 = the produced binary ran and returned exactly that. */
+/* v0.57: the source now starts with REAL preprocessing. Every line above main()
+ * is load-bearing: the three #includes are resolved against /usr/include on the
+ * VFS and their prototypes are parsed, SYS_WRITE comes from outrun_abi.h rather
+ * than a hardcoded 0, ADD is a function-like macro, and the #ifdef/#else pair
+ * proves conditional compilation picks the taken branch and discards the other.
+ * If any of that silently did nothing, the arithmetic below stops adding up. */
+/* v0.57 Stage C: a header shared by BOTH units, authored next to them so the
+ * quoted #include form has to resolve it relative to /src/ rather than
+ * /usr/include. Because each unit is preprocessed with a fresh macro table,
+ * this header's guard is fresh too and its text really is pasted into both —
+ * which is exactly why occ accepts a struct redefinition whose layout is
+ * identical and rejects one whose layout is not. */
+#define SELF_HDR \
+  "#ifndef SHARED_H\n" \
+  "#define SHARED_H 1\n" \
+  "struct Inner { int a; int b; };\n" \
+  "struct Outer { char tag; int val; struct Inner in; struct Outer *next; };\n" \
+  "union U { int word; char byte; };\n" \
+  "typedef struct Outer Node;\n" \
+  "int helper2(int x);\n" \
+  "int fib(int n);\n" \
+  "#endif\n"
+
+/* The SECOND translation unit. It calls fib(), which is defined in the FIRST
+ * one, and is itself called from the first — so a single compile has to resolve
+ * a reference in each direction: backward to an already-emitted function, and
+ * forward through the fixup table to one that does not exist yet. It also uses
+ * Node, proving the shared header reached this unit too. */
+#define SELF_SRC2 \
+  "#include \"shared.h\"\n" \
+  "int helper2(int x) { return x + fib(3); }\n" \
+  "int tag_of(Node *p) { return p->tag; }\n"
+
 #define SELF_SRC \
+  "#include <stdio.h>\n" \
+  "#include <string.h>\n" \
+  "#include <outrun_abi.h>\n" \
+  "#define BONUS 7\n" \
+  "#define ADD(a,b) ((a) + (b))\n" \
+  "#define WANT_PP 1\n" \
+  "#ifdef WANT_PP\n" \
+  "#define PPOK 5\n" \
+  "#else\n" \
+  "#define PPOK 999\n" \
+  "#endif\n" \
+  "#ifndef NOT_DEFINED\n" \
+  "#define GUARD_OK 2\n" \
+  "#endif\n" \
+  "#include \"shared.h\"\n" \
+  "int bump(Node *p) { p->val = p->val + 1; return p->val; }\n" \
   "int fib(int n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }\n" \
   "int main() {\n" \
   "  int s; int i; char *p;\n" \
@@ -1980,23 +2082,61 @@ static void posix_execpath_worker(void) {
   "  if (strlen(p) != 3) { return 904; }\n" \
   "  if (__ldb(p, 0) != 115) { return 905; }\n" \
   "  s = s + ((1 << 4) | 3);\n" \
+  "  s = s + BONUS;\n" \
+  "  s = s + ADD(1, 2);\n" \
+  "  s = s + PPOK;\n" \
+  "  s = s + GUARD_OK;\n" \
+  "  { Node n1; Node n2; union U u;\n" \
+  "    n1.tag = 65; n1.val = 10; n1.in.a = 3; n1.in.b = 4; n1.next = &n2;\n" \
+  "    n2.tag = 66; n2.val = 20; n2.in.a = 0; n2.in.b = 0; n2.next = 0;\n" \
+  "    if (n1.tag != 65) { return 910; }\n" \
+  "    if (n1.in.a + n1.in.b != 7) { return 911; }\n" \
+  "    if (n1.next->val != 20) { return 912; }\n" \
+  "    if (bump(&n2) != 21) { return 913; }\n" \
+  "    if (n1.next->val != 21) { return 914; }\n" \
+  "    n1.next->in.b = 9;\n" \
+  "    if (n2.in.b != 9) { return 915; }\n" \
+  "    u.word = 0; u.byte = 7;\n" \
+  "    if (u.word != 7) { return 916; }\n" \
+  "    n1.tag = 300;\n" \
+  "    if (n1.tag != 44) { return 917; }\n" \
+  "    if (n1.val != 10) { return 918; }\n" \
+  "    if (tag_of(&n1) != 44) { return 919; }\n" \
+  "    s = s + n1.in.a + n1.in.b;\n" \
+  "    s = s + helper2(2);\n" \
+  "  }\n" \
+  "  __syscall(SYS_WRITE, \"  [a.out ] SYS_WRITE came from <outrun_abi.h>\\n\", 0, 0);\n" \
   "  puts(\"  [a.out ] compiled by occ against /usr/lib/libc.oc; main returns \");\n" \
   "  putdec(s); puts(\"\\n\");\n" \
   "  return s;\n" \
   "}\n"
 
-static void posix_selfhost_worker(void) {
-    static const char *csrc = SELF_SRC;
-    /* 1. author the source into the VFS */
-    int fd = ocreat("/src/t.c");
-    if (fd < 0)                                   sysc(SYS_EXIT, 941, 0, 0);
-    if (owrite(fd, csrc, ostrlen(csrc) + 1) <= 0) sysc(SYS_EXIT, 942, 0, 0);
-    oclose(fd);
+static int ounlink(const char *path) { return (int)(i64)sysc(SYS_VFS_UNLINK, (u64)path, 0, 0); }
 
-    /* 2. compile it, in a separate process running the real compiler */
+/* Author one file into the VFS; returns 0 on success. */
+static int selfhost_author(const char *path, const char *text) {
+    int fd = ocreat(path);
+    if (fd < 0) return -1;
+    if (owrite(fd, text, ostrlen(text) + 1) <= 0) { oclose(fd); return -2; }
+    oclose(fd);
+    return 0;
+}
+
+static void posix_selfhost_worker(void) {
+    static const char *csrc  = SELF_SRC;
+    static const char *csrc2 = SELF_SRC2;
+    static const char *chdr  = SELF_HDR;
+    /* 1. author a shared header and TWO translation units into the VFS */
+    if (selfhost_author("/src/shared.h", chdr) < 0) sysc(SYS_EXIT, 941, 0, 0);
+    if (selfhost_author("/src/t.c",      csrc) < 0) sysc(SYS_EXIT, 942, 0, 0);
+    if (selfhost_author("/src/lib2.c",   csrc2) < 0) sysc(SYS_EXIT, 949, 0, 0);
+
+    /* 2. compile BOTH units in one invocation, in a separate process running
+     *    the real compiler. -o is the explicit output form. */
     i64 pid = ofork();
     if (pid == 0) {
-        static const char *av[] = { "/bin/occ", "/src/t.c", "/bin/t.elf", 0 };
+        static const char *av[] = { "/bin/occ", "/src/t.c", "/src/lib2.c",
+                                    "-o", "/bin/t.elf", 0 };
         static const char *ev[] = { "STAGE=compile", 0 };
         oexecve("/bin/occ", av, ev);
         sysc(SYS_EXIT, 199, 0, 0);                /* exec failed */
@@ -2025,19 +2165,163 @@ static void posix_selfhost_worker(void) {
     if (pid < 0)                                  sysc(SYS_EXIT, 945, 0, 0);
     i64 rst = owaitpid((u32)pid, 250000);
     if (rst == -11)                               sysc(SYS_EXIT, 948, 0, 0);
-    /* 28 + 55 + 6 + 11 + 19 — see the SELF_SRC comment for what each proves.
+    /* 28 + 55 + 6 + 11 + 19 + 7 (BONUS) + 3 (ADD) + 5 (PPOK) + 2 (GUARD_OK)
+     * — see the SELF_SRC comment for what each proves.
      * The value is PRINTED on failure: "the program returned the wrong answer"
      * is not actionable, but "it returned 100" points straight at which of the
      * five contributions above did not happen. */
-    if (rst != 119) {
+    if (rst != 147) {
         oputs("  [self  ] the compiled program returned ");
         sysc(SYS_WRITEHEX, (u64)rst, 0, 0);
-        oputs(" hex (want 77 hex = 119)\n");
+        oputs(" hex (want 93 hex = 147)\n");
         sysc(SYS_EXIT, 946, 0, 0);
     }
 
     oputs("  [self  ] authored, compiled and RAN a program without a host toolchain\n");
     sysc(SYS_EXIT, 940, 0, 0);
+}
+
+/* --- role 39: COMPILER COMPLETENESS (the ring-3 half of `compilerstrs`) ----
+ * Where role 38 proves the self-hosting LOOP works, this one interrogates the
+ * LANGUAGE. It authors a small project, compiles it, runs it, and then proves
+ * the compiler REJECTS four things it must reject — because a compiler that
+ * accepts everything is not a compiler that understands anything.
+ *
+ * The positive program checks its own struct offsets from the inside, using
+ * `&s.member - &s`. That is the strongest form this test can take: it is not
+ * comparing against numbers the compiler reported, it is measuring the
+ * addresses the compiler actually generated.
+ *
+ * Exit 950 = everything passed. Anything else names the step that failed.  */
+#define CS_HDR \
+  "#ifndef CS_HDR_H\n" \
+  "#define CS_HDR_H 1\n" \
+  "#define CS_ONE 1\n" \
+  "#define CS_TWO (CS_ONE + 1)\n" \
+  "#define CS_MUL(a,b) ((a) * (b))\n" \
+  "#ifdef CS_HDR_H\n" \
+  "#define CS_GUARDED 4\n" \
+  "#else\n" \
+  "#define CS_GUARDED 999\n" \
+  "#endif\n" \
+  "struct S1 { char a; int b; };\n" \
+  "struct S2 { char a; char b; int c; };\n" \
+  "struct N  { char t; struct S1 s; };\n" \
+  "union  U  { int w; char b; };\n" \
+  "typedef struct N Nest;\n" \
+  "int cs_sum(Nest *p);\n" \
+  "int cs_off_b(void);\n" \
+  "#endif\n"
+
+/* Unit A: main, plus a helper the OTHER unit calls back into. */
+#define CS_A \
+  "#include \"cs_hdr.h\"\n" \
+  "int cs_off_b(void) { struct S1 s; int base; int m; base = &s; m = &s.b; return m - base; }\n" \
+  "int main() {\n" \
+  "  struct S1 s1; struct S2 s2; Nest n; union U u;\n" \
+  "  int base;\n" \
+  "  if (CS_TWO != 2) { return 1; }\n" \
+  "  if (CS_MUL(3,4) != 12) { return 2; }\n" \
+  "  if (CS_GUARDED != 4) { return 3; }\n" \
+  "  base = &s1;\n" \
+  "  if ((&s1.a) - base != 0) { return 10; }\n" \
+  "  if ((&s1.b) - base != 8) { return 11; }\n" \
+  "  base = &s2;\n" \
+  "  if ((&s2.a) - base != 0) { return 12; }\n" \
+  "  if ((&s2.b) - base != 1) { return 13; }\n" \
+  "  if ((&s2.c) - base != 8) { return 14; }\n" \
+  "  base = &n;\n" \
+  "  if ((&n.t) - base != 0) { return 15; }\n" \
+  "  if ((&n.s) - base != 8) { return 16; }\n" \
+  "  if ((&n.s.b) - base != 16) { return 17; }\n" \
+  "  base = &u;\n" \
+  "  if ((&u.w) - base != 0) { return 18; }\n" \
+  "  if ((&u.b) - base != 0) { return 19; }\n" \
+  "  s2.a = 0; s2.b = 0; s2.c = 7;\n" \
+  "  s2.a = 300;\n" \
+  "  if (s2.a != 44) { return 20; }\n" \
+  "  if (s2.b != 0)  { return 21; }\n" \
+  "  if (s2.c != 7)  { return 22; }\n" \
+  "  n.t = 5; n.s.a = 2; n.s.b = 30;\n" \
+  "  if (cs_sum(&n) != 37) { return 23; }\n" \
+  "  if (cs_off_b() != 8)  { return 24; }\n" \
+  "  return 0;\n" \
+  "}\n"
+
+/* Unit B: reads a nested struct through a pointer, and is reached only if the
+ * shared header laid the type out identically in both units. */
+#define CS_B \
+  "#include \"cs_hdr.h\"\n" \
+  "int cs_sum(Nest *p) { return p->t + p->s.a + p->s.b; }\n"
+
+/* Four programs that MUST NOT compile. */
+#define CS_N1 "#include \"cs_hdr.h\"\nint main() { struct S1 *p; return p.a; }\n"
+#define CS_N2 "int main() { return 0; }\nint main() { return 1; }\n"
+#define CS_N3 "struct Q { int a; };\nstruct Q { char a; };\nint main() { return 0; }\n"
+#define CS_N4 "#include \"cs_hdr.h\"\nint main() { struct S1 s; return s.zzz; }\n"
+
+/* Compile `srcs` and return the compiler's exit status, or -1 if it could not
+ * be run at all. Used for both the positive and the negative rounds. */
+static i64 cs_compile(const char **av) {
+    i64 pid = ofork();
+    if (pid == 0) {
+        static const char *ev[] = { "STAGE=compilerstrs", 0 };
+        oexecve("/bin/occ", av, ev);
+        sysc(SYS_EXIT, 199, 0, 0);
+    }
+    if (pid < 0) return -1;
+    return owaitpid((u32)pid, 250000);
+}
+
+static void compiler_stress_worker(void) {
+    if (selfhost_author("/src/cs_hdr.h", CS_HDR) < 0) sysc(SYS_EXIT, 951, 0, 0);
+    if (selfhost_author("/src/cs_a.c",   CS_A)   < 0) sysc(SYS_EXIT, 952, 0, 0);
+    if (selfhost_author("/src/cs_b.c",   CS_B)   < 0) sysc(SYS_EXIT, 953, 0, 0);
+
+    /* ---- positive round: two units, one ELF, run it ---- */
+    { static const char *av[] = { "/bin/occ", "/src/cs_a.c", "/src/cs_b.c",
+                                  "-o", "/bin/cs.elf", 0 };
+      i64 st = cs_compile(av);
+      if (st == -11) sysc(SYS_EXIT, 954, 0, 0);           /* compiler timed out */
+      if (st != 0)   sysc(SYS_EXIT, 955, 0, 0);           /* should have built  */
+    }
+    { i64 pid = ofork();
+      if (pid == 0) {
+          static const char *av2[] = { "/bin/cs.elf", 0 };
+          static const char *ev2[] = { 0 };
+          oexecve("/bin/cs.elf", av2, ev2);
+          sysc(SYS_EXIT, 198, 0, 0);
+      }
+      if (pid < 0) sysc(SYS_EXIT, 956, 0, 0);
+      i64 rst = owaitpid((u32)pid, 250000);
+      if (rst == -11) sysc(SYS_EXIT, 957, 0, 0);
+      if (rst != 0) {
+          /* the program returns the number of the check that failed */
+          oputs("  [compst] the compiled program failed check ");
+          sysc(SYS_WRITEHEX, (u64)rst, 0, 0);
+          oputs(" hex\n");
+          sysc(SYS_EXIT, 958, 0, 0);
+      }
+      oputs("  [compst] offsets, alignment, nesting and cross-unit calls all verified\n");
+    }
+
+    /* ---- negative rounds: each of these MUST be refused ----
+     * The output is unlinked first, so "the compiler failed" and "the compiler
+     * silently produced something anyway" are distinguishable. */
+    { static const char *n1[] = { "/bin/occ", "/src/cs_n.c", "-o", "/bin/cs_n.elf", 0 };
+      static const char *bodies[4] = { CS_N1, CS_N2, CS_N3, CS_N4 };
+      for (int i = 0; i < 4; i++) {
+          ounlink("/bin/cs_n.elf");
+          if (selfhost_author("/src/cs_n.c", bodies[i]) < 0) sysc(SYS_EXIT, 959, 0, 0);
+          i64 st = cs_compile(n1);
+          if (st == -11)      sysc(SYS_EXIT, 960 + i, 0, 0);   /* timed out      */
+          if (st == 0)        sysc(SYS_EXIT, 964 + i, 0, 0);   /* WRONGLY built  */
+          { int t = oopen("/bin/cs_n.elf");
+            if (t >= 0) { oclose(t); sysc(SYS_EXIT, 968 + i, 0, 0); } }  /* left output */
+      }
+      oputs("  [compst] all four invalid programs were REFUSED, and none left an output file\n");
+    }
+    sysc(SYS_EXIT, 950, 0, 0);
 }
 
 int main(int argc, const char **argv, const char **envp);
@@ -2132,6 +2416,7 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 35) { posix_heap_worker(); }            /* v0.56 ring-3 heap: sbrk/malloc/free/realloc        */
     if (role == 36) { posix_execpath_worker(); }        /* v0.56 execve /bin/init BY PATH from the VFS        */
     if (role == 37) { occ_main(argc, argv); }           /* v0.56 the native C compiler                        */
+    if (role == 39) { compiler_stress_worker(); }       /* v0.57 language completeness + refusal checks        */
     if (role == 38) { posix_selfhost_worker(); }        /* v0.56 author -> compile -> run, natively           */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"

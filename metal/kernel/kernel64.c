@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.56.0-metal"
+#define KERNEL_VERSION "0.57.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -3397,6 +3397,12 @@ static void cmd_net(void) {
 
 
 /* Scheduler + concurrency demonstration.                                     */
+/* v0.57: where raw-block demos are allowed to write. Defined with the CAS
+ * globals further down; declared here because worker_fn precedes them. Returns
+ * the reserved scratch region when a volume is mounted, and the historical
+ * fixed sector when there is no filesystem to damage. */
+static uint64_t cas_scratch_base(uint64_t fallback);
+
 static uint8_t          g_sbuf[8][512] __attribute__((aligned(512)));
 static volatile int     g_workers_left = 0;
 static volatile uint64_t g_spin_ctr = 0;
@@ -3408,7 +3414,11 @@ static void worker_fn(void *arg) {
     uint8_t rb[512]  __attribute__((aligned(512)));
     int ok = 1;
     for (int r = 0; r < 4; r++) {
-        uint64_t sec = 300 + (uint64_t)id * 8 + r;
+        /* v0.57: the RESERVED scratch region, not a hardcoded sector. This demo
+         * used to write 300..331 unconditionally; once the content index grew
+         * to cover blocks 3..514 those writes landed inside it. See the
+         * scratch_start comment on struct cas_superblock. */
+        uint64_t sec = cas_scratch_base(300) + (uint64_t)id * 8 + r;
         for (int i = 0; i < 512; i++) buf[i] = (uint8_t)(0x41 + id);
         virtio_write_block(sec, buf);                      /* blocks -> parks    */
         for (int i = 0; i < 512; i++) rb[i] = 0;
@@ -3507,6 +3517,24 @@ struct cas_superblock {
     /* compatibility mode instead of trusting these fields. See cas_mount().   */
     uint64_t vjournal_start, vjournal_blocks;   /* VFS-directory journal        */
     uint64_t cjournal_start, cjournal_blocks;   /* CAS-metadata journal          */
+    /* v0.57 (version 5): a RESERVED RAW-BLOCK SCRATCH REGION.
+     *
+     * Two demos predating the CAS wrote to hardcoded absolute sectors on the
+     * same device the filesystem owns: the thread-concurrency worker used
+     * sectors 300..331, and the virtio-blk round-trip check wrote sector 0 —
+     * the superblock itself. Both were harmless only by accident of layout.
+     * When v0.57 sized the content index from the volume, the index grew to
+     * cover blocks 3..514 and the worker demo began scribbling 0x41+id across
+     * 32 index sectors mid-boot, silently destroying whatever entries lived
+     * there. It showed up as ONE lost chunk out of 505 — because with ~1 live
+     * entry per sector, wiping 32 sectors loses about one that mattered — and
+     * the symptom was /bin/init failing to exec four thousand log lines later.
+     *
+     * The fix is not a different magic number, which would rot the same way.
+     * The region is declared here, reserved in the bitmap by cas_format, and
+     * the demos ask the superblock where it is. A raw-block test that needs
+     * blocks now says so in the layout. */
+    uint64_t scratch_start, scratch_blocks;
 } __attribute__((packed));
 
 struct cas_islot { uint64_t hash; uint32_t block; uint32_t len; } __attribute__((packed));
@@ -3562,6 +3590,11 @@ static uint8_t g_blk[512]     __attribute__((aligned(512)));
 static int     g_cas_mounted = 0;
 static int     g_cas_legacy  = 0;      /* v0.48: mounted a pre-journal (version 2) volume */
 #define SB ((struct cas_superblock *)g_sbblk)
+
+static uint64_t cas_scratch_base(uint64_t fallback) {
+    if (!g_cas_mounted || !SB->scratch_blocks) return fallback;
+    return SB->scratch_start;
+}
 
 /* --- VFS directory: names -> content, layered on CAS ---------------------- */
 /* v0.56: 64 slots. An SDK layout needs far more names than the suites' 29
@@ -3662,10 +3695,27 @@ static void bm_free(uint64_t b) {
     if (SB->used_blocks) SB->used_blocks--;
 }
 
+/* v0.57: the probe START is derived from a MIXED hash, not from the hash's low
+ * bits directly. The stored hash is unchanged — this only decides where probing
+ * begins — but it matters a great deal now that the table is sized from the
+ * volume: `hash % slots` with slots a power of two uses only the low bits, and
+ * this hash has visibly poor ones (every 512-byte chunk in a boot log hashes to
+ * a value ending in the same byte, so hundreds of distinct chunks wanted the
+ * same handful of starting slots). Long probe chains in an open-addressed table
+ * mean one block read per probe, on the real device. Both cas_index_find and
+ * cas_index_stage call this, so they always agree. */
+static uint64_t cas_slot_of(uint64_t hash, uint64_t slots) {
+    uint64_t h = hash;
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 29; h *= 0xc4ceb9fe1a85ec53ull;
+    h ^= h >> 32;
+    return h % slots;
+}
+
 /* Open-addressed (linear-probe) index; hash 0 marks an empty slot.            */
 static int64_t cas_index_find(uint64_t hash, uint32_t *out_len) {
     uint64_t slots = SB->index_blocks * CAS_SLOTS_PER_BLOCK;
-    uint64_t start = hash % slots;
+    uint64_t start = cas_slot_of(hash, slots);
     for (uint64_t probe = 0; probe < slots; probe++) {
         uint64_t s   = (start + probe) % slots;
         uint64_t sec = SB->index_start + s / CAS_SLOTS_PER_BLOCK;
@@ -3685,7 +3735,7 @@ static int64_t cas_index_find(uint64_t hash, uint32_t *out_len) {
  * hash is already present (caller treats that as a dedup, same as before). */
 static int64_t cas_index_stage(uint64_t hash, uint32_t block, uint32_t len) {
     uint64_t slots = SB->index_blocks * CAS_SLOTS_PER_BLOCK;
-    uint64_t start = hash % slots;
+    uint64_t start = cas_slot_of(hash, slots);
     for (uint64_t probe = 0; probe < slots; probe++) {
         uint64_t s   = (start + probe) % slots;
         uint64_t sec = SB->index_start + s / CAS_SLOTS_PER_BLOCK;
@@ -3848,18 +3898,46 @@ static void cas_format(void) {
      * all, so cas_mount refuses anything below 4 and the volume is reformatted.
      * That is the honest outcome: silently misreading a directory would corrupt
      * it on the next flush. */
-    SB->version = 4; SB->block_size = CAS_BS; SB->total_blocks = total;
+    /* v0.57: version 5 — THE CONTENT INDEX IS SIZED FROM THE VOLUME.
+     *
+     * It was a hardcoded 16 blocks, and CAS_SLOTS_PER_BLOCK is 32, so the index
+     * held 512 entries for a volume of 8192 blocks. A single full regression
+     * boot stores well over 512 distinct chunks, so the index filled up part-way
+     * through every boot and every put after that point could not be recorded.
+     *
+     * That is the root cause of the defect v0.56 shipped as "a near-full CAS
+     * volume has an unexplained read-back mismatch: the right byte count, the
+     * wrong bytes". It was never about the volume being near-full for DATA —
+     * 537 of 8192 blocks were used. It was the INDEX being full at 512 of 512.
+     * Before v0.56, cas_put returned the hash anyway with nothing recorded, so
+     * cas_get later missed and vfs_read_file handed back whatever stale bytes
+     * the shared bounce buffer held. v0.56 made that fail loudly instead of
+     * corrupting; this is the fix for why it was happening at all.
+     *
+     * Sized at TWO slots per data block: an open-addressed linear-probe table
+     * degrades badly above ~70% load, and 50% keeps probe chains short. For the
+     * 4 MiB test volume that is 512 index blocks out of 8192 (6%), which is a
+     * fair price for a content-addressed store that cannot lose an entry.
+     *
+     * Widening the region moves data_start, so a version-4 volume's blocks all
+     * sit at the wrong offsets — cas_mount refuses anything below 5 and
+     * reformats, exactly as the v4 bump did for the widened dirent. */
+    SB->version = 5; SB->block_size = CAS_BS; SB->total_blocks = total;
     SB->bitmap_start  = 1;
     SB->bitmap_blocks = (total / 8 + CAS_BS - 1) / CAS_BS;
     SB->index_start   = SB->bitmap_start + SB->bitmap_blocks;
-    SB->index_blocks  = 16;
+    SB->index_blocks  = (total * 2 + CAS_SLOTS_PER_BLOCK - 1) / CAS_SLOTS_PER_BLOCK;
+    if (SB->index_blocks < 16) SB->index_blocks = 16;      /* tiny volumes      */
+    if (SB->index_blocks > total / 4) SB->index_blocks = total / 4;  /* never eat the volume */
     SB->dir_start     = SB->index_start + SB->index_blocks;
     SB->dir_blocks    = VFS_DIR_BLOCKS;                    /* VFS directory (fixed, was hardcoded 8) */
     SB->vjournal_start  = SB->dir_start + SB->dir_blocks;
     SB->vjournal_blocks = 1 + VFS_DIR_BLOCKS;              /* header + full-dir shadow  */
     SB->cjournal_start  = SB->vjournal_start + SB->vjournal_blocks;
     SB->cjournal_blocks = 4;                               /* header + sb + bitmap-blk + index-blk */
-    SB->data_start    = SB->cjournal_start + SB->cjournal_blocks;
+    SB->scratch_start   = SB->cjournal_start + SB->cjournal_blocks;
+    SB->scratch_blocks  = 32;                              /* v0.57: raw-block demos live HERE */
+    SB->data_start    = SB->scratch_start + SB->scratch_blocks;
     SB->used_blocks   = SB->data_start;
     cmemset(g_bitmap, 0, sizeof g_bitmap);
     for (uint64_t b = 0; b < SB->data_start; b++) bm_set(b);
@@ -3875,6 +3953,8 @@ static void cas_format(void) {
             SB->total_blocks, SB->bitmap_start, SB->bitmap_blocks,
             SB->index_start, SB->index_blocks, SB->dir_start, SB->dir_blocks,
             SB->vjournal_start, SB->vjournal_blocks, SB->cjournal_start, SB->cjournal_blocks, SB->data_start);
+    kprintf("[cas    ]   raw-block scratch region: %d block(s) at %d (reserved, never allocated)\n",
+            SB->scratch_blocks, SB->scratch_start);
 }
 
 static void vfs_journal_apply(void);   /* fwd: v0.48, defined in the VFS section below */
@@ -3886,11 +3966,13 @@ static void vfs_journal_apply(void);   /* fwd: v0.48, defined in the VFS section
 static int cas_mount(void) {
     virtio_read_block(0, g_sbblk);
     const char mg[8] = { 'O','R','U','N','C','A','S','1' };
-    /* v0.56: only version 4 mounts. Versions 2 and 3 predate the widened dirent
-     * name, so their directory records have a different shape — reading one
-     * would yield garbage names and lengths, and the first vfs_flush would then
-     * write that garbage back. Refusing the mount makes cas_format run instead. */
-    if (cmemcmp(SB->magic, mg, 8) != 0 || SB->version != 4) return 0;
+    /* v0.57: only version 5 mounts. v2/v3 predate the widened dirent name, and
+     * v4 sized the content index at a hardcoded 16 blocks — so a v4 volume's
+     * data_start, dir_start and journal regions all sit at different offsets
+     * than this kernel computes. Reading one would yield garbage names and
+     * lengths and the first flush would write that garbage back. Refusing the
+     * mount makes cas_format run instead, which is the honest outcome. */
+    if (cmemcmp(SB->magic, mg, 8) != 0 || SB->version != 5) return 0;
     /* v0.48: a version-2 volume predates both the dir_blocks fix and the        */
     /* journal regions — its on-disk bytes past dir_blocks/8 are DATA blocks,    */
     /* not journal headers, so trusting SB->vjournal_start/cjournal_start here   */
@@ -4644,9 +4726,13 @@ static void cmd_disk(void) {
     for (int i = 0; i < 512; i++) g_disk_buf[i] = (uint8_t)(0x30 + (i & 0x3F));
     for (int i = 0; tag[i]; i++)  g_disk_buf[i] = (uint8_t)tag[i];
 
-    if (virtio_write_block(0, g_disk_buf) != 0) { kputs("[disk   ] write failed\n"); return; }
+    /* v0.57: sector 0 is the CAS SUPERBLOCK. This round-trip check used to
+     * overwrite it outright, which only ever looked harmless because the
+     * format that follows rewrote it. Use the reserved scratch region. */
+    uint64_t rt = cas_scratch_base(0);
+    if (virtio_write_block(rt, g_disk_buf) != 0) { kputs("[disk   ] write failed\n"); return; }
     for (int i = 0; i < 512; i++) g_disk_buf2[i] = 0;
-    if (virtio_read_block(0, g_disk_buf2) != 0) { kputs("[disk   ] readback failed\n"); return; }
+    if (virtio_read_block(rt, g_disk_buf2) != 0) { kputs("[disk   ] readback failed\n"); return; }
 
     int ok = 1;
     for (int i = 0; i < 512; i++) if (g_disk_buf[i] != g_disk_buf2[i]) { ok = 0; break; }
@@ -11570,11 +11656,14 @@ static int exec_from_cas(const char *name, int proc_idx) {
  * no structs, no varargs, no preprocessor), not C89. Naming it libc.c would
  * invite a host compiler to be pointed at it. */
 static const char SDK_ABI_H[] =
+"#ifndef OUTRUN_ABI_H\n"
+"#define OUTRUN_ABI_H 1\n"
 "/* outrun_abi.h — the OutRun OS system-call ABI. Normative.\n"
 " *\n"
-" * occ has no preprocessor: it SKIPS every '#' line, so including this header\n"
-" * costs nothing and defines nothing. It is here to be read. In occ source,\n"
-" * make system calls with the builtin:  __syscall(n, a0, a1, a2)\n"
+" * v0.57: occ HAS a preprocessor now, so #including this header really does\n"
+" * define the constants below and you can write SYS_WRITE instead of 0. It is\n"
+" * still worth reading rather than only including. In occ source, make system\n"
+" * calls with the builtin:  __syscall(n, a0, a1, a2)\n"
 " *\n"
 " * Calling convention (identical to the kernel's syscall_entry):\n"
 " *   rax = number, rdi = a0, rsi = a1, rdx = a2  ->  rax = result\n"
@@ -11603,10 +11692,16 @@ static const char SDK_ABI_H[] =
 "#define SYS_EXECVE_PATH     59   /* (const char *path, argv, envp)           */\n"
 "\n"
 "#define O_CREAT 1                /* the ONLY defined SYS_OPEN flag. Any other\n"
-"                                  * bit is rejected with -22, on purpose.   */\n";
+"                                  * bit is rejected with -22, on purpose.   */\n"
+"#endif\n";
 
 static const char SDK_STDIO_H[] =
+"#ifndef OUTRUN_STDIO_H\n"
+"#define OUTRUN_STDIO_H 1\n"
 "/* stdio.h — what /usr/lib/libc.oc actually provides.\n"
+" * v0.57: these prototypes are REAL declarations now — occ parses them, and a\n"
+" * name declared here but never defined in the runtime fails the compile with\n"
+" * \"undefined function\" rather than being quietly ignored.\n"
 " * There is no FILE, no printf and no varargs: occ has no varargs, so a\n"
 " * printf could not be written in this subset even if it were declared here.\n"
 " * putdec() is the honest substitute for %d. */\n"
@@ -11618,29 +11713,41 @@ static const char SDK_STDIO_H[] =
 "int  creat(char *path);          /* create if absent (SYS_OPEN | O_CREAT)    */\n"
 "int  read(int fd, char *buf, int n);\n"
 "int  write(int fd, char *buf, int n);\n"
-"int  close(int fd);\n";
+"int  close(int fd);\n"
+"#endif\n";
 
 static const char SDK_STDLIB_H[] =
+"#ifndef OUTRUN_STDLIB_H\n"
+"#define OUTRUN_STDLIB_H 1\n"
 "/* stdlib.h — occ's `int` is 64-BIT, so these all take and return machine\n"
 " * words. malloc() below is a BUMP allocator over SYS_BRK: free() is a no-op\n"
 " * and says so rather than pretending to reclaim. A compiled program that\n"
 " * needs real reclamation should use the kernel's heap through the full libc\n"
 " * in /bin/init instead. */\n"
 "char *malloc(int n);\n"
-"void  free(char *p);             /* no-op: bump allocator, no free list      */\n"
+"int   free(char *p);             /* no-op: bump allocator, no free list.     */\n"
+"                                 /* Returns int, not void: occ has no void   */\n"
+"                                 /* return values, and this header must say  */\n"
+"                                 /* what libc.oc actually defines.           */\n"
 "int   atoi(char *s);\n"
 "int   abs(int v);\n"
-"void  exit(int status);\n";
+"int   exit(int status);          /* does not return; typed int, see free()   */\n"
+"#endif\n";
 
 static const char SDK_STRING_H[] =
+"#ifndef OUTRUN_STRING_H\n"
+"#define OUTRUN_STRING_H 1\n"
 "/* string.h */\n"
 "int   strlen(char *s);\n"
 "int   strcmp(char *a, char *b);\n"
 "char *strcpy(char *d, char *s);\n"
 "char *memcpy(char *d, char *s, int n);\n"
-"char *memset(char *d, int c, int n);\n";
+"char *memset(char *d, int c, int n);\n"
+"#endif\n";
 
 static const char SDK_UNISTD_H[] =
+"#ifndef OUTRUN_UNISTD_H\n"
+"#define OUTRUN_UNISTD_H 1\n"
 "/* unistd.h */\n"
 "int getpid(void);\n"
 "int getppid(void);\n"
@@ -11654,9 +11761,12 @@ static const char SDK_UNISTD_H[] =
 " * back is normally larger than what was asked for. On failure it returns the\n"
 " * current break unchanged, which is why callers must test `>=` and never\n"
 " * `==`. libc.oc's sbrk() does exactly that; write your own the same way. */\n"
-"char *sbrk(int delta);\n";
+"char *sbrk(int delta);\n"
+"#endif\n";
 
 static const char SDK_SIGNAL_H[] =
+"#ifndef OUTRUN_SIGNAL_H\n"
+"#define OUTRUN_SIGNAL_H 1\n"
 "/* signal.h — SCOPE NOTE, read this before using it from occ.\n"
 " *\n"
 " * The kernel's signal machinery is real and fully exercised (see the posixstrs\n"
@@ -11674,9 +11784,12 @@ static const char SDK_SIGNAL_H[] =
 "#define SIGSEGV 11\n"
 "#define SIGALRM 14\n"
 "#define SIGTERM 15\n"
-"int kill(int pid, int sig);\n";
+"int kill(int pid, int sig);\n"
+"#endif\n";
 
 static const char SDK_PTHREAD_H[] =
+"#ifndef OUTRUN_PTHREAD_H\n"
+"#define OUTRUN_PTHREAD_H 1\n"
 "/* pthread.h — SCOPE NOTE.\n"
 " *\n"
 " * Threads are real: SYS_THREAD_CREATE (52) and SYS_THREAD_EXIT (53) create\n"
@@ -11693,7 +11806,8 @@ static const char SDK_PTHREAD_H[] =
 " * Declared here because it is part of the ABI a program targeting this system\n"
 " * needs to know about, not because occ can call it today. */\n"
 "#define SYS_THREAD_CREATE 52\n"
-"#define SYS_THREAD_EXIT   53\n";
+"#define SYS_THREAD_EXIT   53\n"
+"#endif\n";
 
 /* The runtime. This IS compiled — occ prepends it to every translation unit,
  * so it must stay inside occ's subset: 64-bit `int`, pointers to int/char, no
@@ -13122,16 +13236,17 @@ static void tccheck(const char *n, int c) {
  * over that default block. */
 static void cmd_cc(int argc, char **argv) {
     if (argc < 3) {
-        kputs("usage: cc <source.c> <output.elf>\n"
+        kputs("usage: cc <source.c> [more.c ...] <output.elf>\n"
               "       compiles with the native compiler; /usr/lib/libc.oc is\n"
-              "       prepended automatically. Diagnostics come back here.\n");
+              "       prepended automatically and several inputs are fused into\n"
+              "       one translation unit. Diagnostics come back here.\n");
         return;
     }
     if (!g_cas_mounted) { kputs("[cc     ] no filesystem mounted\n"); return; }
-    if (vfs_find(argv[1]) < 0) {
-        kprintf("[cc     ] no such source file: %s\n", argv[1]);
-        return;
-    }
+    /* v0.57: everything but the last argument is an input. Check them all
+     * before spawning, so a typo costs a message rather than a process. */
+    for (int i = 1; i < argc - 1; i++)
+        if (vfs_find(argv[i]) < 0) { kprintf("[cc     ] no such source file: %s\n", argv[i]); return; }
     uint64_t save = current_proc_idx;
     int p = kproc_spawn("/bin/occ", PCAP_FILESYSTEM);
     if (p < 0) { kputs("[cc     ] no free process slot\n"); return; }
@@ -13141,18 +13256,22 @@ static void cmd_cc(int argc, char **argv) {
     kprocs[p].entry = e;
 
     { char av[UARG_N][UARG_LEN], ev[UARG_N][UARG_LEN];
-      const char *a[3] = { "/bin/occ", argv[1], argv[2] };
-      for (int i = 0; i < 3; i++) {
-          int n = 0; while (n < UARG_LEN - 1 && a[i][n]) { av[i][n] = a[i][n]; n++; }
-          av[i][n] = 0;
+      int na = 0;
+      const char *a0 = "/bin/occ";
+      { int n = 0; while (n < UARG_LEN - 1 && a0[n]) { av[0][n] = a0[n]; n++; } av[0][n] = 0; na = 1; }
+      /* every input, then the output as the trailing positional argument */
+      for (int i = 1; i < argc && na < UARG_N; i++) {
+          int n = 0; while (n < UARG_LEN - 1 && argv[i][n]) { av[na][n] = argv[i][n]; n++; }
+          av[na][n] = 0; na++;
       }
       const char *e0 = "PATH=/usr/lib", *e1 = "OUTRUN=" KERNEL_VERSION;
       int n; for (n = 0; n < UARG_LEN - 1 && e0[n]; n++) ev[0][n] = e0[n]; ev[0][n] = 0;
       for (n = 0; n < UARG_LEN - 1 && e1[n]; n++) ev[1][n] = e1[n]; ev[1][n] = 0;
-      uargs_build(kprocs[p].cr3, 3, (const char (*)[UARG_LEN])av,
+      uargs_build(kprocs[p].cr3, na, (const char (*)[UARG_LEN])av,
                                  2, (const char (*)[UARG_LEN])ev); }
 
-    kprintf("[cc     ] %s -> %s (pid %u)\n", argv[1], argv[2], kprocs[p].pid);
+    kprintf("[cc     ] %d input(s) -> %s (pid %u)\n",
+            (uint64_t)(int64_t)(argc - 2), argv[argc - 1], kprocs[p].pid);
     rq_push(0, p);
     __sync_synchronize();
     int n_on = g_ncpu_online; if (n_on > MAX_CPUS) n_on = MAX_CPUS;
@@ -13166,11 +13285,146 @@ static void cmd_cc(int argc, char **argv) {
     current_proc_idx = save;
     if (!kprocs[p].torn_down) { kputs("[cc     ] TIMED OUT\n"); return; }
 
-    int oi = vfs_find(argv[2]);
+    int oi = vfs_find(argv[argc - 1]);
     if (kprocs[p].exit_code == 0 && oi >= 0)
-        kprintf("[cc     ] ok: %s is %u bytes\n", argv[2], (uint64_t)DENTS[oi].len);
+        kprintf("[cc     ] ok: %s is %u bytes\n", argv[argc - 1], (uint64_t)DENTS[oi].len);
     else
         kprintf("[cc     ] compile FAILED (exit %u)\n", kprocs[p].exit_code);
+}
+
+/* ===========================================================================
+ * v0.57: COMPILER STRESS — language completeness, and what must be REFUSED
+ * ===========================================================================
+ * toolstrs proves the self-hosting LOOP works. This proves the LANGUAGE does.
+ * The ring-3 half (role 39) authors a three-file project, compiles the two
+ * units into one ELF, runs it, and then feeds the compiler four programs that
+ * must not compile. The kernel half checks what ring 3 cannot honestly claim
+ * about itself: that a real multi-unit executable appeared, that its own
+ * program headers describe a well-formed 3-segment W^X image, and that the
+ * refused programs left NO output behind.
+ *
+ * The positive program measures its own struct offsets with `&s.member - &s`.
+ * That matters: it is not comparing against numbers the compiler reported, it
+ * is measuring the addresses the compiler actually generated. A layout bug
+ * cannot agree with itself here.                                            */
+static int g_cspass, g_csfail;
+static void cscheck(const char *n, int c) {
+    if (c) { g_cspass++; kprintf("[compstrs]  PASS  %s\n", n); }
+    else   { g_csfail++; kprintf("[compstrs]  FAIL  %s\n", n); }
+}
+
+static void cmd_compiler_stress(void) {
+    kputs("-- COMPILER STRESS: preprocessor, struct layout, multi-unit, and refusals --\n");
+    g_cspass = g_csfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    if (!g_cas_mounted) { cscheck("CAS mounted before the compiler can run", 0);
+        kprintf("[compstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_cspass, (uint64_t)g_csfail);
+        return; }
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+
+    /* A fresh output every run, so "it appeared" means something. */
+    if (vfs_find("/bin/cs.elf") >= 0)   vfs_unlink("/bin/cs.elf");
+    if (vfs_find("/bin/cs_n.elf") >= 0) vfs_unlink("/bin/cs_n.elf");
+
+    int p = kproc_spawn("compstr", PCAP_FILESYSTEM);
+    if (p < 0) { cscheck("kproc_spawn never fails", 0);
+        kprintf("[compstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_cspass, (uint64_t)g_csfail);
+        return; }
+    kprocs[p].role = 39;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { cscheck("the driver's ELF loads", 0);
+        kprintf("[compstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_cspass, (uint64_t)g_csfail);
+        return; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    /* Six compiles and one program run, all under TCG. The four refusals are
+     * cheap because they bail early; the two real compiles are not. */
+    int finished = posix_drain(procs, 1, &R, 90000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[compstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 950 ? "" :
+        R.code[0] == 951 || R.code[0] == 952 || R.code[0] == 953 ? "could not author a source file" :
+        R.code[0] == 954 ? "the compiler TIMED OUT on the two-unit build" :
+        R.code[0] == 955 ? "the two-unit build FAILED but should have succeeded" :
+        R.code[0] == 956 ? "fork failed before running the built program" :
+        R.code[0] == 957 ? "the built program TIMED OUT" :
+        R.code[0] == 958 ? "the built program reported a failed check (see its own line above)" :
+        R.code[0] == 959 ? "could not author a negative-test source" :
+        (R.code[0] >= 960 && R.code[0] <= 963) ? "a negative test TIMED OUT in the compiler" :
+        (R.code[0] >= 964 && R.code[0] <= 967) ? "an INVALID program compiled successfully" :
+        (R.code[0] >= 968 && R.code[0] <= 971) ? "a refused compile still left an output file" :
+                                                 "unknown";
+    if (R.code[0] != 950)
+        kprintf("[compstrs] driver exit %u — %s\n", R.code[0], why);
+
+    cscheck("the driver authored, built, ran and validated a multi-unit project (exit 950)",
+            finished && R.code[0] == 950);
+
+    /* A real multi-unit executable exists, and it is a well-formed W^X ELF. */
+    int oi = vfs_find("/bin/cs.elf");
+    int elf_ok = 0, wx_ok = 0, audited = 0;
+    if (oi >= 0 && DENTS[oi].len > 64) {
+        static uint8_t img[32768];
+        int64_t got = vfs_read_file(oi, img, sizeof img);
+        struct elf64_hdr *eh = (struct elf64_hdr *)img;
+        if (got > 64 && eh->ident[0] == 0x7F && eh->ident[1] == 'E' &&
+            eh->ident[2] == 'L' && eh->ident[3] == 'F' &&
+            eh->machine == 0x3E && eh->phnum == 3) {
+            int rx = 0, ro = 0, rw = 0, bad = 0;
+            for (int i = 0; i < eh->phnum; i++) {
+                struct elf64_phdr *ph = (struct elf64_phdr *)(img + eh->phoff + (uint64_t)i * eh->phentsize);
+                if (ph->type != 1) continue;
+                if ((ph->flags & 0x3) == 0x3) bad = 1;
+                if (ph->flags == 5) rx++;
+                if (ph->flags == 4) ro++;
+                if (ph->flags == 6) rw++;
+            }
+            audited = 1;
+            elf_ok = (rx == 1 && ro == 1 && rw == 1);
+            wx_ok  = !bad;
+        }
+        kprintf("[compstrs] /bin/cs.elf: %u bytes, %u chunk(s), from TWO source units\n",
+                (uint64_t)DENTS[oi].len, (uint64_t)DENTS[oi].nchunks);
+    }
+    cscheck("a multi-unit executable was produced in the VFS", oi >= 0 && DENTS[oi].len > 64);
+    cscheck("it is a well-formed 3-segment x86-64 ELF (R+X, R, R+W)", audited && elf_ok);
+    cscheck("NO segment is both writable and executable (W^X holds for multi-unit output)",
+            audited && wx_ok);
+    /* The refusals must not have produced anything. Checked from OUTSIDE the
+     * process that ran them, because the process asserting its own negative
+     * result is the weaker claim. */
+    cscheck("no output file survives from any REFUSED compile", vfs_find("/bin/cs_n.elf") < 0);
+
+    int fds_leaked = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    cscheck("no descriptor leaked across seven compiler processes", fds_leaked == 0);
+
+    kprintf("[compstrs] +%u freed, +%u reused; global depth %u\n",
+            g_frames_freed - freed0, g_frames_reused - reused0, g_frame_free_depth);
+    cscheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    cscheck("no lock-rank violation across the compiler paths", g_rank_violations == viol0);
+
+    kprintf("[compstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_cspass, (uint64_t)g_csfail);
+    if (!g_csfail)
+        kputs("[compstrs] LANGUAGE VERIFIED — preprocessor, struct layout, multi-unit linkage, and refusals\n");
+    else kputs("[compstrs] COMPILER DEFECTS PRESENT\n");
+    kputs("-- done --\n");
 }
 
 static void cmd_selfhost_test(void) {
@@ -15461,9 +15715,12 @@ static void cmd_demo(void) {
 
 static void shell_exec(char *line) {
     /* tokenize in place */
-    char *argv[4] = {0};
+    /* v0.57: 8, not 4 — `cc a.c b.c c.c -o out.elf` needs more than four
+     * tokens, and a tokenizer that silently drops the tail would compile the
+     * wrong set of files. */
+    char *argv[8] = {0};
     int argc = 0;
-    for (char *p = line; *p && argc < 4; ) {
+    for (char *p = line; *p && argc < 8; ) {
         while (*p == ' ') p++;
         if (!*p) break;
         argv[argc++] = p;
@@ -15525,6 +15782,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "posixstress")) cmd_posix_stress();
     else if (!kstrcmp(argv[0], "toolchainstress")) cmd_selfhost_test();
     else if (!kstrcmp(argv[0], "cc")) cmd_cc(argc, argv);
+    else if (!kstrcmp(argv[0], "compilerstress")) cmd_compiler_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -15707,6 +15965,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_apps_stress();      /* v0.54: concurrent ring-3 GUI apps (terminal/sysmon/filer), incl. app crashes */
     cmd_posix_stress();     /* v0.55: fork/exec chains, signal frames, pthread mutexes under SMP */
     cmd_selfhost_test();    /* v0.56: author -> compile -> run, natively (no host toolchain)     */
+    cmd_compiler_stress();  /* v0.57: language completeness + what the compiler must REFUSE      */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();

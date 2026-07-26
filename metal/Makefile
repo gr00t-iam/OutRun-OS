@@ -20,7 +20,7 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-VERSION := 0.56.0
+VERSION := 0.57.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean
@@ -70,7 +70,12 @@ $(BUILD)/ipc_ring.o: cpp/ipc_ring.cpp | $(BUILD)
 # ---- userland: a standalone ring-3 ELF shipped as a boot module ------------
 UCFLAGS := -ffreestanding -O2 -Wall -mcmodel=large -fno-pic -fno-stack-protector -fno-builtin \
            -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -msoft-float
-$(BUILD)/user_init.o: user/init.c | $(BUILD)
+# v0.57: occ.c is #included by init.c, so it is a real prerequisite. Without it
+# listed here, `make` reported success while silently shipping the PREVIOUS
+# compiler — an edit to occ.c alone never reached the image, which cost a full
+# boot cycle to notice. A header-style dependency that make cannot see is worse
+# than a slow build.
+$(BUILD)/user_init.o: user/init.c user/occ.c | $(BUILD)
 	$(CC) $(UCFLAGS) -c $< -o $@
 $(BUILD)/user_init.elf: $(BUILD)/user_init.o user/user.ld
 	$(LD) -n -T user/user.ld $< -o $@
