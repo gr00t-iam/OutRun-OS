@@ -50,11 +50,11 @@
 #define OCC_DATA_BASE   0x0000500000400000ull
 #define OCC_STACK_TOP   0x0000500000FF3C00ull   /* mirrors the kernel's USTK_INIT */
 
-#define OCC_MAXSRC   (48u * 1024u)
+#define OCC_MAXSRC   (192u * 1024u)  /* v0.57: prelude + headers + user code */
 #define OCC_MAXTEXT  (48u * 1024u)
 #define OCC_MAXDATA  (8u * 1024u)
-#define OCC_MAXSYM   96
-#define OCC_MAXFIX   256
+#define OCC_MAXSYM   256
+#define OCC_MAXFIX   1024
 #define OCC_MAXLOC   32
 #define OCC_NAMELEN  32
 
@@ -63,21 +63,22 @@
  * up in the Cyber-Terminal exactly like any other program's output. */
 static int   occ_errors;
 static int   occ_line;
-/* v0.56 Stage F: how many lines of /usr/lib/libc.oc were prepended to this
- * translation unit. Diagnostics subtract it so a user gets THEIR line number,
- * and errors that genuinely land inside the runtime say so instead of quoting
- * a line number the user cannot find in their own file. */
-static int   occ_prelude_lines;
+/* v0.57: the file the current line came from. Maintained by the lexer from the
+ * `#line N FILE` markers the preprocessor emits, which replaces v0.56's
+ * "subtract the prelude's line count" arithmetic — that worked only while the
+ * prelude was the single thing prepended, and #include ended that. */
+#define OCC_FILELEN 64
+static char  occ_file[OCC_FILELEN] = "<none>";
 
 static void occ_err(const char *msg, const char *what) {
     occ_errors++;
-    char b[224]; int n = 0;
-    int in_prelude = (occ_line <= occ_prelude_lines);
-    int shown = in_prelude ? occ_line : occ_line - occ_prelude_lines;
-    const char *p = in_prelude ? "occ: /usr/lib/libc.oc line " : "occ: line ";
+    char b[288]; int n = 0;
+    const char *p = "occ: ";
     while (*p) b[n++] = *p++;
+    for (int k = 0; occ_file[k] && n < 80; k++) b[n++] = occ_file[k];
+    b[n++] = ':';
     /* line number, decimal */
-    { int v = shown, d[8], k = 0; if (!v) d[k++] = 0; while (v) { d[k++] = v % 10; v /= 10; }
+    { int v = occ_line, d[8], k = 0; if (!v) d[k++] = 0; while (v) { d[k++] = v % 10; v /= 10; }
       while (k) b[n++] = (char)('0' + d[--k]); }
     b[n++] = ':'; b[n++] = ' ';
     for (const char *q = msg; *q && n < 160; q++) b[n++] = *q;
@@ -104,6 +105,452 @@ static void occ_note(const char *msg, const char *what) {
     owrite(STDERR_FILENO, b, (u64)n);
 }
 
+/* ===========================================================================
+ * v0.57: THE PREPROCESSOR
+ * ===========================================================================
+ * A genuine pass, not a skip. It runs to completion BEFORE the lexer sees a
+ * single character, turning a source file plus its includes into one expanded
+ * translation unit in `occ_src`. The fused lexer/parser/codegen below is
+ * untouched by it, which is the whole reason for doing it as a separate pass:
+ * a single-pass code generator cannot also be re-entered to expand a macro.
+ *
+ * WHAT IT DOES
+ *   #include <h> / "h"   resolved against /usr/include/ on the VFS (and, for
+ *                        the quoted form, first against the including file's
+ *                        own directory — that is the only difference between
+ *                        the two forms here, and it is the standard one)
+ *   #define NAME body    object-like substitution
+ *   #define NAME(a,b) …  function-like substitution with positional arguments
+ *   #undef NAME
+ *   #ifdef / #ifndef / #else / #endif   nested, so header guards work
+ *   #line n "file"       EMITTED by this pass, CONSUMED by the lexer, so a
+ *                        diagnostic names the user's real file and line even
+ *                        after the prelude and three headers have been pasted
+ *                        in front of their code. This is what replaces v0.56's
+ *                        "subtract the prelude's line count" arithmetic, which
+ *                        could not survive #include at all.
+ *
+ * COMMENTS ARE STRIPPED FIRST, on load, before any directive is looked at.
+ * That ordering is not cosmetic: /usr/include/outrun_abi.h contains
+ *
+ *     #define O_CREAT 1   / * the ONLY defined SYS_OPEN flag. Any other
+ *                           * bit is rejected with -22, on purpose.   * /
+ *
+ * — a macro whose body is followed by a comment that runs onto the next line.
+ * Processing directives first would define O_CREAT as `1 / * the ONLY …`.
+ * Newlines inside comments are preserved so line numbers stay honest.
+ *
+ * HONEST LIMITS, all of them deliberate and none of them hidden:
+ *   - A function-like macro's invocation must fit on one line.
+ *   - Rescanning for nested macros is bounded (OCC_PP_RESCAN passes) rather
+ *     than a proper recursive expansion; a macro that expands to itself is
+ *     also blocked by a per-macro `expanding` flag, so neither can loop.
+ *   - No #if with expressions, no #elif, no ##, no #, no varargs macros.
+ *     #ifdef/#ifndef is what header guards need and that is what is here.
+ * ==========================================================================*/
+/* Shared by the preprocessor and the lexer, so they live above both. */
+static int occ_isalpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+static int occ_isdigit(char c) { return c >= '0' && c <= '9'; }
+static int occ_isalnum(char c) { return occ_isalpha(c) || occ_isdigit(c); }
+
+#define OCC_MAXMACRO    128
+#define OCC_MACRO_BODY  192
+#define OCC_MACRO_PARAM 6
+#define OCC_PP_MAXDEPTH 8
+#define OCC_PP_RESCAN   8
+#define OCC_PP_MAXLINE  1024
+
+struct occ_macro {
+    char name[OCC_NAMELEN];
+    char body[OCC_MACRO_BODY];
+    char params[OCC_MACRO_PARAM][OCC_NAMELEN];
+    int  nparams;                    /* -1 = object-like                      */
+    int  used;
+    int  expanding;                  /* blue paint: no self-recursion         */
+};
+static struct occ_macro occ_macros[OCC_MAXMACRO];
+static int  occ_nmacro;
+
+static char *occ_ppout;              /* the expanded unit being built         */
+static int   occ_ppn;                /* bytes written so far                  */
+static int   occ_ppcap;
+static int   occ_pp_depth;
+static int   occ_pp_includes;        /* how many files were pasted in         */
+
+static int occ_ppeq(const char *a, const char *b) { return ostrneq(a, b, OCC_NAMELEN); }
+
+static int occ_macro_find(const char *n) {
+    for (int i = 0; i < occ_nmacro; i++)
+        if (occ_macros[i].used && occ_ppeq(occ_macros[i].name, n)) return i;
+    return -1;
+}
+static void occ_macro_undef(const char *n) {
+    int i = occ_macro_find(n);
+    if (i >= 0) occ_macros[i].used = 0;
+}
+static void occ_ppemit(const char *s, int n) {
+    for (int i = 0; i < n && occ_ppn < occ_ppcap - 1; i++) occ_ppout[occ_ppn++] = s[i];
+}
+static void occ_ppemitc(char c) { if (occ_ppn < occ_ppcap - 1) occ_ppout[occ_ppn++] = c; }
+static void occ_ppemitz(const char *s) { while (*s) occ_ppemitc(*s++); }
+
+/* `#line N FILE` — the lexer parses these to keep occ_line/occ_file truthful.
+ * The filename is emitted bare (no quotes) because the lexer reads it as a
+ * run of non-space characters, and no path in this system contains a space. */
+static void occ_ppmark(int line, const char *file) {
+    char b[32]; int n = 0, d[10], k = 0, v = line;
+    occ_ppemitz("\n#line ");
+    if (!v) d[k++] = 0;
+    while (v) { d[k++] = v % 10; v /= 10; }
+    while (k) b[n++] = (char)('0' + d[--k]);
+    occ_ppemit(b, n);
+    occ_ppemitc(' ');
+    occ_ppemitz(file);
+    occ_ppemitc('\n');
+}
+
+/* Strip both comment forms in place, keeping every newline so that line
+ * numbers survive. Also collapses a backslash-newline continuation, which is
+ * how a macro body longer than one line is written. */
+static void occ_pp_decomment(char *s) {
+    int r = 0, w = 0;
+    while (s[r]) {
+        if (s[r] == '\\' && s[r + 1] == '\n') { s[w++] = ' '; r += 2; continue; }
+        if (s[r] == '/' && s[r + 1] == '/') {
+            while (s[r] && s[r] != '\n') r++;
+            continue;
+        }
+        if (s[r] == '/' && s[r + 1] == '*') {
+            r += 2;
+            while (s[r] && !(s[r] == '*' && s[r + 1] == '/')) {
+                if (s[r] == '\n') s[w++] = '\n';         /* keep the line count */
+                r++;
+            }
+            if (s[r]) r += 2;
+            s[w++] = ' ';
+            continue;
+        }
+        if (s[r] == '"' || s[r] == '\'') {               /* never look inside   */
+            char q = s[r];
+            s[w++] = s[r++];
+            while (s[r] && s[r] != q) {
+                if (s[r] == '\\' && s[r + 1]) s[w++] = s[r++];
+                s[w++] = s[r++];
+            }
+            if (s[r]) s[w++] = s[r++];
+            continue;
+        }
+        s[w++] = s[r++];
+    }
+    s[w] = 0;
+}
+
+static int occ_ppspace(char c) { return c == ' ' || c == '\t' || c == '\r'; }
+
+/* Copy one identifier out of `s` at `i`; returns its length. */
+static int occ_ppident(const char *s, int i, char *out, int cap) {
+    int n = 0;
+    while (s[i] && occ_isalnum(s[i]) && n < cap - 1) out[n++] = s[i++];
+    out[n] = 0;
+    return n;
+}
+
+/* Substitute every macro invocation in `in`, writing to `out`. Returns 1 if
+ * anything was replaced, so the caller can rescan for nested macros. */
+static int occ_pp_expand_once(const char *in, char *out, int cap) {
+    int i = 0, o = 0, did = 0;
+    while (in[i] && o < cap - 1) {
+        if (in[i] == '"' || in[i] == '\'') {             /* literals are opaque */
+            char q = in[i];
+            out[o++] = in[i++];
+            while (in[i] && in[i] != q && o < cap - 2) {
+                if (in[i] == '\\' && in[i + 1]) out[o++] = in[i++];
+                out[o++] = in[i++];
+            }
+            if (in[i]) out[o++] = in[i++];
+            continue;
+        }
+        if (!occ_isalpha(in[i])) { out[o++] = in[i++]; continue; }
+
+        char id[OCC_NAMELEN];
+        int  idl = occ_ppident(in, i, id, sizeof id);
+        int  mi  = occ_macro_find(id);
+        if (mi < 0 || occ_macros[mi].expanding) {
+            for (int k = 0; k < idl && o < cap - 1; k++) out[o++] = in[i + k];
+            i += idl;
+            continue;
+        }
+        struct occ_macro *m = &occ_macros[mi];
+
+        if (m->nparams < 0) {                            /* object-like        */
+            i += idl;
+            m->expanding = 1;
+            for (const char *p = m->body; *p && o < cap - 1; p++) out[o++] = *p;
+            m->expanding = 0;
+            did = 1;
+            continue;
+        }
+
+        /* function-like: it is only an invocation if a '(' follows */
+        int j = i + idl;
+        while (in[j] && occ_ppspace(in[j])) j++;
+        if (in[j] != '(') {
+            for (int k = 0; k < idl && o < cap - 1; k++) out[o++] = in[i + k];
+            i += idl;
+            continue;
+        }
+        j++;                                             /* past '('           */
+        char args[OCC_MACRO_PARAM][OCC_MACRO_BODY];
+        int  na = 0, depth = 1;
+        for (int a = 0; a < OCC_MACRO_PARAM; a++) args[a][0] = 0;
+        int al = 0;
+        while (in[j] && depth > 0) {
+            if (in[j] == '(') depth++;
+            else if (in[j] == ')') { depth--; if (!depth) { j++; break; } }
+            if (depth == 1 && in[j] == ',') {
+                if (na < OCC_MACRO_PARAM - 1) { args[na][al] = 0; na++; al = 0; }
+                j++;
+                while (in[j] && occ_ppspace(in[j])) j++;
+                continue;
+            }
+            if (na < OCC_MACRO_PARAM && al < OCC_MACRO_BODY - 1) args[na][al++] = in[j];
+            j++;
+        }
+        if (na < OCC_MACRO_PARAM) { args[na][al] = 0; na++; }
+        if (na != m->nparams) {
+            occ_err("wrong argument count for macro", m->name);
+            for (int k = 0; k < idl && o < cap - 1; k++) out[o++] = in[i + k];
+            i += idl;
+            continue;
+        }
+        /* paste the body, replacing parameter names with the actual arguments */
+        m->expanding = 1;
+        for (int b = 0; m->body[b] && o < cap - 1; ) {
+            if (!occ_isalpha(m->body[b])) { out[o++] = m->body[b++]; continue; }
+            char bid[OCC_NAMELEN];
+            int bl = occ_ppident(m->body, b, bid, sizeof bid);
+            int pi = -1;
+            for (int p = 0; p < m->nparams; p++) if (occ_ppeq(m->params[p], bid)) { pi = p; break; }
+            if (pi >= 0) {
+                out[o++] = '(';                          /* keep precedence     */
+                for (const char *q = args[pi]; *q && o < cap - 2; q++) out[o++] = *q;
+                if (o < cap - 1) out[o++] = ')';
+            } else {
+                for (int k = 0; k < bl && o < cap - 1; k++) out[o++] = m->body[b + k];
+            }
+            b += bl;
+        }
+        m->expanding = 0;
+        i = j;
+        did = 1;
+    }
+    out[o] = 0;
+    return did;
+}
+
+static void occ_pp_expand(const char *in, char *out, int cap) {
+    static char a[OCC_PP_MAXLINE * 2], b[OCC_PP_MAXLINE * 2];
+    int n = 0;
+    while (in[n] && n < (int)sizeof a - 1) { a[n] = in[n]; n++; }
+    a[n] = 0;
+    for (int pass = 0; pass < OCC_PP_RESCAN; pass++) {
+        if (!occ_pp_expand_once(a, b, (int)sizeof b)) break;
+        for (n = 0; b[n] && n < (int)sizeof a - 1; n++) a[n] = b[n];
+        a[n] = 0;
+    }
+    int o = 0;
+    while (a[o] && o < cap - 1) { out[o] = a[o]; o++; }
+    out[o] = 0;
+}
+
+static void occ_pp_file(const char *path);
+
+/* Resolve an #include target. `<x>` looks only in /usr/include; `"x"` tries
+ * the including file's own directory first, then falls back the same way. */
+static void occ_pp_include(const char *spec, int angled, const char *from) {
+    char path[OCC_MACRO_BODY];
+    int n = 0;
+    if (!angled) {
+        int slash = -1;
+        for (int i = 0; from[i]; i++) if (from[i] == '/') slash = i;
+        if (slash > 0) {
+            for (int i = 0; i <= slash && n < (int)sizeof path - 1; i++) path[n++] = from[i];
+            for (int i = 0; spec[i] && n < (int)sizeof path - 1; i++) path[n++] = spec[i];
+            path[n] = 0;
+            if (oopen(path) >= 0) { occ_pp_file(path); return; }
+            /* not there: fall through to the system directory */
+            n = 0;
+        }
+    }
+    const char *inc = "/usr/include/";
+    n = 0;
+    for (int i = 0; inc[i] && n < (int)sizeof path - 1; i++) path[n++] = inc[i];
+    for (int i = 0; spec[i] && n < (int)sizeof path - 1; i++) path[n++] = spec[i];
+    path[n] = 0;
+    occ_pp_file(path);
+}
+
+/* Process one file into occ_ppout. Recursive, depth-limited. */
+static void occ_pp_file(const char *path) {
+    if (occ_pp_depth >= OCC_PP_MAXDEPTH) { occ_err("#include nested too deeply at", path); return; }
+
+    int fd = oopen(path);
+    if (fd < 0) { occ_err("cannot open include", path); return; }
+    char *buf = (char *)omalloc(OCC_MAXSRC);
+    if (!buf) { oclose(fd); occ_err("out of memory reading", path); return; }
+    i64 n = oread(fd, buf, OCC_MAXSRC - 1);
+    oclose(fd);
+    if (n < 0) { ofree(buf); occ_err("cannot read", path); return; }
+    while (n > 0 && buf[n - 1] == 0) n--;                /* stored NUL, if any */
+    buf[n] = 0;
+    occ_pp_decomment(buf);
+    occ_pp_depth++;
+    occ_pp_includes++;
+
+    /* Conditional-compilation stack. `cond_active[k]` is strictly "level k's
+     * OWN branch is the live one" — never "we are emitting at level k". Those
+     * two are different and conflating them is the classic way nested
+     * conditionals go wrong: `emitting` is the AND across all open levels and
+     * is recomputed from scratch by occ_pp_emitting() whenever the stack
+     * changes, so no level's state depends on the order it was pushed. */
+    int  cond_active[16], cond_taken[16];
+    int  ncond = 0;
+    int  emitting = 1;
+    int  line = 1;
+    occ_ppmark(line, path);
+
+    int i = 0;
+    static char raw[OCC_PP_MAXLINE], exp[OCC_PP_MAXLINE * 2];
+    while (buf[i]) {
+        int l = 0;
+        while (buf[i] && buf[i] != '\n' && l < OCC_PP_MAXLINE - 1) raw[l++] = buf[i++];
+        raw[l] = 0;
+        if (buf[i] == '\n') i++;
+
+        int p = 0;
+        while (raw[p] && occ_ppspace(raw[p])) p++;
+
+        if (raw[p] == '#') {
+            p++;
+            while (raw[p] && occ_ppspace(raw[p])) p++;
+            char dir[OCC_NAMELEN];
+            int dl = occ_ppident(raw, p, dir, sizeof dir);
+            p += dl;
+            while (raw[p] && occ_ppspace(raw[p])) p++;
+
+            if (occ_ppeq(dir, "ifdef") || occ_ppeq(dir, "ifndef")) {
+                char nm[OCC_NAMELEN];
+                occ_ppident(raw, p, nm, sizeof nm);
+                int have = occ_macro_find(nm) >= 0;
+                int want = occ_ppeq(dir, "ifdef") ? have : !have;
+                if (ncond < 16) {
+                    cond_active[ncond] = want;
+                    cond_taken[ncond]  = want;
+                    ncond++;
+                    emitting = 1;
+                    for (int k = 0; k < ncond; k++) if (!cond_active[k]) emitting = 0;
+                } else occ_err("#ifdef nested too deeply in", path);
+                line++; continue;
+            }
+            if (occ_ppeq(dir, "else")) {
+                if (ncond > 0) {
+                    cond_active[ncond - 1] = !cond_taken[ncond - 1];
+                    cond_taken[ncond - 1]  = 1;
+                    emitting = 1;
+                    for (int k = 0; k < ncond; k++) if (!cond_active[k]) emitting = 0;
+                } else occ_err("#else without #ifdef in", path);
+                line++; continue;
+            }
+            if (occ_ppeq(dir, "endif")) {
+                if (ncond > 0) {
+                    ncond--;
+                    emitting = 1;
+                    for (int k = 0; k < ncond; k++) if (!cond_active[k]) emitting = 0;
+                } else occ_err("#endif without #ifdef in", path);
+                line++; continue;
+            }
+            if (!emitting) { line++; continue; }
+
+            if (occ_ppeq(dir, "define")) {
+                char nm[OCC_NAMELEN];
+                int nl = occ_ppident(raw, p, nm, sizeof nm);
+                p += nl;
+                int mi = occ_macro_find(nm);
+                if (mi < 0) {
+                    if (occ_nmacro >= OCC_MAXMACRO) { occ_err("too many macros at", nm); line++; continue; }
+                    mi = occ_nmacro++;
+                }
+                struct occ_macro *m = &occ_macros[mi];
+                for (int k = 0; k < OCC_NAMELEN; k++) m->name[k] = nm[k];
+                m->used = 1; m->expanding = 0; m->nparams = -1;
+                if (raw[p] == '(') {                     /* function-like       */
+                    p++;
+                    m->nparams = 0;
+                    for (;;) {
+                        while (raw[p] && occ_ppspace(raw[p])) p++;
+                        if (raw[p] == ')') { p++; break; }
+                        char pn[OCC_NAMELEN];
+                        int pl = occ_ppident(raw, p, pn, sizeof pn);
+                        if (!pl) { p++; continue; }
+                        p += pl;
+                        if (m->nparams < OCC_MACRO_PARAM) {
+                            for (int k = 0; k < OCC_NAMELEN; k++) m->params[m->nparams][k] = pn[k];
+                            m->nparams++;
+                        } else occ_err("too many macro parameters in", nm);
+                        while (raw[p] && occ_ppspace(raw[p])) p++;
+                        if (raw[p] == ',') { p++; continue; }
+                        if (raw[p] == ')') { p++; break; }
+                        if (!raw[p]) break;
+                    }
+                }
+                while (raw[p] && occ_ppspace(raw[p])) p++;
+                int b = 0;
+                while (raw[p] && b < OCC_MACRO_BODY - 1) m->body[b++] = raw[p++];
+                while (b > 0 && occ_ppspace(m->body[b - 1])) b--;   /* trim tail */
+                m->body[b] = 0;
+                line++; continue;
+            }
+            if (occ_ppeq(dir, "undef")) {
+                char nm[OCC_NAMELEN];
+                occ_ppident(raw, p, nm, sizeof nm);
+                occ_macro_undef(nm);
+                line++; continue;
+            }
+            if (occ_ppeq(dir, "include")) {
+                char spec[OCC_MACRO_BODY];
+                int angled = 0, s = 0;
+                if (raw[p] == '<' || raw[p] == '"') {
+                    char close = (raw[p] == '<') ? '>' : '"';
+                    angled = (raw[p] == '<');
+                    p++;
+                    while (raw[p] && raw[p] != close && s < (int)sizeof spec - 1) spec[s++] = raw[p++];
+                    spec[s] = 0;
+                    occ_pp_include(spec, angled, path);
+                    occ_ppmark(++line, path);            /* back to this file   */
+                    continue;
+                }
+                occ_err("malformed #include in", path);
+                line++; continue;
+            }
+            if (occ_ppeq(dir, "line")) { line++; continue; }   /* ours; ignore  */
+            /* Anything else (#pragma, #if, #elif, #error) is SKIPPED rather
+             * than guessed at, and says so instead of silently mis-compiling. */
+            occ_err("unsupported preprocessor directive", dir);
+            line++; continue;
+        }
+
+        if (emitting) {
+            occ_pp_expand(raw, exp, (int)sizeof exp);
+            occ_ppemitz(exp);
+        }
+        occ_ppemitc('\n');
+        line++;
+    }
+    if (ncond) occ_err("unterminated #ifdef in", path);
+    occ_pp_depth--;
+    ofree(buf);
+}
+
 /* ---- lexer ---------------------------------------------------------------*/
 enum { T_EOF = 0, T_NUM, T_IDENT, T_STR, T_PUNCT, T_KW };
 
@@ -115,9 +562,6 @@ static char  occ_txt[OCC_NAMELEN];   /* T_IDENT / T_KW / T_PUNCT spelling */
 static char  occ_str[256];           /* T_STR contents          */
 static int   occ_strlen_;
 
-static int occ_isalpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
-static int occ_isdigit(char c) { return c >= '0' && c <= '9'; }
-static int occ_isalnum(char c) { return occ_isalpha(c) || occ_isdigit(c); }
 
 static int occ_kw(const char *s) {
     static const char *kws[] = { "int", "char", "return", "if", "else", "while",
@@ -145,11 +589,32 @@ static void occ_next(void) {
             if (occ_src[occ_pos]) occ_pos += 2;
             continue;
         }
-        /* A #include or any other directive is SKIPPED, not processed: occ has
-         * no preprocessor, and silently ignoring the line is more useful than
-         * failing, because the SDK headers exist to be read by humans and by a
-         * future front end. Declarations still have to appear in the file. */
-        if (c == '#') { while (occ_src[occ_pos] && occ_src[occ_pos] != '\n') occ_pos++; continue; }
+        /* v0.57: the ONLY directive that can still be here is `#line N FILE`,
+         * which the preprocessor emitted for us. Consuming it is what makes a
+         * diagnostic name the user's own file and line after the prelude and
+         * several headers have been pasted in front of their code — the thing
+         * v0.56's "subtract the prelude's line count" arithmetic could not do
+         * once #include existed. Any other '#' means the preprocessor missed
+         * something, so it is skipped and reported rather than ignored. */
+        if (c == '#') {
+            int q = occ_pos + 1;
+            if (occ_src[q] == 'l' && occ_src[q+1] == 'i' && occ_src[q+2] == 'n' && occ_src[q+3] == 'e') {
+                q += 4;
+                while (occ_src[q] == ' ' || occ_src[q] == '\t') q++;
+                int v = 0;
+                while (occ_isdigit(occ_src[q])) { v = v * 10 + (occ_src[q] - '0'); q++; }
+                while (occ_src[q] == ' ' || occ_src[q] == '\t') q++;
+                int n = 0;
+                while (occ_src[q] && occ_src[q] != '\n' && n < OCC_FILELEN - 1) occ_file[n++] = occ_src[q++];
+                occ_file[n] = 0;
+                occ_line = v;
+                occ_pos  = q;
+                continue;                        /* occ_line is now authoritative */
+            }
+            occ_err("stray preprocessor directive reached the lexer", 0);
+            while (occ_src[occ_pos] && occ_src[occ_pos] != '\n') occ_pos++;
+            continue;
+        }
         break;
     }
     char c = occ_src[occ_pos];
@@ -684,8 +1149,6 @@ static void occ_toplevel(void) {
 
         if (occ_accept("(")) {                                   /* function */
             int si = occ_sym_get(nm, 0);
-            occ_syms[si].addr = occ_tlen;
-            occ_syms[si].defined = 1;
             occ_nloc = 0; occ_frame = 0;
 
             /* parameters become the first locals */
@@ -704,6 +1167,23 @@ static void occ_toplevel(void) {
                 if (!occ_accept(",")) break;
             }
             occ_expect(")");
+
+            /* v0.57: a PROTOTYPE — `int strlen(char *s);` — ends here with a
+             * semicolon and emits nothing. This became mandatory the moment
+             * #include started pasting real header text into the unit: every
+             * declaration in /usr/include/string.h would otherwise be parsed as
+             * a function DEFINITION whose body turned out to be a ';'.
+             *
+             * The symbol is registered but deliberately left `defined = 0`, so
+             * the existing fixup pass still reports "undefined function" for
+             * anything declared and never defined — a prototype is a promise,
+             * not an implementation, and occ has no linker to satisfy it from
+             * somewhere else. Nothing was emitted while parsing the parameter
+             * list, so unwinding here is just resetting the frame bookkeeping. */
+            if (occ_accept(";")) { occ_nloc = 0; occ_frame = 0; continue; }
+
+            occ_syms[si].addr = occ_tlen;
+            occ_syms[si].defined = 1;
 
             occ_emit(0x55);                                      /* push rbp        */
             occ_emit(0x48); occ_emit(0x89); occ_emit(0xE5);      /* mov rbp,rsp     */
@@ -816,43 +1296,41 @@ static int occ_compile(const char *srcpath, const char *outpath) {
     occ_rod  = (u8 *)omalloc(OCC_MAXDATA);
     if (!occ_src || !occ_text || !occ_data || !occ_rod) { occ_err("out of memory", 0); return -1; }
 
-    /* v0.56 Stage F: THE PRELUDE. /usr/lib/libc.oc is read out of the VFS and
-     * placed AHEAD of the user's source in the same buffer, so its definitions
-     * are already in scope — and already emitted — by the time the user's code
-     * is parsed. That ordering matters for a single-pass compiler: a prelude
-     * appended afterwards would need a forward fixup for every libc call, and
-     * a prelude in a separate buffer would need a linker, which occ does not
-     * have. Source inclusion IS occ's linkage model, and this is it.
+    /* v0.57: THE PREPROCESSOR BUILDS THE TRANSLATION UNIT.
      *
-     * A missing /usr/lib/libc.oc is not fatal: the program simply compiles
-     * without a runtime, and any call it makes to strlen() fails the ordinary
-     * "undefined function" check. That is the property that makes /usr/lib
-     * genuinely load-bearing rather than decorative — remove it and compiles
-     * that depend on it start failing, with a diagnostic that names it. */
-    occ_prelude_lines = 0;
-    u64 base = 0;
-    int lfd = oopen("/usr/lib/libc.oc");
-    if (lfd >= 0) {
-        i64 ln = oread(lfd, occ_src, OCC_MAXSRC / 2);
-        oclose(lfd);
-        if (ln > 0) {
-            /* oread includes the stored NUL; drop it or the lexer stops here. */
-            while (ln > 0 && occ_src[ln - 1] == 0) ln--;
-            for (i64 i = 0; i < ln; i++) if (occ_src[i] == '\n') occ_prelude_lines++;
-            occ_src[ln] = '\n'; occ_prelude_lines++;
-            base = (u64)ln + 1;
-        }
-    } else {
-        occ_note("no /usr/lib/libc.oc — compiling with no runtime;",
-                 "calls to strlen/puts/malloc will be undefined");
-    }
+     * v0.56 concatenated /usr/lib/libc.oc and the user's file into one buffer
+     * by hand and skipped every '#' line. That was the honest thing to do with
+     * no preprocessor, but it could not survive #include: line numbers were
+     * corrected by subtracting a fixed prelude length, which is meaningless
+     * once a third and fourth file can be pasted in at arbitrary points.
+     *
+     * Now both go through occ_pp_file(), which emits `#line N FILE` markers the
+     * lexer consumes — so the prelude, every header, and the user's own code
+     * all report their own real names and line numbers. The prelude is still
+     * FIRST, for the same single-pass reason as before: definitions must be
+     * emitted before the code that calls them, or every call needs a fixup.
+     *
+     * The prelude is included as source, not linked, because occ still has no
+     * linker. That has not changed and is not being implied away. */
+    occ_ppout = occ_src; occ_ppn = 0; occ_ppcap = (int)OCC_MAXSRC;
+    occ_pp_depth = 0; occ_pp_includes = 0;
+    occ_nmacro = 0;
+    for (int i = 0; i < OCC_MAXMACRO; i++) { occ_macros[i].used = 0; occ_macros[i].expanding = 0; }
 
-    int fd = oopen(srcpath);
-    if (fd < 0) { occ_err("cannot open source", srcpath); return -2; }
-    i64 n = oread(fd, occ_src + base, OCC_MAXSRC - 1 - base);
-    oclose(fd);
-    if (n < 0) { occ_err("cannot read source", srcpath); return -2; }
-    occ_src[base + (u64)n] = 0;
+    /* These are existence probes, and they must CLOSE what they open —
+     * occ_pp_file opens the file itself. Leaking a descriptor per probe would
+     * burn two of the sixteen global kernel descriptors on every compile. */
+    { int t = oopen("/usr/lib/libc.oc");
+      if (t >= 0) { oclose(t); occ_pp_file("/usr/lib/libc.oc"); }
+      else occ_note("no /usr/lib/libc.oc - compiling with no runtime;",
+                    "calls to strlen/puts/malloc will be undefined"); }
+
+    { int t = oopen(srcpath);
+      if (t < 0) { occ_err("cannot open source", srcpath); return -2; }
+      oclose(t); }
+    occ_pp_file(srcpath);
+    occ_src[occ_ppn] = 0;
+    if (occ_errors) return -3;
 
     /* A tiny entry stub is emitted FIRST so the ELF entry point is offset 0:
      * it calls main and turns the return value into SYS_EXIT. This is the crt0
@@ -897,6 +1375,27 @@ static int occ_compile(const char *srcpath, const char *outpath) {
     oclose(ofd);
     ofree(img);
     ofree(occ_src); ofree(occ_text); ofree(occ_data); ofree(occ_rod);
-    if (w != (i64)len) { occ_err("short write to", outpath); return -6; }
+    if (w != (i64)len) {
+        /* "short write" alone is not actionable: whether the image is too big,
+         * the filesystem refused it, or the descriptor went bad are three
+         * different faults with the same symptom. Report all of it. */
+        char b[160]; int bn = 0;
+        const char *pre = "short write: len=";
+        while (*pre) b[bn++] = *pre++;
+        struct { const char *lbl; i64 v; } f[] = {
+            { 0, (i64)len }, { " wrote=", w }, { " text=", occ_tlen },
+            { " rodata=", occ_rlen }, { " data=", occ_dlen },
+        };
+        for (int k = 0; k < 5; k++) {
+            if (f[k].lbl) { const char *q = f[k].lbl; while (*q) b[bn++] = *q++; }
+            i64 v = f[k].v; if (v < 0) { b[bn++] = '-'; v = -v; }
+            int d[20], dk = 0; if (!v) d[dk++] = 0;
+            while (v) { d[dk++] = (int)(v % 10); v /= 10; }
+            while (dk) b[bn++] = (char)('0' + d[--dk]);
+        }
+        b[bn] = 0;
+        occ_err(b, outpath);
+        return -6;
+    }
     return 0;
 }

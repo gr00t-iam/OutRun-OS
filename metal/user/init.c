@@ -1958,12 +1958,37 @@ static void posix_execpath_worker(void) {
  *     fib(10)  = 55   recursion through the fixup table
  *     strlen   =  6   byte addressing via __ldb (a[i] alone cannot do this)
  *     atoi     = 11   byte addressing plus the digit loop
- *     (1<<4)|3 = 19   the new shift and bitwise-or levels
+ *     (1<<4)|3 = 19   the shift and bitwise-or levels
+ *     BONUS    =  7   v0.57: an object-like #define
+ *     ADD(1,2) =  3   v0.57: a function-like #define with arguments
+ *     PPOK     =  5   v0.57: #ifdef took the taken branch (the other is 999,
+ *                     so picking wrong is unmissable rather than off-by-one)
+ *     GUARD_OK =  2   v0.57: #ifndef — the shape every header guard uses
  *                ---
- *                119
+ *                136
  *
  * Exit 940 = the produced binary ran and returned exactly that. */
+/* v0.57: the source now starts with REAL preprocessing. Every line above main()
+ * is load-bearing: the three #includes are resolved against /usr/include on the
+ * VFS and their prototypes are parsed, SYS_WRITE comes from outrun_abi.h rather
+ * than a hardcoded 0, ADD is a function-like macro, and the #ifdef/#else pair
+ * proves conditional compilation picks the taken branch and discards the other.
+ * If any of that silently did nothing, the arithmetic below stops adding up. */
 #define SELF_SRC \
+  "#include <stdio.h>\n" \
+  "#include <string.h>\n" \
+  "#include <outrun_abi.h>\n" \
+  "#define BONUS 7\n" \
+  "#define ADD(a,b) ((a) + (b))\n" \
+  "#define WANT_PP 1\n" \
+  "#ifdef WANT_PP\n" \
+  "#define PPOK 5\n" \
+  "#else\n" \
+  "#define PPOK 999\n" \
+  "#endif\n" \
+  "#ifndef NOT_DEFINED\n" \
+  "#define GUARD_OK 2\n" \
+  "#endif\n" \
   "int fib(int n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }\n" \
   "int main() {\n" \
   "  int s; int i; char *p;\n" \
@@ -1980,6 +2005,11 @@ static void posix_execpath_worker(void) {
   "  if (strlen(p) != 3) { return 904; }\n" \
   "  if (__ldb(p, 0) != 115) { return 905; }\n" \
   "  s = s + ((1 << 4) | 3);\n" \
+  "  s = s + BONUS;\n" \
+  "  s = s + ADD(1, 2);\n" \
+  "  s = s + PPOK;\n" \
+  "  s = s + GUARD_OK;\n" \
+  "  __syscall(SYS_WRITE, \"  [a.out ] SYS_WRITE came from <outrun_abi.h>\\n\", 0, 0);\n" \
   "  puts(\"  [a.out ] compiled by occ against /usr/lib/libc.oc; main returns \");\n" \
   "  putdec(s); puts(\"\\n\");\n" \
   "  return s;\n" \
@@ -2025,14 +2055,15 @@ static void posix_selfhost_worker(void) {
     if (pid < 0)                                  sysc(SYS_EXIT, 945, 0, 0);
     i64 rst = owaitpid((u32)pid, 250000);
     if (rst == -11)                               sysc(SYS_EXIT, 948, 0, 0);
-    /* 28 + 55 + 6 + 11 + 19 — see the SELF_SRC comment for what each proves.
+    /* 28 + 55 + 6 + 11 + 19 + 7 (BONUS) + 3 (ADD) + 5 (PPOK) + 2 (GUARD_OK)
+     * — see the SELF_SRC comment for what each proves.
      * The value is PRINTED on failure: "the program returned the wrong answer"
      * is not actionable, but "it returned 100" points straight at which of the
      * five contributions above did not happen. */
-    if (rst != 119) {
+    if (rst != 136) {
         oputs("  [self  ] the compiled program returned ");
         sysc(SYS_WRITEHEX, (u64)rst, 0, 0);
-        oputs(" hex (want 77 hex = 119)\n");
+        oputs(" hex (want 88 hex = 136)\n");
         sysc(SYS_EXIT, 946, 0, 0);
     }
 
