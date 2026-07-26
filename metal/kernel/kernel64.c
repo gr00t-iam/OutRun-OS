@@ -4194,7 +4194,7 @@ static int vfs_open_for(const char *name, int owner, int creat) {
      * "prove this name is gone" check silently created the name it was checking
      * for. The new dirent is claimed under the same lock that found it missing,
      * so two cores opening the same new path cannot both claim a slot. */
-    if (di < 0 && creat) {
+    if (di < 0 && creat && name[0]) {   /* never create an unnamed dirent */
         for (int i = 0; i < VFS_MAXFILES; i++) if (!DENTS[i].used) {
             cmemset(&DENTS[i], 0, 256);
             kstrcpy_n(DENTS[i].name, name, VFS_NAME_MAX);
@@ -8034,8 +8034,17 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         char name[64];
         if (copy_user_str(kprocs[current_proc_idx].cr3, a0, name, sizeof name) < 0) return (uint64_t)-14;
         fs_witness_enter();
-        /* v0.56: a1 is now a flags word; bit 0 is O_CREAT. Every pre-v0.56
-         * caller passes 0, so plain open keeps failing on a missing name. */
+        /* v0.56: a1 is a flags word; bit 0 is O_CREAT and nothing else is defined
+         * yet. UNKNOWN BITS ARE REJECTED — an ABI that silently ignores flags it
+         * does not understand cannot ever add one safely, and here it was worse
+         * than that: cmd_fuzz throws random values at syscall arguments, so a
+         * random a1 with bit 0 set had the fuzzer CREATING garbage-named files
+         * and claiming descriptors it never closes. That poisoned the global
+         * descriptor table for every later suite that audits it (cio, dmastrs,
+         * kpstrs, ipcstrs, vfsstrs, posixstrs all failed identically and
+         * intermittently). The fuzzer was right; the flags word was not
+         * validated. */
+        if (a1 & ~1ull) return (uint64_t)-22;              /* EINVAL */
         int fd = (a1 & 1) ? vfs_open_creat(name) : vfs_open(name);
         fs_witness_leave();
         return (uint64_t)(int64_t)fd;
