@@ -1918,10 +1918,46 @@ static void posix_heap_worker(void) {
  * argv is the command line: occ <source.c> <output.elf>. Diagnostics go to
  * stderr, so a compile error lands in the Cyber-Terminal like any other
  * program's output. Exit status is 0 on success. */
+#define OCC_MAXINPUT 8
+
+/* v0.57: the command line accepts SEVERAL sources.
+ *
+ *     occ a.c b.c c.c -o out.elf     explicit output
+ *     occ a.c out.elf                the legacy two-argument form
+ *
+ * The `-o` form is the real one. The positional form is kept because every
+ * existing caller uses it — including the self-hosting driver and the `cc`
+ * shell command — and silently changing what the last argument means would
+ * turn a working invocation into one that overwrites its own source. When no
+ * -o is given the LAST argument is the output, which is why a bare
+ * `occ a.c b.c` is rejected rather than guessed at: with no -o there is no way
+ * to tell a second input from an output path. */
 static void occ_main(int argc, const char **argv) {
-    const char *src = (argc >= 2) ? argv[1] : "/src/hello.c";
-    const char *out = (argc >= 3) ? argv[2] : "/bin/a.out";
-    int r = occ_compile(src, out);
+    const char *srcs[OCC_MAXINPUT];
+    int nsrc = 0;
+    const char *out = 0;
+
+    for (int i = 1; i < argc && argv[i]; i++) {
+        if (ostrneq(argv[i], "-o", 3)) {
+            if (i + 1 < argc && argv[i + 1]) out = argv[++i];
+            else { oputs("occ: -o needs a path\n"); sysc(SYS_EXIT, 902, 0, 0); }
+            continue;
+        }
+        if (nsrc < OCC_MAXINPUT) srcs[nsrc++] = argv[i];
+        else { oputs("occ: too many input files\n"); sysc(SYS_EXIT, 903, 0, 0); }
+    }
+
+    if (!out) {
+        /* legacy positional form: the last argument is the output */
+        if (nsrc < 2) {
+            oputs("usage: occ <source.c>... -o <output.elf>\n");
+            sysc(SYS_EXIT, 904, 0, 0);
+        }
+        out = srcs[--nsrc];
+    }
+    if (!nsrc) { oputs("occ: no input files\n"); sysc(SYS_EXIT, 905, 0, 0); }
+
+    int r = occ_compile(srcs, nsrc, out);
     if (r == 0) oputs("  [occ   ] compiled OK\n");
     sysc(SYS_EXIT, r == 0 ? 0 : (u64)(900 + (-r)), 0, 0);
 }
@@ -1965,8 +2001,10 @@ static void posix_execpath_worker(void) {
  *                     so picking wrong is unmissable rather than off-by-one)
  *     GUARD_OK =  2   v0.57: #ifndef — the shape every header guard uses
  *     n1.in.a+b =  7   v0.57: NESTED struct member reads through two levels
+ *     helper2(2) = 4   v0.57: a CROSS-UNIT call into /src/lib2.c, which itself
+ *                     calls fib() back in this file — 2 + fib(3) = 4
  *                ---
- *                143
+ *                147
  *
  * The struct block also returns 910-918 on specific failures rather than a
  * wrong total, so a broken offset says WHICH property broke. The two that
@@ -1984,6 +2022,33 @@ static void posix_execpath_worker(void) {
  * than a hardcoded 0, ADD is a function-like macro, and the #ifdef/#else pair
  * proves conditional compilation picks the taken branch and discards the other.
  * If any of that silently did nothing, the arithmetic below stops adding up. */
+/* v0.57 Stage C: a header shared by BOTH units, authored next to them so the
+ * quoted #include form has to resolve it relative to /src/ rather than
+ * /usr/include. Because each unit is preprocessed with a fresh macro table,
+ * this header's guard is fresh too and its text really is pasted into both —
+ * which is exactly why occ accepts a struct redefinition whose layout is
+ * identical and rejects one whose layout is not. */
+#define SELF_HDR \
+  "#ifndef SHARED_H\n" \
+  "#define SHARED_H 1\n" \
+  "struct Inner { int a; int b; };\n" \
+  "struct Outer { char tag; int val; struct Inner in; struct Outer *next; };\n" \
+  "union U { int word; char byte; };\n" \
+  "typedef struct Outer Node;\n" \
+  "int helper2(int x);\n" \
+  "int fib(int n);\n" \
+  "#endif\n"
+
+/* The SECOND translation unit. It calls fib(), which is defined in the FIRST
+ * one, and is itself called from the first — so a single compile has to resolve
+ * a reference in each direction: backward to an already-emitted function, and
+ * forward through the fixup table to one that does not exist yet. It also uses
+ * Node, proving the shared header reached this unit too. */
+#define SELF_SRC2 \
+  "#include \"shared.h\"\n" \
+  "int helper2(int x) { return x + fib(3); }\n" \
+  "int tag_of(Node *p) { return p->tag; }\n"
+
 #define SELF_SRC \
   "#include <stdio.h>\n" \
   "#include <string.h>\n" \
@@ -1999,10 +2064,7 @@ static void posix_execpath_worker(void) {
   "#ifndef NOT_DEFINED\n" \
   "#define GUARD_OK 2\n" \
   "#endif\n" \
-  "struct Inner { int a; int b; };\n" \
-  "struct Outer { char tag; int val; struct Inner in; struct Outer *next; };\n" \
-  "union U { int word; char byte; };\n" \
-  "typedef struct Outer Node;\n" \
+  "#include \"shared.h\"\n" \
   "int bump(Node *p) { p->val = p->val + 1; return p->val; }\n" \
   "int fib(int n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }\n" \
   "int main() {\n" \
@@ -2039,7 +2101,9 @@ static void posix_execpath_worker(void) {
   "    n1.tag = 300;\n" \
   "    if (n1.tag != 44) { return 917; }\n" \
   "    if (n1.val != 10) { return 918; }\n" \
+  "    if (tag_of(&n1) != 44) { return 919; }\n" \
   "    s = s + n1.in.a + n1.in.b;\n" \
+  "    s = s + helper2(2);\n" \
   "  }\n" \
   "  __syscall(SYS_WRITE, \"  [a.out ] SYS_WRITE came from <outrun_abi.h>\\n\", 0, 0);\n" \
   "  puts(\"  [a.out ] compiled by occ against /usr/lib/libc.oc; main returns \");\n" \
@@ -2047,18 +2111,30 @@ static void posix_execpath_worker(void) {
   "  return s;\n" \
   "}\n"
 
-static void posix_selfhost_worker(void) {
-    static const char *csrc = SELF_SRC;
-    /* 1. author the source into the VFS */
-    int fd = ocreat("/src/t.c");
-    if (fd < 0)                                   sysc(SYS_EXIT, 941, 0, 0);
-    if (owrite(fd, csrc, ostrlen(csrc) + 1) <= 0) sysc(SYS_EXIT, 942, 0, 0);
+/* Author one file into the VFS; returns 0 on success. */
+static int selfhost_author(const char *path, const char *text) {
+    int fd = ocreat(path);
+    if (fd < 0) return -1;
+    if (owrite(fd, text, ostrlen(text) + 1) <= 0) { oclose(fd); return -2; }
     oclose(fd);
+    return 0;
+}
 
-    /* 2. compile it, in a separate process running the real compiler */
+static void posix_selfhost_worker(void) {
+    static const char *csrc  = SELF_SRC;
+    static const char *csrc2 = SELF_SRC2;
+    static const char *chdr  = SELF_HDR;
+    /* 1. author a shared header and TWO translation units into the VFS */
+    if (selfhost_author("/src/shared.h", chdr) < 0) sysc(SYS_EXIT, 941, 0, 0);
+    if (selfhost_author("/src/t.c",      csrc) < 0) sysc(SYS_EXIT, 942, 0, 0);
+    if (selfhost_author("/src/lib2.c",   csrc2) < 0) sysc(SYS_EXIT, 949, 0, 0);
+
+    /* 2. compile BOTH units in one invocation, in a separate process running
+     *    the real compiler. -o is the explicit output form. */
     i64 pid = ofork();
     if (pid == 0) {
-        static const char *av[] = { "/bin/occ", "/src/t.c", "/bin/t.elf", 0 };
+        static const char *av[] = { "/bin/occ", "/src/t.c", "/src/lib2.c",
+                                    "-o", "/bin/t.elf", 0 };
         static const char *ev[] = { "STAGE=compile", 0 };
         oexecve("/bin/occ", av, ev);
         sysc(SYS_EXIT, 199, 0, 0);                /* exec failed */
@@ -2092,10 +2168,10 @@ static void posix_selfhost_worker(void) {
      * The value is PRINTED on failure: "the program returned the wrong answer"
      * is not actionable, but "it returned 100" points straight at which of the
      * five contributions above did not happen. */
-    if (rst != 143) {
+    if (rst != 147) {
         oputs("  [self  ] the compiled program returned ");
         sysc(SYS_WRITEHEX, (u64)rst, 0, 0);
-        oputs(" hex (want 8f hex = 143)\n");
+        oputs(" hex (want 93 hex = 147)\n");
         sysc(SYS_EXIT, 946, 0, 0);
     }
 

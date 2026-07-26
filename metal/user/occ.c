@@ -1260,8 +1260,32 @@ static int occ_parse_type(int *sidx, int *ptr, int *size) {
                 for (int i = 0; i < OCC_NAMELEN; i++) occ_structs[si].name[i] = nm[i];
                 occ_structs[si].used = 1;
             }
+            /* v0.57: a shared header is legitimately pasted into EVERY unit,
+             * because each unit gets a fresh macro table and therefore a fresh
+             * include guard. So the same struct really is defined more than
+             * once in one translation unit, and refusing that outright would
+             * make shared headers unusable across units.
+             *
+             * Redefinition is accepted only if the layout comes out IDENTICAL.
+             * That keeps the common case working while still catching the case
+             * that actually hurts: two different definitions of one name, where
+             * whichever parsed last would silently decide every member offset
+             * for code compiled against the other. */
+            int redef = occ_structs[si].nm > 0;
+            struct occ_struct prev;
+            if (redef) prev = occ_structs[si];
             occ_structs[si].is_union = is_union;
             occ_struct_body(si);
+            if (redef) {
+                struct occ_struct *now = &occ_structs[si];
+                int same = (now->nm == prev.nm && now->size == prev.size &&
+                            now->align == prev.align && now->is_union == prev.is_union);
+                for (int i = 0; same && i < now->nm; i++)
+                    if (now->m[i].off != prev.m[i].off || now->m[i].size != prev.m[i].size ||
+                        now->m[i].ptr != prev.m[i].ptr || now->m[i].sidx != prev.m[i].sidx ||
+                        !ostrneq(now->m[i].name, prev.m[i].name, OCC_NAMELEN)) same = 0;
+                if (!same) occ_err("struct redefined with a DIFFERENT layout", now->name);
+            }
         } else if (si < 0) {
             occ_err("unknown struct or union", nm[0] ? nm : "<anonymous>");
             return 0;
@@ -1519,6 +1543,10 @@ static void occ_toplevel(void) {
              * list, so unwinding here is just resetting the frame bookkeeping. */
             if (occ_accept(";")) { occ_nloc = 0; occ_frame = 0; continue; }
 
+            /* v0.57: with several inputs fused into one unit, a name defined
+             * twice used to overwrite the first symbol's address in silence,
+             * and every call to it went to whichever unit was parsed last. */
+            if (occ_syms[si].defined) occ_err("function already defined", nm);
             occ_syms[si].addr = occ_tlen;
             occ_syms[si].defined = 1;
 
@@ -1557,6 +1585,11 @@ static void occ_toplevel(void) {
          * offset computed from it would be misaligned. */
         { int ga = occ_align_of(bsidx, dptr, dsize);
           if (ga > 1) while (occ_dlen % ga) { if (occ_dlen < (int)OCC_MAXDATA) occ_data[occ_dlen++] = 0; else break; } }
+        /* Same hazard as a duplicate function, with a worse failure mode: the
+         * second definition would move the symbol's address to freshly reserved
+         * storage, so writes through the old name and the new one would land in
+         * different places and neither would see the other's value. */
+        if (occ_syms[si].defined) occ_err("global already defined", nm);
         occ_syms[si].addr = occ_dlen;
         occ_syms[si].defined = 1;
         occ_syms[si].sidx = bsidx; occ_syms[si].ptr = dptr; occ_syms[si].size = dsize;
@@ -1630,9 +1663,31 @@ static int occ_write_elf(u8 *out, int cap, u64 entry) {
 }
 
 /* ---- driver --------------------------------------------------------------
- * occ_compile(srcpath, outpath) -> 0 on success, negative on failure.
- * Reads the source out of the VFS, compiles, and writes the ELF back. */
-static int occ_compile(const char *srcpath, const char *outpath) {
+ * occ_compile(srcs, nsrc, outpath) -> 0 on success, negative on failure.
+ *
+ * v0.57: MULTI-UNIT. Every input file is preprocessed, in order, into ONE
+ * translation unit, and then a single code-generation pass runs over the whole
+ * thing. That is not a shortcut around linking — it IS occ's linkage model, the
+ * same one /usr/lib/libc.oc has always used, and it is the only one available
+ * to a compiler with no relocations, no symbol table in its output, and no
+ * linker. Cross-unit references resolve through the existing forward-call fixup
+ * table, so a function in the second file may call one in the third.
+ *
+ * WHAT THIS IS NOT: separate compilation. There are no object files, nothing is
+ * compiled independently, and a change to any input recompiles everything. Two
+ * consequences are visible to a user and are handled rather than hidden:
+ *
+ *   - Each input gets a FRESH MACRO TABLE. In real C a #define in a.c cannot
+ *     reach b.c, and concatenating the files naively would let it. Resetting
+ *     per unit costs re-pasting the headers each unit includes — harmless,
+ *     since a prototype emits no code — and buys the semantics a user expects.
+ *     The prelude is preprocessed once, before any of them; it defines
+ *     functions, not macros, so nothing leaks from it either.
+ *   - A name DEFINED in two units is a hard error now, reported with the file
+ *     and line of the duplicate. Without that check the second definition
+ *     silently overwrote the first symbol's address and calls went to whichever
+ *     unit happened to be parsed last. */
+static int occ_compile(const char **srcs, int nsrc, const char *outpath) {
     occ_errors = 0; occ_line = 1; occ_pos = 0;
     occ_tlen = occ_dlen = occ_rlen = 0;
     occ_nsym = occ_nfix = occ_nloc = 0; occ_frame = 0;
@@ -1672,12 +1727,24 @@ static int occ_compile(const char *srcpath, const char *outpath) {
       else occ_note("no /usr/lib/libc.oc - compiling with no runtime;",
                     "calls to strlen/puts/malloc will be undefined"); }
 
-    { int t = oopen(srcpath);
-      if (t < 0) { occ_err("cannot open source", srcpath); return -2; }
-      oclose(t); }
-    occ_pp_file(srcpath);
+    for (int u = 0; u < nsrc; u++) {
+        int t = oopen(srcs[u]);
+        if (t < 0) { occ_err("cannot open source", srcs[u]); return -2; }
+        oclose(t);
+        /* Fresh macro table per unit — see the note above. */
+        occ_nmacro = 0;
+        for (int i = 0; i < OCC_MAXMACRO; i++) { occ_macros[i].used = 0; occ_macros[i].expanding = 0; }
+        occ_pp_file(srcs[u]);
+    }
     occ_src[occ_ppn] = 0;
     if (occ_errors) return -3;
+    if (nsrc > 1) {
+        char b[32]; int n = 0, d[8], k = 0, v = nsrc;
+        while (v) { d[k++] = v % 10; v /= 10; }
+        while (k) b[n++] = (char)('0' + d[--k]);
+        b[n] = 0;
+        occ_note(b, "input files compiled as one translation unit");
+    }
 
     /* A tiny entry stub is emitted FIRST so the ELF entry point is offset 0:
      * it calls main and turns the return value into SYS_EXIT. This is the crt0
@@ -1693,7 +1760,9 @@ static int occ_compile(const char *srcpath, const char *outpath) {
     occ_next();
     occ_toplevel();
 
-    if (!occ_syms[main_sym].defined) occ_err("no main() in", srcpath);
+    /* With several inputs, main() may be defined in any of them — so the
+     * message names the OUTPUT being built rather than one arbitrary input. */
+    if (!occ_syms[main_sym].defined) occ_err("no main() in any input file, building", outpath);
 
     /* resolve the entry stub's call and every forward call */
     if (occ_syms[main_sym].defined) {

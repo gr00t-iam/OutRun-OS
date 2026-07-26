@@ -13236,16 +13236,17 @@ static void tccheck(const char *n, int c) {
  * over that default block. */
 static void cmd_cc(int argc, char **argv) {
     if (argc < 3) {
-        kputs("usage: cc <source.c> <output.elf>\n"
+        kputs("usage: cc <source.c> [more.c ...] <output.elf>\n"
               "       compiles with the native compiler; /usr/lib/libc.oc is\n"
-              "       prepended automatically. Diagnostics come back here.\n");
+              "       prepended automatically and several inputs are fused into\n"
+              "       one translation unit. Diagnostics come back here.\n");
         return;
     }
     if (!g_cas_mounted) { kputs("[cc     ] no filesystem mounted\n"); return; }
-    if (vfs_find(argv[1]) < 0) {
-        kprintf("[cc     ] no such source file: %s\n", argv[1]);
-        return;
-    }
+    /* v0.57: everything but the last argument is an input. Check them all
+     * before spawning, so a typo costs a message rather than a process. */
+    for (int i = 1; i < argc - 1; i++)
+        if (vfs_find(argv[i]) < 0) { kprintf("[cc     ] no such source file: %s\n", argv[i]); return; }
     uint64_t save = current_proc_idx;
     int p = kproc_spawn("/bin/occ", PCAP_FILESYSTEM);
     if (p < 0) { kputs("[cc     ] no free process slot\n"); return; }
@@ -13255,18 +13256,22 @@ static void cmd_cc(int argc, char **argv) {
     kprocs[p].entry = e;
 
     { char av[UARG_N][UARG_LEN], ev[UARG_N][UARG_LEN];
-      const char *a[3] = { "/bin/occ", argv[1], argv[2] };
-      for (int i = 0; i < 3; i++) {
-          int n = 0; while (n < UARG_LEN - 1 && a[i][n]) { av[i][n] = a[i][n]; n++; }
-          av[i][n] = 0;
+      int na = 0;
+      const char *a0 = "/bin/occ";
+      { int n = 0; while (n < UARG_LEN - 1 && a0[n]) { av[0][n] = a0[n]; n++; } av[0][n] = 0; na = 1; }
+      /* every input, then the output as the trailing positional argument */
+      for (int i = 1; i < argc && na < UARG_N; i++) {
+          int n = 0; while (n < UARG_LEN - 1 && argv[i][n]) { av[na][n] = argv[i][n]; n++; }
+          av[na][n] = 0; na++;
       }
       const char *e0 = "PATH=/usr/lib", *e1 = "OUTRUN=" KERNEL_VERSION;
       int n; for (n = 0; n < UARG_LEN - 1 && e0[n]; n++) ev[0][n] = e0[n]; ev[0][n] = 0;
       for (n = 0; n < UARG_LEN - 1 && e1[n]; n++) ev[1][n] = e1[n]; ev[1][n] = 0;
-      uargs_build(kprocs[p].cr3, 3, (const char (*)[UARG_LEN])av,
+      uargs_build(kprocs[p].cr3, na, (const char (*)[UARG_LEN])av,
                                  2, (const char (*)[UARG_LEN])ev); }
 
-    kprintf("[cc     ] %s -> %s (pid %u)\n", argv[1], argv[2], kprocs[p].pid);
+    kprintf("[cc     ] %d input(s) -> %s (pid %u)\n",
+            (uint64_t)(int64_t)(argc - 2), argv[argc - 1], kprocs[p].pid);
     rq_push(0, p);
     __sync_synchronize();
     int n_on = g_ncpu_online; if (n_on > MAX_CPUS) n_on = MAX_CPUS;
@@ -13280,9 +13285,9 @@ static void cmd_cc(int argc, char **argv) {
     current_proc_idx = save;
     if (!kprocs[p].torn_down) { kputs("[cc     ] TIMED OUT\n"); return; }
 
-    int oi = vfs_find(argv[2]);
+    int oi = vfs_find(argv[argc - 1]);
     if (kprocs[p].exit_code == 0 && oi >= 0)
-        kprintf("[cc     ] ok: %s is %u bytes\n", argv[2], (uint64_t)DENTS[oi].len);
+        kprintf("[cc     ] ok: %s is %u bytes\n", argv[argc - 1], (uint64_t)DENTS[oi].len);
     else
         kprintf("[cc     ] compile FAILED (exit %u)\n", kprocs[p].exit_code);
 }
@@ -15575,9 +15580,12 @@ static void cmd_demo(void) {
 
 static void shell_exec(char *line) {
     /* tokenize in place */
-    char *argv[4] = {0};
+    /* v0.57: 8, not 4 — `cc a.c b.c c.c -o out.elf` needs more than four
+     * tokens, and a tokenizer that silently drops the tail would compile the
+     * wrong set of files. */
+    char *argv[8] = {0};
     int argc = 0;
-    for (char *p = line; *p && argc < 4; ) {
+    for (char *p = line; *p && argc < 8; ) {
         while (*p == ' ') p++;
         if (!*p) break;
         argv[argc++] = p;
