@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.56.0-metal"
+#define KERNEL_VERSION "0.57.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -13292,6 +13292,141 @@ static void cmd_cc(int argc, char **argv) {
         kprintf("[cc     ] compile FAILED (exit %u)\n", kprocs[p].exit_code);
 }
 
+/* ===========================================================================
+ * v0.57: COMPILER STRESS — language completeness, and what must be REFUSED
+ * ===========================================================================
+ * toolstrs proves the self-hosting LOOP works. This proves the LANGUAGE does.
+ * The ring-3 half (role 39) authors a three-file project, compiles the two
+ * units into one ELF, runs it, and then feeds the compiler four programs that
+ * must not compile. The kernel half checks what ring 3 cannot honestly claim
+ * about itself: that a real multi-unit executable appeared, that its own
+ * program headers describe a well-formed 3-segment W^X image, and that the
+ * refused programs left NO output behind.
+ *
+ * The positive program measures its own struct offsets with `&s.member - &s`.
+ * That matters: it is not comparing against numbers the compiler reported, it
+ * is measuring the addresses the compiler actually generated. A layout bug
+ * cannot agree with itself here.                                            */
+static int g_cspass, g_csfail;
+static void cscheck(const char *n, int c) {
+    if (c) { g_cspass++; kprintf("[compstrs]  PASS  %s\n", n); }
+    else   { g_csfail++; kprintf("[compstrs]  FAIL  %s\n", n); }
+}
+
+static void cmd_compiler_stress(void) {
+    kputs("-- COMPILER STRESS: preprocessor, struct layout, multi-unit, and refusals --\n");
+    g_cspass = g_csfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    if (!g_cas_mounted) { cscheck("CAS mounted before the compiler can run", 0);
+        kprintf("[compstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_cspass, (uint64_t)g_csfail);
+        return; }
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+
+    /* A fresh output every run, so "it appeared" means something. */
+    if (vfs_find("/bin/cs.elf") >= 0)   vfs_unlink("/bin/cs.elf");
+    if (vfs_find("/bin/cs_n.elf") >= 0) vfs_unlink("/bin/cs_n.elf");
+
+    int p = kproc_spawn("compstr", PCAP_FILESYSTEM);
+    if (p < 0) { cscheck("kproc_spawn never fails", 0);
+        kprintf("[compstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_cspass, (uint64_t)g_csfail);
+        return; }
+    kprocs[p].role = 39;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { cscheck("the driver's ELF loads", 0);
+        kprintf("[compstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_cspass, (uint64_t)g_csfail);
+        return; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    /* Six compiles and one program run, all under TCG. The four refusals are
+     * cheap because they bail early; the two real compiles are not. */
+    int finished = posix_drain(procs, 1, &R, 90000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[compstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 950 ? "" :
+        R.code[0] == 951 || R.code[0] == 952 || R.code[0] == 953 ? "could not author a source file" :
+        R.code[0] == 954 ? "the compiler TIMED OUT on the two-unit build" :
+        R.code[0] == 955 ? "the two-unit build FAILED but should have succeeded" :
+        R.code[0] == 956 ? "fork failed before running the built program" :
+        R.code[0] == 957 ? "the built program TIMED OUT" :
+        R.code[0] == 958 ? "the built program reported a failed check (see its own line above)" :
+        R.code[0] == 959 ? "could not author a negative-test source" :
+        (R.code[0] >= 960 && R.code[0] <= 963) ? "a negative test TIMED OUT in the compiler" :
+        (R.code[0] >= 964 && R.code[0] <= 967) ? "an INVALID program compiled successfully" :
+        (R.code[0] >= 968 && R.code[0] <= 971) ? "a refused compile still left an output file" :
+                                                 "unknown";
+    if (R.code[0] != 950)
+        kprintf("[compstrs] driver exit %u — %s\n", R.code[0], why);
+
+    cscheck("the driver authored, built, ran and validated a multi-unit project (exit 950)",
+            finished && R.code[0] == 950);
+
+    /* A real multi-unit executable exists, and it is a well-formed W^X ELF. */
+    int oi = vfs_find("/bin/cs.elf");
+    int elf_ok = 0, wx_ok = 0, audited = 0;
+    if (oi >= 0 && DENTS[oi].len > 64) {
+        static uint8_t img[32768];
+        int64_t got = vfs_read_file(oi, img, sizeof img);
+        struct elf64_hdr *eh = (struct elf64_hdr *)img;
+        if (got > 64 && eh->ident[0] == 0x7F && eh->ident[1] == 'E' &&
+            eh->ident[2] == 'L' && eh->ident[3] == 'F' &&
+            eh->machine == 0x3E && eh->phnum == 3) {
+            int rx = 0, ro = 0, rw = 0, bad = 0;
+            for (int i = 0; i < eh->phnum; i++) {
+                struct elf64_phdr *ph = (struct elf64_phdr *)(img + eh->phoff + (uint64_t)i * eh->phentsize);
+                if (ph->type != 1) continue;
+                if ((ph->flags & 0x3) == 0x3) bad = 1;
+                if (ph->flags == 5) rx++;
+                if (ph->flags == 4) ro++;
+                if (ph->flags == 6) rw++;
+            }
+            audited = 1;
+            elf_ok = (rx == 1 && ro == 1 && rw == 1);
+            wx_ok  = !bad;
+        }
+        kprintf("[compstrs] /bin/cs.elf: %u bytes, %u chunk(s), from TWO source units\n",
+                (uint64_t)DENTS[oi].len, (uint64_t)DENTS[oi].nchunks);
+    }
+    cscheck("a multi-unit executable was produced in the VFS", oi >= 0 && DENTS[oi].len > 64);
+    cscheck("it is a well-formed 3-segment x86-64 ELF (R+X, R, R+W)", audited && elf_ok);
+    cscheck("NO segment is both writable and executable (W^X holds for multi-unit output)",
+            audited && wx_ok);
+    /* The refusals must not have produced anything. Checked from OUTSIDE the
+     * process that ran them, because the process asserting its own negative
+     * result is the weaker claim. */
+    cscheck("no output file survives from any REFUSED compile", vfs_find("/bin/cs_n.elf") < 0);
+
+    int fds_leaked = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    cscheck("no descriptor leaked across seven compiler processes", fds_leaked == 0);
+
+    kprintf("[compstrs] +%u freed, +%u reused; global depth %u\n",
+            g_frames_freed - freed0, g_frames_reused - reused0, g_frame_free_depth);
+    cscheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    cscheck("no lock-rank violation across the compiler paths", g_rank_violations == viol0);
+
+    kprintf("[compstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_cspass, (uint64_t)g_csfail);
+    if (!g_csfail)
+        kputs("[compstrs] LANGUAGE VERIFIED — preprocessor, struct layout, multi-unit linkage, and refusals\n");
+    else kputs("[compstrs] COMPILER DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 static void cmd_selfhost_test(void) {
     kputs("-- TOOLCHAIN STRESS: author -> compile -> run, natively in ring 3 --\n");
     g_tcpass = g_tcfail = 0;
@@ -15647,6 +15782,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "posixstress")) cmd_posix_stress();
     else if (!kstrcmp(argv[0], "toolchainstress")) cmd_selfhost_test();
     else if (!kstrcmp(argv[0], "cc")) cmd_cc(argc, argv);
+    else if (!kstrcmp(argv[0], "compilerstress")) cmd_compiler_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -15829,6 +15965,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_apps_stress();      /* v0.54: concurrent ring-3 GUI apps (terminal/sysmon/filer), incl. app crashes */
     cmd_posix_stress();     /* v0.55: fork/exec chains, signal frames, pthread mutexes under SMP */
     cmd_selfhost_test();    /* v0.56: author -> compile -> run, natively (no host toolchain)     */
+    cmd_compiler_stress();  /* v0.57: language completeness + what the compiler must REFUSE      */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();

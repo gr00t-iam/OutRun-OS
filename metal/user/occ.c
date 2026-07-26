@@ -926,6 +926,15 @@ static int occ_lvalue(void) {     /* returns 1 if it emitted an address */
     }
     occ_lv_size = size;
     if (occ_accept("[")) {                   /* a[i] -> *(a + i*8) */
+        /* v0.57: indexing is WORD-scaled, which is right for `int *` and wrong
+         * for an array of structs — the index would be multiplied by 8 instead
+         * of by the struct's size, and the base is an address rather than a
+         * pointer value so the load below is wrong too. Rather than emit code
+         * that is quietly off by a factor, say so. Reaching struct arrays means
+         * scaling the index by the element size, which is a change to the
+         * indexing model, not a patch here. */
+        if (sidx >= 0 && ptr == 0)
+            occ_err("indexing an array of structs is not supported", nm);
         occ_load_rax_ind();                  /* the array/pointer value        */
         occ_push_rax();
         occ_expr();
