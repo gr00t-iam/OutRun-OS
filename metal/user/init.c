@@ -1945,15 +1945,44 @@ static void posix_execpath_worker(void) {
  * then run the binary that compiler produced. Nothing here touches a host
  * toolchain, and the only thing linking the three steps is the filesystem.
  *
- * Exit 940 = the produced binary ran and returned the right answer. */
+ * v0.56 Stage F: the program it authors now CALLS THE SDK — strlen, strcmp,
+ * strcpy, atoi, malloc, putdec and puts all come from /usr/lib/libc.oc, which
+ * occ prepends to the translation unit. That is deliberate: it is the only
+ * check that can tell a real /usr/lib from a directory of props. Nothing in
+ * this source defines those names, so if the prelude were not being read the
+ * compile would fail with "undefined function" and this worker would exit 944
+ * rather than quietly passing.
+ *
+ * The expected answer is built from pieces that each prove a different thing:
+ *     0+1+..+7 = 28   the for loop and local arithmetic
+ *     fib(10)  = 55   recursion through the fixup table
+ *     strlen   =  6   byte addressing via __ldb (a[i] alone cannot do this)
+ *     atoi     = 11   byte addressing plus the digit loop
+ *     (1<<4)|3 = 19   the new shift and bitwise-or levels
+ *                ---
+ *                119
+ *
+ * Exit 940 = the produced binary ran and returned exactly that. */
 #define SELF_SRC \
   "int fib(int n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }\n" \
   "int main() {\n" \
-  "  int s; int i;\n" \
+  "  int s; int i; char *p;\n" \
   "  s = 0;\n" \
   "  for (i = 0; i < 8; i = i + 1) { s = s + i; }\n" \
-  "  __syscall(0, \"  [a.out ] compiled by occ, running natively at ring 3\\n\", 0, 0);\n" \
-  "  return s + fib(10);\n" \
+  "  s = s + fib(10);\n" \
+  "  s = s + strlen(\"outrun\");\n" \
+  "  s = s + atoi(\"11\");\n" \
+  "  if (strcmp(\"abc\", \"abc\") != 0) { return 901; }\n" \
+  "  if (strcmp(\"abc\", \"abd\") == 0) { return 902; }\n" \
+  "  p = malloc(64);\n" \
+  "  if (p == 0) { return 903; }\n" \
+  "  strcpy(p, \"sdk\");\n" \
+  "  if (strlen(p) != 3) { return 904; }\n" \
+  "  if (__ldb(p, 0) != 115) { return 905; }\n" \
+  "  s = s + ((1 << 4) | 3);\n" \
+  "  puts(\"  [a.out ] compiled by occ against /usr/lib/libc.oc; main returns \");\n" \
+  "  putdec(s); puts(\"\\n\");\n" \
+  "  return s;\n" \
   "}\n"
 
 static void posix_selfhost_worker(void) {
@@ -1973,7 +2002,16 @@ static void posix_selfhost_worker(void) {
         sysc(SYS_EXIT, 199, 0, 0);                /* exec failed */
     }
     if (pid < 0)                                  sysc(SYS_EXIT, 943, 0, 0);
-    i64 cst = owaitpid((u32)pid, 60000);
+    /* v0.56 Stage F: the budget went from 60000 to 250000 spins, and a timeout
+     * now has its OWN exit code. With the SDK prelude in front of it the
+     * compiler has ~4 KiB more source to get through and emits an image nine
+     * times larger, and under TCG that pushed it past the old budget — the
+     * parent gave up while the child was still working, then reported the
+     * generic "child failed" 944 even though the compile went on to succeed
+     * and print "compiled OK". A wait that times out and a child that fails
+     * are different events and must not share an exit code. */
+    i64 cst = owaitpid((u32)pid, 250000);
+    if (cst == -11)                               sysc(SYS_EXIT, 947, 0, 0);
     if (cst != 0)                                 sysc(SYS_EXIT, 944, 0, 0);
 
     /* 3. run what the compiler produced */
@@ -1985,9 +2023,18 @@ static void posix_selfhost_worker(void) {
         sysc(SYS_EXIT, 198, 0, 0);
     }
     if (pid < 0)                                  sysc(SYS_EXIT, 945, 0, 0);
-    i64 rst = owaitpid((u32)pid, 60000);
-    /* 0+1+..+7 = 28, fib(10) = 55, so main() returns 83 */
-    if (rst != 83)                                sysc(SYS_EXIT, 946, 0, 0);
+    i64 rst = owaitpid((u32)pid, 250000);
+    if (rst == -11)                               sysc(SYS_EXIT, 948, 0, 0);
+    /* 28 + 55 + 6 + 11 + 19 — see the SELF_SRC comment for what each proves.
+     * The value is PRINTED on failure: "the program returned the wrong answer"
+     * is not actionable, but "it returned 100" points straight at which of the
+     * five contributions above did not happen. */
+    if (rst != 119) {
+        oputs("  [self  ] the compiled program returned ");
+        sysc(SYS_WRITEHEX, (u64)rst, 0, 0);
+        oputs(" hex (want 77 hex = 119)\n");
+        sysc(SYS_EXIT, 946, 0, 0);
+    }
 
     oputs("  [self  ] authored, compiled and RAN a program without a host toolchain\n");
     sysc(SYS_EXIT, 940, 0, 0);

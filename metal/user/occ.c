@@ -23,13 +23,21 @@
  *   decls      global `int`/`char *` variables; functions with <= 6 parameters
  *   stmts      compound blocks, local declarations, if/else, while, for,
  *              return, expression statements
- *   exprs      = || && == != < > <= >= + - * / %  unary - ! * &  calls,
- *              integer literals, character literals, string literals,
- *              identifiers, parentheses, indexing a[i]
- *   builtin    __syscall(n, a0, a1, a2) — the whole OS ABI in one intrinsic,
- *              so a compiled program can do real I/O with no libc linked in
+ *   exprs      = || && | ^ & == != < > <= >= << >> + - * / %
+ *              unary - ! * &  calls, integer literals, character literals,
+ *              string literals, identifiers, parentheses, indexing a[i]
+ *              — but note a[i] means *(a + i*8): a WORD, never a byte.
+ *   builtins   __syscall(n, a0, a1, a2) — the whole OS ABI in one intrinsic,
+ *                  so a compiled program can do real I/O with no libc linked in
+ *              __ldb(p, i)     — the unsigned BYTE at p[i]
+ *              __stb(p, i, v)  — store v's low byte at p[i]; returns v
+ *                  These two exist because a[i] is word-scaled, so without them
+ *                  occ could not walk a C string and /usr/lib/libc.oc's
+ *                  strlen/strcpy/atoi could not be written at all.
  *   NOT here   structs, unions, enums, typedefs, floats, switch, goto, the
- *              preprocessor, varargs, and multi-file linking
+ *              preprocessor, varargs, multi-file linking, and LOCAL ARRAYS
+ *              (a local declaration is one 8-byte slot; scratch buffers have
+ *              to be globals, which is why libc.oc's are)
  *
  * MEMORY MODEL. Three fixed, page-aligned bases mean absolute addressing works
  * and no relocation machinery is needed: text is emitted before data sizes are
@@ -55,20 +63,43 @@
  * up in the Cyber-Terminal exactly like any other program's output. */
 static int   occ_errors;
 static int   occ_line;
+/* v0.56 Stage F: how many lines of /usr/lib/libc.oc were prepended to this
+ * translation unit. Diagnostics subtract it so a user gets THEIR line number,
+ * and errors that genuinely land inside the runtime say so instead of quoting
+ * a line number the user cannot find in their own file. */
+static int   occ_prelude_lines;
 
 static void occ_err(const char *msg, const char *what) {
     occ_errors++;
-    char b[192]; int n = 0;
-    const char *p = "occ: line ";
+    char b[224]; int n = 0;
+    int in_prelude = (occ_line <= occ_prelude_lines);
+    int shown = in_prelude ? occ_line : occ_line - occ_prelude_lines;
+    const char *p = in_prelude ? "occ: /usr/lib/libc.oc line " : "occ: line ";
     while (*p) b[n++] = *p++;
     /* line number, decimal */
-    { int v = occ_line, d[8], k = 0; if (!v) d[k++] = 0; while (v) { d[k++] = v % 10; v /= 10; }
+    { int v = shown, d[8], k = 0; if (!v) d[k++] = 0; while (v) { d[k++] = v % 10; v /= 10; }
       while (k) b[n++] = (char)('0' + d[--k]); }
     b[n++] = ':'; b[n++] = ' ';
     for (const char *q = msg; *q && n < 160; q++) b[n++] = *q;
     if (what && *what) { b[n++] = ' '; b[n++] = '\'';
         for (const char *q = what; *q && n < 185; q++) b[n++] = *q;
         b[n++] = '\''; }
+    b[n++] = '\n'; b[n] = 0;
+    owrite(STDERR_FILENO, b, (u64)n);
+}
+
+/* Same channel, for things that are not errors (the SDK banner). Diagnostics
+ * exist to be READ, and on this system the thing reading them is the
+ * Cyber-Terminal: it arms the kernel console capture via SYS_RUN_CMD, and
+ * ring-3 SYS_WRITE goes through the kernel's kputc, so anything written here
+ * lands in the terminal's window as well as on the serial console. */
+static void occ_note(const char *msg, const char *what) {
+    char b[224]; int n = 0;
+    const char *p = "occ: ";
+    while (*p) b[n++] = *p++;
+    for (const char *q = msg; *q && n < 160; q++) b[n++] = *q;
+    if (what && *what) { b[n++] = ' ';
+        for (const char *q = what; *q && n < 210; q++) b[n++] = *q; }
     b[n++] = '\n'; b[n] = 0;
     owrite(STDERR_FILENO, b, (u64)n);
 }
@@ -90,7 +121,7 @@ static int occ_isalnum(char c) { return occ_isalpha(c) || occ_isdigit(c); }
 
 static int occ_kw(const char *s) {
     static const char *kws[] = { "int", "char", "return", "if", "else", "while",
-                                 "for", "void", "__syscall", 0 };
+                                 "for", "void", "__syscall", "__ldb", "__stb", 0 };
     for (int i = 0; kws[i]; i++) if (ostrneq(s, kws[i], OCC_NAMELEN)) return 1;
     return 0;
 }
@@ -178,7 +209,7 @@ static void occ_next(void) {
         occ_tk = T_STR; return;
     }
     /* punctuation, longest match first so >= does not lex as > then = */
-    static const char *two[] = { "==", "!=", "<=", ">=", "&&", "||", 0 };
+    static const char *two[] = { "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", 0 };
     for (int i = 0; two[i]; i++)
         if (c == two[i][0] && occ_src[occ_pos + 1] == two[i][1]) {
             occ_txt[0] = two[i][0]; occ_txt[1] = two[i][1]; occ_txt[2] = 0;
@@ -336,6 +367,47 @@ static void occ_primary(void) {
         occ_emit(0x0F); occ_emit(0x05);                  /* syscall */
         return;
     }
+    /* v0.56 Stage F: BYTE ADDRESSING. occ's `a[i]` is defined as *(a + i*8) —
+     * every value is a machine word, which is the simplification the whole
+     * code generator rests on. The consequence is that occ could not touch a
+     * BYTE, and therefore could not walk a C string: a strlen() written with
+     * s[n] reads eight bytes at a time and stops at the first NUL-containing
+     * word. A "string.h" whose strlen cannot walk a string is a prop, so these
+     * two intrinsics exist instead of a type system:
+     *
+     *     __ldb(p, i)      -> the unsigned byte at p[i]
+     *     __stb(p, i, v)   -> stores the low byte of v at p[i], returns v
+     *
+     * They are builtins for the same reason __syscall is: they need no types,
+     * no addressing modes and no new syntax, and they make the runtime in
+     * /usr/lib/libc.oc genuinely implementable in occ's own subset. */
+    if (occ_is("__ldb")) {
+        occ_next(); occ_expect("(");
+        occ_expr(); occ_push_rax();                      /* p */
+        occ_expect(",");
+        occ_expr();                                      /* i -> rax */
+        occ_expect(")");
+        occ_mov_rdi_rax();                               /* rdi = i        */
+        occ_pop_rax();                                   /* rax = p        */
+        occ_emit(0x48); occ_emit(0x0F); occ_emit(0xB6);
+        occ_emit(0x04); occ_emit(0x38);                  /* movzx rax,[rax+rdi] */
+        return;
+    }
+    if (occ_is("__stb")) {
+        occ_next(); occ_expect("(");
+        occ_expr(); occ_push_rax();                      /* p */
+        occ_expect(",");
+        occ_expr(); occ_push_rax();                      /* i */
+        occ_expect(",");
+        occ_expr();                                      /* v -> rax */
+        occ_expect(")");
+        occ_emit(0x48); occ_emit(0x89); occ_emit(0xC2);  /* mov rdx,rax (v) */
+        occ_emit(0x5F);                                  /* pop rdi     (i) */
+        occ_emit(0x58);                                  /* pop rax     (p) */
+        occ_emit(0x88); occ_emit(0x14); occ_emit(0x38);  /* mov [rax+rdi],dl */
+        occ_emit(0x48); occ_emit(0x89); occ_emit(0xD0);  /* mov rax,rdx     */
+        return;
+    }
     if (occ_tk == T_IDENT) {
         char nm[OCC_NAMELEN];
         for (int i = 0; i < OCC_NAMELEN; i++) nm[i] = occ_txt[i];
@@ -394,10 +466,18 @@ static void occ_binop(int lvl);
 
 static void occ_unary(void) { occ_postfix(); }
 
-/* precedence climbing: 0 = || , 1 = && , 2 = == != , 3 = relational,
- *                      4 = + - , 5 = * / %  */
+/* precedence climbing, C's order:
+ *   0 = ||   1 = &&   2 = |   3 = ^   4 = &   5 = == !=
+ *   6 = relational    7 = << >>       8 = + -  9 = * / %
+ *
+ * v0.56 Stage F: levels 2, 3, 4 and 7 are new. A systems compiler without
+ * shifts and masks cannot express a byte-packing routine or a hex formatter,
+ * and libc.oc's puthex was the immediate proof — it had to be written with
+ * repeated division because `>>` did not exist. The renumbering below is
+ * mechanical; the two-character tokens "<<" and ">>" also had to be added to
+ * the lexer, or `a >> b` lexed as two separate '>' punctuators. */
 static void occ_binop(int lvl) {
-    if (lvl > 5) { occ_unary(); return; }
+    if (lvl > 9) { occ_unary(); return; }
     occ_binop(lvl + 1);
     for (;;) {
         if (lvl == 0 && occ_is("||")) {
@@ -425,12 +505,12 @@ static void occ_binop(int lvl) {
             continue;
         }
         int cmp = 0; u8 cc = 0;
-        if (lvl == 2 && occ_is("==")) { cc = 0x94; cmp = 1; }
-        else if (lvl == 2 && occ_is("!=")) { cc = 0x95; cmp = 1; }
-        else if (lvl == 3 && occ_is("<"))  { cc = 0x9C; cmp = 1; }
-        else if (lvl == 3 && occ_is(">"))  { cc = 0x9F; cmp = 1; }
-        else if (lvl == 3 && occ_is("<=")) { cc = 0x9E; cmp = 1; }
-        else if (lvl == 3 && occ_is(">=")) { cc = 0x9D; cmp = 1; }
+        if (lvl == 5 && occ_is("==")) { cc = 0x94; cmp = 1; }
+        else if (lvl == 5 && occ_is("!=")) { cc = 0x95; cmp = 1; }
+        else if (lvl == 6 && occ_is("<"))  { cc = 0x9C; cmp = 1; }
+        else if (lvl == 6 && occ_is(">"))  { cc = 0x9F; cmp = 1; }
+        else if (lvl == 6 && occ_is("<=")) { cc = 0x9E; cmp = 1; }
+        else if (lvl == 6 && occ_is(">=")) { cc = 0x9D; cmp = 1; }
         if (cmp) {
             occ_next(); occ_push_rax(); occ_binop(lvl + 1);
             occ_mov_rdi_rax(); occ_pop_rax();
@@ -438,14 +518,35 @@ static void occ_binop(int lvl) {
             occ_setcc(cc);
             continue;
         }
-        if (lvl == 4 && (occ_is("+") || occ_is("-"))) {
+        /* bitwise: one shape, three opcodes (or/xor/and on rax, rdi) */
+        int bop = 0; u8 bcode = 0;
+        if      (lvl == 2 && occ_is("|")) { bcode = 0x09; bop = 1; }
+        else if (lvl == 3 && occ_is("^")) { bcode = 0x31; bop = 1; }
+        else if (lvl == 4 && occ_is("&")) { bcode = 0x21; bop = 1; }
+        if (bop) {
+            occ_next(); occ_push_rax(); occ_binop(lvl + 1);
+            occ_mov_rdi_rax(); occ_pop_rax();
+            occ_emit(0x48); occ_emit(bcode); occ_emit(0xF8);           /* op rax,rdi */
+            continue;
+        }
+        /* shifts: the count has to be in cl, and cl is the ONLY place x86-64
+         * will take it from, so the operand order here is forced. */
+        if (lvl == 7 && (occ_is("<<") || occ_is(">>"))) {
+            int right = occ_is(">>");
+            occ_next(); occ_push_rax(); occ_binop(lvl + 1);
+            occ_emit(0x48); occ_emit(0x89); occ_emit(0xC1);            /* mov rcx,rax */
+            occ_pop_rax();
+            occ_emit(0x48); occ_emit(0xD3); occ_emit(right ? 0xF8 : 0xE0); /* sar/shl rax,cl */
+            continue;
+        }
+        if (lvl == 8 && (occ_is("+") || occ_is("-"))) {
             int sub = occ_is("-");
             occ_next(); occ_push_rax(); occ_binop(lvl + 1);
             occ_mov_rdi_rax(); occ_pop_rax();
             occ_emit(0x48); occ_emit(sub ? 0x29 : 0x01); occ_emit(0xF8);
             continue;
         }
-        if (lvl == 5 && (occ_is("*") || occ_is("/") || occ_is("%"))) {
+        if (lvl == 9 && (occ_is("*") || occ_is("/") || occ_is("%"))) {
             int op = occ_is("*") ? 0 : occ_is("/") ? 1 : 2;
             occ_next(); occ_push_rax(); occ_binop(lvl + 1);
             occ_mov_rdi_rax(); occ_pop_rax();
@@ -715,12 +816,43 @@ static int occ_compile(const char *srcpath, const char *outpath) {
     occ_rod  = (u8 *)omalloc(OCC_MAXDATA);
     if (!occ_src || !occ_text || !occ_data || !occ_rod) { occ_err("out of memory", 0); return -1; }
 
+    /* v0.56 Stage F: THE PRELUDE. /usr/lib/libc.oc is read out of the VFS and
+     * placed AHEAD of the user's source in the same buffer, so its definitions
+     * are already in scope — and already emitted — by the time the user's code
+     * is parsed. That ordering matters for a single-pass compiler: a prelude
+     * appended afterwards would need a forward fixup for every libc call, and
+     * a prelude in a separate buffer would need a linker, which occ does not
+     * have. Source inclusion IS occ's linkage model, and this is it.
+     *
+     * A missing /usr/lib/libc.oc is not fatal: the program simply compiles
+     * without a runtime, and any call it makes to strlen() fails the ordinary
+     * "undefined function" check. That is the property that makes /usr/lib
+     * genuinely load-bearing rather than decorative — remove it and compiles
+     * that depend on it start failing, with a diagnostic that names it. */
+    occ_prelude_lines = 0;
+    u64 base = 0;
+    int lfd = oopen("/usr/lib/libc.oc");
+    if (lfd >= 0) {
+        i64 ln = oread(lfd, occ_src, OCC_MAXSRC / 2);
+        oclose(lfd);
+        if (ln > 0) {
+            /* oread includes the stored NUL; drop it or the lexer stops here. */
+            while (ln > 0 && occ_src[ln - 1] == 0) ln--;
+            for (i64 i = 0; i < ln; i++) if (occ_src[i] == '\n') occ_prelude_lines++;
+            occ_src[ln] = '\n'; occ_prelude_lines++;
+            base = (u64)ln + 1;
+        }
+    } else {
+        occ_note("no /usr/lib/libc.oc — compiling with no runtime;",
+                 "calls to strlen/puts/malloc will be undefined");
+    }
+
     int fd = oopen(srcpath);
     if (fd < 0) { occ_err("cannot open source", srcpath); return -2; }
-    i64 n = oread(fd, occ_src, OCC_MAXSRC - 1);
+    i64 n = oread(fd, occ_src + base, OCC_MAXSRC - 1 - base);
     oclose(fd);
     if (n < 0) { occ_err("cannot read source", srcpath); return -2; }
-    occ_src[n] = 0;
+    occ_src[base + (u64)n] = 0;
 
     /* A tiny entry stub is emitted FIRST so the ELF entry point is offset 0:
      * it calls main and turns the return value into SYS_EXIT. This is the crt0
