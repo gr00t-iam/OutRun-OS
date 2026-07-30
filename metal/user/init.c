@@ -2102,6 +2102,21 @@ static void posix_execpath_worker(void) {
   "    if (n1.tag != 44) { return 917; }\n" \
   "    if (n1.val != 10) { return 918; }\n" \
   "    if (tag_of(&n1) != 44) { return 919; }\n" \
+  "    { char cb[8]; int iv[4]; int j;\n" \
+  "      strcpy(cb, \"abc\");\n" \
+  "      if (strlen(cb) != 3) { return 920; }\n" \
+  "      if (cb[0] != 97) { return 921; }\n" \
+  "      if (cb[2] != 99) { return 922; }\n" \
+  "      cb[1] = 90;\n" \
+  "      if (cb[1] != 90) { return 923; }\n" \
+  "      if (cb[0] != 97) { return 924; }\n" \
+  "      if (cb[2] != 99) { return 925; }\n" \
+  "      j = 0; while (j < 4) { iv[j] = j * 100; j = j + 1; }\n" \
+  "      if (iv[0] != 0) { return 926; }\n" \
+  "      if (iv[3] != 300) { return 927; }\n" \
+  "      if ((&cb[1]) - (&cb[0]) != 1) { return 928; }\n" \
+  "      if ((&iv[1]) - (&iv[0]) != 8) { return 929; }\n" \
+  "    }\n" \
   "    s = s + n1.in.a + n1.in.b;\n" \
   "    s = s + helper2(2);\n" \
   "  }\n" \
