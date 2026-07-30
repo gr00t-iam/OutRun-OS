@@ -26,18 +26,24 @@
  *   exprs      = || && | ^ & == != < > <= >= << >> + - * / %
  *              unary - ! * &  calls, integer literals, character literals,
  *              string literals, identifiers, parentheses, indexing a[i]
- *              — but note a[i] means *(a + i*8): a WORD, never a byte.
+ *              — v0.58: a[i] is scaled by the ELEMENT size, so s[i] on a
+ *              `char *` steps one byte and p[i] on a `struct P *` steps
+ *              sizeof(P). Only indexing an untyped value expression (f()[i])
+ *              still assumes 8, because there is no type to consult.
  *   builtins   __syscall(n, a0, a1, a2) — the whole OS ABI in one intrinsic,
  *                  so a compiled program can do real I/O with no libc linked in
  *              __ldb(p, i)     — the unsigned BYTE at p[i]
  *              __stb(p, i, v)  — store v's low byte at p[i]; returns v
- *                  These two exist because a[i] is word-scaled, so without them
- *                  occ could not walk a C string and /usr/lib/libc.oc's
- *                  strlen/strcpy/atoi could not be written at all.
- *   NOT here   structs, unions, enums, typedefs, floats, switch, goto, the
- *              preprocessor, varargs, multi-file linking, and LOCAL ARRAYS
- *              (a local declaration is one 8-byte slot; scratch buffers have
- *              to be globals, which is why libc.oc's are)
+ *                  v0.58: these are no longer REQUIRED to walk a string, since
+ *                  s[i] on a `char *` now steps one byte. They remain for
+ *                  poking a byte at an address whose type occ does not know.
+ *   NOT here   enums, floats, switch, goto, function pointers, varargs,
+ *              bitfields, anonymous struct members, struct assignment/
+ *              arguments/returns (refused, not truncated), and separate
+ *              compilation (multi-file input is FUSED into one unit).
+ *              v0.57 added structs, unions, typedefs and the preprocessor;
+ *              v0.58 added local arrays, so libc.oc's scratch buffers are
+ *              locals now and its formatters are reentrant.
  *
  * MEMORY MODEL. Three fixed, page-aligned bases mean absolute addressing works
  * and no relocation machinery is needed: text is emitted before data sizes are
@@ -50,11 +56,18 @@
 #define OCC_DATA_BASE   0x0000500000400000ull
 #define OCC_STACK_TOP   0x0000500000FF3C00ull   /* mirrors the kernel's USTK_INIT */
 
+/* v0.58: the compiler's own userland is now its biggest customer. /src/vedit.c
+ * and /src/omake.c are several hundred lines each, and a single-pass code
+ * generator with no register allocator emits a LOT of instructions per
+ * statement — omake alone overran the v0.57 48 KiB text arena. These are
+ * arena sizes, not policy: the failure they prevent is "output image too
+ * large", which is a diagnostic rather than a miscompile, but it is a
+ * diagnostic that stops the system building its own tools. */
 #define OCC_MAXSRC   (192u * 1024u)  /* v0.57: prelude + headers + user code */
-#define OCC_MAXTEXT  (48u * 1024u)
-#define OCC_MAXDATA  (8u * 1024u)
-#define OCC_MAXSYM   256
-#define OCC_MAXFIX   1024
+#define OCC_MAXTEXT  (160u * 1024u)
+#define OCC_MAXDATA  (32u * 1024u)
+#define OCC_MAXSYM   512
+#define OCC_MAXFIX   4096
 #define OCC_MAXLOC   32
 #define OCC_NAMELEN  32
 
@@ -703,7 +716,7 @@ static void occ_emit64(u64 v) { for (int i = 0; i < 8; i++) occ_emit((u8)(v >> (
 
 /* ---- symbols -------------------------------------------------------------*/
 struct occ_sym { char name[OCC_NAMELEN]; int kind; i64 addr; int defined;
-                 int sidx, ptr, size; };   /* v0.57: type of a global variable */
+                 int sidx, ptr, size, esize, nelem; };  /* v0.57/58: its type */
 /* kind: 0 = function, 1 = global variable */
 static struct occ_sym occ_syms[OCC_MAXSYM];
 static int occ_nsym;
@@ -744,7 +757,12 @@ static int occ_nfix;
 #define OCC_MAXMEMBER  16
 #define OCC_MAXTYPEDEF 32
 
-struct occ_member { char name[OCC_NAMELEN]; int off, size, sidx, ptr; };
+/* v0.58: `esize` is the size of ONE STEP — what indexing or a dereference
+ * yields. It is what `size` cannot be: a `char *` has size 8 (a pointer) but
+ * esize 1 (a byte), and an array of a 24-byte struct has size 96 but esize 24.
+ * Without it `a[i]` had to assume 8 for everything, which is right only for
+ * `int *`. */
+struct occ_member { char name[OCC_NAMELEN]; int off, size, sidx, ptr, esize; };
 struct occ_struct {
     char name[OCC_NAMELEN];
     struct occ_member m[OCC_MAXMEMBER];
@@ -767,6 +785,18 @@ static int occ_td_find(const char *n) {
         if (occ_tds[i].used && ostrneq(occ_tds[i].name, n, OCC_NAMELEN)) return i;
     return -1;
 }
+/* v0.58: the size of one element of `T`, i.e. what T[i] or *T yields.
+ *   char *      -> 1     a byte, which is why walking a string used to need __ldb
+ *   int *       -> 8
+ *   struct P *  -> sizeof(P)
+ *   T **        -> 8     one step off a pointer-to-pointer is a pointer
+ * `base` is the undecorated specifier size (1 for char, 8 otherwise). */
+static int occ_elem_size(int sidx, int ptr, int base) {
+    if (ptr > 1) return 8;
+    if (sidx >= 0) return occ_structs[sidx].size;
+    return base == 1 ? 1 : 8;
+}
+
 /* Alignment of a type: a struct's own alignment, else its size (1 or 8). */
 static int occ_align_of(int sidx, int ptr, int size) {
     if (sidx >= 0 && ptr == 0) return occ_structs[sidx].align;
@@ -774,7 +804,10 @@ static int occ_align_of(int sidx, int ptr, int size) {
     return ptr ? 8 : (size == 1 ? 1 : 8);
 }
 
-static struct occ_loc { char name[OCC_NAMELEN]; int off; int sidx, ptr, size; } occ_locs[OCC_MAXLOC];
+static struct occ_loc { char name[OCC_NAMELEN]; int off;
+                       int sidx, ptr, size, esize;
+                       int nelem;   /* v0.58: >0 => an ARRAY of nelem elements */
+                     } occ_locs[OCC_MAXLOC];
 static int occ_nloc, occ_frame;
 
 static int occ_sym_find(const char *n) {
@@ -789,6 +822,7 @@ static int occ_sym_get(const char *n, int kind) {
     for (int k = 0; k < OCC_NAMELEN; k++) occ_syms[i].name[k] = n[k] ? n[k] : 0;
     occ_syms[i].kind = kind; occ_syms[i].addr = 0; occ_syms[i].defined = 0;
     occ_syms[i].sidx = -1; occ_syms[i].ptr = 0; occ_syms[i].size = 8;
+    occ_syms[i].esize = 8; occ_syms[i].nelem = 0;
     return i;
 }
 static int occ_loc_find(const char *n) {
@@ -816,6 +850,10 @@ static void occ_lea_local(int off)  { /* lea rax,[rbp+off] */
 static void occ_add_rax_imm32(int v) {
     if (!v) return;
     occ_emit(0x48); occ_emit(0x05); occ_emit32((u32)v);      /* add rax, imm32   */
+}
+static void occ_imul_rax_imm32(int v) {
+    if (v == 1) return;
+    occ_emit(0x48); occ_emit(0x69); occ_emit(0xC0); occ_emit32((u32)v);  /* imul rax,rax,imm32 */
 }
 static void occ_load_rax_sized(int size) {
     if (size == 1) { occ_emit(0x48); occ_emit(0x0F); occ_emit(0xB6); occ_emit(0x00); }  /* movzx rax,[rax] */
@@ -866,7 +904,7 @@ static int occ_lv_size;
  *        misuse into a diagnostic instead of a wrong offset.
  *
  * Threads (sidx, ptr, size) in and out; the final size lands in occ_lv_size. */
-static void occ_member_chain(int *sidx, int *ptr, int *size) {
+static void occ_member_chain(int *sidx, int *ptr, int *size, int *esize) {
     for (;;) {
         int arrow = occ_is("->");
         if (!arrow && !occ_is(".")) break;
@@ -885,9 +923,10 @@ static void occ_member_chain(int *sidx, int *ptr, int *size) {
         if (mi < 0) { occ_err("no such member", mn); occ_next(); return; }
 
         occ_add_rax_imm32(st->m[mi].off);
-        *sidx = st->m[mi].sidx;
-        *ptr  = st->m[mi].ptr;
-        *size = st->m[mi].size;
+        *sidx  = st->m[mi].sidx;
+        *ptr   = st->m[mi].ptr;
+        *size  = st->m[mi].size;
+        *esize = st->m[mi].esize;
         occ_next();
 
         /* A pointer member must be LOADED before it can be stepped through
@@ -914,42 +953,70 @@ static int occ_lvalue(void) {     /* returns 1 if it emitted an address */
         for (int i = 0; i < OCC_NAMELEN; i++) occ_txt[i] = nm[i];
         return 0;
     }
-    int sidx = -1, ptr = 0, size = 8;
+    int sidx = -1, ptr = 0, size = 8, esize = 8, nelem = 0;
     int li = occ_loc_find(nm);
     if (li >= 0) {
         occ_lea_local(occ_locs[li].off);
         sidx = occ_locs[li].sidx; ptr = occ_locs[li].ptr; size = occ_locs[li].size;
+        esize = occ_locs[li].esize; nelem = occ_locs[li].nelem;
     } else {
         int si = occ_sym_get(nm, 1);
         occ_mov_rax_imm(OCC_DATA_BASE + (u64)occ_syms[si].addr);
         sidx = occ_syms[si].sidx; ptr = occ_syms[si].ptr; size = occ_syms[si].size;
+        esize = occ_syms[si].esize; nelem = occ_syms[si].nelem;
     }
     occ_lv_size = size;
-    if (occ_accept("[")) {                   /* a[i] -> *(a + i*8) */
-        /* v0.57: indexing is WORD-scaled, which is right for `int *` and wrong
-         * for an array of structs — the index would be multiplied by 8 instead
-         * of by the struct's size, and the base is an address rather than a
-         * pointer value so the load below is wrong too. Rather than emit code
-         * that is quietly off by a factor, say so. Reaching struct arrays means
-         * scaling the index by the element size, which is a change to the
-         * indexing model, not a patch here. */
-        if (sidx >= 0 && ptr == 0)
-            occ_err("indexing an array of structs is not supported", nm);
-        occ_load_rax_ind();                  /* the array/pointer value        */
+    if (occ_accept("[")) {                   /* a[i] -> *(a + i*ELEMSIZE) */
+        /* v0.58: scaled by the ELEMENT size, not by 8. `char *s` steps one
+         * byte, `struct P *p` steps sizeof(P). Before this every step was 8,
+         * which is correct only for `int *` — and it is why walking a string
+         * needed the __ldb intrinsic instead of s[i].
+         *
+         * An ARRAY's name is already its base address, so it must NOT be
+         * loaded; a POINTER's value must be. Getting that backwards reads the
+         * first element as if it were an address. */
+        if (!nelem) occ_load_rax_ind();      /* a pointer: fetch its value     */
         occ_push_rax();
         occ_expr();
-        occ_emit(0x48); occ_emit(0xC1); occ_emit(0xE0); occ_emit(3);   /* shl rax,3 */
+        occ_imul_rax_imm32(esize);
         occ_mov_rdi_rax(); occ_pop_rax();
         occ_emit(0x48); occ_emit(0x01); occ_emit(0xF8);                /* add rax,rdi */
         occ_expect("]");
-        occ_lv_size = 8;
+        /* one step consumed: `struct P *p; p[i]` is a struct, so a following
+         * `.` is correct there while `->` would be a level too far. */
+        if (ptr > 0) ptr--;
+        size = esize;
+        occ_lv_size = esize;
+        if (occ_is(".") || occ_is("->")) {
+            if (occ_is("->")) occ_load_rax_sized(8);
+            occ_member_chain(&sidx, &ptr, &size, &esize);
+        }
         return 1;
     }
     if (occ_is(".") || occ_is("->")) {
         /* RAX holds the variable's ADDRESS. For `.` that is already what the
          * chain wants. For `->` the POINTER VALUE is wanted, so load it. */
         if (occ_is("->")) occ_load_rax_sized(8);
-        occ_member_chain(&sidx, &ptr, &size);
+        occ_member_chain(&sidx, &ptr, &size, &esize);
+        /* v0.58: `p->buf[i]` — indexing a MEMBER. Without this the trailing
+         * `[i]` fell through to the untyped postfix path, which scales by 8 and
+         * would step eight bytes at a time through a char buffer. */
+        if (occ_accept("[")) {
+            if (ptr > 0) occ_load_rax_ind();     /* a pointer member: its value */
+            occ_push_rax();
+            occ_expr();
+            occ_imul_rax_imm32(esize);
+            occ_mov_rdi_rax(); occ_pop_rax();
+            occ_emit(0x48); occ_emit(0x01); occ_emit(0xF8);
+            occ_expect("]");
+            if (ptr > 0) ptr--;
+            size = esize;
+            occ_lv_size = esize;
+            if (occ_is(".") || occ_is("->")) {
+                if (occ_is("->")) occ_load_rax_sized(8);
+                occ_member_chain(&sidx, &ptr, &size, &esize);
+            }
+        }
     }
     return 1;
 }
@@ -1056,23 +1123,61 @@ static void occ_primary(void) {
             occ_emit32(0);
             return;
         }
-        int sidx = -1, ptr = 0, size = 8, isloc = 0;
+        int sidx = -1, ptr = 0, size = 8, esize = 8, nelem = 0;
         int li = occ_loc_find(nm);
         int si = -1;
         if (li >= 0) {
             occ_lea_local(occ_locs[li].off);
             sidx = occ_locs[li].sidx; ptr = occ_locs[li].ptr; size = occ_locs[li].size;
-            isloc = 1;
+            esize = occ_locs[li].esize; nelem = occ_locs[li].nelem;
         } else {
             si = occ_sym_get(nm, 1);
             occ_mov_rax_imm(OCC_DATA_BASE + (u64)occ_syms[si].addr);
             sidx = occ_syms[si].sidx; ptr = occ_syms[si].ptr; size = occ_syms[si].size;
+            esize = occ_syms[si].esize; nelem = occ_syms[si].nelem;
         }
-        (void)isloc;
         /* RAX now holds the variable's ADDRESS. */
+        if (occ_is("[")) {
+            occ_next();
+            if (!nelem) occ_load_rax_ind();          /* pointer: fetch value   */
+            occ_push_rax();
+            occ_expr();
+            occ_imul_rax_imm32(esize);
+            occ_mov_rdi_rax(); occ_pop_rax();
+            occ_emit(0x48); occ_emit(0x01); occ_emit(0xF8);            /* add rax,rdi */
+            occ_expect("]");
+            if (ptr > 0) ptr--;
+            size = esize;
+            if (occ_is(".") || occ_is("->")) {
+                if (occ_is("->")) occ_load_rax_sized(8);
+                occ_member_chain(&sidx, &ptr, &size, &esize);
+            }
+            /* an element that is itself a struct stays an ADDRESS */
+            if (!(sidx >= 0 && ptr == 0)) occ_load_rax_sized(size);
+            return;
+        }
+        /* v0.58: an ARRAY decays to its base address, exactly as a struct does
+         * and for the same reason — there is no way to hold either in a
+         * register, and C says the same. */
+        if (nelem) return;
         if (occ_is(".") || occ_is("->")) {
             if (occ_is("->")) occ_load_rax_sized(8);       /* want the pointer VALUE */
-            occ_member_chain(&sidx, &ptr, &size);
+            occ_member_chain(&sidx, &ptr, &size, &esize);
+            if (occ_accept("[")) {               /* v0.58: p->buf[i] */
+                if (ptr > 0) occ_load_rax_ind();
+                occ_push_rax();
+                occ_expr();
+                occ_imul_rax_imm32(esize);
+                occ_mov_rdi_rax(); occ_pop_rax();
+                occ_emit(0x48); occ_emit(0x01); occ_emit(0xF8);
+                occ_expect("]");
+                if (ptr > 0) ptr--;
+                size = esize;
+                if (occ_is(".") || occ_is("->")) {
+                    if (occ_is("->")) occ_load_rax_sized(8);
+                    occ_member_chain(&sidx, &ptr, &size, &esize);
+                }
+            }
             /* A member that is itself a struct stays an ADDRESS — there is no
              * way to hold a struct in a register, and C says the same. */
             if (!(sidx >= 0 && ptr == 0)) occ_load_rax_sized(size);
@@ -1091,6 +1196,12 @@ static void occ_primary(void) {
 }
 
 static void occ_postfix(void) {
+    /* v0.58: the FALLBACK index path — indexing an arbitrary value expression,
+     * e.g. f()[i], where there is no declared type to take an element size
+     * from. It is word-scaled, which is right for `int *` and the only defensible
+     * default with no type information. Every path that DOES know the type
+     * (a variable, a member, a chain) scales by that type's element size in
+     * occ_lvalue/occ_primary and never reaches here. */
     /* index on a value expression: p[i] */
     occ_primary();
     while (occ_is("[")) {
@@ -1346,6 +1457,7 @@ static void occ_struct_body(int si) {
                  * pointer member it is what `->` will dereference to. `ptr`
                  * distinguishes them. */
                 mm->size = xsz; mm->sidx = msi; mm->ptr = xptr;
+                mm->esize = occ_elem_size(msi, xptr, msz);
                 if (a > st->align) st->align = a;
                 if (st->is_union && xsz > st->size) st->size = xsz;
                 st->nm++;
@@ -1369,37 +1481,61 @@ static void occ_stmt(void) {
     if (occ_accept("{")) { while (!occ_is("}") && occ_tk != T_EOF) occ_stmt(); occ_expect("}"); return; }
 
     if (occ_is_type()) {                         /* local declaration */
-        int sidx, ptr, size;
-        if (!occ_parse_type(&sidx, &ptr, &size)) { occ_err("expected a type", occ_txt); occ_next(); return; }
+        int sidx, ptr, bsz;
+        if (!occ_parse_type(&sidx, &ptr, &bsz)) { occ_err("expected a type", occ_txt); occ_next(); return; }
         /* `struct P { int x; };` inside a function defines the type and
          * declares nothing — allow it rather than demanding a declarator. */
         if (occ_accept(";")) return;
         for (;;) {
-            int xptr = ptr, xsz = size;
+            int xptr = ptr, xsz = bsz;
             while (occ_accept("*")) { xptr++; xsz = 8; }
             if (occ_tk != T_IDENT) { occ_err("expected a declarator", occ_txt); return; }
-            if (occ_nloc >= OCC_MAXLOC) occ_err("too many locals in one function", occ_txt);
+            char lname[OCC_NAMELEN];
+            for (int i = 0; i < OCC_NAMELEN; i++) lname[i] = occ_txt[i];
+            occ_next();
+
+            /* v0.58: LOCAL ARRAYS. A local was one 8-byte slot, so `char buf[64];`
+             * could not be written at all — which is why /usr/lib/libc.oc's
+             * scratch buffers are globals and its formatters are not reentrant. */
+            int nelem = 0;
+            if (occ_accept("[")) {
+                if (occ_tk == T_NUM) { nelem = (int)occ_val; occ_next(); }
+                else occ_err("a local array needs a constant size", lname);
+                occ_expect("]");
+                if (nelem <= 0) { occ_err("array size must be positive", lname); nelem = 1; }
+            }
+            int esz = occ_elem_size(sidx, xptr, bsz);
+
+            int slot = -1;
+            if (occ_nloc >= OCC_MAXLOC) occ_err("too many locals in one function", lname);
             else {
                 struct occ_loc *L = &occ_locs[occ_nloc];
-                for (int i = 0; i < OCC_NAMELEN; i++) L->name[i] = occ_txt[i];
-                /* v0.57: a struct local occupies its REAL size, rounded up to 8
-                 * so the frame stays qword-aligned. Every local was one 8-byte
-                 * slot before this, which is exactly why structs needed it. */
-                int slotsz = (xsz + 7) & ~7;
+                for (int i = 0; i < OCC_NAMELEN; i++) L->name[i] = lname[i];
+                /* An array reserves nelem elements; a struct its real size; a
+                 * scalar a full word. Rounded up to 8 so the frame stays
+                 * qword-aligned regardless. */
+                int bytes = nelem ? nelem * esz : xsz;
+                int slotsz = (bytes + 7) & ~7;
                 occ_frame += slotsz;
-                L->off  = -occ_frame;
-                L->sidx = (xptr ? sidx : sidx);
-                L->ptr  = xptr;
-                L->size = xsz;
+                L->off   = -occ_frame;
+                L->sidx  = sidx;
+                L->ptr   = xptr;
+                L->size  = nelem ? esz : xsz;   /* size of ONE element/value */
+                L->esize = esz;
+                L->nelem = nelem;
                 occ_nloc++;
+                slot = occ_nloc - 1;
             }
-            int slot = occ_nloc - 1;
-            occ_next();
             if (occ_accept("=")) {
-                if (slot >= 0 && occ_locs[slot].sidx >= 0 && occ_locs[slot].ptr == 0)
-                    occ_err("cannot initialise a struct by assignment", occ_locs[slot].name);
+                if (slot >= 0 && occ_locs[slot].nelem)
+                    occ_err("cannot initialise an array by assignment", lname);
+                else if (slot >= 0 && occ_locs[slot].sidx >= 0 && occ_locs[slot].ptr == 0)
+                    occ_err("cannot initialise a struct by assignment", lname);
                 occ_expr();
-                occ_emit(0x48); occ_emit(0x89); occ_emit(0x85); occ_emit32((u32)occ_locs[slot].off);
+                if (slot >= 0) {
+                    occ_emit(0x48); occ_emit(0x89); occ_emit(0x85);
+                    occ_emit32((u32)occ_locs[slot].off);
+                }
             }
             if (!occ_accept(",")) break;
         }
@@ -1529,6 +1665,8 @@ static void occ_toplevel(void) {
                         for (int i = 0; i < OCC_NAMELEN; i++) L->name[i] = occ_txt[i];
                         occ_frame += 8; L->off = -occ_frame;
                         L->sidx = psidx; L->ptr = pptr; L->size = psize;
+                        L->esize = occ_elem_size(psidx, pptr, psize);
+                        L->nelem = 0;
                         occ_nloc++;
                     }
                     np++;
@@ -1602,9 +1740,13 @@ static void occ_toplevel(void) {
         occ_syms[si].addr = occ_dlen;
         occ_syms[si].defined = 1;
         occ_syms[si].sidx = bsidx; occ_syms[si].ptr = dptr; occ_syms[si].size = dsize;
+        occ_syms[si].esize = occ_elem_size(bsidx, dptr, bsize);
         i64 init = 0;
         int cells = 1;
-        if (occ_accept("[")) { if (occ_tk == T_NUM) { cells = (int)occ_val; occ_next(); } occ_expect("]"); }
+        if (occ_accept("[")) { if (occ_tk == T_NUM) { cells = (int)occ_val; occ_next(); } occ_expect("]");
+                               occ_syms[si].nelem = cells;
+                               /* an array's "value size" is one element */
+                               occ_syms[si].size = occ_syms[si].esize; }
         if (occ_accept("=")) { if (occ_tk == T_NUM) { init = occ_val; occ_next(); }
                                else { occ_err("global initialiser must be a constant", nm); occ_next(); } }
         /* v0.57: reserve the type's REAL size per cell. An array of a 24-byte
@@ -1757,8 +1899,24 @@ static int occ_compile(const char **srcs, int nsrc, const char *outpath) {
 
     /* A tiny entry stub is emitted FIRST so the ELF entry point is offset 0:
      * it calls main and turns the return value into SYS_EXIT. This is the crt0
-     * of a compiled program, generated rather than linked. */
+     * of a compiled program, generated rather than linked.
+     *
+     * v0.58: IT NOW PASSES argc/argv/envp. The kernel already enters ring 3
+     * with RSP pointing at the SysV process-start block — /bin/init's
+     * hand-written crt0 has read it since v0.55 — but occ's stub called main
+     * with whatever happened to be in the argument registers, so an
+     * occ-compiled program could not be told anything at startup. Every
+     * compiled program was therefore a program with exactly one behaviour.
+     *
+     * Three instructions fix that, and they are the same three /bin/init's
+     * crt0 uses. They must come BEFORE the call, while RSP still points at the
+     * block. RSP is deliberately NOT realigned: occ emits no SSE, its frames
+     * are already rounded to 16, and moving RSP here would only make this stub
+     * differ from the one that has been working. */
     int main_sym = occ_sym_get("main", 0);
+    occ_emit(0x48); occ_emit(0x8B); occ_emit(0x3C); occ_emit(0x24);        /* mov (%rsp),%rdi      -> argc */
+    occ_emit(0x48); occ_emit(0x8D); occ_emit(0x74); occ_emit(0x24); occ_emit(0x08);  /* lea 8(%rsp),%rsi -> argv */
+    occ_emit(0x48); occ_emit(0x8D); occ_emit(0x54); occ_emit(0xFC); occ_emit(0x10);  /* lea 16(%rsp,%rdi,8),%rdx -> envp */
     occ_emit(0xE8);
     int entry_fix = occ_tlen; occ_emit32(0);
     occ_mov_rdi_rax();                                    /* exit status = main's return */

@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.57.0-metal"
+#define KERNEL_VERSION "0.58.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -84,7 +84,48 @@ static void vga_scroll(void) {
         VGA_MEM[(VGA_H - 1) * VGA_W + c] = (uint16_t)(' ' | (vga_color << 8));
     vga_row = VGA_H - 1;
 }
+/* v0.58: the two escape sequences a full-screen program needs.
+ *
+ * vedit is a ring-3 program that clears and redraws the screen, and it does
+ * that the way every terminal program does: by writing CSI sequences. On the
+ * serial console those already worked, because the thing on the other end is a
+ * real terminal. The VGA text console is not a terminal — it is a character
+ * cell array this file writes into directly — so the sequences arrived as
+ * literal '[' '2' 'J' garbage and the "clear" never happened.
+ *
+ * This is the smallest honest fix: a three-state recogniser for ESC '[' <n> J
+ * and ESC '[' H, and nothing else. Any other sequence is CONSUMED rather than
+ * printed — a half-understood terminal that echoes the parameters of sequences
+ * it does not implement is worse than one that quietly drops them, because the
+ * parameters land in the middle of the user's text. Existing kernel output is
+ * completely unaffected: nothing else in this kernel ever emits ESC.          */
+static int vga_esc;                  /* 0 none, 1 saw ESC, 2 inside CSI */
+static int vga_esc_num;
+static void vga_erase_to_eol(void) {
+    for (int c = vga_col; c < VGA_W; c++)
+        VGA_MEM[vga_row * VGA_W + c] = (uint16_t)(' ' | (vga_color << 8));
+}
+static int vga_ansi(char ch) {       /* returns 1 if the byte was consumed */
+    if (vga_esc == 0) {
+        if (ch != 27) return 0;
+        vga_esc = 1; return 1;
+    }
+    if (vga_esc == 1) {
+        vga_esc = (ch == '[') ? 2 : 0;    /* only CSI is understood */
+        vga_esc_num = 0;
+        return 1;
+    }
+    if (ch >= '0' && ch <= '9') { vga_esc_num = vga_esc_num * 10 + (ch - '0'); return 1; }
+    if (ch == ';') { vga_esc_num = 0; return 1; }     /* only the last parameter matters here */
+    vga_esc = 0;
+    if (ch == 'J') { if (vga_esc_num == 2) vga_clear(); else vga_erase_to_eol(); }
+    else if (ch == 'H' || ch == 'f') { vga_row = 0; vga_col = 0; vga_move_cursor(); }
+    else if (ch == 'K') vga_erase_to_eol();
+    return 1;                                          /* anything else: consumed, not printed */
+}
+
 static void vga_putc(char ch) {
+    if (vga_esc || ch == 27) { if (vga_ansi(ch)) return; }
     if (ch == '\n') { vga_col = 0; vga_row++; }
     else if (ch == '\b') {
         if (vga_col > 0) { vga_col--; VGA_MEM[vga_row * VGA_W + vga_col] = (uint16_t)(' ' | (vga_color << 8)); }
@@ -1366,6 +1407,13 @@ static uint64_t create_address_space(void) {
 #define PCAP_SURFACE         (1ull << 10)   /* v0.50: required for any SYS_GPU_* call */
 #define PCAP_AUDIO           (1ull << 11)   /* v0.51: required for any SYS_AUDIO_* call */
 #define PCAP_WIMP            (1ull << 12)   /* v0.53: required for any SYS_WIN_* call */
+/* v0.58: reading the SHARED console keyboard. Writing to the console has never
+ * been gated (SYS_WRITE is how a process says anything at all), but reading it
+ * is a different thing entirely: the queue a ring-3 process would drain is the
+ * same one the kernel shell reads, so an ungated SYS_TTY_READ would let any
+ * process take keystrokes meant for another and see everything typed. It is a
+ * capability, and only processes spawned to be interactive get it.           */
+#define PCAP_CONSOLE         (1ull << 13)   /* v0.58: required for SYS_TTY_READ */
 
 /* v0.55: POSIX signal numbers actually supported by this kernel. Values match
  * Linux/POSIX so ring-3 code can use the familiar constants. */
@@ -9472,6 +9520,60 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         }
         return (uint64_t)-10;
     }
+    case 60: {   /* SYS_TTY_READ(buf, n) -> bytes read, 0 if nothing is pending.
+                  *
+                  * v0.58. NON-BLOCKING, on purpose: this kernel still has no
+                  * sleep/wake queue for ring 3, so a blocking read would have to
+                  * spin inside the syscall with the caller's time slice held —
+                  * which on a uniprocessor means the process that would produce
+                  * the next keystroke never runs. Returning 0 and letting the
+                  * caller SYS_YIELD is the same shape SYS_WAITPID already has,
+                  * and it is why vedit's key loop yields rather than spinning.
+                  *
+                  * The bytes come from the SAME two sinks the kernel shell polls
+                  * — PS/2 (or USB HID, which xhci_poll_hid feeds into the same
+                  * queue) and COM1 — so a ring-3 editor is driven by real keys
+                  * from either console, exactly like the shell is. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_CONSOLE)) return (uint64_t)-13;
+        uint32_t want = (uint32_t)a1;
+        if (want > 256) want = 256;
+        if (!want) return 0;
+        if (!access_ok(kprocs[current_proc_idx].cr3, a0, want, 1)) return (uint64_t)-14;
+        char *dst = (char *)a0;
+        uint32_t n = 0;
+        while (n < want) {
+            xhci_poll_hid();                       /* USB HID lands in the PS/2 queue */
+            int c = kbd_getc_nonblock();
+            if (c < 0) c = serial_getc_nonblock();
+            if (c < 0) break;
+            dst[n++] = (char)c;
+        }
+        return n;
+    }
+    case 61: {   /* SYS_STAT(path, out) -> 0 found, -2 absent, -14 bad pointer.
+                  *   out = { uint64_t content_hash; uint64_t length; }
+                  *
+                  * v0.58. This exists because omake needs to decide what is out
+                  * of date and this filesystem has NO TIMESTAMPS — dirents carry
+                  * a content hash and a length, and nothing else. Rather than
+                  * bolt a clock onto a content-addressed store, the ABI exposes
+                  * what the store actually knows, and the build tool compares
+                  * content instead of time. SYS_READDIR could not serve this: its
+                  * output record has no hash field and widening it would break
+                  * every existing caller's 72-byte struct. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+        char path[VFS_NAME_MAX];
+        if (copy_user_str(kprocs[current_proc_idx].cr3, a0, path, sizeof path) < 0) return (uint64_t)-14;
+        struct { uint64_t hash, len; } st;
+        if (!access_ok(kprocs[current_proc_idx].cr3, a1, sizeof st, 1)) return (uint64_t)-14;
+        fs_witness_enter();
+        int di = vfs_find(path);
+        st.hash = di >= 0 ? DENTS[di].file_hash : 0;
+        st.len  = di >= 0 ? DENTS[di].len : 0;
+        fs_witness_leave();
+        cmemcpy((void *)a1, &st, sizeof st);
+        return di >= 0 ? 0 : (uint64_t)-2;
+    }
     }
     return (uint64_t)-1;
 }
@@ -11690,6 +11792,17 @@ static const char SDK_ABI_H[] =
 "#define SYS_WAITPID         56   /* (int pid, int timeout) -> exit status    */\n"
 "#define SYS_BRK             58   /* (new_brk) -> current brk (0 to query)    */\n"
 "#define SYS_EXECVE_PATH     59   /* (const char *path, argv, envp)           */\n"
+"#define SYS_TTY_READ        60   /* (char *buf, int n) -> bytes read, or 0.  */\n"
+"                                 /* v0.58. NON-BLOCKING and it stays that    */\n"
+"                                 /* way: 0 means 'no key yet', so yield and  */\n"
+"                                 /* ask again. Needs CAP_CONSOLE.            */\n"
+"#define SYS_STAT            61   /* (const char *path, void *out) -> 0 / -2  */\n"
+"                                 /* out = { int content_hash; int length; }  */\n"
+"                                 /* v0.58. There are NO TIMESTAMPS in this   */\n"
+"                                 /* filesystem, by design: it is content-    */\n"
+"                                 /* addressed, so what it can tell you about */\n"
+"                                 /* a file is what the bytes hash to. Build  */\n"
+"                                 /* tools compare THAT, not a clock.         */\n"
 "\n"
 "#define O_CREAT 1                /* the ONLY defined SYS_OPEN flag. Any other\n"
 "                                  * bit is rejected with -22, on purpose.   */\n"
@@ -11714,6 +11827,13 @@ static const char SDK_STDIO_H[] =
 "int  read(int fd, char *buf, int n);\n"
 "int  write(int fd, char *buf, int n);\n"
 "int  close(int fd);\n"
+"/* v0.58. ttyread() is how a full-screen program gets keys; it returns 0 when\n"
+" * nothing is pending, so poll it with yield() in between (see /src/vedit.c).\n"
+" * statf() fills a TWO-WORD buffer: out[0] is the content hash, out[1] the\n"
+" * length. It returns 0 when the file exists and -2 when it does not, which is\n"
+" * also the cheapest way to ask 'is this file there'.                        */\n"
+"int  ttyread(char *buf, int n);\n"
+"int  statf(char *path, char *out);\n"
 "#endif\n";
 
 static const char SDK_STDLIB_H[] =
@@ -11755,6 +11875,13 @@ static const char SDK_UNISTD_H[] =
 "int waitpid(int pid, int timeout);\n"
 "int yield(void);\n"
 "int unlink(char *path);\n"
+"/* v0.58: execp() replaces this image with an ELF loaded BY PATH out of the\n"
+" * VFS. `argv` is a WORD array of pointers terminated by a 0 — which is what\n"
+" * p[i] indexes natively in occ's subset, so building one is three lines (see\n"
+" * mk_exec in /src/omake.c). envp may be 0. It returns only on failure.\n"
+" * With fork() above it, an occ-compiled program can now run another program:\n"
+" * that is the whole of what /bin/omake needs from the kernel.              */\n"
+"int execp(char *path, char *argv, char *envp);\n"
 "/* sbrk() grows the heap by at least `delta` and returns the OLD break, or 0.\n"
 " * The underlying SYS_BRK is PAGE-GRANULAR: it rounds the requested break up\n"
 " * to a page boundary and returns the resulting break, so the value it hands\n"
@@ -11821,45 +11948,43 @@ static const char SDK_LIBC_OC[] =
 " * TWO SUBSET RULES GOVERN EVERYTHING BELOW, and breaking either one produces\n"
 " * code that compiles and is wrong, so they are stated up front:\n"
 " *\n"
-" *   1. occ has NO LOCAL ARRAYS. A local declaration is one 8-byte slot. Every\n"
-" *      scratch buffer here is therefore a GLOBAL, and its address is taken\n"
-" *      with &name. That makes these functions non-reentrant, which is stated\n"
-" *      honestly rather than hidden.\n"
-" *   2. p[i] means *(p + i*8) — a WORD, never a byte. Byte access goes through\n"
-" *      the __ldb/__stb intrinsics. Anything walking a C string must use them.\n"
+" *   v0.58 CHANGED BOTH OF THE RULES THAT USED TO GOVERN THIS FILE.\n"
+" *   1. LOCAL ARRAYS EXIST NOW, so the scratch buffers below are locals rather\n"
+" *      than globals — which makes putdec/puthex/putchar REENTRANT. They were\n"
+" *      not, and this comment used to say so.\n"
+" *   2. p[i] is scaled by the ELEMENT size, so s[i] on a `char *` steps one\n"
+" *      byte. Walking a C string no longer needs __ldb. The intrinsics remain\n"
+" *      for poking a byte at an address of unknown type.\n"
 " */\n"
-"char lc_buf[8];        /* 64 bytes of scratch: putchar/putdec/puthex output */\n"
-"char lc_tmp[8];        /* 64 more: digit reversal                          */\n"
-"\n"
 "/* --- strings. Byte-addressed, so these work on real C strings. ---------- */\n"
-"int strlen(char *s) { int n; n = 0; while (__ldb(s, n)) { n = n + 1; } return n; }\n"
+"int strlen(char *s) { int n; n = 0; while (s[n]) { n = n + 1; } return n; }\n"
 "int strcmp(char *a, char *b) {\n"
 "  int i; i = 0;\n"
-"  while (__ldb(a, i) && __ldb(a, i) == __ldb(b, i)) { i = i + 1; }\n"
-"  return __ldb(a, i) - __ldb(b, i);\n"
+"  while (a[i] && a[i] == b[i]) { i = i + 1; }\n"
+"  return a[i] - b[i];\n"
 "}\n"
 "char *strcpy(char *d, char *s) {\n"
 "  int i; i = 0;\n"
-"  while (__ldb(s, i)) { __stb(d, i, __ldb(s, i)); i = i + 1; }\n"
-"  __stb(d, i, 0); return d;\n"
+"  while (s[i]) { d[i] = s[i]; i = i + 1; }\n"
+"  d[i] = 0; return d;\n"
 "}\n"
 "char *memcpy(char *d, char *s, int n) {\n"
 "  int i; i = 0;\n"
-"  while (i < n) { __stb(d, i, __ldb(s, i)); i = i + 1; }\n"
+"  while (i < n) { d[i] = s[i]; i = i + 1; }\n"
 "  return d;\n"
 "}\n"
 "char *memset(char *d, int c, int n) {\n"
 "  int i; i = 0;\n"
-"  while (i < n) { __stb(d, i, c); i = i + 1; }\n"
+"  while (i < n) { d[i] = c; i = i + 1; }\n"
 "  return d;\n"
 "}\n"
 "int abs(int v) { if (v < 0) { return 0 - v; } return v; }\n"
 "int atoi(char *s) {\n"
 "  int i; int v; int neg;\n"
 "  i = 0; v = 0; neg = 0;\n"
-"  if (__ldb(s, 0) == 45) { neg = 1; i = 1; }\n"
-"  while (__ldb(s, i) >= 48 && __ldb(s, i) <= 57) {\n"
-"    v = v * 10 + (__ldb(s, i) - 48); i = i + 1;\n"
+"  if (s[0] == 45) { neg = 1; i = 1; }\n"
+"  while (s[i] >= 48 && s[i] <= 57) {\n"
+"    v = v * 10 + (s[i] - 48); i = i + 1;\n"
 "  }\n"
 "  if (neg) { return 0 - v; }\n"
 "  return v;\n"
@@ -11867,32 +11992,33 @@ static const char SDK_LIBC_OC[] =
 "/* --- I/O. SYS_WRITE takes a NUL-terminated string, so these build one. --- */\n"
 "int puts(char *s) { __syscall(0, s, 0, 0); return 0; }\n"
 "int putchar(int c) {\n"
-"  __stb(&lc_buf, 0, c); __stb(&lc_buf, 1, 0);\n"
-"  __syscall(0, &lc_buf, 0, 0);\n"
+"  char b[2];\n"
+"  b[0] = c; b[1] = 0;\n"
+"  __syscall(0, b, 0, 0);\n"
 "  return c;\n"
 "}\n"
 "int putdec(int v) {\n"
-"  int i; int k;\n"
+"  char b[24]; char t[24]; int i; int k;\n"
 "  i = 0;\n"
 "  if (v < 0) { putchar(45); v = 0 - v; }\n"
-"  if (v == 0) { __stb(&lc_tmp, 0, 48); i = 1; }\n"
-"  while (v > 0) { __stb(&lc_tmp, i, 48 + v % 10); v = v / 10; i = i + 1; }\n"
+"  if (v == 0) { t[0] = 48; i = 1; }\n"
+"  while (v > 0) { t[i] = 48 + v % 10; v = v / 10; i = i + 1; }\n"
 "  k = 0;\n"
-"  while (i > 0) { i = i - 1; __stb(&lc_buf, k, __ldb(&lc_tmp, i)); k = k + 1; }\n"
-"  __stb(&lc_buf, k, 0);\n"
-"  __syscall(0, &lc_buf, 0, 0);\n"
+"  while (i > 0) { i = i - 1; b[k] = t[i]; k = k + 1; }\n"
+"  b[k] = 0;\n"
+"  __syscall(0, b, 0, 0);\n"
 "  return 0;\n"
 "}\n"
 "int puthex(int v) {\n"
-"  int i; int d;\n"
+"  char b[20]; int i; int d;\n"
 "  i = 0;\n"
 "  while (i < 16) {\n"
 "    d = (v >> (60 - i * 4)) & 15;\n"
-"    if (d < 10) { __stb(&lc_buf, i, 48 + d); } else { __stb(&lc_buf, i, 87 + d); }\n"
+"    if (d < 10) { b[i] = 48 + d; } else { b[i] = 87 + d; }\n"
 "    i = i + 1;\n"
 "  }\n"
-"  __stb(&lc_buf, 16, 0);\n"
-"  __syscall(0, &lc_buf, 0, 0);\n"
+"  b[16] = 0;\n"
+"  __syscall(0, b, 0, 0);\n"
 "  return 0;\n"
 "}\n"
 "int open(char *path)  { return __syscall(5, path, 0, 0); }\n"
@@ -11909,6 +12035,13 @@ static const char SDK_LIBC_OC[] =
 "int yield(void)   { return __syscall(15, 0, 0, 0); }\n"
 "int kill(int pid, int sig) { return __syscall(50, pid, sig, 0); }\n"
 "int exit(int status) { __syscall(2, status, 0, 0); return 0; }\n"
+"/* v0.58: run another program, and read the console. These three are what turn\n"
+" * a compiled program from something that computes into something that can\n"
+" * drive the system: execp() is how omake runs the compiler, and ttyread() is\n"
+" * how vedit gets a keystroke. */\n"
+"int execp(char *path, char *argv, char *envp) { return __syscall(59, path, argv, envp); }\n"
+"int ttyread(char *buf, int n) { return __syscall(60, buf, n, 0); }\n"
+"int statf(char *path, char *out) { return __syscall(61, path, out, 0); }\n"
 "/* --- heap. BUMP ONLY: free() cannot reclaim and does not pretend to. -----\n"
 " * SYS_BRK IS PAGE-GRANULAR. It rounds the requested break UP to the next page\n"
 " * and returns the RESULTING break, which is therefore usually larger than what\n"
@@ -11950,10 +12083,25 @@ static const char SDK_LIB_README[] =
 "Reaching a real crt0.o and libc.a means giving occ relocations, a symbol\n"
 "table, and a linker. That is a milestone, not a file.\n";
 
-/* Publish the SDK into the VFS. Nine dirents, written once at boot. Every one
- * of them is a real file the running system can open, read and compile
- * against; toolstrs checks the important ones are present and non-empty, and
- * that /usr/lib/libc.oc really is what makes strlen() resolve. */
+/* ---------------------------------------------------------------------------
+ * v0.58: THE USERLAND SOURCE TREE, in /src.
+ *
+ * These are generated by tools/mkstr.py from the real files under user/, which
+ * is the whole point: /src/vedit.c and /src/omake.c are several hundred lines
+ * of occ-subset C each, and a program that only exists as \n-spliced quotes
+ * inside this file cannot be read, diffed or reviewed. Edit user/*.oc; the
+ * build regenerates the header.
+ *
+ * What is published here is SOURCE, not binaries. Nothing ships /bin/vedit.elf
+ * — the running system compiles it, with its own compiler, out of the tree it
+ * carries. That is the claim this milestone actually makes, and shipping a
+ * prebuilt editor next to its source would quietly undo it. */
+#include "../build/sdk_sources.h"
+
+/* Publish the SDK into the VFS. Written once at boot. Every one of them is a
+ * real file the running system can open, read and compile against; toolstrs
+ * checks the important ones are present and non-empty, and that
+ * /usr/lib/libc.oc really is what makes strlen() resolve. */
 static void sdk_install(void) {
     struct { const char *path; const char *body; } f[] = {
         { "/usr/include/outrun_abi.h", SDK_ABI_H     },
@@ -11965,6 +12113,13 @@ static void sdk_install(void) {
         { "/usr/include/pthread.h",    SDK_PTHREAD_H },
         { "/usr/lib/libc.oc",          SDK_LIBC_OC   },
         { "/usr/lib/README",           SDK_LIB_README},
+        /* v0.58: the two native tools, as source, plus a project that builds. */
+        { "/src/vedit.c",              SDK_VEDIT_C   },
+        { "/src/omake.c",              SDK_OMAKE_C   },
+        { "/src/demo.mk",              SDK_DEMO_MK   },
+        { "/src/hello.h",              SDK_HELLO_H   },
+        { "/src/hello_a.c",            SDK_HELLO_A   },
+        { "/src/hello_b.c",            SDK_HELLO_B   },
     };
     int n = (int)(sizeof f / sizeof f[0]), ok = 0;
     uint32_t bytes = 0;
@@ -11974,7 +12129,8 @@ static void sdk_install(void) {
         else kprintf("[sdk    ] FAILED to install %s\n", f[i].path);
     }
     kprintf("[sdk    ] installed %d/%d SDK files (%u bytes): 7 headers in "
-            "/usr/include, the runtime + README in /usr/lib\n",
+            "/usr/include, the runtime + README in /usr/lib, the toolchain's "
+            "own sources in /src\n",
             (uint64_t)ok, (uint64_t)n, (uint64_t)bytes);
 }
 

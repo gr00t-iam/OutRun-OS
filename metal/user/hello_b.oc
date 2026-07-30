@@ -1,0 +1,5 @@
+/* hello_b.c - the second unit. It is reached only because occ fuses every
+ * input into ONE translation unit and omake passed both paths in one call. */
+#include "hello.h"
+
+int hello_sum(int a, int b) { return a + b; }
