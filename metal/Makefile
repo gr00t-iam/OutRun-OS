@@ -20,7 +20,7 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-VERSION := 0.58.0
+VERSION := 0.60.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean
@@ -54,12 +54,13 @@ EXTRA   ?=
 # converted to C string literals at build time. Keeping several hundred lines of
 # occ-subset C as escaped quotes inside kernel64.c would make them unreadable
 # and, worse, unreviewable.
-SDK_SRCS := user/vedit.oc user/omake.oc user/demo.mk \
+SDK_SRCS := user/vedit.oc user/omake.oc user/vsh.oc user/demo.mk \
             user/hello.h user/hello_a.oc user/hello_b.oc
 $(BUILD)/sdk_sources.h: $(SDK_SRCS) tools/mkstr.py | $(BUILD)
 	python3 tools/mkstr.py $@ \
 	  SDK_VEDIT_C=user/vedit.oc \
 	  SDK_OMAKE_C=user/omake.oc \
+	  SDK_VSH_C=user/vsh.oc \
 	  SDK_DEMO_MK=user/demo.mk \
 	  SDK_HELLO_H=user/hello.h \
 	  SDK_HELLO_A=user/hello_a.oc \

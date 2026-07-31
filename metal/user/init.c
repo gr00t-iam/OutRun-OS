@@ -84,6 +84,13 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_SIGUNMASK           57
 #define SYS_BRK                 58
 #define SYS_EXECVE_PATH         59
+#define SYS_TTY_READ            60
+#define SYS_STAT                61
+/* v0.59. SYS_PIPE fills TWO 64-BIT WORDS: out[0] read end, out[1] write end.
+ * SYS_SETREDIR(which, fd) points stdin (0) or stdout (1) at a descriptor, or
+ * -1 for the console; it is kproc state, so it survives SYS_EXECVE_PATH. */
+#define SYS_PIPE                62
+#define SYS_SETREDIR            63
 /* Mirrors the kernel's HEAP_USER_V (kernel64.c is the master). */
 #define HEAP_USER_V_LO 0x0000570000000000ull
 
@@ -1820,28 +1827,38 @@ static void posix_fd_worker(void) {
 
     int fd = oopen("motd");
     if (fd >= 0 && fd < 3) sysc(SYS_EXIT, 961, 0, 0);   /* collided with the std three */
+    char buf[64]; i64 pn = 0;
     if (fd >= 3) {
-        char buf[64];
-        if (oread(fd, buf, sizeof buf - 1) <= 0) sysc(SYS_EXIT, 964, 0, 0);
+        pn = oread(fd, buf, sizeof buf - 1);
+        if (pn <= 0) sysc(SYS_EXIT, 964, 0, 0);
     }
 
     i64 r = ofork();
     if (r == 0) {                                       /* ---- CHILD ---- */
         /* The userland table is ordinary process memory, so fork inherits it
          * byte for byte: the child sees the same fd numbers bound the same way,
-         * and the console-backed std three work immediately. The KERNEL
-         * descriptor underneath is deliberately NOT duplicated (each kernel fd
-         * has exactly one owning kproc, which is what lets the teardown hooks
-         * guarantee no leaks) — so a read through an inherited FILE fd must be
-         * DENIED cleanly rather than silently reading another process's file.
-         * That containment is the property asserted here. */
+         * and the console-backed std three work immediately.
+         *
+         * v0.59 INVERTED THE ASSERTION BELOW, deliberately. Through v0.58 the
+         * kernel descriptor under an inherited fd was NOT duplicated — each
+         * kernel fd had exactly one owning kproc — so this test required a read
+         * through an inherited FILE fd to be DENIED, and called that
+         * containment. With ofile.owner_mask the child is a genuine co-owner,
+         * so the read must now SUCCEED and return the same bytes the parent
+         * saw. That is POSIX behaviour and the thing pipelines are built on;
+         * the leak guarantee it used to protect is now kept by refcounting
+         * (the entry survives until BOTH owners drop it) rather than by
+         * forbidding the share. */
         if (g_ofd[STDOUT_FILENO] != OFD_CONSOLE) sysc(SYS_EXIT, 963, 0, 0);
         if (g_ofd[STDERR_FILENO] != OFD_CONSOLE) sysc(SYS_EXIT, 963, 0, 0);
         oputs("  [posix ] child wrote through the inherited stdout mapping\n");
         if (fd >= 3) {
             char b2[64];
             if (g_ofd[fd] < 0) sysc(SYS_EXIT, 963, 0, 0);        /* table not inherited */
-            if (oread(fd, b2, sizeof b2 - 1) >= 0) sysc(SYS_EXIT, 969, 0, 0);  /* must be denied */
+            i64 cn = oread(fd, b2, sizeof b2 - 1);
+            if (cn != pn) sysc(SYS_EXIT, 969, 0, 0);   /* inherited fd must READ, and read the same */
+            for (i64 k = 0; k < cn; k++)
+                if (b2[k] != buf[k]) sysc(SYS_EXIT, 969, 0, 0);
         }
         sysc(SYS_EXIT, 42, 0, 0);
     }
@@ -2137,6 +2154,244 @@ static int selfhost_author(const char *path, const char *text) {
     return 0;
 }
 
+/* --- role 40: pipe mechanics (the ring-3 half of `pipestrs`) ---------------
+ *
+ * Works on RAW kernel descriptors rather than through g_ofd[], because a pipe
+ * end IS a kernel descriptor and layering the userland table over it would
+ * only put a second mapping between the assertion and the thing asserted.
+ *
+ * Exit codes name the broken property, in the 95x family:
+ *   950 all assertions held      955 EOF not reported once the last writer left
+ *   951 SYS_PIPE failed          956 EPIPE not reported with no reader left
+ *   952 round trip corrupted     957 cross-process transfer failed
+ *   953 EAGAIN not reported      958 redirection failed
+ *   954 buffer bound wrong       959 fork failed
+ */
+static void pipe_worker(void) {
+    u64 fds[2];
+    char buf[128];
+    int i;
+    const char *msg = "outrun-pipe";
+    u64 mlen = ostrlen(msg);
+
+    /* 1. a pipe hands back two DISTINCT descriptors. */
+    if ((i64)sysc(SYS_PIPE, (u64)fds, 0, 0) != 0)          sysc(SYS_EXIT, 951, 0, 0);
+    int rfd = (int)fds[0], wfd = (int)fds[1];
+    if (rfd < 0 || wfd < 0 || rfd == wfd)                  sysc(SYS_EXIT, 951, 0, 0);
+
+    /* 2. bytes survive the round trip, in order. */
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)wfd, (u64)msg, mlen) != (i64)mlen)
+                                                           sysc(SYS_EXIT, 952, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, sizeof buf) != (i64)mlen)
+                                                           sysc(SYS_EXIT, 952, 0, 0);
+    for (i = 0; i < (int)mlen; i++) if (buf[i] != msg[i])   sysc(SYS_EXIT, 952, 0, 0);
+
+    /* 3. EMPTY but a writer still exists: that is "not yet" (EAGAIN), NOT end
+     *    of file. A reader that confuses the two exits early on a slow
+     *    producer, which is the single most common way to break a pipeline. */
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, 8) != -11)  sysc(SYS_EXIT, 953, 0, 0);
+
+    /* 4. the buffer is FINITE, and says so honestly: a write larger than the
+     *    free space is SHORT (never a silent truncation), and a write with no
+     *    space at all is EAGAIN. The exact capacity is deliberately not
+     *    asserted here — only that the bound exists and is reported. */
+    static char big[4096];
+    for (i = 0; i < 4096; i++) big[i] = (char)('a' + (i % 26));
+    i64 w = (i64)sysc(SYS_WRITE_FILE, (u64)wfd, (u64)big, 4096);
+    if (w <= 0 || w >= 4096)                                sysc(SYS_EXIT, 954, 0, 0);
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)wfd, (u64)big, 8) != -11)
+                                                            sysc(SYS_EXIT, 954, 0, 0);
+    u64 drained = 0;
+    while (drained < (u64)w) {
+        i64 n = (i64)sysc(SYS_READ, (u64)rfd, (u64)buf, sizeof buf);
+        if (n <= 0)                                         sysc(SYS_EXIT, 954, 0, 0);
+        drained += (u64)n;
+    }
+    if (drained != (u64)w)                                  sysc(SYS_EXIT, 954, 0, 0);
+
+    /* 5. the LAST writer closing turns the same empty read into a real EOF. */
+    sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, 8) != 0)    sysc(SYS_EXIT, 955, 0, 0);
+    sysc(SYS_CLOSE, (u64)rfd, 0, 0);
+
+    /* 6. writing with no reader left can never succeed, so it must fail loudly
+     *    rather than block forever. */
+    if ((i64)sysc(SYS_PIPE, (u64)fds, 0, 0) != 0)           sysc(SYS_EXIT, 951, 0, 0);
+    rfd = (int)fds[0]; wfd = (int)fds[1];
+    sysc(SYS_CLOSE, (u64)rfd, 0, 0);
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)wfd, (u64)msg, mlen) != -32)
+                                                            sysc(SYS_EXIT, 956, 0, 0);
+    sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+
+    /* 7. ACROSS A FORK — the property the whole milestone exists for. The
+     *    child inherits both ends, writes through its own, and closes it. The
+     *    parent drops its write end FIRST, so the EOF the parent finally sees
+     *    can only have come from the child's close: that is what proves the
+     *    refcount is per-DESCRIPTOR and not per-process. */
+    const char *cmsg = "child-says-hi";
+    u64 clen = ostrlen(cmsg);
+    if ((i64)sysc(SYS_PIPE, (u64)fds, 0, 0) != 0)           sysc(SYS_EXIT, 951, 0, 0);
+    rfd = (int)fds[0]; wfd = (int)fds[1];
+    i64 r = ofork();
+    if (r == 0) {
+        sysc(SYS_CLOSE, (u64)rfd, 0, 0);                    /* not the child's end */
+        sysc(SYS_WRITE_FILE, (u64)wfd, (u64)cmsg, clen);
+        sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+        sysc(SYS_EXIT, 43, 0, 0);
+    }
+    if (r < 0)                                              sysc(SYS_EXIT, 959, 0, 0);
+    sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+    u64 tot = 0; int spins = 0;
+    while (tot < clen && spins < 200000) {
+        i64 n = (i64)sysc(SYS_READ, (u64)rfd, (u64)(buf + tot), sizeof buf - tot);
+        if (n > 0) tot += (u64)n;
+        else if (n == 0) break;                             /* EOF before the payload */
+        else if (n == -11) { sysc(SYS_YIELD, 0, 0, 0); spins++; }
+        else                                                sysc(SYS_EXIT, 957, 0, 0);
+    }
+    if (tot != clen)                                        sysc(SYS_EXIT, 957, 0, 0);
+    for (i = 0; i < (int)clen; i++) if (buf[i] != cmsg[i])  sysc(SYS_EXIT, 957, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, 8) != 0)    sysc(SYS_EXIT, 957, 0, 0);
+    sysc(SYS_CLOSE, (u64)rfd, 0, 0);
+    if (owaitpid((u32)r, 30000) != 43)                      sysc(SYS_EXIT, 957, 0, 0);
+
+    /* 8. REDIRECTION into a pipe: an ordinary SYS_WRITE, which knows nothing
+     *    about any of this, lands in the pipe instead of on the console. */
+    if ((i64)sysc(SYS_PIPE, (u64)fds, 0, 0) != 0)           sysc(SYS_EXIT, 951, 0, 0);
+    rfd = (int)fds[0]; wfd = (int)fds[1];
+    if ((i64)sysc(SYS_SETREDIR, 1, (u64)(i64)wfd, 0) != 0)  sysc(SYS_EXIT, 958, 0, 0);
+    sysc(SYS_WRITE, (u64)"redirected", 0, 0);
+    sysc(SYS_SETREDIR, 1, (u64)(i64)-1, 0);                 /* back to the console */
+    sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, sizeof buf) != 10)
+                                                            sysc(SYS_EXIT, 958, 0, 0);
+    for (i = 0; i < 10; i++) if (buf[i] != "redirected"[i]) sysc(SYS_EXIT, 958, 0, 0);
+    sysc(SYS_CLOSE, (u64)rfd, 0, 0);
+
+    /* 9. REDIRECTION into a FILE, twice, to prove the write APPENDS. A
+     *    redirected stdout is a stream of writes and the store's write
+     *    primitive replaces whole files, so this is the case that would
+     *    silently keep only the last line if the append staging were wrong. */
+    i64 k = (i64)sysc(SYS_OPEN, (u64)"tmp/redir.txt", 1, 0);   /* O_CREAT */
+    if (k < 0)                                              sysc(SYS_EXIT, 958, 0, 0);
+    if ((i64)sysc(SYS_SETREDIR, 1, (u64)k, 0) != 0)         sysc(SYS_EXIT, 958, 0, 0);
+    sysc(SYS_WRITE, (u64)"one:", 0, 0);
+    sysc(SYS_WRITE, (u64)"two", 0, 0);
+    sysc(SYS_SETREDIR, 1, (u64)(i64)-1, 0);
+    sysc(SYS_CLOSE, (u64)k, 0, 0);
+    k = (i64)sysc(SYS_OPEN, (u64)"tmp/redir.txt", 0, 0);
+    if (k < 0)                                              sysc(SYS_EXIT, 958, 0, 0);
+    i64 fn = (i64)sysc(SYS_READ, (u64)k, (u64)buf, sizeof buf);
+    sysc(SYS_CLOSE, (u64)k, 0, 0);
+    if (fn != 7)                                            sysc(SYS_EXIT, 958, 0, 0);
+    for (i = 0; i < 7; i++) if (buf[i] != "one:two"[i])     sysc(SYS_EXIT, 958, 0, 0);
+
+    /* 10. THE HEAP SURVIVES FORK. Not strictly a pipe property, but it is the
+     *     other half of what a shell needs from fork and it was silently
+     *     missing until v0.59: the heap sits above the window boundary that
+     *     vm_clone_user used as its upper bound, so a forked child faulted on
+     *     its first access to malloc'd memory. Nothing caught it because no
+     *     suite forked and then used the heap — this one does. */
+    char *hp = (char *)omalloc(256);
+    if (!hp)                                                sysc(SYS_EXIT, 959, 0, 0);
+    for (i = 0; i < 256; i++) hp[i] = (char)(i & 0x7F);
+    i64 hr = ofork();
+    if (hr == 0) {
+        for (int k = 0; k < 256; k++)
+            if (hp[k] != (char)(k & 0x7F)) sysc(SYS_EXIT, 949, 0, 0);
+        hp[0] = 'X';                                        /* private, not shared */
+        sysc(SYS_EXIT, 44, 0, 0);
+    }
+    if (hr < 0)                                             sysc(SYS_EXIT, 959, 0, 0);
+    if (owaitpid((u32)hr, 30000) != 44)                     sysc(SYS_EXIT, 949, 0, 0);
+    if (hp[0] != 0)                                         sysc(SYS_EXIT, 949, 0, 0);  /* copy, not alias */
+
+    oputs("  [pipe  ] bounds, EAGAIN/EOF/EPIPE, fork inheritance, redirection "
+          "and heap-across-fork all hold\n");
+    sysc(SYS_EXIT, 950, 0, 0);
+}
+
+/* --- role 41: build /bin/vsh with occ, then run a real script through it ---
+ *
+ * This is the end-to-end claim of the milestone: the shell is COMPILED on the
+ * running system out of /src/vsh.c by /bin/occ, and then executes a script
+ * that uses `>` and `|` against programs that were themselves compiled the
+ * same way. Nothing here was built by a host toolchain.
+ *
+ * Two tiny filters are authored and compiled alongside it, because a pipeline
+ * needs something to pipe: /bin/emit writes a known string, /bin/wcx counts
+ * the bytes arriving on its stdin. wcx is the piece that proves a REDIRECTED
+ * READER works — it calls ttyread() exactly as an interactive program would,
+ * and gets the upstream stage's bytes instead of the keyboard.
+ *
+ * Exit codes, 96x family:
+ *   960 all good        963 authoring a source failed
+ *   961 a compile failed 964 vsh itself did not run
+ *   962 fork failed
+ */
+#define VSH_EMIT_SRC \
+  "int main() { puts(\"PIPEDATA\"); return 0; }\n"
+
+/* Counts stdin bytes and prints the count. The EAGAIN/EOF distinction is the
+ * whole subtlety: 0 means the upstream writer is gone for good, negative means
+ * "nothing yet, try again". Treating EAGAIN as EOF would report 0 bytes on any
+ * producer that was not already finished. */
+#define VSH_WCX_SRC \
+  "int main() {\n" \
+  "  int n; int t; char b[64];\n" \
+  "  t = 0;\n" \
+  "  while (1) {\n" \
+  "    n = ttyread(b, 64);\n" \
+  "    if (n == 0) { putdec(t); return 0; }\n" \
+  "    if (n < 0) { yield(); } else { t = t + n; }\n" \
+  "  }\n" \
+  "  return 0;\n" \
+  "}\n"
+
+#define VSH_SCRIPT \
+  "# generated by pipestrs\n" \
+  "/bin/emit > tmp/one.txt\n" \
+  "/bin/emit | /bin/wcx > tmp/two.txt\n"
+
+static int vsh_compile(const char *src, const char *out) {
+    i64 pid = ofork();
+    if (pid == 0) {
+        const char *av[] = { "/bin/occ", src, "-o", out, 0 };
+        const char *ev[] = { "STAGE=compile", 0 };
+        oexecve("/bin/occ", av, ev);
+        sysc(SYS_EXIT, 199, 0, 0);
+    }
+    if (pid < 0) return -1;
+    i64 st = owaitpid((u32)pid, 250000);
+    return st == 0 ? 0 : -1;
+}
+
+static void vsh_worker(void) {
+    if (selfhost_author("/src/emit.c", VSH_EMIT_SRC) < 0)  sysc(SYS_EXIT, 963, 0, 0);
+    if (selfhost_author("/src/wcx.c",  VSH_WCX_SRC)  < 0)  sysc(SYS_EXIT, 963, 0, 0);
+    if (selfhost_author("/src/t.vsh",  VSH_SCRIPT)   < 0)  sysc(SYS_EXIT, 963, 0, 0);
+
+    /* /src/vsh.c is published by the kernel's SDK, not authored here — the
+     * point is that the shipped source compiles, unmodified. */
+    if (vsh_compile("/src/vsh.c",  "/bin/vsh") < 0)        sysc(SYS_EXIT, 961, 0, 0);
+    if (vsh_compile("/src/emit.c", "/bin/emit") < 0)       sysc(SYS_EXIT, 961, 0, 0);
+    if (vsh_compile("/src/wcx.c",  "/bin/wcx") < 0)        sysc(SYS_EXIT, 961, 0, 0);
+    oputs("  [vsh   ] occ built /bin/vsh, /bin/emit and /bin/wcx from source\n");
+
+    i64 pid = ofork();
+    if (pid == 0) {
+        const char *av[] = { "/bin/vsh", "/src/t.vsh", 0 };
+        const char *ev[] = { "OUTRUN=1", 0 };
+        oexecve("/bin/vsh", av, ev);
+        sysc(SYS_EXIT, 199, 0, 0);
+    }
+    if (pid < 0)                                           sysc(SYS_EXIT, 962, 0, 0);
+    if (owaitpid((u32)pid, 250000) != 0)                   sysc(SYS_EXIT, 964, 0, 0);
+
+    oputs("  [vsh   ] /bin/vsh ran a script using '>' and '|'\n");
+    sysc(SYS_EXIT, 960, 0, 0);
+}
+
 static void posix_selfhost_worker(void) {
     static const char *csrc  = SELF_SRC;
     static const char *csrc2 = SELF_SRC2;
@@ -2288,6 +2543,205 @@ static i64 cs_compile(const char **av) {
     return owaitpid((u32)pid, 250000);
 }
 
+/* --- role 40: LANGUAGE COMPLETENESS (the ring-3 half of `langstrs`) --------
+ * v0.60. compilerstrs interrogates types and linkage; this interrogates the
+ * four constructs v0.60 added — sizeof, declarations in a for-initialiser,
+ * switch/case/default, and the unsigned integer types — plus break/continue,
+ * which switch is useless without.
+ *
+ * Every unsigned check below is written so that SIGNED code generation gives
+ * the WRONG answer. That is deliberate and it is the whole value of the test:
+ * `big > 1` is true for an unsigned 0xFFFF...F and false for a signed -1, so a
+ * compiler that parsed `u64` and then emitted setg fails here rather than
+ * passing quietly and corrupting arithmetic somewhere far away. The signed
+ * block immediately after re-checks that plain `int` still uses setl/idiv/sar,
+ * because the failure mode of this work is not only "unsigned stayed signed"
+ * but also "everything became unsigned".
+ *
+ * The program returns the number of the check that failed, or 0. Exit 970 from
+ * the driver means every round passed.                                       */
+#define LANG_SRC \
+  "struct S1 { char a; int b; };\n" \
+  "int classify(int x) {\n" \
+  "  int r; r = 0;\n" \
+  "  switch (x) {\n" \
+  "    case 1: r = 10; break;\n" \
+  "    case 2: r = 20; break;\n" \
+  "    case 3:\n" \
+  "    case 4: r = 34; break;\n" \
+  "    default: r = 99;\n" \
+  "  }\n" \
+  "  return r;\n" \
+  "}\n" \
+  "int main() {\n" \
+  "  char buf[64]; int s; int i; int n;\n" \
+  "  u64 big; u8 b; u16 h; u32 w; u8 ub[4]; u8 *up;\n" \
+  "  /* ---- sizeof ---- */\n" \
+  "  if (sizeof(char) != 1) { return 1; }\n" \
+  "  if (sizeof(int)  != 8) { return 2; }\n" \
+  "  if (sizeof(u8)   != 1) { return 3; }\n" \
+  "  if (sizeof(u16)  != 2) { return 4; }\n" \
+  "  if (sizeof(u32)  != 4) { return 5; }\n" \
+  "  if (sizeof(u64)  != 8) { return 6; }\n" \
+  "  if (sizeof(struct S1) != 16) { return 7; }\n" \
+  "  if (sizeof(char *) != 8) { return 8; }\n" \
+  "  if (sizeof buf != 64) { return 9; }\n" \
+  "  /* ---- declaration in a for-initialiser, and its scope ---- */\n" \
+  "  s = 0;\n" \
+  "  for (int k = 0; k < 10; k = k + 1) { s = s + k; }\n" \
+  "  if (s != 45) { return 10; }\n" \
+  "  for (int k = 0; k < 5; k = k + 1) { s = s + 100; }\n" \
+  "  if (s != 545) { return 11; }\n" \
+  "  /* ---- switch / case / default, including fallthrough ---- */\n" \
+  "  if (classify(1) != 10) { return 20; }\n" \
+  "  if (classify(2) != 20) { return 21; }\n" \
+  "  if (classify(3) != 34) { return 22; }\n" \
+  "  if (classify(4) != 34) { return 23; }\n" \
+  "  if (classify(9) != 99) { return 24; }\n" \
+  "  /* ---- unsigned: each of these is WRONG under signed codegen ---- */\n" \
+  "  big = 0; big = big - 1;\n" \
+  "  if (big <= 1) { return 30; }\n" \
+  "  if (big / 2 <= 1000) { return 31; }\n" \
+  "  if ((big >> 60) != 15) { return 32; }\n" \
+  "  if (big % 10 != 5) { return 33; }\n" \
+  "  /* ---- signed must STAY signed ---- */\n" \
+  "  n = 0 - 1;\n" \
+  "  if (n >= 1) { return 34; }\n" \
+  "  if (n / 2 != 0) { return 35; }\n" \
+  "  if ((n >> 8) != 0 - 1) { return 36; }\n" \
+  "  /* ---- narrowing on store, zero-extension on load ---- */\n" \
+  "  b = 300;    if (b != 44) { return 40; }\n" \
+  "  h = 70000;  if (h != 4464) { return 41; }\n" \
+  "  w = 0; w = w - 1; if (w != 4294967295) { return 42; }\n" \
+  "  /* ---- break and continue ---- */\n" \
+  "  i = 0;\n" \
+  "  while (1) { i = i + 1; if (i == 5) { break; } }\n" \
+  "  if (i != 5) { return 50; }\n" \
+  "  s = 0;\n" \
+  "  for (int k = 0; k < 10; k = k + 1) { if (k % 2 == 0) { continue; } s = s + k; }\n" \
+  "  if (s != 25) { return 51; }\n" \
+  "  /* continue inside a switch belongs to the enclosing LOOP */\n" \
+  "  s = 0;\n" \
+  "  for (int k = 0; k < 6; k = k + 1) {\n" \
+  "    switch (k) { case 2: continue; case 4: break; default: s = s + 1000; }\n" \
+  "    s = s + 1;\n" \
+  "  }\n" \
+  "  if (s != 4005) { return 52; }\n" \
+  "  /* ---- an unsigned ELEMENT through a pointer ---- */\n" \
+  "  up = ub;\n" \
+  "  __stb(ub, 0, 200); __stb(ub, 1, 1);\n" \
+  "  if (up[0] != 200) { return 60; }\n" \
+  "  if (up[0] <= 100) { return 61; }\n" \
+  "  if (up[1] != 1)   { return 62; }\n" \
+  "  return 0;\n" \
+  "}\n"
+
+/* Two programs that MUST be refused. Both are new failure modes that only
+ * exist because v0.60 added the constructs, so neither could be caught by the
+ * refusal round compilerstrs already runs. */
+#define LANG_N1 "int main() { break; return 0; }\n"
+#define LANG_N2 "int main() { switch (1) { default: ; default: ; } return 0; }\n"
+
+static void lang_stress_worker(void) {
+    if (selfhost_author("/src/lang.c", LANG_SRC) < 0) sysc(SYS_EXIT, 971, 0, 0);
+
+    /* ---- the language round ---- */
+    { static const char *av[] = { "/bin/occ", "/src/lang.c", "-o", "/bin/lang.elf", 0 };
+      i64 st = cs_compile(av);
+      if (st == -11) sysc(SYS_EXIT, 972, 0, 0);
+      if (st != 0)   sysc(SYS_EXIT, 973, 0, 0);
+    }
+    { i64 pid = ofork();
+      if (pid == 0) {
+          static const char *av2[] = { "/bin/lang.elf", 0 };
+          static const char *ev2[] = { 0 };
+          oexecve("/bin/lang.elf", av2, ev2);
+          sysc(SYS_EXIT, 198, 0, 0);
+      }
+      if (pid < 0) sysc(SYS_EXIT, 974, 0, 0);
+      i64 rst = owaitpid((u32)pid, 250000);
+      if (rst == -11) sysc(SYS_EXIT, 975, 0, 0);
+      if (rst != 0) {
+          oputs("  [lang  ] the compiled program failed check ");
+          sysc(SYS_WRITEHEX, (u64)rst, 0, 0);
+          oputs(" hex\n");
+          sysc(SYS_EXIT, 976, 0, 0);
+      }
+      oputs("  [lang  ] sizeof, for-init scope, switch/case, unsigned arithmetic and break/continue all verified\n");
+    }
+
+    /* ---- refusals ---- */
+    { static const char *n1[] = { "/bin/occ", "/src/lang_n.c", "-o", "/bin/lang_n.elf", 0 };
+      static const char *bodies[2] = { LANG_N1, LANG_N2 };
+      for (int i = 0; i < 2; i++) {
+          ounlink("/bin/lang_n.elf");
+          if (selfhost_author("/src/lang_n.c", bodies[i]) < 0) sysc(SYS_EXIT, 977, 0, 0);
+          i64 st = cs_compile(n1);
+          if (st == -11) sysc(SYS_EXIT, 978 + i, 0, 0);
+          if (st == 0)   sysc(SYS_EXIT, 980 + i, 0, 0);   /* WRONGLY accepted */
+          { int t = oopen("/bin/lang_n.elf");
+            if (t >= 0) { oclose(t); sysc(SYS_EXIT, 982 + i, 0, 0); } }
+      }
+      oputs("  [lang  ] a stray break and a duplicated default were both REFUSED\n");
+    }
+
+    /* Release the sources now that they have been consumed. The VFS root
+     * directory holds VFS_MAXFILES (64) entries and this suite runs LAST in the
+     * boot sequence, so it inherits every file every earlier suite created —
+     * without this the omake round below cannot create its output and occ
+     * reports "cannot open output" from a directory that is simply full.
+     * /bin/lang.elf is deliberately kept: the kernel half audits it after the
+     * driver exits, and a test that deleted its own evidence would be checking
+     * nothing. */
+    ounlink("/src/lang.c");
+    ounlink("/src/lang_n.c");
+
+    /* ---- the toolchain round: build omake, then let omake drive occ ----
+     * This is what the argv fix is for. omake hands execve an array of
+     * POINTERS; while that array was declared `char *` every entry was
+     * truncated to its low byte, so the compiler could never be launched. A
+     * test that only compiled omake would not have noticed — it has to RUN it
+     * and check that the target it was asked for actually appeared. */
+    { static const char *av[] = { "/bin/occ", "/src/omake.c", "-o", "/bin/omake", 0 };
+      i64 st = cs_compile(av);
+      if (st == -11) sysc(SYS_EXIT, 984, 0, 0);
+      if (st != 0)   sysc(SYS_EXIT, 985, 0, 0);
+    }
+    ounlink("/bin/hello.elf");
+    ounlink("/var/omake.stamp");
+    { i64 pid = ofork();
+      if (pid == 0) {
+          static const char *av2[] = { "/bin/omake", "-f", "/src/demo.mk", 0 };
+          static const char *ev2[] = { "PATH=/usr/lib", 0 };
+          oexecve("/bin/omake", av2, ev2);
+          sysc(SYS_EXIT, 198, 0, 0);
+      }
+      if (pid < 0) sysc(SYS_EXIT, 986, 0, 0);
+      i64 rst = owaitpid((u32)pid, 400000);
+      if (rst == -11) sysc(SYS_EXIT, 987, 0, 0);
+      if (rst != 0)   sysc(SYS_EXIT, 988, 0, 0);
+      { int t = oopen("/bin/hello.elf");
+        if (t < 0) sysc(SYS_EXIT, 989, 0, 0);            /* omake claimed success
+                                                          * but built nothing   */
+        oclose(t); }
+      oputs("  [lang  ] omake parsed a makefile and drove occ to build /bin/hello.elf\n");
+    }
+    /* Run what omake built: hello_sum(37, 5) == 42. */
+    { i64 pid = ofork();
+      if (pid == 0) {
+          static const char *av2[] = { "/bin/hello.elf", 0 };
+          static const char *ev2[] = { 0 };
+          oexecve("/bin/hello.elf", av2, ev2);
+          sysc(SYS_EXIT, 198, 0, 0);
+      }
+      if (pid < 0) sysc(SYS_EXIT, 990, 0, 0);
+      i64 rst = owaitpid((u32)pid, 250000);
+      if (rst == -11) sysc(SYS_EXIT, 991, 0, 0);
+      if (rst != 42)  sysc(SYS_EXIT, 992, 0, 0);
+    }
+    sysc(SYS_EXIT, 970, 0, 0);
+}
+
 static void compiler_stress_worker(void) {
     if (selfhost_author("/src/cs_hdr.h", CS_HDR) < 0) sysc(SYS_EXIT, 951, 0, 0);
     if (selfhost_author("/src/cs_a.c",   CS_A)   < 0) sysc(SYS_EXIT, 952, 0, 0);
@@ -2433,6 +2887,9 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 37) { occ_main(argc, argv); }           /* v0.56 the native C compiler                        */
     if (role == 39) { compiler_stress_worker(); }       /* v0.57 language completeness + refusal checks        */
     if (role == 38) { posix_selfhost_worker(); }        /* v0.56 author -> compile -> run, natively           */
+    if (role == 40) { pipe_worker(); }                  /* v0.59 pipe mechanics: bounds, EOF, EPIPE, fork      */
+    if (role == 41) { vsh_worker(); }                   /* v0.59 build /bin/vsh with occ and run a real script */
+    if (role == 42) { lang_stress_worker(); }           /* v0.60 sizeof/for-init/switch/unsigned + omake       */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");

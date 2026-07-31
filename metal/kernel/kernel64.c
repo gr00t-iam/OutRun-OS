@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.58.0-metal"
+#define KERNEL_VERSION "0.60.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -1075,7 +1075,17 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
  * (device DMA, shared pixels, per-thread stacks); only the region below it is
  * ordinary anonymous process image + main stack. fork() clones exactly that
  * region and nothing else — an MMIO alias or a shared surface must never be
- * silently duplicated into a child. */
+ * silently duplicated into a child.
+ *
+ * v0.59: WITH ONE EXCEPTION, the HEAP. When the ring-3 heap arrived in v0.56 it
+ * was placed at HEAP_USER_V, which is above this line, so it fell inside an
+ * exclusion written for shared and device-backed windows — and fork silently
+ * stopped copying it. The heap is neither shared nor device-backed: it is
+ * ordinary anonymous private memory, exactly like the image and stack fork
+ * already clones, and POSIX fork copies it. Until v0.59 nothing noticed,
+ * because no suite forked and then touched malloc'd memory; /bin/vsh does
+ * (it mallocs its token table and then forks per pipeline stage) and every
+ * child page-faulted on the first access at HEAP_USER_V. */
 #define UPRIVATE_VMAX DMA_USER_V
 #define THR_STK_PAGES 4                     /* 16 KiB per thread                          */
 #define THR_STK_STRIDE 0x8000ull            /* 8 pages: 4 mapped + 4 unmapped guard       */
@@ -1514,6 +1524,18 @@ struct kproc {
      * post-preemption migration target selection in cpu_exec_proc, so a
      * directed migrate_to can never place the task on a forbidden core.      */
     volatile uint32_t affinity;
+    /* v0.59: process-level stdin/stdout redirection. A kernel fd, or -1 for
+     * "the console" (the default every process starts with). These live on the
+     * KPROC rather than in a userland fd table for one decisive reason: they
+     * have to survive SYS_EXECVE. A shell redirects by forking, pointing the
+     * child's stdout at a file or a pipe end, and only THEN exec'ing the real
+     * program — so anything stored in the old address space is gone at exactly
+     * the moment it needs to take effect. SYS_EXECVE keeps the kproc slot, so
+     * state parked here is still there when the new image's first write runs.
+     * They are inherited across fork, which is what makes `a | b | c` work at
+     * all, and reset to -1 whenever the fd behind them is closed. */
+    int      redir_in;
+    int      redir_out;
     /* v0.49: SMP_SLOTS private scratch pages this process can remap/unmap at
      * will via SYS_SMP_REMAP/SYS_SMP_UNMAP, at fixed vaddrs SMP_USER_V+n*4K.
      * Holds the CURRENT backing frame's physical address (0 = unmapped) so a
@@ -1596,6 +1618,8 @@ static void kproc_reset(struct kproc *p) {
     p->pstate = 0;
     p->migrate_to = -1;
     p->migrate_pin = -1;
+    p->redir_in = -1;                 /* v0.59: -1 == the console, the default */
+    p->redir_out = -1;
     p->uctx = (struct uctx){0};
     p->ran_on = 0;
     /* v0.55: POSIX state — default dispositions, nothing pending/blocked,
@@ -4283,6 +4307,7 @@ static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
 #define VOL_ROOT 0
 #define VOL_TMP  1
 #define VOL_DEV  2
+#define VOL_PIPE 3   /* v0.59: not a store at all — a live channel, see g_pipes */
 
 #define TMP_MAXFILES 4                 /* small, ephemeral, RAM-only scratch area */
 #define TMP_MAXBYTES 512
@@ -4356,21 +4381,221 @@ static int64_t dev_read_file(void *buf, uint32_t max) {
  * v0.48: `.volume` records which of the three volumes this fd was opened
  * against — a fd is bound to its volume for life; there is no operation that
  * lets one fd be reinterpreted as a different volume's handle, which is what
- * makes the volume boundary an isolation guarantee rather than a convention. */
-struct ofile { int used; int dirent; uint64_t off; int owner; int volume; };
+ * makes the volume boundary an isolation guarantee rather than a convention.
+ * v0.59: `.owner` became `.owner_mask`, a BITMASK of kproc slots rather than a
+ * single slot index. Through v0.58 a descriptor had exactly one owner for its
+ * whole life, which is precisely why SYS_FORK refused to hand descriptors to
+ * the child (see sys_fork): aliasing one fd into a second slot would have made
+ * "the owner" ambiguous and broken descriptor_teardown_kproc's guarantee that
+ * an exiting process leaves nothing behind. A mask makes the shared case
+ * representable instead of forbidden — the fd stays alive while ANY owner
+ * holds it, and is reclaimed the instant the last one drops it. MAX_KPROC is
+ * 64, so one uint64_t covers every slot exactly; this is the same bitmask
+ * pattern g_ipc_shm[].owner_mask has used since v0.46.
+ * v0.59: `.pipe` is >= 0 when this descriptor is one END of a kernel pipe
+ * rather than a handle on a stored file, with `.pipe_w` saying which end. A
+ * pipe end carries no dirent and belongs to no volume — VOL_PIPE exists so
+ * that every `switch (volume)` in the read/write paths has to account for it
+ * explicitly rather than silently treating a pipe as a ROOT file.           */
+struct ofile { int used; int dirent; uint64_t off; uint64_t owner_mask; int volume;
+               int pipe; int pipe_w; };
 static struct ofile g_ofiles[16];
+
+/* ===========================================================================
+ * v0.59: KERNEL PIPE OBJECTS — the byte channel behind `|`
+ * ===========================================================================
+ * A fixed pool of ring buffers, each referenced by the descriptors that name
+ * its two ends. The refcounts (`readers`/`writers`) are what give a pipe its
+ * defining behaviours, and both are counted in DESCRIPTORS, not processes,
+ * because fork aliases descriptors into a second slot and each alias is an
+ * independent right to read or write:
+ *
+ *   - a read on an empty pipe with writers > 0 is "not yet" (the caller
+ *     yields and retries); the SAME read with writers == 0 is END OF FILE.
+ *     Getting that distinction wrong is how a shell pipeline hangs forever,
+ *     so it is tested directly by pipestrs.
+ *   - a write to a pipe with readers == 0 is EPIPE: nobody can ever consume
+ *     it, so blocking would be a guaranteed deadlock.
+ *
+ * The buffer is deliberately small (PIPE_CAP). A pipeline whose producer
+ * outruns its consumer MUST exercise the full-buffer path — if the buffer
+ * were large enough to swallow every test payload, the interesting half of
+ * the code would never run in any suite we ship.                            */
+#define PIPE_CAP   1024
+#define MAX_PIPES  8
+struct kpipe {
+    int      used;
+    uint32_t head, tail, count;      /* ring: count bytes live at [head, tail) */
+    int      readers, writers;       /* open descriptor ends, not processes    */
+    uint8_t  buf[PIPE_CAP];
+};
+static struct kpipe g_pipes[MAX_PIPES];
+static uint64_t g_pipe_bytes;        /* telemetry: total bytes through pipes   */
+static uint64_t g_pipes_made;        /* telemetry: SYS_PIPE calls that succeeded */
+
+/* Both callers already hold g_ofile_lock. A pipe's refcounts and its ring are
+ * covered by that same lock — there is no separate pipe lock, which keeps the
+ * lock ranking (1 = VFS-name, 2 = ofile) exactly as it was. */
+static void pipe_ref_locked(int pi, int is_w) {
+    if (pi < 0 || pi >= MAX_PIPES || !g_pipes[pi].used) return;
+    if (is_w) g_pipes[pi].writers++; else g_pipes[pi].readers++;
+}
+static void pipe_unref_locked(int pi, int is_w) {
+    if (pi < 0 || pi >= MAX_PIPES || !g_pipes[pi].used) return;
+    if (is_w) { if (g_pipes[pi].writers > 0) g_pipes[pi].writers--; }
+    else      { if (g_pipes[pi].readers > 0) g_pipes[pi].readers--; }
+    if (g_pipes[pi].readers == 0 && g_pipes[pi].writers == 0)
+        g_pipes[pi].used = 0;        /* last end closed: the buffer is garbage */
+}
+
 static int ofile_claim(int owner, int volume, int dirent) {
     klock_acquire(&g_ofile_lock);
     for (int fd = 0; fd < 16; fd++)
         if (!g_ofiles[fd].used) {
             g_ofiles[fd].used = 1; g_ofiles[fd].dirent = dirent;
-            g_ofiles[fd].off = 0; g_ofiles[fd].owner = owner;
+            g_ofiles[fd].off = 0;
+            g_ofiles[fd].owner_mask = 1ull << owner;
             g_ofiles[fd].volume = volume;
+            g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
             klock_release(&g_ofile_lock);
             return fd;
         }
     klock_release(&g_ofile_lock);
     return -1;
+}
+
+/* Release one slot's claim on a descriptor. The entry only goes away when the
+ * LAST owner drops it — that single rule is what makes fork-inherited fds and
+ * IPC-transferred fds safe, and it is the one place a pipe end's refcount is
+ * given back. Caller holds g_ofile_lock. Returns 1 if the entry was freed. */
+static int ofile_drop_locked(int fd, int slot) {
+    if (fd < 0 || fd >= 16 || !g_ofiles[fd].used) return 0;
+    if (!(g_ofiles[fd].owner_mask & (1ull << slot))) return 0;
+    g_ofiles[fd].owner_mask &= ~(1ull << slot);
+    /* A pipe end is refcounted PER OWNER, because fork took a reference per
+     * owner — so the release has to happen on every owner's drop, not only on
+     * the one that empties the mask. Deferring it to the last drop leaves
+     * `writers` permanently above zero, and a reader that can never reach zero
+     * writers never sees end-of-file: `a | b` hangs, and the pipe object is
+     * never reclaimed. (Caught by pipestrs' cross-fork round on the first run
+     * of this suite — the failure mode is invisible to a single-process test,
+     * which is exactly why the suite forks.) */
+    if (g_ofiles[fd].pipe >= 0) pipe_unref_locked(g_ofiles[fd].pipe, g_ofiles[fd].pipe_w);
+    /* v0.59: a redirection is a REFERENCE to this descriptor, so dropping the
+     * descriptor has to drop the reference with it. Otherwise the fd number is
+     * recycled by the next open and this process's stdout silently reattaches
+     * to a stranger's file — a data-corruption bug, not a leak, and invisible
+     * until something writes. Cleared for this slot always; for every slot
+     * once the entry itself is gone. */
+    if (kprocs[slot].redir_in  == fd) kprocs[slot].redir_in  = -1;
+    if (kprocs[slot].redir_out == fd) kprocs[slot].redir_out = -1;
+    if (g_ofiles[fd].owner_mask) return 0;             /* other owners remain */
+    for (int s = 0; s < n_kproc; s++) {
+        if (kprocs[s].redir_in  == fd) kprocs[s].redir_in  = -1;
+        if (kprocs[s].redir_out == fd) kprocs[s].redir_out = -1;
+    }
+    g_ofiles[fd].used = 0; g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
+    return 1;   /* the pipe reference was already given back above, per owner */
+}
+
+/* --- pipe transfer ---------------------------------------------------------
+ * NON-BLOCKING, returning -11 (EAGAIN) where a POSIX pipe would sleep. This is
+ * the same decision SYS_TTY_READ and SYS_WAITPID already made and for the same
+ * hard reason: there is still no sleep/wake queue for ring 3, so blocking
+ * inside the syscall would hold the caller's time slice while it waited — and
+ * on a uniprocessor the process that would supply the missing bytes (or drain
+ * the full buffer) is exactly the one that then never runs. A pipeline built
+ * on that would deadlock the machine rather than merely stall. Userland spins
+ * on SYS_YIELD instead, which is what vsh's pump loop does.
+ *
+ * The one case that must NOT be EAGAIN is a genuinely finished pipe: empty
+ * with no writers left is 0, real end-of-file. A reader that cannot tell those
+ * two apart either exits early on a slow producer or hangs forever on a
+ * finished one, so pipestrs tests the boundary from both sides.              */
+static int64_t pipe_read_fd(int fd, void *dst, uint32_t len) {
+    int slot = (int)current_proc_idx;
+    klock_acquire(&g_ofile_lock);
+    if (fd < 0 || fd >= 16 || !g_ofiles[fd].used ||
+        !(g_ofiles[fd].owner_mask & (1ull << slot)) ||
+        g_ofiles[fd].pipe < 0 || g_ofiles[fd].pipe_w) {
+        klock_release(&g_ofile_lock); return -9;           /* EBADF: not a read end we hold */
+    }
+    struct kpipe *pp = &g_pipes[g_ofiles[fd].pipe];
+    int64_t r;
+    if (pp->count == 0) {
+        r = pp->writers ? -11 : 0;                         /* EAGAIN vs true EOF */
+    } else {
+        uint32_t n = pp->count < len ? pp->count : len;
+        for (uint32_t i = 0; i < n; i++) {
+            ((uint8_t *)dst)[i] = pp->buf[pp->head];
+            pp->head = (pp->head + 1) % PIPE_CAP;
+        }
+        pp->count -= n;
+        r = (int64_t)n;
+    }
+    klock_release(&g_ofile_lock);
+    return r;
+}
+static int64_t pipe_write_fd(int fd, const void *src, uint32_t len) {
+    int slot = (int)current_proc_idx;
+    klock_acquire(&g_ofile_lock);
+    if (fd < 0 || fd >= 16 || !g_ofiles[fd].used ||
+        !(g_ofiles[fd].owner_mask & (1ull << slot)) ||
+        g_ofiles[fd].pipe < 0 || !g_ofiles[fd].pipe_w) {
+        klock_release(&g_ofile_lock); return -9;           /* EBADF: not a write end we hold */
+    }
+    struct kpipe *pp = &g_pipes[g_ofiles[fd].pipe];
+    int64_t r;
+    if (pp->readers == 0) {
+        r = -32;                                           /* EPIPE: nobody can ever read it */
+    } else {
+        uint32_t space = PIPE_CAP - pp->count;
+        if (!space) r = -11;                               /* full: EAGAIN, never a silent drop */
+        else {
+            uint32_t n = len < space ? len : space;        /* SHORT WRITE, like a real pipe */
+            for (uint32_t i = 0; i < n; i++) {
+                pp->buf[pp->tail] = ((const uint8_t *)src)[i];
+                pp->tail = (pp->tail + 1) % PIPE_CAP;
+            }
+            pp->count += n; g_pipe_bytes += n;
+            r = (int64_t)n;
+        }
+    }
+    klock_release(&g_ofile_lock);
+    return r;
+}
+
+/* Create a pipe and claim both ends for `owner`. Returns 0 with rfd/wfd set,
+ * or negative if the pipe pool or the descriptor table is exhausted — and on
+ * that failure path it must leave NOTHING half-claimed, which is why the read
+ * end is released explicitly when the write end cannot be had. */
+static int pipe_create_for(int owner, int *rfd, int *wfd) {
+    int pi = -1;
+    klock_acquire(&g_ofile_lock);
+    for (int i = 0; i < MAX_PIPES; i++) if (!g_pipes[i].used) { pi = i; break; }
+    if (pi >= 0) {
+        g_pipes[pi].used = 1; g_pipes[pi].head = g_pipes[pi].tail = g_pipes[pi].count = 0;
+        g_pipes[pi].readers = 0; g_pipes[pi].writers = 0;
+    }
+    klock_release(&g_ofile_lock);
+    if (pi < 0) return -24;                                /* EMFILE: pipe pool exhausted */
+
+    int r = ofile_claim(owner, VOL_PIPE, pi);
+    if (r < 0) { klock_acquire(&g_ofile_lock); g_pipes[pi].used = 0; klock_release(&g_ofile_lock); return -24; }
+    int w = ofile_claim(owner, VOL_PIPE, pi);
+    if (w < 0) {
+        klock_acquire(&g_ofile_lock);
+        g_ofiles[r].used = 0; g_ofiles[r].owner_mask = 0;  /* not yet a pipe end: no refcount to give back */
+        g_pipes[pi].used = 0;
+        klock_release(&g_ofile_lock);
+        return -24;
+    }
+    klock_acquire(&g_ofile_lock);
+    g_ofiles[r].pipe = pi; g_ofiles[r].pipe_w = 0; g_pipes[pi].readers = 1;
+    g_ofiles[w].pipe = pi; g_ofiles[w].pipe_w = 1; g_pipes[pi].writers = 1;
+    klock_release(&g_ofile_lock);
+    *rfd = r; *wfd = w;
+    return 0;
 }
 static int vfs_open_for(const char *name, int owner, int creat) {
     if (path_has_prefix(name, "tmp/")) {
@@ -4434,7 +4659,7 @@ static int vfs_unlink(const char *name) {
     klock_acquire(&g_ofile_lock);              /* separate, non-nested section (rank 1) */
     for (int fd = 0; fd < 16; fd++)
         if (g_ofiles[fd].used && g_ofiles[fd].volume == VOL_ROOT && g_ofiles[fd].dirent == idx)
-            { g_ofiles[fd].used = 0; g_ofiles[fd].owner = -1; }
+            { g_ofiles[fd].used = 0; g_ofiles[fd].owner_mask = 0; }
     klock_release(&g_ofile_lock);
     return 0;
 }
@@ -4461,17 +4686,22 @@ static void descriptor_teardown_kproc(int proc_idx) {
     struct kproc *p = &kprocs[proc_idx];
     int before = 0, after = 0;
     klock_acquire(&g_ofile_lock);
+    uint64_t bit = 1ull << proc_idx;
     for (int fd = 0; fd < 16; fd++)
-        if (g_ofiles[fd].used && g_ofiles[fd].owner == proc_idx) before++;
+        if (g_ofiles[fd].used && (g_ofiles[fd].owner_mask & bit)) before++;
     for (int fd = 0; fd < 16; fd++) {
-        if (!g_ofiles[fd].used || g_ofiles[fd].owner != proc_idx) continue;
+        if (!g_ofiles[fd].used || !(g_ofiles[fd].owner_mask & bit)) continue;
         if (g_debug_kproc_lifetime)
             kprintf("[dbgkpr ] pid %u slot %d: force-closing fd %d (dirent %d) — never reached SYS_CLOSE\n",
                     p->pid, proc_idx, fd, g_ofiles[fd].dirent);
-        g_ofiles[fd].used = 0; g_ofiles[fd].owner = -1;
+        /* v0.59: dropping THIS slot's claim, which frees the entry only if no
+         * other slot still holds it. A forked child that faults with an
+         * inherited fd open must not yank that fd out from under its parent —
+         * before the owner mask that was not even expressible. */
+        ofile_drop_locked(fd, proc_idx);
     }
     for (int fd = 0; fd < 16; fd++)
-        if (g_ofiles[fd].used && g_ofiles[fd].owner == proc_idx) after++;
+        if (g_ofiles[fd].used && (g_ofiles[fd].owner_mask & bit)) after++;
     klock_release(&g_ofile_lock);
 
     if (g_debug_kproc_lifetime)
@@ -8050,7 +8280,8 @@ static inline void fs_witness_leave(void) { __sync_fetch_and_sub(&g_fs_inflight,
 static int ofile_deref(int fd, int *out_vol) {
     if (fd < 0 || fd >= 16) return -1;
     klock_acquire(&g_ofile_lock);
-    int di = (g_ofiles[fd].used && g_ofiles[fd].owner == (int)current_proc_idx)
+    int di = (g_ofiles[fd].used &&
+              (g_ofiles[fd].owner_mask & (1ull << (int)current_proc_idx)))
            ? g_ofiles[fd].dirent : -1;
     if (di >= 0 && out_vol) *out_vol = g_ofiles[fd].volume;
     klock_release(&g_ofile_lock);
@@ -8074,11 +8305,21 @@ static void shell_exec(char *line);   /* fwd: v0.54 SYS_RUN_CMD runs the real sh
  *
  * The child gets: a cloned address space (eager copy, see vm_clone_user), the
  * parent's capabilities and role, the parent's signal DISPOSITIONS (POSIX) but
- * an empty pending set, and a ppid link so its exit raises SIGCHLD. It does NOT
- * inherit DMA grants, window ownership, sockets or open descriptors — those are
- * per-process kernel resources whose teardown hooks are keyed on the owning
- * slot, and aliasing them into a second slot would break that invariant. This
- * is a stated scope gap, not an oversight (see the changelog). */
+ * an empty pending set, and a ppid link so its exit raises SIGCHLD.
+ *
+ * v0.59: it now ALSO inherits open descriptors and the stdin/stdout
+ * redirections. Through v0.58 it did not, and the reason stated here was that
+ * teardown hooks are keyed on the owning slot, so aliasing an fd into a second
+ * slot would break that invariant — true of a single-owner field, and exactly
+ * what ofile.owner_mask replaced. Teardown now drops ONE slot's claim and frees
+ * the entry only when the mask empties, so sharing became expressible without
+ * weakening the guarantee that an exiting process leaves nothing behind. This
+ * is the milestone's load-bearing change: without it a shell cannot hand a
+ * pipe end to a child, and `a | b` is unimplementable.
+ *
+ * DMA grants, window ownership and sockets are still NOT inherited. Those
+ * remain genuinely single-owner (a grant names one IOMMU domain, a window one
+ * compositor client) and stay a stated scope gap. */
 static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
     (void)flags;
     if (!sf) return (uint64_t)-1;                       /* no user context: kernel caller */
@@ -8096,12 +8337,38 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
     }
     kprocs[ch].role      = kprocs[par].role;
     kprocs[ch].ppid_slot = par;
+    /* v0.59: the break comes across with the pages. Cloning the heap's contents
+     * but resetting the child's brk to the base would hand the child's next
+     * malloc() an address range its own live data already occupies. */
+    kprocs[ch].heap_brk  = kprocs[par].heap_brk;
     kprocs[ch].entry     = kprocs[par].entry;
     kprocs[ch].affinity  = kprocs[par].affinity;
     for (int sg = 0; sg < NSIG; sg++) kprocs[ch].sig_handler[sg] = kprocs[par].sig_handler[sg];
     kprocs[ch].sig_pending = 0;                         /* POSIX: pending set is NOT inherited */
     kprocs[ch].sig_mask    = 0;
     kprocs[ch].sigframe_sp = 0;
+
+    /* v0.59: DESCRIPTOR INHERITANCE — the scope gap this comment used to
+     * declare permanent. Every fd the parent holds gains the child's bit, so
+     * both slots own it and the entry survives until BOTH have dropped it;
+     * each inherited pipe end takes its own refcount, because the child's
+     * right to read or write that pipe is independent of the parent's (a
+     * parent that closes its write end while the child still holds one must
+     * NOT give the reader a spurious EOF — that bug is precisely what a
+     * per-process refcount instead of a per-descriptor one would cause).
+     * The redirections come across too: a shell sets up the child's stdout
+     * before forking, and the fork is what carries it into the new process. */
+    klock_acquire(&g_ofile_lock);
+    int inherited = 0;
+    for (int fd = 0; fd < 16; fd++) {
+        if (!g_ofiles[fd].used || !(g_ofiles[fd].owner_mask & (1ull << par))) continue;
+        g_ofiles[fd].owner_mask |= (1ull << ch);
+        if (g_ofiles[fd].pipe >= 0) pipe_ref_locked(g_ofiles[fd].pipe, g_ofiles[fd].pipe_w);
+        inherited++;
+    }
+    klock_release(&g_ofile_lock);
+    kprocs[ch].redir_in  = kprocs[par].redir_in;
+    kprocs[ch].redir_out = kprocs[par].redir_out;
 
     struct uctx *u = &kprocs[ch].uctx;
     u->r15 = sf->r15; u->r14 = sf->r14; u->r13 = sf->r13; u->r12 = sf->r12;
@@ -8123,8 +8390,9 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
         if (g_cpu[cc].online) lapic_ipi(g_cpu[cc].apic_id, IPI_PING, 0);
     g_forks++;
     if (g_debug_posix)
-        kprintf("[dbgposix] fork pid %u -> child pid %u (%d page(s) cloned, resume rip %X rsp %X)\n",
-                kprocs[par].pid, kprocs[ch].pid, (uint64_t)(int64_t)pages, sf->rip, sf->rsp);
+        kprintf("[dbgposix] fork pid %u -> child pid %u (%d page(s) cloned, %d fd(s) inherited, resume rip %X rsp %X)\n",
+                kprocs[par].pid, kprocs[ch].pid, (uint64_t)(int64_t)pages,
+                (uint64_t)(int64_t)inherited, sf->rip, sf->rsp);
     return kprocs[ch].pid;
 }
 
@@ -8220,11 +8488,111 @@ static void posix_sigcheck_on_return(struct sysframe *sf, uint64_t rv) {
     enter_user_ctx(&u);                                  /* into the handler; never returns */
 }
 
+/* ===========================================================================
+ * v0.59: REDIRECTED stdin/stdout
+ * ===========================================================================
+ * kproc.redir_in/redir_out name a kernel fd (or -1 for the console). SYS_WRITE
+ * and SYS_TTY_READ consult them, so a program written against the console is
+ * redirected without knowing it — which is the whole point: `occ` did not have
+ * to change one line to become usable on the right-hand side of a `>`.
+ *
+ * Files need more than a straight hand-off to the VFS, for two reasons that
+ * both come from the store being content-addressed rather than block-indexed:
+ *
+ *   - WRITES APPEND. vfs_write_by_dirent replaces a file's ENTIRE contents
+ *     (it re-chunks and re-hashes), while a redirected stdout is a stream of
+ *     many small writes. Handing each one straight through would leave the
+ *     file holding only whatever the last write happened to be. So the
+ *     existing bytes are staged, the new ones concatenated, and the whole
+ *     thing written back.
+ *   - READS ADVANCE. vfs_read_file always reads from byte 0, so successive
+ *     reads of a redirected stdin would return the same opening bytes
+ *     forever — a `< file` program would never reach EOF and never terminate.
+ *     ofile.off (present since v0.48 and until now only ever zero) becomes the
+ *     real read cursor.
+ *
+ * The staging buffer is shared, so it is covered by its own lock. That lock
+ * ranks BELOW every other (rank 0): it is always acquired first and then the
+ * VFS or ofile lock beneath it, never the other way round.
+ *
+ * The size cap is a genuine limit, not a placeholder: a redirect that would
+ * grow the file past REDIR_STAGE_MAX fails with ENOSPC rather than silently
+ * truncating what is already there. Reading a file already larger than the
+ * buffer fails the same way, so no write-back can ever shorten a file it
+ * could not fully read. */
+#define REDIR_STAGE_MAX 32768
+static uint8_t g_redir_stage[REDIR_STAGE_MAX];
+static struct klock g_redir_lock = { 0, "redir", 0, 0, 0 };
+
+static int64_t redirect_write_bytes(int fd, const void *data, uint32_t len) {
+    int vol = VOL_ROOT;
+    int di = ofile_deref(fd, &vol);
+    if (di < 0) return -9;                                  /* EBADF */
+    if (vol == VOL_PIPE) return pipe_write_fd(fd, data, len);
+    if (vol == VOL_DEV)  return -13;                        /* read-only volume */
+    if (!len) return 0;
+
+    klock_acquire(&g_redir_lock);
+    int64_t have = (vol == VOL_ROOT) ? vfs_read_file(di, g_redir_stage, REDIR_STAGE_MAX)
+                                     : tmp_read_file(di, g_redir_stage, REDIR_STAGE_MAX);
+    if (have < 0) have = 0;                                 /* empty/new file */
+    if ((uint32_t)have >= REDIR_STAGE_MAX) {                /* cannot append without truncating */
+        klock_release(&g_redir_lock); return -28;           /* ENOSPC */
+    }
+    uint32_t room = REDIR_STAGE_MAX - (uint32_t)have;
+    uint32_t n = len < room ? len : room;
+    cmemcpy(g_redir_stage + have, data, n);
+    int r = (vol == VOL_ROOT) ? vfs_write_by_dirent(di, g_redir_stage, (uint32_t)have + n)
+                              : tmp_write_file(di, g_redir_stage, (uint32_t)have + n);
+    klock_release(&g_redir_lock);
+    return r < 0 ? (int64_t)r : (int64_t)n;
+}
+
+static int64_t redirect_read_bytes(int fd, void *buf, uint32_t len) {
+    int vol = VOL_ROOT;
+    int di = ofile_deref(fd, &vol);
+    if (di < 0) return -9;
+    if (vol == VOL_PIPE) return pipe_read_fd(fd, buf, len);
+    if (!len) return 0;
+
+    klock_acquire(&g_redir_lock);
+    int64_t have = (vol == VOL_ROOT) ? vfs_read_file(di, g_redir_stage, REDIR_STAGE_MAX)
+                  : (vol == VOL_TMP) ? tmp_read_file(di, g_redir_stage, REDIR_STAGE_MAX)
+                                     : dev_read_file(g_redir_stage, REDIR_STAGE_MAX);
+    if (have < 0) have = 0;
+    klock_acquire(&g_ofile_lock);                           /* rank 0 -> 1: the declared order */
+    uint64_t off = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
+    uint32_t n = 0;
+    if (off < (uint64_t)have) {
+        uint64_t left = (uint64_t)have - off;
+        n = len < left ? len : (uint32_t)left;
+        cmemcpy(buf, g_redir_stage + off, n);
+        if (g_ofiles[fd].used) g_ofiles[fd].off = off + n;
+    }
+    klock_release(&g_ofile_lock);
+    klock_release(&g_redir_lock);
+    return (int64_t)n;                                      /* 0 == end of file */
+}
+
 uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     switch (num) {
     case 0: {                                              /* SYS_WRITE(cstr)            */
         char buf[257];
         if (copy_user_str(kprocs[current_proc_idx].cr3, a0, buf, sizeof buf) < 0) return (uint64_t)-14;
+        /* v0.59: honour an active stdout redirection. The RETURN VALUE differs
+         * by destination, deliberately: to the console this still returns 0
+         * ("all of it, always" — a console write cannot be short), but a
+         * redirected write returns the BYTE COUNT accepted, because a pipe
+         * with a full buffer takes part of a string and -11 (EAGAIN) when it
+         * can take nothing. Callers that may be redirected therefore have to
+         * loop; libc.oc's puts() does, which is what makes an ordinary
+         * puts()-based program survive being put in a pipeline. */
+        int ro = kprocs[current_proc_idx].redir_out;
+        if (ro >= 0) {
+            uint32_t n = 0; while (buf[n]) n++;
+            if (!n) return 0;
+            return (uint64_t)redirect_write_bytes(ro, buf, n);
+        }
         for (int i = 0; buf[i]; i++) kputc(buf[i]);
         return 0;
     }
@@ -8297,6 +8665,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (di >= 0) {
             if (vol == VOL_ROOT)      n = vfs_read_file(di, (void *)a1, len);
             else if (vol == VOL_TMP)  n = tmp_read_file(di, (void *)a1, len);
+            else if (vol == VOL_PIPE) n = pipe_read_fd(fd, (void *)a1, len);   /* v0.59 */
             else /* VOL_DEV */        n = dev_read_file((void *)a1, len);
         }
         fs_witness_leave();
@@ -8310,22 +8679,27 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         fs_witness_enter();
         int vol = VOL_ROOT;
         int di = ofile_deref(fd, &vol);
-        int r = -9;
+        int64_t r = -9;
         if (di >= 0) {
             if (vol == VOL_ROOT)      r = vfs_write_by_dirent(di, (const void *)a1, len);  /* COW */
             else if (vol == VOL_TMP)  r = tmp_write_file(di, (const void *)a1, len);
+            else if (vol == VOL_PIPE) r = pipe_write_fd(fd, (const void *)a1, len);        /* v0.59 */
             else /* VOL_DEV */        r = -13;              /* read-only volume: capability-style denial */
         }
         fs_witness_leave();
-        return r < 0 ? (uint64_t)(int64_t)r : len;
+        /* v0.59: a pipe write is allowed to be SHORT (the buffer is finite), so
+         * the byte count it actually accepted is the answer — returning `len`
+         * unconditionally, as the file paths do, would silently swallow the
+         * tail of every payload larger than the free space in the ring. */
+        if (r < 0) return (uint64_t)r;
+        return vol == VOL_PIPE ? (uint64_t)r : len;
     }
     case 8: {                                              /* SYS_CLOSE(fd)              */
         int fd = (int)a0;
         if (fd >= 0 && fd < 16) {
             fs_witness_enter();
             klock_acquire(&g_ofile_lock);
-            if (g_ofiles[fd].used && g_ofiles[fd].owner == (int)current_proc_idx)
-                { g_ofiles[fd].used = 0; g_ofiles[fd].owner = -1; }
+            ofile_drop_locked(fd, (int)current_proc_idx);
             klock_release(&g_ofile_lock);
             fs_witness_leave();
         }
@@ -8486,8 +8860,13 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
             int fd = (int)kmsg.xfer_handle;
             klock_acquire(&g_ofile_lock);
-            int ok = fd >= 0 && fd < 16 && g_ofiles[fd].used && g_ofiles[fd].owner == (int)current_proc_idx;
-            if (ok) g_ofiles[fd].owner = rcpt;            /* ownership moves NOW, not at RECV  */
+            /* v0.59: a TRANSFER, still — the sender's bit clears as the recipient's
+             * sets, so the descriptor never has two owners by way of this path.
+             * That keeps "handing someone a key" exactly as it read before the
+             * mask existed; fork is the one thing that genuinely shares.       */
+            uint64_t sbit = 1ull << (int)current_proc_idx;
+            int ok = fd >= 0 && fd < 16 && g_ofiles[fd].used && (g_ofiles[fd].owner_mask & sbit);
+            if (ok) g_ofiles[fd].owner_mask = (g_ofiles[fd].owner_mask & ~sbit) | (1ull << rcpt);
             klock_release(&g_ofile_lock);
             if (!ok) return (uint64_t)-9;
         } else if (kmsg.msg_type == IPC_MSG_XFER_SHM) {
@@ -8528,8 +8907,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             if (kmsg.msg_type == IPC_MSG_XFER_FD) {
                 int fd = (int)kmsg.xfer_handle;
                 klock_acquire(&g_ofile_lock);
-                if (fd >= 0 && fd < 16 && g_ofiles[fd].used && g_ofiles[fd].owner == (int)current_proc_idx)
-                    { g_ofiles[fd].used = 0; g_ofiles[fd].owner = -1; }
+                ofile_drop_locked(fd, (int)current_proc_idx);
                 klock_release(&g_ofile_lock);
             } else if (kmsg.msg_type == IPC_MSG_XFER_SHM) {
                 klock_acquire(&g_ipc_lock);
@@ -9539,6 +9917,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (want > 256) want = 256;
         if (!want) return 0;
         if (!access_ok(kprocs[current_proc_idx].cr3, a0, want, 1)) return (uint64_t)-14;
+        /* v0.59: an active stdin redirection replaces the keyboard entirely —
+         * the same substitution stdout gets, and what lets a filter read a
+         * file or an upstream pipe without knowing it is not a terminal. */
+        int ri = kprocs[current_proc_idx].redir_in;
+        if (ri >= 0) return (uint64_t)redirect_read_bytes(ri, (void *)a0, want);
         char *dst = (char *)a0;
         uint32_t n = 0;
         while (n < want) {
@@ -9573,6 +9956,58 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         fs_witness_leave();
         cmemcpy((void *)a1, &st, sizeof st);
         return di >= 0 ? 0 : (uint64_t)-2;
+    }
+    case 62: {   /* SYS_PIPE(*out2) -> 0 ok, negative. out2[0]=read fd, out2[1]=write fd.
+                  *
+                  * v0.59. Both ends belong to the caller; a pipeline is built by
+                  * forking AFTER the pipe exists, so each child inherits both and
+                  * closes the end it does not want. Closing the unused end is not
+                  * hygiene — it is load-bearing: the reader only ever sees EOF
+                  * once the LAST write end is gone, so a shell that leaks its own
+                  * copy of the write end hangs its own pipeline forever. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+        /* TWO 64-BIT WORDS, not two C ints. occ's `int` is 64-bit, so an
+         * occ-compiled `int fds[2]` is a pair of words — writing 32-bit ints
+         * here would pack both descriptors into fds[0] and leave fds[1] zero.
+         * SYS_STAT's two-word out-buffer set the same precedent. */
+        if (!access_ok(kprocs[current_proc_idx].cr3, a0, 16, 1)) return (uint64_t)-14;
+        int rfd = -1, wfd = -1;
+        int r = pipe_create_for((int)current_proc_idx, &rfd, &wfd);
+        if (r < 0) return (uint64_t)(int64_t)r;
+        ((uint64_t *)a0)[0] = (uint64_t)rfd; ((uint64_t *)a0)[1] = (uint64_t)wfd;
+        g_pipes_made++;
+        if (g_debug_posix)
+            kprintf("[dbgposix] pipe pid %u -> rfd %d wfd %d\n",
+                    kprocs[current_proc_idx].pid, (uint64_t)(int64_t)rfd, (uint64_t)(int64_t)wfd);
+        return 0;
+    }
+    case 63: {   /* SYS_SETREDIR(which, fd) -> 0 ok, negative. which: 0=stdin, 1=stdout.
+                  * fd of -1 restores the console.
+                  *
+                  * v0.59. The redirection lives on the KPROC, so it survives
+                  * SYS_EXECVE — which is the entire reason it is a syscall and
+                  * not a userland fd table. The shell's sequence is fork, then
+                  * SYS_SETREDIR in the child, then SYS_EXECVE the real program:
+                  * anything held in the child's address space would be destroyed
+                  * by that exec at precisely the wrong moment.
+                  *
+                  * The fd must be one this process actually holds, checked here
+                  * rather than at write time, so a bad redirect fails loudly at
+                  * the point of the mistake instead of silently discarding the
+                  * program's output later. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+        int which = (int)a0, fd = (int)(int64_t)a1;
+        if (which != 0 && which != 1) return (uint64_t)-22;   /* EINVAL */
+        if (fd >= 0) {
+            int vol = VOL_ROOT;
+            if (ofile_deref(fd, &vol) < 0) return (uint64_t)-9;  /* EBADF: not ours */
+        }
+        if (which) kprocs[current_proc_idx].redir_out = fd;
+        else       kprocs[current_proc_idx].redir_in  = fd;
+        if (g_debug_posix)
+            kprintf("[dbgposix] setredir pid %u %s -> fd %d\n", kprocs[current_proc_idx].pid,
+                    which ? "stdout" : "stdin", (uint64_t)(int64_t)fd);
+        return 0;
     }
     }
     return (uint64_t)-1;
@@ -9705,10 +10140,21 @@ static uint64_t uargs_default(uint64_t cr3, const char *name) {
  * an MMIO alias would hand the child a device it never asked for, and aliasing
  * a shared surface would corrupt the owner's window.
  * Returns the number of pages copied, or -1 on allocation failure. */
+/* v0.59: which addresses fork duplicates. The image and main stack below
+ * UPRIVATE_VMAX, plus the anonymous heap — and nothing else, so a DMA alias, a
+ * shared surface, a WIMP thumbnail or a per-thread stack is never silently
+ * copied into a child. Expressed as a predicate rather than a loop bound
+ * because the forkable regions are no longer one contiguous range. */
+static inline int va_is_forkable(uint64_t va) {
+    if (va < UPRIVATE_VMAX) return 1;
+    if (va >= HEAP_USER_V && va < HEAP_USER_V + HEAP_MAX_BYTES) return 1;
+    return 0;
+}
+
 static int vm_clone_user(uint64_t src_cr3, uint64_t dst_cr3) {
     uint64_t *pml4 = (uint64_t *)src_cr3;
     int copied = 0;
-    for (uint64_t i4 = USER_VMIN >> 39; i4 < (UPRIVATE_VMAX >> 39); i4++) {
+    for (uint64_t i4 = USER_VMIN >> 39; i4 < (USER_VMAX >> 39); i4++) {
         if (!(pml4[i4] & PTE_PRESENT) || !(pml4[i4] & PTE_USER)) continue;
         uint64_t *pdpt = (uint64_t *)(pml4[i4] & ADDR_MASK);
         for (uint64_t i3 = 0; i3 < 512; i3++) {
@@ -9722,7 +10168,7 @@ static int vm_clone_user(uint64_t src_cr3, uint64_t dst_cr3) {
                     if (!(pte & PTE_PRESENT) || !(pte & PTE_USER)) continue;
                     if (pte & PTE_PCD) continue;         /* device/DMA alias: never clone */
                     uint64_t va = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
-                    if (va >= UPRIVATE_VMAX) continue;
+                    if (!va_is_forkable(va)) continue;
                     uint64_t nf = alloc_frame();
                     if (!nf) return -1;
                     const uint8_t *s = (const uint8_t *)(pte & ADDR_MASK);
@@ -11889,6 +12335,12 @@ static const char SDK_UNISTD_H[] =
 " * current break unchanged, which is why callers must test `>=` and never\n"
 " * `==`. libc.oc's sbrk() does exactly that; write your own the same way. */\n"
 "char *sbrk(int delta);\n"
+"/* v0.59: pipe() fills a two-word buffer — fds[0] read end, fds[1] write end.\n"
+" * setredir() points stdin (0) or stdout (1) at an fd, or -1 for the console;\n"
+" * it is process state, so it SURVIVES execp(). Together with fork() above,\n"
+" * these three are the entire mechanism behind /bin/vsh's `<`, `>` and `|`. */\n"
+"int pipe(char *fds);\n"
+"int setredir(int which, int fd);\n"
 "#endif\n";
 
 static const char SDK_SIGNAL_H[] =
@@ -11990,7 +12442,28 @@ static const char SDK_LIBC_OC[] =
 "  return v;\n"
 "}\n"
 "/* --- I/O. SYS_WRITE takes a NUL-terminated string, so these build one. --- */\n"
-"int puts(char *s) { __syscall(0, s, 0, 0); return 0; }\n"
+"/* v0.59: puts() LOOPS, because SYS_WRITE is no longer always all-or-nothing.\n"
+" * To the console it still writes everything and returns 0. To a REDIRECTED\n"
+" * stdout it returns the byte count it accepted, which for a pipe is however\n"
+" * much fitted in the buffer — and -11 (EAGAIN) when none did, meaning the\n"
+" * reader has not drained it yet. Yielding and retrying is what lets an\n"
+" * ordinary puts()-based program sit in a pipeline unmodified; returning after\n"
+" * one call would silently truncate its output at the buffer boundary.\n"
+" * -32 (EPIPE) is NOT retried: with no reader left it can never succeed.\n"
+" * __syscall(15,...) is yield() written out, because occ is single-pass and\n"
+" * yield() is defined further down this file. */\n"
+"int puts(char *s) {\n"
+"  int n; int i; int r;\n"
+"  n = strlen(s); i = 0;\n"
+"  while (i < n) {\n"
+"    r = __syscall(0, s + i, 0, 0);\n"
+"    if (r == 0) { return 0; }\n"
+"    if (r < 0) {\n"
+"      if (r == 0 - 11) { __syscall(15, 0, 0, 0); } else { return r; }\n"
+"    } else { i = i + r; }\n"
+"  }\n"
+"  return 0;\n"
+"}\n"
 "int putchar(int c) {\n"
 "  char b[2];\n"
 "  b[0] = c; b[1] = 0;\n"
@@ -12042,6 +12515,17 @@ static const char SDK_LIBC_OC[] =
 "int execp(char *path, char *argv, char *envp) { return __syscall(59, path, argv, envp); }\n"
 "int ttyread(char *buf, int n) { return __syscall(60, buf, n, 0); }\n"
 "int statf(char *path, char *out) { return __syscall(61, path, out, 0); }\n"
+"/* v0.59: pipes and redirection — what /bin/vsh is built out of.\n"
+" * pipe() fills a TWO-WORD buffer: out[0] is the read end, out[1] the write\n"
+" * end. Declare it as `int fds[2]`; occ's int is a machine word, which is what\n"
+" * the kernel writes.\n"
+" * setredir(which, fd) points this process's stdin (which=0) or stdout\n"
+" * (which=1) at an open fd; -1 puts it back on the console. It lives on the\n"
+" * PROCESS, not in this table, so it SURVIVES execp() — which is the whole\n"
+" * reason a shell can redirect a program it has not launched yet. The order is\n"
+" * always fork, then setredir in the child, then execp. */\n"
+"int pipe(char *fds) { return __syscall(62, fds, 0, 0); }\n"
+"int setredir(int which, int fd) { return __syscall(63, which, fd, 0); }\n"
 "/* --- heap. BUMP ONLY: free() cannot reclaim and does not pretend to. -----\n"
 " * SYS_BRK IS PAGE-GRANULAR. It rounds the requested break UP to the next page\n"
 " * and returns the RESULTING break, which is therefore usually larger than what\n"
@@ -12116,6 +12600,7 @@ static void sdk_install(void) {
         /* v0.58: the two native tools, as source, plus a project that builds. */
         { "/src/vedit.c",              SDK_VEDIT_C   },
         { "/src/omake.c",              SDK_OMAKE_C   },
+        { "/src/vsh.c",                SDK_VSH_C     },   /* v0.59: the shell */
         { "/src/demo.mk",              SDK_DEMO_MK   },
         { "/src/hello.h",              SDK_HELLO_H   },
         { "/src/hello_a.c",            SDK_HELLO_A   },
@@ -12130,7 +12615,7 @@ static void sdk_install(void) {
     }
     kprintf("[sdk    ] installed %d/%d SDK files (%u bytes): 7 headers in "
             "/usr/include, the runtime + README in /usr/lib, the toolchain's "
-            "own sources in /src\n",
+            "and the shell's own sources in /src\n",
             (uint64_t)ok, (uint64_t)n, (uint64_t)bytes);
 }
 
@@ -13583,6 +14068,173 @@ static void cmd_compiler_stress(void) {
     kputs("-- done --\n");
 }
 
+/* ===========================================================================
+ * v0.60: LANGUAGE STRESS — sizeof, for-init, switch, unsigned, and omake
+ * ===========================================================================
+ * compilerstrs proved the type system and multi-unit linkage. This proves the
+ * four constructs v0.60 added, and then proves the TOOLCHAIN they were added
+ * for still assembles into something that works end to end: /bin/omake, built
+ * by /bin/occ on this system, reads a makefile and drives /bin/occ to build a
+ * two-unit program, which then runs and returns a value only a correct build
+ * could produce.
+ *
+ * That last round is the one that catches the argv defect. omake hands execve
+ * an array of POINTERS; while that array was declared `char *`, v0.58's
+ * element-scaled indexing truncated every entry to its low byte and the
+ * compiler could never be launched. Compiling omake would not have revealed
+ * it — only running it and demanding its output does.
+ *
+ * The kernel half checks, from outside, what the driver cannot honestly claim
+ * about itself: that the executables really appeared in the VFS, that they are
+ * well-formed W^X images, that the refused programs left nothing behind, and
+ * that nothing leaked across the seven processes involved.                  */
+static int g_lspass, g_lsfail;
+static void lscheck(const char *n, int c) {
+    if (c) { g_lspass++; kprintf("[langstrs]  PASS  %s\n", n); }
+    else   { g_lsfail++; kprintf("[langstrs]  FAIL  %s\n", n); }
+}
+
+/* Read `path` out of the VFS and audit it as a 3-segment W^X x86-64 ELF. */
+static int lang_elf_ok(const char *path, int *wx_ok) {
+    *wx_ok = 0;
+    int oi = vfs_find(path);
+    if (oi < 0 || DENTS[oi].len <= 64) return 0;
+    static uint8_t img[32768];
+    int64_t got = vfs_read_file(oi, img, sizeof img);
+    struct elf64_hdr *eh = (struct elf64_hdr *)img;
+    if (got <= 64 || eh->ident[0] != 0x7F || eh->ident[1] != 'E' ||
+        eh->ident[2] != 'L' || eh->ident[3] != 'F' ||
+        eh->machine != 0x3E || eh->phnum != 3) return 0;
+    int rx = 0, ro = 0, rw = 0, bad = 0;
+    for (int i = 0; i < eh->phnum; i++) {
+        struct elf64_phdr *ph = (struct elf64_phdr *)(img + eh->phoff + (uint64_t)i * eh->phentsize);
+        if (ph->type != 1) continue;
+        if ((ph->flags & 0x3) == 0x3) bad = 1;
+        if (ph->flags == 5) rx++;
+        if (ph->flags == 4) ro++;
+        if (ph->flags == 6) rw++;
+    }
+    *wx_ok = !bad;
+    return rx == 1 && ro == 1 && rw == 1;
+}
+
+static void cmd_lang_stress(void) {
+    kputs("-- LANGUAGE STRESS: sizeof, for-init, switch/case, unsigned, and omake --\n");
+    g_lspass = g_lsfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    if (!g_cas_mounted) { lscheck("CAS mounted before the compiler can run", 0);
+        kprintf("[langstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_lspass, (uint64_t)g_lsfail);
+        return; }
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+
+    /* Fresh outputs, so "it appeared" means this run produced it. */
+    if (vfs_find("/bin/lang.elf")   >= 0) vfs_unlink("/bin/lang.elf");
+    if (vfs_find("/bin/lang_n.elf") >= 0) vfs_unlink("/bin/lang_n.elf");
+    if (vfs_find("/bin/omake")      >= 0) vfs_unlink("/bin/omake");
+    if (vfs_find("/bin/hello.elf")  >= 0) vfs_unlink("/bin/hello.elf");
+
+    int p = kproc_spawn("langstr", PCAP_FILESYSTEM);
+    if (p < 0) { lscheck("kproc_spawn never fails", 0);
+        kprintf("[langstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_lspass, (uint64_t)g_lsfail);
+        return; }
+    kprocs[p].role = 42;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { lscheck("the driver's ELF loads", 0);
+        kprintf("[langstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_lspass, (uint64_t)g_lsfail);
+        return; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    /* Four compiles (lang, two refusals, omake) plus three program runs, all
+     * under TCG. omake forks occ again from inside, so this is the longest
+     * single driver in the suite. */
+    int finished = posix_drain(procs, 1, &R, 140000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[langstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 970 ? "" :
+        R.code[0] == 971 ? "could not author /src/lang.c" :
+        R.code[0] == 972 ? "the compiler TIMED OUT on the language program" :
+        R.code[0] == 973 ? "the language program FAILED to compile but should have built" :
+        R.code[0] == 974 ? "fork failed before running the language program" :
+        R.code[0] == 975 ? "the language program TIMED OUT" :
+        R.code[0] == 976 ? "a LANGUAGE CHECK FAILED (its number is on the line above)" :
+        R.code[0] == 977 ? "could not author a refusal-test source" :
+        (R.code[0] == 978 || R.code[0] == 979) ? "a refusal test TIMED OUT in the compiler" :
+        (R.code[0] == 980 || R.code[0] == 981) ? "an INVALID program compiled successfully" :
+        (R.code[0] == 982 || R.code[0] == 983) ? "a refused compile still left an output file" :
+        R.code[0] == 984 ? "the compiler TIMED OUT building omake" :
+        R.code[0] == 985 ? "omake itself FAILED to compile" :
+        R.code[0] == 986 ? "fork failed before running omake" :
+        R.code[0] == 987 ? "omake TIMED OUT" :
+        R.code[0] == 988 ? "omake exited non-zero" :
+        R.code[0] == 989 ? "omake reported success but built NOTHING (the argv defect)" :
+        R.code[0] == 990 ? "fork failed before running what omake built" :
+        R.code[0] == 991 ? "the program omake built TIMED OUT" :
+        R.code[0] == 992 ? "the program omake built returned the wrong value" :
+                           "unknown";
+    if (R.code[0] != 970)
+        kprintf("[langstrs] driver exit %u — %s\n", R.code[0], why);
+
+    lscheck("the driver compiled, ran and validated the language program (exit 970)",
+            finished && R.code[0] == 970);
+
+    int wx = 0, ok = lang_elf_ok("/bin/lang.elf", &wx);
+    int li = vfs_find("/bin/lang.elf");
+    if (li >= 0)
+        kprintf("[langstrs] /bin/lang.elf: %u bytes, %u chunk(s)\n",
+                (uint64_t)DENTS[li].len, (uint64_t)DENTS[li].nchunks);
+    lscheck("the language program was produced in the VFS", li >= 0 && DENTS[li].len > 64);
+    lscheck("it is a well-formed 3-segment x86-64 ELF (R+X, R, R+W)", ok);
+    lscheck("no segment is both writable and executable", ok && wx);
+    lscheck("no output survives from either REFUSED program",
+            vfs_find("/bin/lang_n.elf") < 0);
+
+    /* The toolchain round, audited from outside the processes that ran it. */
+    int mi = vfs_find("/bin/omake");
+    int mwx = 0, mok = lang_elf_ok("/bin/omake", &mwx);
+    if (mi >= 0)
+        kprintf("[langstrs] /bin/omake: %u bytes, %u chunk(s), compiled by occ on this system\n",
+                (uint64_t)DENTS[mi].len, (uint64_t)DENTS[mi].nchunks);
+    lscheck("occ compiled /src/omake.c — the shipped build tool, unmodified", mi >= 0 && mok && mwx);
+    int hi = vfs_find("/bin/hello.elf");
+    if (hi >= 0)
+        kprintf("[langstrs] /bin/hello.elf: %u bytes, built by omake from TWO units\n",
+                (uint64_t)DENTS[hi].len);
+    lscheck("omake drove occ and the target it was asked for actually appeared",
+            hi >= 0 && DENTS[hi].len > 64);
+
+    int fds_leaked = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    lscheck("no descriptor leaked across the compiler and build-tool processes", fds_leaked == 0);
+
+    kprintf("[langstrs] +%u freed, +%u reused; global depth %u\n",
+            g_frames_freed - freed0, g_frames_reused - reused0, g_frame_free_depth);
+    lscheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    lscheck("no lock-rank violation across the language and toolchain paths",
+            g_rank_violations == viol0);
+
+    kprintf("[langstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_lspass, (uint64_t)g_lsfail);
+    if (!g_lsfail)
+        kputs("[langstrs] LANGUAGE AND TOOLCHAIN VERIFIED — sizeof, for-init, switch, unsigned, and a native make\n");
+    else kputs("[langstrs] LANGUAGE DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 static void cmd_selfhost_test(void) {
     kputs("-- TOOLCHAIN STRESS: author -> compile -> run, natively in ring 3 --\n");
     g_tcpass = g_tcfail = 0;
@@ -13754,6 +14406,179 @@ static void cmd_selfhost_test(void) {
     if (!g_tcfail)
         kputs("[toolstrs] SELF-HOSTING VERIFIED — OutRun compiled and ran a program with no host toolchain\n");
     else kputs("[toolstrs] SELF-HOSTING DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.59: `pipestrs` — the descriptor substrate, pipes, and the native shell
+ * ===========================================================================
+ * Two ring-3 rounds, then the audits ring 3 cannot honestly perform on itself.
+ *
+ *   role 40 exercises the MECHANISM at the syscall level: round trips, the
+ *           finite buffer's short-write and EAGAIN, the EAGAIN-vs-EOF
+ *           distinction, EPIPE, inheritance across fork, and both flavours of
+ *           redirection (into a pipe, and into a file where writes must
+ *           append rather than replace).
+ *
+ *   role 41 exercises the RESULT: /bin/occ compiles /src/vsh.c — the shell as
+ *           shipped, unmodified — plus two small filters, and then the shell
+ *           runs a script containing a `>` redirect and a real `a | b`
+ *           pipeline. The output files are checked HERE, from the kernel,
+ *           because a shell reporting its own success proves nothing.
+ *
+ * The leak audits are the point of doing this from outside. ofile.owner_mask
+ * made descriptors shareable, and the failure mode a shared descriptor
+ * introduces is precisely one that a passing functional test would hide: an
+ * entry whose last owner exited but whose mask never emptied stays `used`
+ * forever. So the descriptor table and the pipe pool are both required to
+ * return to their exact pre-suite state.                                    */
+static int g_ppass, g_pfail;
+static void ppcheck(const char *n, int c) {
+    if (c) { g_ppass++; kprintf("[pipestrs]  PASS  %s\n", n); }
+    else   { g_pfail++; kprintf("[pipestrs]  FAIL  %s\n", n); }
+}
+
+/* Compare a TMP-volume file against an expected exact content. */
+static int pipe_tmp_is(const char *name, const char *want) {
+    uint32_t wl = (uint32_t)cstrlen(want);
+    for (int i = 0; i < TMP_MAXFILES; i++) {
+        if (!g_tmpfiles[i].used) continue;
+        if (!streq_n(g_tmpfiles[i].name, name, VFS_NAME_MAX)) continue;
+        if (g_tmpfiles[i].len != wl) return 0;
+        for (uint32_t k = 0; k < wl; k++)
+            if (g_tmpfiles[i].data[k] != (uint8_t)want[k]) return 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* Run one ring-3 role to completion; returns its exit code, or -1 on watchdog. */
+static int64_t pipe_run_role(const char *label, uint64_t caps, uint64_t role,
+                             uint64_t watchdog) {
+    int save = (int)current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    int p = kproc_spawn(label, caps);
+    if (p < 0) { current_proc_idx = save; return -1; }
+    kprocs[p].role = role;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) return -1;
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int done = posix_drain(procs, 1, &R, watchdog);
+    current_proc_idx = save;
+    if (!done) return -1;
+    return (int64_t)R.code[0];
+}
+
+static void cmd_pipe_stress(void) {
+    kputs("-- pipestrs: descriptor substrate, pipes, redirection, native shell --\n");
+    g_ppass = g_pfail = 0;
+    if (!g_cas_mounted) {
+        ppcheck("CAS mounted before the shell can be built", 0);
+        kprintf("[pipestrs] RESULT: %d passed, %d failed\n", (uint64_t)g_ppass, (uint64_t)g_pfail);
+        return;
+    }
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t pipes0 = g_pipes_made;
+    int fds0 = 0; for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds0++;
+
+    /* ---- round A: the mechanism ---------------------------------------- */
+    int64_t a = pipe_run_role("pipe", PCAP_FILESYSTEM | PCAP_CONSOLE, 40, 20000);
+    if (a != 950) {
+        const char *why =
+            a == -1  ? "TIMED OUT or failed to start" :
+            a == 951 ? "SYS_PIPE did not produce two descriptors" :
+            a == 952 ? "bytes did not survive the round trip" :
+            a == 953 ? "an empty pipe with a live writer did not report EAGAIN" :
+            a == 954 ? "the buffer bound was not reported honestly" :
+            a == 955 ? "EOF was not reported once the last writer closed" :
+            a == 956 ? "writing with no reader did not report EPIPE" :
+            a == 957 ? "the pipe did not survive fork inheritance" :
+            a == 958 ? "redirection did not take effect" :
+            a == 959 ? "fork failed" : "unknown";
+        kprintf("[pipestrs] mechanism round FAILED: exit %d (want 950) — %s\n", a, why);
+    }
+    ppcheck("pipe round trip, finite-buffer bound, EAGAIN/EOF/EPIPE and fork "
+            "inheritance all behave as specified", a == 950);
+    ppcheck("SYS_PIPE was actually exercised (the suite is not vacuously passing)",
+            g_pipes_made > pipes0);
+    ppcheck("stdout redirected to a FILE appends across writes rather than "
+            "replacing (tmp/redir.txt holds both)", pipe_tmp_is("redir.txt", "one:two"));
+
+    /* ---- round B: the shell, built and run ------------------------------ */
+    /* Remove prior outputs so "it appeared" means this run produced it. */
+    if (vfs_find("/bin/vsh") >= 0) vfs_unlink("/bin/vsh");
+    int64_t b = pipe_run_role("vshbuild", PCAP_FILESYSTEM | PCAP_CONSOLE, 41, 400000);
+    if (b != 960) {
+        const char *why =
+            b == -1  ? "TIMED OUT or failed to start" :
+            b == 961 ? "occ could not compile one of the sources" :
+            b == 962 ? "fork failed" :
+            b == 963 ? "authoring a source into the VFS failed" :
+            b == 964 ? "/bin/vsh did not run the script cleanly" : "unknown";
+        kprintf("[pipestrs] shell round FAILED: exit %d (want 960) — %s\n", b, why);
+    }
+    ppcheck("occ compiled /src/vsh.c — the shipped shell source, unmodified — "
+            "together with two filter programs", b == 960);
+
+    int vi = vfs_find("/bin/vsh");
+    ppcheck("/bin/vsh exists in the filesystem and is a non-trivial image",
+            vi >= 0 && DENTS[vi].len > 1024);
+    if (vi >= 0)
+        kprintf("[pipestrs] /bin/vsh: %u bytes, %u chunk(s)\n",
+                (uint64_t)DENTS[vi].len, (uint64_t)DENTS[vi].nchunks);
+
+    /* The two script lines, checked by their RESULTS rather than by the
+     * shell's own report:
+     *   /bin/emit > tmp/one.txt          -> the redirect captured the output
+     *   /bin/emit | /bin/wcx > tmp/two.txt -> wcx counted 8 bytes ("PIPEDATA")
+     *                                        arriving over a real pipe, which
+     *                                        can only happen if the shell built
+     *                                        the pipeline and both stages ran. */
+    ppcheck("vsh's '>' captured a program's stdout into a file "
+            "(tmp/one.txt == \"PIPEDATA\")", pipe_tmp_is("one.txt", "PIPEDATA"));
+    ppcheck("vsh's '|' carried one program's stdout into another's stdin "
+            "(tmp/two.txt == \"8\", the byte count wcx read from emit)",
+            pipe_tmp_is("two.txt", "8"));
+
+    /* ---- audits from outside -------------------------------------------- */
+    int fds1 = 0; for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds1++;
+    ppcheck("no descriptor leaked across the suite (owner_mask emptied on every "
+            "exit, including fds shared with forked children)", fds1 == fds0);
+
+    int pl = 0; for (int i = 0; i < MAX_PIPES; i++) if (g_pipes[i].used) pl++;
+    ppcheck("every pipe object was reclaimed (both ends closed, pool empty)", pl == 0);
+
+    int rd = 0;
+    for (int s = 0; s < n_kproc; s++)
+        if (kprocs[s].used && !kprocs[s].torn_down &&
+            (kprocs[s].redir_in >= 0 || kprocs[s].redir_out >= 0)) rd++;
+    ppcheck("no live process was left holding a redirection to a closed "
+            "descriptor", rd == 0);
+
+    kprintf("[pipestrs] +%u freed, +%u reused; global depth %u; %u pipe(s) made, "
+            "%u byte(s) through them\n",
+            g_frames_freed - freed0, g_frames_reused - reused0,
+            g_frame_free_depth, g_pipes_made - pipes0, g_pipe_bytes);
+    ppcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    ppcheck("no lock-rank violation across the pipe, redirect and shell paths",
+            g_rank_violations == viol0);
+
+    kprintf("[pipestrs] RESULT: %d passed, %d failed\n", (uint64_t)g_ppass, (uint64_t)g_pfail);
+    if (!g_pfail)
+        kputs("[pipestrs] PIPES AND THE NATIVE SHELL VERIFIED — a ring-3 shell "
+              "built by this system's own compiler runs redirected, piped pipelines\n");
+    else kputs("[pipestrs] PIPE/SHELL DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -15939,6 +16764,8 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "toolchainstress")) cmd_selfhost_test();
     else if (!kstrcmp(argv[0], "cc")) cmd_cc(argc, argv);
     else if (!kstrcmp(argv[0], "compilerstress")) cmd_compiler_stress();
+    else if (!kstrcmp(argv[0], "pipestress")) cmd_pipe_stress();
+    else if (!kstrcmp(argv[0], "langstress")) cmd_lang_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -16122,6 +16949,8 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_posix_stress();     /* v0.55: fork/exec chains, signal frames, pthread mutexes under SMP */
     cmd_selfhost_test();    /* v0.56: author -> compile -> run, natively (no host toolchain)     */
     cmd_compiler_stress();  /* v0.57: language completeness + what the compiler must REFUSE      */
+    cmd_pipe_stress();      /* v0.59: pipes, redirection, and a ring-3 shell this system built   */
+    cmd_lang_stress();      /* v0.60: sizeof/for-init/switch/unsigned + omake driving occ natively */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
