@@ -84,6 +84,13 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_SIGUNMASK           57
 #define SYS_BRK                 58
 #define SYS_EXECVE_PATH         59
+#define SYS_TTY_READ            60
+#define SYS_STAT                61
+/* v0.59. SYS_PIPE fills TWO 64-BIT WORDS: out[0] read end, out[1] write end.
+ * SYS_SETREDIR(which, fd) points stdin (0) or stdout (1) at a descriptor, or
+ * -1 for the console; it is kproc state, so it survives SYS_EXECVE_PATH. */
+#define SYS_PIPE                62
+#define SYS_SETREDIR            63
 /* Mirrors the kernel's HEAP_USER_V (kernel64.c is the master). */
 #define HEAP_USER_V_LO 0x0000570000000000ull
 
@@ -1820,28 +1827,38 @@ static void posix_fd_worker(void) {
 
     int fd = oopen("motd");
     if (fd >= 0 && fd < 3) sysc(SYS_EXIT, 961, 0, 0);   /* collided with the std three */
+    char buf[64]; i64 pn = 0;
     if (fd >= 3) {
-        char buf[64];
-        if (oread(fd, buf, sizeof buf - 1) <= 0) sysc(SYS_EXIT, 964, 0, 0);
+        pn = oread(fd, buf, sizeof buf - 1);
+        if (pn <= 0) sysc(SYS_EXIT, 964, 0, 0);
     }
 
     i64 r = ofork();
     if (r == 0) {                                       /* ---- CHILD ---- */
         /* The userland table is ordinary process memory, so fork inherits it
          * byte for byte: the child sees the same fd numbers bound the same way,
-         * and the console-backed std three work immediately. The KERNEL
-         * descriptor underneath is deliberately NOT duplicated (each kernel fd
-         * has exactly one owning kproc, which is what lets the teardown hooks
-         * guarantee no leaks) — so a read through an inherited FILE fd must be
-         * DENIED cleanly rather than silently reading another process's file.
-         * That containment is the property asserted here. */
+         * and the console-backed std three work immediately.
+         *
+         * v0.59 INVERTED THE ASSERTION BELOW, deliberately. Through v0.58 the
+         * kernel descriptor under an inherited fd was NOT duplicated — each
+         * kernel fd had exactly one owning kproc — so this test required a read
+         * through an inherited FILE fd to be DENIED, and called that
+         * containment. With ofile.owner_mask the child is a genuine co-owner,
+         * so the read must now SUCCEED and return the same bytes the parent
+         * saw. That is POSIX behaviour and the thing pipelines are built on;
+         * the leak guarantee it used to protect is now kept by refcounting
+         * (the entry survives until BOTH owners drop it) rather than by
+         * forbidding the share. */
         if (g_ofd[STDOUT_FILENO] != OFD_CONSOLE) sysc(SYS_EXIT, 963, 0, 0);
         if (g_ofd[STDERR_FILENO] != OFD_CONSOLE) sysc(SYS_EXIT, 963, 0, 0);
         oputs("  [posix ] child wrote through the inherited stdout mapping\n");
         if (fd >= 3) {
             char b2[64];
             if (g_ofd[fd] < 0) sysc(SYS_EXIT, 963, 0, 0);        /* table not inherited */
-            if (oread(fd, b2, sizeof b2 - 1) >= 0) sysc(SYS_EXIT, 969, 0, 0);  /* must be denied */
+            i64 cn = oread(fd, b2, sizeof b2 - 1);
+            if (cn != pn) sysc(SYS_EXIT, 969, 0, 0);   /* inherited fd must READ, and read the same */
+            for (i64 k = 0; k < cn; k++)
+                if (b2[k] != buf[k]) sysc(SYS_EXIT, 969, 0, 0);
         }
         sysc(SYS_EXIT, 42, 0, 0);
     }
@@ -2135,6 +2152,244 @@ static int selfhost_author(const char *path, const char *text) {
     if (owrite(fd, text, ostrlen(text) + 1) <= 0) { oclose(fd); return -2; }
     oclose(fd);
     return 0;
+}
+
+/* --- role 40: pipe mechanics (the ring-3 half of `pipestrs`) ---------------
+ *
+ * Works on RAW kernel descriptors rather than through g_ofd[], because a pipe
+ * end IS a kernel descriptor and layering the userland table over it would
+ * only put a second mapping between the assertion and the thing asserted.
+ *
+ * Exit codes name the broken property, in the 95x family:
+ *   950 all assertions held      955 EOF not reported once the last writer left
+ *   951 SYS_PIPE failed          956 EPIPE not reported with no reader left
+ *   952 round trip corrupted     957 cross-process transfer failed
+ *   953 EAGAIN not reported      958 redirection failed
+ *   954 buffer bound wrong       959 fork failed
+ */
+static void pipe_worker(void) {
+    u64 fds[2];
+    char buf[128];
+    int i;
+    const char *msg = "outrun-pipe";
+    u64 mlen = ostrlen(msg);
+
+    /* 1. a pipe hands back two DISTINCT descriptors. */
+    if ((i64)sysc(SYS_PIPE, (u64)fds, 0, 0) != 0)          sysc(SYS_EXIT, 951, 0, 0);
+    int rfd = (int)fds[0], wfd = (int)fds[1];
+    if (rfd < 0 || wfd < 0 || rfd == wfd)                  sysc(SYS_EXIT, 951, 0, 0);
+
+    /* 2. bytes survive the round trip, in order. */
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)wfd, (u64)msg, mlen) != (i64)mlen)
+                                                           sysc(SYS_EXIT, 952, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, sizeof buf) != (i64)mlen)
+                                                           sysc(SYS_EXIT, 952, 0, 0);
+    for (i = 0; i < (int)mlen; i++) if (buf[i] != msg[i])   sysc(SYS_EXIT, 952, 0, 0);
+
+    /* 3. EMPTY but a writer still exists: that is "not yet" (EAGAIN), NOT end
+     *    of file. A reader that confuses the two exits early on a slow
+     *    producer, which is the single most common way to break a pipeline. */
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, 8) != -11)  sysc(SYS_EXIT, 953, 0, 0);
+
+    /* 4. the buffer is FINITE, and says so honestly: a write larger than the
+     *    free space is SHORT (never a silent truncation), and a write with no
+     *    space at all is EAGAIN. The exact capacity is deliberately not
+     *    asserted here — only that the bound exists and is reported. */
+    static char big[4096];
+    for (i = 0; i < 4096; i++) big[i] = (char)('a' + (i % 26));
+    i64 w = (i64)sysc(SYS_WRITE_FILE, (u64)wfd, (u64)big, 4096);
+    if (w <= 0 || w >= 4096)                                sysc(SYS_EXIT, 954, 0, 0);
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)wfd, (u64)big, 8) != -11)
+                                                            sysc(SYS_EXIT, 954, 0, 0);
+    u64 drained = 0;
+    while (drained < (u64)w) {
+        i64 n = (i64)sysc(SYS_READ, (u64)rfd, (u64)buf, sizeof buf);
+        if (n <= 0)                                         sysc(SYS_EXIT, 954, 0, 0);
+        drained += (u64)n;
+    }
+    if (drained != (u64)w)                                  sysc(SYS_EXIT, 954, 0, 0);
+
+    /* 5. the LAST writer closing turns the same empty read into a real EOF. */
+    sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, 8) != 0)    sysc(SYS_EXIT, 955, 0, 0);
+    sysc(SYS_CLOSE, (u64)rfd, 0, 0);
+
+    /* 6. writing with no reader left can never succeed, so it must fail loudly
+     *    rather than block forever. */
+    if ((i64)sysc(SYS_PIPE, (u64)fds, 0, 0) != 0)           sysc(SYS_EXIT, 951, 0, 0);
+    rfd = (int)fds[0]; wfd = (int)fds[1];
+    sysc(SYS_CLOSE, (u64)rfd, 0, 0);
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)wfd, (u64)msg, mlen) != -32)
+                                                            sysc(SYS_EXIT, 956, 0, 0);
+    sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+
+    /* 7. ACROSS A FORK — the property the whole milestone exists for. The
+     *    child inherits both ends, writes through its own, and closes it. The
+     *    parent drops its write end FIRST, so the EOF the parent finally sees
+     *    can only have come from the child's close: that is what proves the
+     *    refcount is per-DESCRIPTOR and not per-process. */
+    const char *cmsg = "child-says-hi";
+    u64 clen = ostrlen(cmsg);
+    if ((i64)sysc(SYS_PIPE, (u64)fds, 0, 0) != 0)           sysc(SYS_EXIT, 951, 0, 0);
+    rfd = (int)fds[0]; wfd = (int)fds[1];
+    i64 r = ofork();
+    if (r == 0) {
+        sysc(SYS_CLOSE, (u64)rfd, 0, 0);                    /* not the child's end */
+        sysc(SYS_WRITE_FILE, (u64)wfd, (u64)cmsg, clen);
+        sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+        sysc(SYS_EXIT, 43, 0, 0);
+    }
+    if (r < 0)                                              sysc(SYS_EXIT, 959, 0, 0);
+    sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+    u64 tot = 0; int spins = 0;
+    while (tot < clen && spins < 200000) {
+        i64 n = (i64)sysc(SYS_READ, (u64)rfd, (u64)(buf + tot), sizeof buf - tot);
+        if (n > 0) tot += (u64)n;
+        else if (n == 0) break;                             /* EOF before the payload */
+        else if (n == -11) { sysc(SYS_YIELD, 0, 0, 0); spins++; }
+        else                                                sysc(SYS_EXIT, 957, 0, 0);
+    }
+    if (tot != clen)                                        sysc(SYS_EXIT, 957, 0, 0);
+    for (i = 0; i < (int)clen; i++) if (buf[i] != cmsg[i])  sysc(SYS_EXIT, 957, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, 8) != 0)    sysc(SYS_EXIT, 957, 0, 0);
+    sysc(SYS_CLOSE, (u64)rfd, 0, 0);
+    if (owaitpid((u32)r, 30000) != 43)                      sysc(SYS_EXIT, 957, 0, 0);
+
+    /* 8. REDIRECTION into a pipe: an ordinary SYS_WRITE, which knows nothing
+     *    about any of this, lands in the pipe instead of on the console. */
+    if ((i64)sysc(SYS_PIPE, (u64)fds, 0, 0) != 0)           sysc(SYS_EXIT, 951, 0, 0);
+    rfd = (int)fds[0]; wfd = (int)fds[1];
+    if ((i64)sysc(SYS_SETREDIR, 1, (u64)(i64)wfd, 0) != 0)  sysc(SYS_EXIT, 958, 0, 0);
+    sysc(SYS_WRITE, (u64)"redirected", 0, 0);
+    sysc(SYS_SETREDIR, 1, (u64)(i64)-1, 0);                 /* back to the console */
+    sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, sizeof buf) != 10)
+                                                            sysc(SYS_EXIT, 958, 0, 0);
+    for (i = 0; i < 10; i++) if (buf[i] != "redirected"[i]) sysc(SYS_EXIT, 958, 0, 0);
+    sysc(SYS_CLOSE, (u64)rfd, 0, 0);
+
+    /* 9. REDIRECTION into a FILE, twice, to prove the write APPENDS. A
+     *    redirected stdout is a stream of writes and the store's write
+     *    primitive replaces whole files, so this is the case that would
+     *    silently keep only the last line if the append staging were wrong. */
+    i64 k = (i64)sysc(SYS_OPEN, (u64)"tmp/redir.txt", 1, 0);   /* O_CREAT */
+    if (k < 0)                                              sysc(SYS_EXIT, 958, 0, 0);
+    if ((i64)sysc(SYS_SETREDIR, 1, (u64)k, 0) != 0)         sysc(SYS_EXIT, 958, 0, 0);
+    sysc(SYS_WRITE, (u64)"one:", 0, 0);
+    sysc(SYS_WRITE, (u64)"two", 0, 0);
+    sysc(SYS_SETREDIR, 1, (u64)(i64)-1, 0);
+    sysc(SYS_CLOSE, (u64)k, 0, 0);
+    k = (i64)sysc(SYS_OPEN, (u64)"tmp/redir.txt", 0, 0);
+    if (k < 0)                                              sysc(SYS_EXIT, 958, 0, 0);
+    i64 fn = (i64)sysc(SYS_READ, (u64)k, (u64)buf, sizeof buf);
+    sysc(SYS_CLOSE, (u64)k, 0, 0);
+    if (fn != 7)                                            sysc(SYS_EXIT, 958, 0, 0);
+    for (i = 0; i < 7; i++) if (buf[i] != "one:two"[i])     sysc(SYS_EXIT, 958, 0, 0);
+
+    /* 10. THE HEAP SURVIVES FORK. Not strictly a pipe property, but it is the
+     *     other half of what a shell needs from fork and it was silently
+     *     missing until v0.59: the heap sits above the window boundary that
+     *     vm_clone_user used as its upper bound, so a forked child faulted on
+     *     its first access to malloc'd memory. Nothing caught it because no
+     *     suite forked and then used the heap — this one does. */
+    char *hp = (char *)omalloc(256);
+    if (!hp)                                                sysc(SYS_EXIT, 959, 0, 0);
+    for (i = 0; i < 256; i++) hp[i] = (char)(i & 0x7F);
+    i64 hr = ofork();
+    if (hr == 0) {
+        for (int k = 0; k < 256; k++)
+            if (hp[k] != (char)(k & 0x7F)) sysc(SYS_EXIT, 949, 0, 0);
+        hp[0] = 'X';                                        /* private, not shared */
+        sysc(SYS_EXIT, 44, 0, 0);
+    }
+    if (hr < 0)                                             sysc(SYS_EXIT, 959, 0, 0);
+    if (owaitpid((u32)hr, 30000) != 44)                     sysc(SYS_EXIT, 949, 0, 0);
+    if (hp[0] != 0)                                         sysc(SYS_EXIT, 949, 0, 0);  /* copy, not alias */
+
+    oputs("  [pipe  ] bounds, EAGAIN/EOF/EPIPE, fork inheritance, redirection "
+          "and heap-across-fork all hold\n");
+    sysc(SYS_EXIT, 950, 0, 0);
+}
+
+/* --- role 41: build /bin/vsh with occ, then run a real script through it ---
+ *
+ * This is the end-to-end claim of the milestone: the shell is COMPILED on the
+ * running system out of /src/vsh.c by /bin/occ, and then executes a script
+ * that uses `>` and `|` against programs that were themselves compiled the
+ * same way. Nothing here was built by a host toolchain.
+ *
+ * Two tiny filters are authored and compiled alongside it, because a pipeline
+ * needs something to pipe: /bin/emit writes a known string, /bin/wcx counts
+ * the bytes arriving on its stdin. wcx is the piece that proves a REDIRECTED
+ * READER works — it calls ttyread() exactly as an interactive program would,
+ * and gets the upstream stage's bytes instead of the keyboard.
+ *
+ * Exit codes, 96x family:
+ *   960 all good        963 authoring a source failed
+ *   961 a compile failed 964 vsh itself did not run
+ *   962 fork failed
+ */
+#define VSH_EMIT_SRC \
+  "int main() { puts(\"PIPEDATA\"); return 0; }\n"
+
+/* Counts stdin bytes and prints the count. The EAGAIN/EOF distinction is the
+ * whole subtlety: 0 means the upstream writer is gone for good, negative means
+ * "nothing yet, try again". Treating EAGAIN as EOF would report 0 bytes on any
+ * producer that was not already finished. */
+#define VSH_WCX_SRC \
+  "int main() {\n" \
+  "  int n; int t; char b[64];\n" \
+  "  t = 0;\n" \
+  "  while (1) {\n" \
+  "    n = ttyread(b, 64);\n" \
+  "    if (n == 0) { putdec(t); return 0; }\n" \
+  "    if (n < 0) { yield(); } else { t = t + n; }\n" \
+  "  }\n" \
+  "  return 0;\n" \
+  "}\n"
+
+#define VSH_SCRIPT \
+  "# generated by pipestrs\n" \
+  "/bin/emit > tmp/one.txt\n" \
+  "/bin/emit | /bin/wcx > tmp/two.txt\n"
+
+static int vsh_compile(const char *src, const char *out) {
+    i64 pid = ofork();
+    if (pid == 0) {
+        const char *av[] = { "/bin/occ", src, "-o", out, 0 };
+        const char *ev[] = { "STAGE=compile", 0 };
+        oexecve("/bin/occ", av, ev);
+        sysc(SYS_EXIT, 199, 0, 0);
+    }
+    if (pid < 0) return -1;
+    i64 st = owaitpid((u32)pid, 250000);
+    return st == 0 ? 0 : -1;
+}
+
+static void vsh_worker(void) {
+    if (selfhost_author("/src/emit.c", VSH_EMIT_SRC) < 0)  sysc(SYS_EXIT, 963, 0, 0);
+    if (selfhost_author("/src/wcx.c",  VSH_WCX_SRC)  < 0)  sysc(SYS_EXIT, 963, 0, 0);
+    if (selfhost_author("/src/t.vsh",  VSH_SCRIPT)   < 0)  sysc(SYS_EXIT, 963, 0, 0);
+
+    /* /src/vsh.c is published by the kernel's SDK, not authored here — the
+     * point is that the shipped source compiles, unmodified. */
+    if (vsh_compile("/src/vsh.c",  "/bin/vsh") < 0)        sysc(SYS_EXIT, 961, 0, 0);
+    if (vsh_compile("/src/emit.c", "/bin/emit") < 0)       sysc(SYS_EXIT, 961, 0, 0);
+    if (vsh_compile("/src/wcx.c",  "/bin/wcx") < 0)        sysc(SYS_EXIT, 961, 0, 0);
+    oputs("  [vsh   ] occ built /bin/vsh, /bin/emit and /bin/wcx from source\n");
+
+    i64 pid = ofork();
+    if (pid == 0) {
+        const char *av[] = { "/bin/vsh", "/src/t.vsh", 0 };
+        const char *ev[] = { "OUTRUN=1", 0 };
+        oexecve("/bin/vsh", av, ev);
+        sysc(SYS_EXIT, 199, 0, 0);
+    }
+    if (pid < 0)                                           sysc(SYS_EXIT, 962, 0, 0);
+    if (owaitpid((u32)pid, 250000) != 0)                   sysc(SYS_EXIT, 964, 0, 0);
+
+    oputs("  [vsh   ] /bin/vsh ran a script using '>' and '|'\n");
+    sysc(SYS_EXIT, 960, 0, 0);
 }
 
 static void posix_selfhost_worker(void) {
@@ -2433,6 +2688,8 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 37) { occ_main(argc, argv); }           /* v0.56 the native C compiler                        */
     if (role == 39) { compiler_stress_worker(); }       /* v0.57 language completeness + refusal checks        */
     if (role == 38) { posix_selfhost_worker(); }        /* v0.56 author -> compile -> run, natively           */
+    if (role == 40) { pipe_worker(); }                  /* v0.59 pipe mechanics: bounds, EOF, EPIPE, fork      */
+    if (role == 41) { vsh_worker(); }                   /* v0.59 build /bin/vsh with occ and run a real script */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");

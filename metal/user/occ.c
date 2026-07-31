@@ -1652,10 +1652,21 @@ static void occ_toplevel(void) {
                  * when its type names a struct — only POINTERS to structs can
                  * be parameters here, which the by-value check below enforces
                  * instead of silently truncating. */
-                int psidx = -1, pptr = 0, psize = 8;
+                int psidx = -1, pptr = 0, psize = 8, pbase = 8;
                 if (occ_is_type()) {
                     if (!occ_parse_type(&psidx, &pptr, &psize)) { occ_err("bad parameter type", occ_txt); occ_next(); }
+                    pbase = psize;      /* the BASE type's width, before any `*` */
                 }
+                /* v0.59 BUGFIX. `psize` becomes 8 here because a POINTER VALUE is
+                 * one word — but occ_elem_size wants the width of the type pointed
+                 * TO, and it was being handed the clobbered 8. So every `char *`
+                 * PARAMETER got an element size of 8 and `s[i]` inside the body
+                 * stepped eight bytes at a time, while the identical declaration
+                 * as a local or a global (both of which pass the preserved base
+                 * size) stepped one. That is why libc.oc's strcmp() compared
+                 * every eighth byte and reported two equal strings as different —
+                 * the toolstrs "compiled program returned the wrong answer"
+                 * failure, present since v0.58 made indexing element-scaled. */
                 while (occ_accept("*")) { pptr++; psize = 8; }
                 if (occ_tk == T_IDENT) {
                     if (psidx >= 0 && pptr == 0)
@@ -1665,7 +1676,7 @@ static void occ_toplevel(void) {
                         for (int i = 0; i < OCC_NAMELEN; i++) L->name[i] = occ_txt[i];
                         occ_frame += 8; L->off = -occ_frame;
                         L->sidx = psidx; L->ptr = pptr; L->size = psize;
-                        L->esize = occ_elem_size(psidx, pptr, psize);
+                        L->esize = occ_elem_size(psidx, pptr, pbase);
                         L->nelem = 0;
                         occ_nloc++;
                     }
