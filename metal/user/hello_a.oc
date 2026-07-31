@@ -1,0 +1,8 @@
+/* hello_a.c - the unit with main(), for the omake demo project.
+ * Compiled on OutRun OS by /bin/occ, driven by /bin/omake. */
+#include "hello.h"
+
+int main(void) {
+  puts("  [hello ] a program omake built, running on the system that built it\n");
+  return hello_sum(HELLO_BASE, 5);
+}

@@ -26,18 +26,24 @@
  *   exprs      = || && | ^ & == != < > <= >= << >> + - * / %
  *              unary - ! * &  calls, integer literals, character literals,
  *              string literals, identifiers, parentheses, indexing a[i]
- *              — but note a[i] means *(a + i*8): a WORD, never a byte.
+ *              — v0.58: a[i] is scaled by the ELEMENT size, so s[i] on a
+ *              `char *` steps one byte and p[i] on a `struct P *` steps
+ *              sizeof(P). Only indexing an untyped value expression (f()[i])
+ *              still assumes 8, because there is no type to consult.
  *   builtins   __syscall(n, a0, a1, a2) — the whole OS ABI in one intrinsic,
  *                  so a compiled program can do real I/O with no libc linked in
  *              __ldb(p, i)     — the unsigned BYTE at p[i]
  *              __stb(p, i, v)  — store v's low byte at p[i]; returns v
- *                  These two exist because a[i] is word-scaled, so without them
- *                  occ could not walk a C string and /usr/lib/libc.oc's
- *                  strlen/strcpy/atoi could not be written at all.
- *   NOT here   structs, unions, enums, typedefs, floats, switch, goto, the
- *              preprocessor, varargs, multi-file linking, and LOCAL ARRAYS
- *              (a local declaration is one 8-byte slot; scratch buffers have
- *              to be globals, which is why libc.oc's are)
+ *                  v0.58: these are no longer REQUIRED to walk a string, since
+ *                  s[i] on a `char *` now steps one byte. They remain for
+ *                  poking a byte at an address whose type occ does not know.
+ *   NOT here   enums, floats, switch, goto, function pointers, varargs,
+ *              bitfields, anonymous struct members, struct assignment/
+ *              arguments/returns (refused, not truncated), and separate
+ *              compilation (multi-file input is FUSED into one unit).
+ *              v0.57 added structs, unions, typedefs and the preprocessor;
+ *              v0.58 added local arrays, so libc.oc's scratch buffers are
+ *              locals now and its formatters are reentrant.
  *
  * MEMORY MODEL. Three fixed, page-aligned bases mean absolute addressing works
  * and no relocation machinery is needed: text is emitted before data sizes are
@@ -50,12 +56,20 @@
 #define OCC_DATA_BASE   0x0000500000400000ull
 #define OCC_STACK_TOP   0x0000500000FF3C00ull   /* mirrors the kernel's USTK_INIT */
 
+/* v0.58: the compiler's own userland is now its biggest customer. /src/vedit.c
+ * and /src/omake.c are several hundred lines each, and a single-pass code
+ * generator with no register allocator emits a LOT of instructions per
+ * statement — omake alone overran the v0.57 48 KiB text arena. These are
+ * arena sizes, not policy: the failure they prevent is "output image too
+ * large", which is a diagnostic rather than a miscompile, but it is a
+ * diagnostic that stops the system building its own tools. */
 #define OCC_MAXSRC   (192u * 1024u)  /* v0.57: prelude + headers + user code */
-#define OCC_MAXTEXT  (48u * 1024u)
-#define OCC_MAXDATA  (8u * 1024u)
-#define OCC_MAXSYM   256
-#define OCC_MAXFIX   1024
+#define OCC_MAXTEXT  (160u * 1024u)
+#define OCC_MAXDATA  (32u * 1024u)
+#define OCC_MAXSYM   512
+#define OCC_MAXFIX   4096
 #define OCC_MAXLOC   32
+#define OCC_MAXCASE  64      /* v0.60: case labels in one switch */
 #define OCC_NAMELEN  32
 
 /* ---- diagnostics ----------------------------------------------------------
@@ -563,10 +577,20 @@ static char  occ_str[256];           /* T_STR contents          */
 static int   occ_strlen_;
 
 
+/* v0.60: `u8`/`u16`/`u32`/`u64` are BUILT-IN type names, not typedefs supplied
+ * by a header. occ.c itself is written in terms of them (70 uses), so making
+ * them primitive is what lets the self-hosting target be approached without
+ * first requiring `typedef unsigned char u8;` to work — and no SDK header or
+ * .oc source defines those names, so reserving them collides with nothing. */
 static int occ_kw(const char *s) {
     static const char *kws[] = { "int", "char", "return", "if", "else", "while",
                                  "for", "void", "__syscall", "__ldb", "__stb",
-                                 "struct", "union", "typedef", 0 };
+                                 "struct", "union", "typedef",
+                                 /* v0.60 */
+                                 "sizeof", "switch", "case", "default",
+                                 "break", "continue",
+                                 "unsigned", "signed",
+                                 "u8", "u16", "u32", "u64", 0 };
     for (int i = 0; kws[i]; i++) if (ostrneq(s, kws[i], OCC_NAMELEN)) return 1;
     return 0;
 }
@@ -703,7 +727,8 @@ static void occ_emit64(u64 v) { for (int i = 0; i < 8; i++) occ_emit((u8)(v >> (
 
 /* ---- symbols -------------------------------------------------------------*/
 struct occ_sym { char name[OCC_NAMELEN]; int kind; i64 addr; int defined;
-                 int sidx, ptr, size; };   /* v0.57: type of a global variable */
+                 int sidx, ptr, size, esize, nelem;     /* v0.57/58: its type */
+                 int unsg, eunsg; };                    /* v0.60 */
 /* kind: 0 = function, 1 = global variable */
 static struct occ_sym occ_syms[OCC_MAXSYM];
 static int occ_nsym;
@@ -744,7 +769,19 @@ static int occ_nfix;
 #define OCC_MAXMEMBER  16
 #define OCC_MAXTYPEDEF 32
 
-struct occ_member { char name[OCC_NAMELEN]; int off, size, sidx, ptr; };
+/* v0.58: `esize` is the size of ONE STEP — what indexing or a dereference
+ * yields. It is what `size` cannot be: a `char *` has size 8 (a pointer) but
+ * esize 1 (a byte), and an array of a 24-byte struct has size 96 but esize 24.
+ * Without it `a[i]` had to assume 8 for everything, which is right only for
+ * `int *`. */
+/* v0.60: `unsg` is the fourth axis of a type. It is NOT cosmetic: it selects
+ * `div` over `idiv`, `shr` over `sar`, and setb/seta over setl/setg. A compiler
+ * that parses `unsigned` and then emits signed compares is worse than one that
+ * refuses it, because the failure is silent and data-dependent — so the flag is
+ * threaded everywhere a size is, and every codegen site that can differ reads
+ * it. `eunsg` is the same question for one ELEMENT, so `u8 *p; p[i]` knows the
+ * byte it loads is unsigned. */
+struct occ_member { char name[OCC_NAMELEN]; int off, size, sidx, ptr, esize, unsg, eunsg; };
 struct occ_struct {
     char name[OCC_NAMELEN];
     struct occ_member m[OCC_MAXMEMBER];
@@ -753,7 +790,7 @@ struct occ_struct {
 static struct occ_struct occ_structs[OCC_MAXSTRUCT];
 static int occ_nstruct;
 
-struct occ_td { char name[OCC_NAMELEN]; int sidx, ptr, size, used; };
+struct occ_td { char name[OCC_NAMELEN]; int sidx, ptr, size, used, unsg; };
 static struct occ_td occ_tds[OCC_MAXTYPEDEF];
 static int occ_ntd;
 
@@ -767,6 +804,18 @@ static int occ_td_find(const char *n) {
         if (occ_tds[i].used && ostrneq(occ_tds[i].name, n, OCC_NAMELEN)) return i;
     return -1;
 }
+/* v0.58: the size of one element of `T`, i.e. what T[i] or *T yields.
+ *   char *      -> 1     a byte, which is why walking a string used to need __ldb
+ *   int *       -> 8
+ *   struct P *  -> sizeof(P)
+ *   T **        -> 8     one step off a pointer-to-pointer is a pointer
+ * `base` is the undecorated specifier size (1 for char, 8 otherwise). */
+static int occ_elem_size(int sidx, int ptr, int base) {
+    if (ptr > 1) return 8;
+    if (sidx >= 0) return occ_structs[sidx].size;
+    return base == 1 ? 1 : 8;
+}
+
 /* Alignment of a type: a struct's own alignment, else its size (1 or 8). */
 static int occ_align_of(int sidx, int ptr, int size) {
     if (sidx >= 0 && ptr == 0) return occ_structs[sidx].align;
@@ -774,7 +823,11 @@ static int occ_align_of(int sidx, int ptr, int size) {
     return ptr ? 8 : (size == 1 ? 1 : 8);
 }
 
-static struct occ_loc { char name[OCC_NAMELEN]; int off; int sidx, ptr, size; } occ_locs[OCC_MAXLOC];
+static struct occ_loc { char name[OCC_NAMELEN]; int off;
+                       int sidx, ptr, size, esize;
+                       int nelem;   /* v0.58: >0 => an ARRAY of nelem elements */
+                       int unsg, eunsg;                          /* v0.60 */
+                     } occ_locs[OCC_MAXLOC];
 static int occ_nloc, occ_frame;
 
 static int occ_sym_find(const char *n) {
@@ -789,6 +842,7 @@ static int occ_sym_get(const char *n, int kind) {
     for (int k = 0; k < OCC_NAMELEN; k++) occ_syms[i].name[k] = n[k] ? n[k] : 0;
     occ_syms[i].kind = kind; occ_syms[i].addr = 0; occ_syms[i].defined = 0;
     occ_syms[i].sidx = -1; occ_syms[i].ptr = 0; occ_syms[i].size = 8;
+    occ_syms[i].esize = 8; occ_syms[i].nelem = 0;
     return i;
 }
 static int occ_loc_find(const char *n) {
@@ -802,6 +856,10 @@ static int occ_loc_find(const char *n) {
  * why every operator below reads "op rax, rdi" and why subtraction and division
  * come out the right way round without a swap. */
 static void occ_mov_rax_imm(u64 v)  { occ_emit(0x48); occ_emit(0xB8); occ_emit64(v); }
+/* v0.60: a full 64-bit constant into RDI. `cmp rax, imm32` sign-extends its
+ * immediate, so comparing a switch label through it would make 0xFFFFFFFF equal
+ * -1; materialising the label first keeps the comparison exact. */
+static void occ_mov_rax_imm_rdi(i64 v) { occ_emit(0x48); occ_emit(0xBF); occ_emit64((u64)v); }
 static void occ_push_rax(void)      { occ_emit(0x50); }
 static void occ_pop_rax(void)       { occ_emit(0x58); }
 static void occ_pop_rdi(void)       { occ_emit(0x5F); }
@@ -817,14 +875,28 @@ static void occ_add_rax_imm32(int v) {
     if (!v) return;
     occ_emit(0x48); occ_emit(0x05); occ_emit32((u32)v);      /* add rax, imm32   */
 }
+static void occ_imul_rax_imm32(int v) {
+    if (v == 1) return;
+    occ_emit(0x48); occ_emit(0x69); occ_emit(0xC0); occ_emit32((u32)v);  /* imul rax,rax,imm32 */
+}
+/* v0.60: widths 2 and 4 exist now because u16/u32 do. Every sub-word load is a
+ * ZERO extension, which is exactly right for the unsigned types and is also
+ * what `char` has always done here — occ's `char` is unsigned, and it is
+ * documented as such rather than quietly changed under code that relies on it.
+ * A 32-bit `mov eax,[rax]` already clears the top half on x86-64, so no
+ * separate widening is emitted for size 4. */
 static void occ_load_rax_sized(int size) {
-    if (size == 1) { occ_emit(0x48); occ_emit(0x0F); occ_emit(0xB6); occ_emit(0x00); }  /* movzx rax,[rax] */
-    else           { occ_emit(0x48); occ_emit(0x8B); occ_emit(0x00); }                  /* mov rax,[rax]   */
+    if (size == 1)      { occ_emit(0x48); occ_emit(0x0F); occ_emit(0xB6); occ_emit(0x00); }  /* movzx rax,byte [rax] */
+    else if (size == 2) { occ_emit(0x48); occ_emit(0x0F); occ_emit(0xB7); occ_emit(0x00); }  /* movzx rax,word [rax] */
+    else if (size == 4) { occ_emit(0x8B); occ_emit(0x00); }                                  /* mov eax,[rax]        */
+    else                { occ_emit(0x48); occ_emit(0x8B); occ_emit(0x00); }                  /* mov rax,[rax]        */
 }
 /* value in rax, destination address in rdi */
 static void occ_store_sized(int size) {
-    if (size == 1) { occ_emit(0x88); occ_emit(0x07); }                                  /* mov [rdi],al    */
-    else           { occ_emit(0x48); occ_emit(0x89); occ_emit(0x07); }                  /* mov [rdi],rax   */
+    if (size == 1)      { occ_emit(0x88); occ_emit(0x07); }                                  /* mov [rdi],al    */
+    else if (size == 2) { occ_emit(0x66); occ_emit(0x89); occ_emit(0x07); }                  /* mov [rdi],ax    */
+    else if (size == 4) { occ_emit(0x89); occ_emit(0x07); }                                  /* mov [rdi],eax   */
+    else                { occ_emit(0x48); occ_emit(0x89); occ_emit(0x07); }                  /* mov [rdi],rax   */
 }
 
 static void occ_setcc(u8 cc) {       /* setcc al ; movzx rax, al */
@@ -842,6 +914,9 @@ static void occ_patch(int at) {      /* make the jump at `at` land here */
 }
 
 static void occ_expr(void);
+static void occ_unary(void);     /* v0.60: sizeof parses one, before it is defined */
+static int  occ_is_type(void);   /* v0.60: sizeof(TYPE) has to recognise one here  */
+static int  occ_parse_type(int *sidx, int *ptr, int *size, int *unsg);
 
 /* ---- expressions ---------------------------------------------------------
  * occ_lvalue() leaves an ADDRESS in RAX; occ_primary() leaves a VALUE. Keeping
@@ -852,6 +927,35 @@ static void occ_expr(void);
  * one. Without this every store was a qword and a char member would flatten
  * the seven bytes after it. */
 static int occ_lv_size;
+static int occ_lv_unsg;     /* v0.60: and whether that object is unsigned */
+
+/* v0.60: THE TYPE OF THE VALUE CURRENTLY IN RAX.
+ *
+ * occ is a single-pass code generator with no AST, so there is nowhere to hang
+ * a type on an expression node — but `a / b`, `a >> b` and `a < b` all need to
+ * know whether their operands are unsigned before they can pick an opcode.
+ * These two globals are that answer, written by whichever production last
+ * produced a value and read by occ_binop immediately afterwards.
+ *
+ *   occ_ety_unsg  the value in RAX came from an unsigned type
+ *   occ_ety_size  the SIZE IN BYTES of the object it came from — what `sizeof`
+ *                 reports. For an array this is the whole array, which is why
+ *                 `sizeof buf` gives the buffer's length and not a pointer's 8.
+ *
+ * They are only meaningful immediately after a production returns; occ_binop
+ * saves the left operand's flag before parsing the right, because parsing the
+ * right overwrites it. */
+static int occ_ety_unsg;
+static int occ_ety_size;
+
+/* Unsignedness of ONE ELEMENT of T — what T[i] or *T yields. A pointer to a
+ * pointer steps to a pointer (treated signed, as occ has always treated
+ * addresses); a struct element is not an arithmetic type at all. */
+static int occ_elem_unsg(int sidx, int ptr, int unsg) {
+    if (ptr > 1) return 0;
+    if (sidx >= 0) return 0;
+    return unsg;
+}
 
 /* v0.57: walk a `.`/`->` chain, folding member offsets into the address already
  * in RAX. Called by both the lvalue and rvalue paths so the two can never
@@ -866,7 +970,7 @@ static int occ_lv_size;
  *        misuse into a diagnostic instead of a wrong offset.
  *
  * Threads (sidx, ptr, size) in and out; the final size lands in occ_lv_size. */
-static void occ_member_chain(int *sidx, int *ptr, int *size) {
+static void occ_member_chain(int *sidx, int *ptr, int *size, int *esize, int *unsg, int *eunsg) {
     for (;;) {
         int arrow = occ_is("->");
         if (!arrow && !occ_is(".")) break;
@@ -885,9 +989,12 @@ static void occ_member_chain(int *sidx, int *ptr, int *size) {
         if (mi < 0) { occ_err("no such member", mn); occ_next(); return; }
 
         occ_add_rax_imm32(st->m[mi].off);
-        *sidx = st->m[mi].sidx;
-        *ptr  = st->m[mi].ptr;
-        *size = st->m[mi].size;
+        *sidx  = st->m[mi].sidx;
+        *ptr   = st->m[mi].ptr;
+        *size  = st->m[mi].size;
+        *esize = st->m[mi].esize;
+        *unsg  = st->m[mi].unsg;
+        *eunsg = st->m[mi].eunsg;
         occ_next();
 
         /* A pointer member must be LOADED before it can be stepped through
@@ -899,6 +1006,7 @@ static void occ_member_chain(int *sidx, int *ptr, int *size) {
         }
     }
     occ_lv_size = *size;
+    occ_lv_unsg = *unsg;
 }
 
 static int occ_lvalue(void) {     /* returns 1 if it emitted an address */
@@ -914,61 +1022,157 @@ static int occ_lvalue(void) {     /* returns 1 if it emitted an address */
         for (int i = 0; i < OCC_NAMELEN; i++) occ_txt[i] = nm[i];
         return 0;
     }
-    int sidx = -1, ptr = 0, size = 8;
+    int sidx = -1, ptr = 0, size = 8, esize = 8, nelem = 0, unsg = 0, eunsg = 0;
     int li = occ_loc_find(nm);
     if (li >= 0) {
         occ_lea_local(occ_locs[li].off);
         sidx = occ_locs[li].sidx; ptr = occ_locs[li].ptr; size = occ_locs[li].size;
+        esize = occ_locs[li].esize; nelem = occ_locs[li].nelem;
+        unsg = occ_locs[li].unsg; eunsg = occ_locs[li].eunsg;
     } else {
         int si = occ_sym_get(nm, 1);
         occ_mov_rax_imm(OCC_DATA_BASE + (u64)occ_syms[si].addr);
         sidx = occ_syms[si].sidx; ptr = occ_syms[si].ptr; size = occ_syms[si].size;
+        esize = occ_syms[si].esize; nelem = occ_syms[si].nelem;
+        unsg = occ_syms[si].unsg; eunsg = occ_syms[si].eunsg;
     }
     occ_lv_size = size;
-    if (occ_accept("[")) {                   /* a[i] -> *(a + i*8) */
-        /* v0.57: indexing is WORD-scaled, which is right for `int *` and wrong
-         * for an array of structs — the index would be multiplied by 8 instead
-         * of by the struct's size, and the base is an address rather than a
-         * pointer value so the load below is wrong too. Rather than emit code
-         * that is quietly off by a factor, say so. Reaching struct arrays means
-         * scaling the index by the element size, which is a change to the
-         * indexing model, not a patch here. */
-        if (sidx >= 0 && ptr == 0)
-            occ_err("indexing an array of structs is not supported", nm);
-        occ_load_rax_ind();                  /* the array/pointer value        */
+    occ_lv_unsg = unsg;
+    if (occ_accept("[")) {                   /* a[i] -> *(a + i*ELEMSIZE) */
+        /* v0.58: scaled by the ELEMENT size, not by 8. `char *s` steps one
+         * byte, `struct P *p` steps sizeof(P). Before this every step was 8,
+         * which is correct only for `int *` — and it is why walking a string
+         * needed the __ldb intrinsic instead of s[i].
+         *
+         * An ARRAY's name is already its base address, so it must NOT be
+         * loaded; a POINTER's value must be. Getting that backwards reads the
+         * first element as if it were an address. */
+        if (!nelem) occ_load_rax_ind();      /* a pointer: fetch its value     */
         occ_push_rax();
         occ_expr();
-        occ_emit(0x48); occ_emit(0xC1); occ_emit(0xE0); occ_emit(3);   /* shl rax,3 */
+        occ_imul_rax_imm32(esize);
         occ_mov_rdi_rax(); occ_pop_rax();
         occ_emit(0x48); occ_emit(0x01); occ_emit(0xF8);                /* add rax,rdi */
         occ_expect("]");
-        occ_lv_size = 8;
+        /* one step consumed: `struct P *p; p[i]` is a struct, so a following
+         * `.` is correct there while `->` would be a level too far. */
+        if (ptr > 0) ptr--;
+        size = esize;
+        occ_lv_size = esize; occ_lv_unsg = eunsg; unsg = eunsg;
+        if (occ_is(".") || occ_is("->")) {
+            if (occ_is("->")) occ_load_rax_sized(8);
+            occ_member_chain(&sidx, &ptr, &size, &esize, &unsg, &eunsg);
+        }
         return 1;
     }
     if (occ_is(".") || occ_is("->")) {
         /* RAX holds the variable's ADDRESS. For `.` that is already what the
          * chain wants. For `->` the POINTER VALUE is wanted, so load it. */
         if (occ_is("->")) occ_load_rax_sized(8);
-        occ_member_chain(&sidx, &ptr, &size);
+        occ_member_chain(&sidx, &ptr, &size, &esize, &unsg, &eunsg);
+        /* v0.58: `p->buf[i]` — indexing a MEMBER. Without this the trailing
+         * `[i]` fell through to the untyped postfix path, which scales by 8 and
+         * would step eight bytes at a time through a char buffer. */
+        if (occ_accept("[")) {
+            if (ptr > 0) occ_load_rax_ind();     /* a pointer member: its value */
+            occ_push_rax();
+            occ_expr();
+            occ_imul_rax_imm32(esize);
+            occ_mov_rdi_rax(); occ_pop_rax();
+            occ_emit(0x48); occ_emit(0x01); occ_emit(0xF8);
+            occ_expect("]");
+            if (ptr > 0) ptr--;
+            size = esize;
+            occ_lv_size = esize; occ_lv_unsg = eunsg; unsg = eunsg;
+            if (occ_is(".") || occ_is("->")) {
+                if (occ_is("->")) occ_load_rax_sized(8);
+                occ_member_chain(&sidx, &ptr, &size, &esize, &unsg, &eunsg);
+            }
+        }
     }
     return 1;
 }
 
 static void occ_primary(void) {
-    if (occ_tk == T_NUM) { occ_mov_rax_imm((u64)occ_val); occ_next(); return; }
+    if (occ_tk == T_NUM) {
+        occ_mov_rax_imm((u64)occ_val);
+        occ_ety_unsg = 0; occ_ety_size = 8;
+        occ_next(); return;
+    }
+    /* v0.60: SIZEOF.
+     *
+     *   sizeof(TYPE)   answered straight from the type tables
+     *   sizeof EXPR    the expression is PARSED for its type and then its code
+     *                  is thrown away, by rewinding the three output cursors
+     *                  (text, rodata, fixups) to where they were. That is what
+     *                  makes `sizeof` an unevaluated context in a compiler with
+     *                  no AST to inspect instead: the parse is the only way to
+     *                  learn the type, so it happens, and the emission is undone.
+     *                  Rewinding the fixup count matters as much as the text —
+     *                  a call inside `sizeof` would otherwise leave a relocation
+     *                  pointing into code that no longer exists.
+     *
+     * The result is the size of the OBJECT, so `sizeof buf` on an array is the
+     * whole array and `sizeof p` on a pointer is 8. */
+    if (occ_is("sizeof")) {
+        occ_next();
+        int sz = 8;
+        if (occ_is("(")) {
+            /* `(` could open a type or a parenthesised expression. Try the type
+             * reading first and roll the lexer back if it is not one. */
+            int save_pos = occ_pos, save_tk = occ_tk, save_line = occ_line;
+            i64 save_val = occ_val;
+            char save_txt[OCC_NAMELEN];
+            for (int i = 0; i < OCC_NAMELEN; i++) save_txt[i] = occ_txt[i];
+            occ_next();                                  /* consume '(' */
+            if (occ_is_type()) {
+                int tsi, tptr, tsz, tunsg;
+                if (occ_parse_type(&tsi, &tptr, &tsz, &tunsg)) {
+                    while (occ_accept("*")) { tptr++; tsz = 8; }
+                    /* `sizeof(struct P)` is the layout size; a pointer is 8. */
+                    if (tptr == 0 && tsi >= 0) tsz = occ_structs[tsi].size;
+                    else if (tptr) tsz = 8;
+                    occ_expect(")");
+                    occ_mov_rax_imm((u64)tsz);
+                    occ_ety_unsg = 1; occ_ety_size = 8;
+                    return;
+                }
+            }
+            occ_pos = save_pos; occ_tk = save_tk; occ_val = save_val; occ_line = save_line;
+            for (int i = 0; i < OCC_NAMELEN; i++) occ_txt[i] = save_txt[i];
+        }
+        {
+            int t0 = occ_tlen, r0 = occ_rlen, x0 = occ_nfix;
+            occ_ety_size = 8;
+            occ_unary();                                 /* parsed for its TYPE */
+            sz = occ_ety_size;
+            occ_tlen = t0; occ_rlen = r0; occ_nfix = x0; /* and its code discarded */
+        }
+        occ_mov_rax_imm((u64)sz);
+        occ_ety_unsg = 1; occ_ety_size = 8;
+        return;
+    }
     if (occ_tk == T_STR) {
         u64 addr = OCC_RODATA_BASE + (u64)occ_rlen;
+        int slen = occ_strlen_;
         for (int i = 0; i <= occ_strlen_ && occ_rlen < (int)OCC_MAXDATA; i++)
             occ_rod[occ_rlen++] = (u8)occ_str[i];
         while (occ_rlen & 7) occ_rod[occ_rlen++] = 0;
-        occ_mov_rax_imm(addr); occ_next(); return;
+        occ_mov_rax_imm(addr);
+        /* a string literal is an ARRAY of char: sizeof "abc" is 4, not 8 */
+        occ_ety_unsg = 0; occ_ety_size = slen + 1;
+        occ_next(); return;
     }
     if (occ_accept("(")) { occ_expr(); occ_expect(")"); return; }
     if (occ_accept("-")) { occ_primary();
-        occ_emit(0x48); occ_emit(0xF7); occ_emit(0xD8); return; }     /* neg rax */
-    if (occ_accept("!")) { occ_primary(); occ_test_rax(); occ_setcc(0x94); return; }
-    if (occ_accept("*")) { occ_primary(); occ_load_rax_ind(); return; }
-    if (occ_accept("&")) { if (!occ_lvalue()) occ_err("& needs an lvalue", 0); return; }
+        occ_emit(0x48); occ_emit(0xF7); occ_emit(0xD8);               /* neg rax */
+        occ_ety_unsg = 0; occ_ety_size = 8; return; }
+    if (occ_accept("!")) { occ_primary(); occ_test_rax(); occ_setcc(0x94);
+        occ_ety_unsg = 0; occ_ety_size = 8; return; }
+    if (occ_accept("*")) { occ_primary(); occ_load_rax_ind();
+        occ_ety_unsg = 0; occ_ety_size = 8; return; }
+    if (occ_accept("&")) { if (!occ_lvalue()) occ_err("& needs an lvalue", 0);
+        occ_ety_unsg = 0; occ_ety_size = 8; return; }
     if (occ_is("__syscall")) {                /* the OS ABI intrinsic */
         occ_next(); occ_expect("(");
         /* Arguments are evaluated left to right and parked on the stack, then
@@ -986,6 +1190,7 @@ static void occ_primary(void) {
         occ_emit(0x5F);                                  /* pop rdi  (a0) */
         occ_emit(0x58);                                  /* pop rax  (num) */
         occ_emit(0x0F); occ_emit(0x05);                  /* syscall */
+        occ_ety_unsg = 0; occ_ety_size = 8;              /* results may be negative */
         return;
     }
     /* v0.56 Stage F: BYTE ADDRESSING. occ's `a[i]` is defined as *(a + i*8) —
@@ -1012,6 +1217,7 @@ static void occ_primary(void) {
         occ_pop_rax();                                   /* rax = p        */
         occ_emit(0x48); occ_emit(0x0F); occ_emit(0xB6);
         occ_emit(0x04); occ_emit(0x38);                  /* movzx rax,[rax+rdi] */
+        occ_ety_unsg = 1; occ_ety_size = 8;
         return;
     }
     if (occ_is("__stb")) {
@@ -1054,25 +1260,75 @@ static void occ_primary(void) {
             occ_emit(0xE8);
             if (occ_nfix < OCC_MAXFIX) { occ_fixes[occ_nfix].at = occ_tlen; occ_fixes[occ_nfix].sym = si; occ_nfix++; }
             occ_emit32(0);
+            /* occ has no return types beyond the machine word, so a call
+             * yields a signed word. */
+            occ_ety_unsg = 0; occ_ety_size = 8;
             return;
         }
-        int sidx = -1, ptr = 0, size = 8, isloc = 0;
+        int sidx = -1, ptr = 0, size = 8, esize = 8, nelem = 0, unsg = 0, eunsg = 0;
         int li = occ_loc_find(nm);
         int si = -1;
         if (li >= 0) {
             occ_lea_local(occ_locs[li].off);
             sidx = occ_locs[li].sidx; ptr = occ_locs[li].ptr; size = occ_locs[li].size;
-            isloc = 1;
+            esize = occ_locs[li].esize; nelem = occ_locs[li].nelem;
+            unsg = occ_locs[li].unsg; eunsg = occ_locs[li].eunsg;
         } else {
             si = occ_sym_get(nm, 1);
             occ_mov_rax_imm(OCC_DATA_BASE + (u64)occ_syms[si].addr);
             sidx = occ_syms[si].sidx; ptr = occ_syms[si].ptr; size = occ_syms[si].size;
+            esize = occ_syms[si].esize; nelem = occ_syms[si].nelem;
+            unsg = occ_syms[si].unsg; eunsg = occ_syms[si].eunsg;
         }
-        (void)isloc;
+        /* v0.60: `sizeof` reports the whole OBJECT, so an array is nelem
+         * elements wide and everything else is its own width. */
+        occ_ety_size = nelem ? nelem * esize : size;
+        occ_ety_unsg = unsg;
         /* RAX now holds the variable's ADDRESS. */
+        if (occ_is("[")) {
+            occ_next();
+            if (!nelem) occ_load_rax_ind();          /* pointer: fetch value   */
+            occ_push_rax();
+            occ_expr();
+            occ_imul_rax_imm32(esize);
+            occ_mov_rdi_rax(); occ_pop_rax();
+            occ_emit(0x48); occ_emit(0x01); occ_emit(0xF8);            /* add rax,rdi */
+            occ_expect("]");
+            if (ptr > 0) ptr--;
+            size = esize;
+            unsg = eunsg;
+            if (occ_is(".") || occ_is("->")) {
+                if (occ_is("->")) occ_load_rax_sized(8);
+                occ_member_chain(&sidx, &ptr, &size, &esize, &unsg, &eunsg);
+            }
+            occ_ety_size = size; occ_ety_unsg = unsg;
+            /* an element that is itself a struct stays an ADDRESS */
+            if (!(sidx >= 0 && ptr == 0)) occ_load_rax_sized(size);
+            return;
+        }
+        /* v0.58: an ARRAY decays to its base address, exactly as a struct does
+         * and for the same reason — there is no way to hold either in a
+         * register, and C says the same. */
+        if (nelem) return;
         if (occ_is(".") || occ_is("->")) {
             if (occ_is("->")) occ_load_rax_sized(8);       /* want the pointer VALUE */
-            occ_member_chain(&sidx, &ptr, &size);
+            occ_member_chain(&sidx, &ptr, &size, &esize, &unsg, &eunsg);
+            if (occ_accept("[")) {               /* v0.58: p->buf[i] */
+                if (ptr > 0) occ_load_rax_ind();
+                occ_push_rax();
+                occ_expr();
+                occ_imul_rax_imm32(esize);
+                occ_mov_rdi_rax(); occ_pop_rax();
+                occ_emit(0x48); occ_emit(0x01); occ_emit(0xF8);
+                occ_expect("]");
+                if (ptr > 0) ptr--;
+                size = esize; unsg = eunsg;
+                if (occ_is(".") || occ_is("->")) {
+                    if (occ_is("->")) occ_load_rax_sized(8);
+                    occ_member_chain(&sidx, &ptr, &size, &esize, &unsg, &eunsg);
+                }
+            }
+            occ_ety_size = size; occ_ety_unsg = unsg;
             /* A member that is itself a struct stays an ADDRESS — there is no
              * way to hold a struct in a register, and C says the same. */
             if (!(sidx >= 0 && ptr == 0)) occ_load_rax_sized(size);
@@ -1082,6 +1338,7 @@ static void occ_primary(void) {
          * array does in C. Loading it would put the first eight bytes of the
          * struct in RAX and call it the value, which is meaningless. */
         if (sidx >= 0 && ptr == 0) return;
+        occ_ety_size = size; occ_ety_unsg = unsg;
         occ_load_rax_sized(size);
         return;
     }
@@ -1091,6 +1348,12 @@ static void occ_primary(void) {
 }
 
 static void occ_postfix(void) {
+    /* v0.58: the FALLBACK index path — indexing an arbitrary value expression,
+     * e.g. f()[i], where there is no declared type to take an element size
+     * from. It is word-scaled, which is right for `int *` and the only defensible
+     * default with no type information. Every path that DOES know the type
+     * (a variable, a member, a chain) scales by that type's element size in
+     * occ_lvalue/occ_primary and never reaches here. */
     /* index on a value expression: p[i] */
     occ_primary();
     while (occ_is("[")) {
@@ -1102,6 +1365,7 @@ static void occ_postfix(void) {
         occ_emit(0x48); occ_emit(0x01); occ_emit(0xF8);                /* add rax,rdi */
         occ_load_rax_ind();
         occ_expect("]");
+        occ_ety_unsg = 0; occ_ety_size = 8;
     }
 }
 
@@ -1147,18 +1411,39 @@ static void occ_binop(int lvl) {
             occ_patch(e);
             continue;
         }
-        int cmp = 0; u8 cc = 0;
+        /* v0.60: RELATIONAL OPERATORS ARE SIGNEDNESS-DEPENDENT.
+         *
+         * setl/setg compare as two's-complement; setb/seta compare as magnitudes.
+         * For `u64 a = 0x8000000000000000; a > 1` the signed form says NO and the
+         * unsigned form says YES, and only one of those is what the source asked
+         * for. Equality is the one comparison that does not care, so == and !=
+         * keep a single encoding.
+         *
+         * The left operand's flag has to be captured BEFORE the right side is
+         * parsed, because parsing it overwrites occ_ety_unsg. C's usual
+         * arithmetic conversions make the result unsigned if EITHER side is, and
+         * that is the rule applied here. */
+        int cmp = 0; u8 cc = 0; int signed_dep = 0;
         if (lvl == 5 && occ_is("==")) { cc = 0x94; cmp = 1; }
         else if (lvl == 5 && occ_is("!=")) { cc = 0x95; cmp = 1; }
-        else if (lvl == 6 && occ_is("<"))  { cc = 0x9C; cmp = 1; }
-        else if (lvl == 6 && occ_is(">"))  { cc = 0x9F; cmp = 1; }
-        else if (lvl == 6 && occ_is("<=")) { cc = 0x9E; cmp = 1; }
-        else if (lvl == 6 && occ_is(">=")) { cc = 0x9D; cmp = 1; }
+        else if (lvl == 6 && occ_is("<"))  { cc = 0x9C; cmp = 1; signed_dep = 1; }
+        else if (lvl == 6 && occ_is(">"))  { cc = 0x9F; cmp = 1; signed_dep = 1; }
+        else if (lvl == 6 && occ_is("<=")) { cc = 0x9E; cmp = 1; signed_dep = 1; }
+        else if (lvl == 6 && occ_is(">=")) { cc = 0x9D; cmp = 1; signed_dep = 1; }
         if (cmp) {
+            int lu = occ_ety_unsg;
             occ_next(); occ_push_rax(); occ_binop(lvl + 1);
+            int u = lu || occ_ety_unsg;
+            if (signed_dep && u) {
+                if      (cc == 0x9C) cc = 0x92;      /* setl  -> setb  */
+                else if (cc == 0x9F) cc = 0x97;      /* setg  -> seta  */
+                else if (cc == 0x9E) cc = 0x96;      /* setle -> setbe */
+                else if (cc == 0x9D) cc = 0x93;      /* setge -> setae */
+            }
             occ_mov_rdi_rax(); occ_pop_rax();
             occ_emit(0x48); occ_emit(0x39); occ_emit(0xF8);            /* cmp rax,rdi */
             occ_setcc(cc);
+            occ_ety_unsg = 0; occ_ety_size = 8;       /* a comparison yields 0 or 1 */
             continue;
         }
         /* bitwise: one shape, three opcodes (or/xor/and on rax, rdi) */
@@ -1167,38 +1452,66 @@ static void occ_binop(int lvl) {
         else if (lvl == 3 && occ_is("^")) { bcode = 0x31; bop = 1; }
         else if (lvl == 4 && occ_is("&")) { bcode = 0x21; bop = 1; }
         if (bop) {
+            int lu = occ_ety_unsg;
             occ_next(); occ_push_rax(); occ_binop(lvl + 1);
             occ_mov_rdi_rax(); occ_pop_rax();
             occ_emit(0x48); occ_emit(bcode); occ_emit(0xF8);           /* op rax,rdi */
+            occ_ety_unsg = lu || occ_ety_unsg; occ_ety_size = 8;
             continue;
         }
         /* shifts: the count has to be in cl, and cl is the ONLY place x86-64
          * will take it from, so the operand order here is forced. */
         if (lvl == 7 && (occ_is("<<") || occ_is(">>"))) {
             int right = occ_is(">>");
+            /* v0.60: `>>` on an unsigned value is a LOGICAL shift. sar on a u64
+             * with the top bit set smears ones downward and turns a large
+             * positive number into a larger one — the classic wrong answer from
+             * a hex formatter shifting a pointer. Only the LEFT operand's
+             * signedness decides; the count's is irrelevant. */
+            int lu = occ_ety_unsg;
             occ_next(); occ_push_rax(); occ_binop(lvl + 1);
             occ_emit(0x48); occ_emit(0x89); occ_emit(0xC1);            /* mov rcx,rax */
             occ_pop_rax();
-            occ_emit(0x48); occ_emit(0xD3); occ_emit(right ? 0xF8 : 0xE0); /* sar/shl rax,cl */
+            u8 sop = right ? (lu ? 0xE8 : 0xF8) : 0xE0;                /* shr / sar / shl */
+            occ_emit(0x48); occ_emit(0xD3); occ_emit(sop);
+            occ_ety_unsg = lu; occ_ety_size = 8;
             continue;
         }
         if (lvl == 8 && (occ_is("+") || occ_is("-"))) {
             int sub = occ_is("-");
+            int lu = occ_ety_unsg;
             occ_next(); occ_push_rax(); occ_binop(lvl + 1);
             occ_mov_rdi_rax(); occ_pop_rax();
+            /* add/sub are bit-identical for both signednesses; only the RESULT
+             * type propagates, so a later compare or shift picks correctly. */
             occ_emit(0x48); occ_emit(sub ? 0x29 : 0x01); occ_emit(0xF8);
+            occ_ety_unsg = lu || occ_ety_unsg; occ_ety_size = 8;
             continue;
         }
         if (lvl == 9 && (occ_is("*") || occ_is("/") || occ_is("%"))) {
             int op = occ_is("*") ? 0 : occ_is("/") ? 1 : 2;
+            int lu = occ_ety_unsg;
             occ_next(); occ_push_rax(); occ_binop(lvl + 1);
+            int u = lu || occ_ety_unsg;
             occ_mov_rdi_rax(); occ_pop_rax();
+            /* imul and mul agree on the LOW 64 bits, so multiplication needs no
+             * variant. Division does: idiv treats both operands as signed, so
+             * `(u64)-1 / 2` yields 0 through idiv and 0x7FFF...F through div.
+             * The dividend extension differs too — cqo sign-extends into rdx,
+             * and an unsigned divide must zero it instead or div faults or
+             * divides by the wrong 128-bit numerator. */
             if (op == 0) { occ_emit(0x48); occ_emit(0x0F); occ_emit(0xAF); occ_emit(0xC7); }
+            else if (u) {
+                occ_emit(0x48); occ_emit(0x31); occ_emit(0xD2);        /* xor rdx,rdx */
+                occ_emit(0x48); occ_emit(0xF7); occ_emit(0xF7);        /* div rdi     */
+                if (op == 2) { occ_emit(0x48); occ_emit(0x89); occ_emit(0xD0); }
+            }
             else {
                 occ_emit(0x48); occ_emit(0x99);                        /* cqo        */
                 occ_emit(0x48); occ_emit(0xF7); occ_emit(0xFF);        /* idiv rdi   */
                 if (op == 2) { occ_emit(0x48); occ_emit(0x89); occ_emit(0xD0); } /* mov rax,rdx */
             }
+            occ_ety_unsg = u; occ_ety_size = 8;
             continue;
         }
         return;
@@ -1243,6 +1556,8 @@ static void occ_expr(void) {
 static int occ_is_type(void) {
     if (occ_is("int") || occ_is("char") || occ_is("void")) return 1;
     if (occ_is("struct") || occ_is("union")) return 1;
+    if (occ_is("unsigned") || occ_is("signed")) return 1;                     /* v0.60 */
+    if (occ_is("u8") || occ_is("u16") || occ_is("u32") || occ_is("u64")) return 1;
     if (occ_tk == T_IDENT && occ_td_find(occ_txt) >= 0) return 1;
     return 0;
 }
@@ -1253,8 +1568,29 @@ static void occ_struct_body(int si);
  * triple through the out-parameters. Also DEFINES the struct if the specifier
  * carries a `{ ... }` body, so `struct P { int x; } ;` and `struct P p;` are
  * both handled by the one function. */
-static int occ_parse_type(int *sidx, int *ptr, int *size) {
-    *sidx = -1; *ptr = 0; *size = 8;
+static int occ_parse_type(int *sidx, int *ptr, int *size, int *unsg) {
+    *sidx = -1; *ptr = 0; *size = 8; *unsg = 0;
+
+    /* v0.60: the fixed-width unsigned primitives. occ's `int` is a signed
+     * 64-bit machine word and stays that way; these are the only types that
+     * carry a width other than 1 or 8. */
+    if (occ_is("u8"))  { occ_next(); *size = 1; *unsg = 1; return 1; }
+    if (occ_is("u16")) { occ_next(); *size = 2; *unsg = 1; return 1; }
+    if (occ_is("u32")) { occ_next(); *size = 4; *unsg = 1; return 1; }
+    if (occ_is("u64")) { occ_next(); *size = 8; *unsg = 1; return 1; }
+
+    /* `unsigned` / `signed`, optionally followed by char/int. Bare `unsigned`
+     * is `unsigned int`, which here is a 64-bit word — occ's int is 64-bit, so
+     * saying otherwise would make `unsigned` and `int` different widths and
+     * every struct laid out with one of them wrong. */
+    if (occ_is("unsigned") || occ_is("signed")) {
+        int u = occ_is("unsigned");
+        occ_next();
+        *unsg = u; *size = 8;
+        if (occ_is("char")) { occ_next(); *size = 1; }
+        else if (occ_is("int")) occ_next();
+        return 1;
+    }
 
     if (occ_is("struct") || occ_is("union")) {
         int is_union = occ_is("union");
@@ -1309,6 +1645,7 @@ static int occ_parse_type(int *sidx, int *ptr, int *size) {
         int ti = occ_td_find(occ_txt);
         if (ti < 0) return 0;
         *sidx = occ_tds[ti].sidx; *ptr = occ_tds[ti].ptr; *size = occ_tds[ti].size;
+        *unsg = occ_tds[ti].unsg;
         occ_next();
     } else return 0;
 
@@ -1327,8 +1664,8 @@ static void occ_struct_body(int si) {
     st->nm = 0; st->size = 0; st->align = 1;
     int off = 0;
     while (!occ_is("}") && occ_tk != T_EOF && !occ_errors) {
-        int msi, mptr, msz;
-        if (!occ_parse_type(&msi, &mptr, &msz)) { occ_err("expected a member type", occ_txt); occ_next(); continue; }
+        int msi, mptr, msz, munsg;
+        if (!occ_parse_type(&msi, &mptr, &msz, &munsg)) { occ_err("expected a member type", occ_txt); occ_next(); continue; }
         for (;;) {                                /* `int x, y;` */
             int xptr = mptr, xsz = msz;
             while (occ_accept("*")) { xptr++; xsz = 8; }
@@ -1346,6 +1683,12 @@ static void occ_struct_body(int si) {
                  * pointer member it is what `->` will dereference to. `ptr`
                  * distinguishes them. */
                 mm->size = xsz; mm->sidx = msi; mm->ptr = xptr;
+                mm->esize = occ_elem_size(msi, xptr, msz);
+                /* A POINTER is a machine word, so the member itself is not
+                 * unsigned even when its target is; the target's signedness
+                 * lives in eunsg and is what a later `[i]` or `*` reads. */
+                mm->unsg  = xptr ? 0 : munsg;
+                mm->eunsg = occ_elem_unsg(msi, xptr, munsg);
                 if (a > st->align) st->align = a;
                 if (st->is_union && xsz > st->size) st->size = xsz;
                 st->nm++;
@@ -1365,47 +1708,130 @@ static void occ_struct_body(int si) {
 
 /* ---- statements ----------------------------------------------------------*/
 
-static void occ_stmt(void) {
-    if (occ_accept("{")) { while (!occ_is("}") && occ_tk != T_EOF) occ_stmt(); occ_expect("}"); return; }
-
-    if (occ_is_type()) {                         /* local declaration */
-        int sidx, ptr, size;
-        if (!occ_parse_type(&sidx, &ptr, &size)) { occ_err("expected a type", occ_txt); occ_next(); return; }
-        /* `struct P { int x; };` inside a function defines the type and
-         * declares nothing — allow it rather than demanding a declarator. */
-        if (occ_accept(";")) return;
+/* v0.60: the local-declaration statement, lifted out of occ_stmt() so that the
+ * initialiser slot of a `for` can run the SAME parser. Duplicating it there
+ * instead would be two declaration parsers to keep in agreement, and the one
+ * inside `for` would be the one that quietly fell behind. Consumes its own
+ * trailing ';'. */
+static void occ_local_decl(void) {
+    int sidx, ptr, bsz, bunsg;
+    if (!occ_parse_type(&sidx, &ptr, &bsz, &bunsg)) { occ_err("expected a type", occ_txt); occ_next(); return; }
+    /* `struct P { int x; };` inside a function defines the type and
+     * declares nothing — allow it rather than demanding a declarator. */
+    if (occ_accept(";")) return;
+    {
         for (;;) {
-            int xptr = ptr, xsz = size;
+            int xptr = ptr, xsz = bsz;
             while (occ_accept("*")) { xptr++; xsz = 8; }
             if (occ_tk != T_IDENT) { occ_err("expected a declarator", occ_txt); return; }
-            if (occ_nloc >= OCC_MAXLOC) occ_err("too many locals in one function", occ_txt);
+            char lname[OCC_NAMELEN];
+            for (int i = 0; i < OCC_NAMELEN; i++) lname[i] = occ_txt[i];
+            occ_next();
+
+            /* v0.58: LOCAL ARRAYS. A local was one 8-byte slot, so `char buf[64];`
+             * could not be written at all — which is why /usr/lib/libc.oc's
+             * scratch buffers are globals and its formatters are not reentrant. */
+            int nelem = 0;
+            if (occ_accept("[")) {
+                if (occ_tk == T_NUM) { nelem = (int)occ_val; occ_next(); }
+                else occ_err("a local array needs a constant size", lname);
+                occ_expect("]");
+                if (nelem <= 0) { occ_err("array size must be positive", lname); nelem = 1; }
+            }
+            int esz = occ_elem_size(sidx, xptr, bsz);
+
+            int slot = -1;
+            if (occ_nloc >= OCC_MAXLOC) occ_err("too many locals in one function", lname);
             else {
                 struct occ_loc *L = &occ_locs[occ_nloc];
-                for (int i = 0; i < OCC_NAMELEN; i++) L->name[i] = occ_txt[i];
-                /* v0.57: a struct local occupies its REAL size, rounded up to 8
-                 * so the frame stays qword-aligned. Every local was one 8-byte
-                 * slot before this, which is exactly why structs needed it. */
-                int slotsz = (xsz + 7) & ~7;
+                for (int i = 0; i < OCC_NAMELEN; i++) L->name[i] = lname[i];
+                /* An array reserves nelem elements; a struct its real size; a
+                 * scalar a full word. Rounded up to 8 so the frame stays
+                 * qword-aligned regardless. */
+                int bytes = nelem ? nelem * esz : xsz;
+                int slotsz = (bytes + 7) & ~7;
                 occ_frame += slotsz;
-                L->off  = -occ_frame;
-                L->sidx = (xptr ? sidx : sidx);
-                L->ptr  = xptr;
-                L->size = xsz;
+                L->off   = -occ_frame;
+                L->sidx  = sidx;
+                L->ptr   = xptr;
+                L->size  = nelem ? esz : xsz;   /* size of ONE element/value */
+                L->esize = esz;
+                L->nelem = nelem;
+                L->unsg  = xptr ? 0 : bunsg;
+                L->eunsg = occ_elem_unsg(sidx, xptr, bunsg);
                 occ_nloc++;
+                slot = occ_nloc - 1;
             }
-            int slot = occ_nloc - 1;
-            occ_next();
             if (occ_accept("=")) {
-                if (slot >= 0 && occ_locs[slot].sidx >= 0 && occ_locs[slot].ptr == 0)
-                    occ_err("cannot initialise a struct by assignment", occ_locs[slot].name);
+                if (slot >= 0 && occ_locs[slot].nelem)
+                    occ_err("cannot initialise an array by assignment", lname);
+                else if (slot >= 0 && occ_locs[slot].sidx >= 0 && occ_locs[slot].ptr == 0)
+                    occ_err("cannot initialise a struct by assignment", lname);
                 occ_expr();
-                occ_emit(0x48); occ_emit(0x89); occ_emit(0x85); occ_emit32((u32)occ_locs[slot].off);
+                if (slot >= 0) {
+                    occ_emit(0x48); occ_emit(0x89); occ_emit(0x85);
+                    occ_emit32((u32)occ_locs[slot].off);
+                }
             }
             if (!occ_accept(",")) break;
         }
         occ_expect(";");
-        return;
     }
+}
+
+/* v0.60: BREAK / CONTINUE / SWITCH bookkeeping.
+ *
+ * There is no AST, so a `break` cannot be resolved when it is parsed — the end
+ * of the construct it leaves has not been emitted yet. Each enclosing breakable
+ * construct therefore pushes a frame holding the list of jump sites that still
+ * need patching, and patches them all when its own end is finally known.
+ *
+ * `continue` is separate from `break` because they land in different places: in
+ * a `for`, continue goes to the INCREMENT, not to the loop top, and getting
+ * that wrong would skip the increment and hang the loop. A switch is breakable
+ * but not continuable, so it pushes a frame with no continue target and
+ * `continue` inside one correctly reaches past it to the enclosing loop. */
+#define OCC_MAXBRK   32
+#define OCC_MAXNEST  16
+struct occ_brkframe {
+    int brk_at[OCC_MAXBRK];  int nbrk;
+    int con_at[OCC_MAXBRK];  int ncon;
+    int continuable;         /* 0 for switch, 1 for while/for */
+};
+static struct occ_brkframe occ_brks[OCC_MAXNEST];
+static int occ_nbrkf;
+
+static void occ_brk_push(int continuable) {
+    if (occ_nbrkf >= OCC_MAXNEST) { occ_err("loops and switches nested too deeply", 0); return; }
+    occ_brks[occ_nbrkf].nbrk = 0;
+    occ_brks[occ_nbrkf].ncon = 0;
+    occ_brks[occ_nbrkf].continuable = continuable;
+    occ_nbrkf++;
+}
+/* Patch every `break` in the innermost frame to land HERE, then pop it. */
+static void occ_brk_pop_here(void) {
+    if (occ_nbrkf <= 0) return;
+    struct occ_brkframe *F = &occ_brks[occ_nbrkf - 1];
+    for (int i = 0; i < F->nbrk; i++) occ_patch(F->brk_at[i]);
+    occ_nbrkf--;
+}
+/* Patch every `continue` in the innermost frame to land at `target`. */
+static void occ_con_resolve(int target) {
+    if (occ_nbrkf <= 0) return;
+    struct occ_brkframe *F = &occ_brks[occ_nbrkf - 1];
+    for (int i = 0; i < F->ncon; i++) {
+        u32 rel = (u32)(target - (F->con_at[i] + 4));
+        for (int k = 0; k < 4; k++) occ_text[F->con_at[i] + k] = (u8)(rel >> (8 * k));
+    }
+}
+
+static void occ_stmt(void);
+
+static void occ_stmt(void) {
+    if (occ_accept("{")) { while (!occ_is("}") && occ_tk != T_EOF) occ_stmt(); occ_expect("}"); return; }
+
+    if (occ_is_type()) { occ_local_decl(); return; }   /* local declaration */
+
     if (occ_accept("return")) {
         if (!occ_is(";")) occ_expr(); else occ_mov_rax_imm(0);
         occ_expect(";");
@@ -1431,15 +1857,31 @@ static void occ_stmt(void) {
         occ_expect("("); occ_expr(); occ_expect(")");
         occ_test_rax();
         int f = occ_jmp_fwd(0x84);
+        occ_brk_push(1);
         occ_stmt();
+        occ_con_resolve(top);                    /* continue -> re-test */
         occ_emit(0xE9); occ_emit32((u32)(top - (occ_tlen + 4)));
         occ_patch(f);
+        occ_brk_pop_here();                      /* break -> past the loop */
         return;
     }
     if (occ_accept("for")) {
         occ_expect("(");
-        if (!occ_is(";")) occ_expr();
-        occ_expect(";");
+        /* v0.60: a DECLARATION in the initialiser. `for (int i = 0; ...)` is 64
+         * of the constructs standing between occ and its own source, and it was
+         * the cheapest of them: the slot below re-runs the ordinary local
+         * declaration parser, and the loop gets a scope so `i` does not leak
+         * out and collide with the next loop's `i`.
+         *
+         * The frame is deliberately NOT rolled back with the scope. Reclaiming
+         * the stack slot would let a later declaration reuse those bytes, which
+         * is only safe if nothing still refers to them — and proving that needs
+         * liveness information a single-pass compiler does not have. Keeping the
+         * slot costs 8 bytes per loop and cannot alias. */
+        int scope_mark = occ_nloc;
+        if (occ_is_type())      occ_local_decl();     /* consumes its own ';' */
+        else if (!occ_is(";"))  { occ_expr(); occ_expect(";"); }
+        else                    occ_expect(";");
         int top = occ_tlen;
         int f = -1;
         if (!occ_is(";")) { occ_expr(); occ_test_rax(); f = occ_jmp_fwd(0x84); }
@@ -1453,9 +1895,107 @@ static void occ_stmt(void) {
         occ_emit(0xE9); occ_emit32((u32)(top - (occ_tlen + 4)));
         occ_expect(")");
         occ_patch(jbody);
+        occ_brk_push(1);
         occ_stmt();
+        occ_con_resolve(inc);                    /* continue -> the INCREMENT */
         occ_emit(0xE9); occ_emit32((u32)(inc - (occ_tlen + 4)));
         if (f >= 0) occ_patch(f);
+        occ_brk_pop_here();
+        occ_nloc = scope_mark;                   /* the loop variable goes out of scope */
+        return;
+    }
+    /* v0.60: SWITCH / CASE / DEFAULT.
+     *
+     * Single pass, no AST, so the case VALUES are not all known until the body
+     * has been parsed — and the case TARGETS are not known until the code for
+     * each has been emitted. The shape that resolves both without a second pass
+     * is to put the dispatch AFTER the body:
+     *
+     *     eval control -> spill to a frame slot
+     *     jmp DISPATCH
+     *   body:  ... case arms, each recording (value, offset) as it is passed ...
+     *     jmp END
+     *   DISPATCH: reload the control value; cmp/je to each recorded arm
+     *             jmp default-arm, or fall through to END if there is none
+     *   END:
+     *
+     * By the time DISPATCH is emitted every arm offset is a BACKWARD reference
+     * and therefore already known, so nothing there needs patching at all. The
+     * control value is spilled to the frame rather than kept on the stack
+     * because the arms in between contain arbitrary code, including `break`
+     * jumps out of the construct, and a value balanced on the stack would not
+     * survive them. */
+    if (occ_accept("switch")) {
+        occ_expect("(");
+        occ_expr();
+        occ_expect(")");
+        occ_frame += 8;
+        int slot = -occ_frame;
+        occ_emit(0x48); occ_emit(0x89); occ_emit(0x85); occ_emit32((u32)slot); /* mov [rbp+slot],rax */
+        int to_dispatch = occ_jmp_fwd(0);
+
+        int cval[OCC_MAXCASE]; int coff[OCC_MAXCASE]; int ncase = 0;
+        int defoff = -1;
+
+        occ_brk_push(0);                          /* breakable, not continuable */
+        occ_expect("{");
+        while (!occ_is("}") && occ_tk != T_EOF && !occ_errors) {
+            if (occ_accept("case")) {
+                if (occ_tk != T_NUM) { occ_err("case needs an integer constant", occ_txt); }
+                i64 v = occ_val;
+                if (occ_tk == T_NUM) occ_next();
+                occ_expect(":");
+                if (ncase >= OCC_MAXCASE) occ_err("too many case labels in one switch", 0);
+                else { cval[ncase] = (int)v; coff[ncase] = occ_tlen; ncase++; }
+                continue;
+            }
+            if (occ_accept("default")) {
+                occ_expect(":");
+                if (defoff >= 0) occ_err("more than one default in one switch", 0);
+                defoff = occ_tlen;
+                continue;
+            }
+            occ_stmt();
+        }
+        occ_expect("}");
+        int to_end = occ_jmp_fwd(0);
+
+        occ_patch(to_dispatch);
+        for (int i = 0; i < ncase; i++) {
+            occ_emit(0x48); occ_emit(0x8B); occ_emit(0x85); occ_emit32((u32)slot); /* mov rax,[rbp+slot] */
+            /* The label is compared as a full 64-bit value: loading it into rdi
+             * first avoids cmp's sign-extended imm32, which would make
+             * `case 0xFFFFFFFF:` match a negative control value. */
+            occ_mov_rax_imm_rdi(cval[i]);
+            occ_emit(0x48); occ_emit(0x39); occ_emit(0xF8);                       /* cmp rax,rdi */
+            occ_emit(0x0F); occ_emit(0x84);                                       /* je rel32    */
+            occ_emit32((u32)(coff[i] - (occ_tlen + 4)));
+        }
+        if (defoff >= 0) { occ_emit(0xE9); occ_emit32((u32)(defoff - (occ_tlen + 4))); }
+        occ_patch(to_end);
+        occ_brk_pop_here();
+        return;
+    }
+    if (occ_accept("break")) {
+        occ_expect(";");
+        if (occ_nbrkf <= 0) { occ_err("break outside a loop or switch", 0); return; }
+        struct occ_brkframe *F = &occ_brks[occ_nbrkf - 1];
+        int at = occ_jmp_fwd(0);
+        if (F->nbrk >= OCC_MAXBRK) occ_err("too many breaks in one construct", 0);
+        else F->brk_at[F->nbrk++] = at;
+        return;
+    }
+    if (occ_accept("continue")) {
+        occ_expect(";");
+        /* Reach past any switch frames to the innermost CONTINUABLE construct:
+         * `continue` inside a switch inside a loop belongs to the loop. */
+        int fi = occ_nbrkf - 1;
+        while (fi >= 0 && !occ_brks[fi].continuable) fi--;
+        if (fi < 0) { occ_err("continue outside a loop", 0); return; }
+        struct occ_brkframe *F = &occ_brks[fi];
+        int at = occ_jmp_fwd(0);
+        if (F->ncon >= OCC_MAXBRK) occ_err("too many continues in one loop", 0);
+        else F->con_at[F->ncon++] = at;
         return;
     }
     if (occ_accept(";")) return;
@@ -1470,8 +2010,8 @@ static void occ_toplevel(void) {
          * `Pt p;` declares a struct with the right size and `Pt *q;` a
          * pointer to it. */
         if (occ_accept("typedef")) {
-            int tsidx, tptr, tsize;
-            if (!occ_parse_type(&tsidx, &tptr, &tsize)) {
+            int tsidx, tptr, tsize, tunsg;
+            if (!occ_parse_type(&tsidx, &tptr, &tsize, &tunsg)) {
                 occ_err("expected a type after typedef", occ_txt); occ_next(); continue;
             }
             while (occ_accept("*")) { tptr++; tsize = 8; }
@@ -1481,6 +2021,7 @@ static void occ_toplevel(void) {
                 struct occ_td *T = &occ_tds[occ_ntd++];
                 for (int i = 0; i < OCC_NAMELEN; i++) T->name[i] = occ_txt[i];
                 T->sidx = tsidx; T->ptr = tptr; T->size = tsize; T->used = 1;
+                T->unsg = tptr ? 0 : tunsg;
             }
             occ_next();
             occ_expect(";");
@@ -1488,8 +2029,8 @@ static void occ_toplevel(void) {
         }
 
         if (!occ_is_type()) { occ_err("expected a declaration", occ_txt); occ_next(); continue; }
-        int bsidx, bptr, bsize;
-        if (!occ_parse_type(&bsidx, &bptr, &bsize)) {
+        int bsidx, bptr, bsize, bunsg;
+        if (!occ_parse_type(&bsidx, &bptr, &bsize, &bunsg)) {
             occ_err("expected a type", occ_txt); occ_next(); continue;
         }
         /* `struct P { int x; };` — a definition with no declarator. */
@@ -1516,10 +2057,21 @@ static void occ_toplevel(void) {
                  * when its type names a struct — only POINTERS to structs can
                  * be parameters here, which the by-value check below enforces
                  * instead of silently truncating. */
-                int psidx = -1, pptr = 0, psize = 8;
+                int psidx = -1, pptr = 0, psize = 8, pbase = 8, punsg = 0;
                 if (occ_is_type()) {
-                    if (!occ_parse_type(&psidx, &pptr, &psize)) { occ_err("bad parameter type", occ_txt); occ_next(); }
+                    if (!occ_parse_type(&psidx, &pptr, &psize, &punsg)) { occ_err("bad parameter type", occ_txt); occ_next(); }
+                    pbase = psize;      /* the BASE type's width, before any `*` */
                 }
+                /* v0.59 BUGFIX. `psize` becomes 8 here because a POINTER VALUE is
+                 * one word — but occ_elem_size wants the width of the type pointed
+                 * TO, and it was being handed the clobbered 8. So every `char *`
+                 * PARAMETER got an element size of 8 and `s[i]` inside the body
+                 * stepped eight bytes at a time, while the identical declaration
+                 * as a local or a global (both of which pass the preserved base
+                 * size) stepped one. That is why libc.oc's strcmp() compared
+                 * every eighth byte and reported two equal strings as different —
+                 * the toolstrs "compiled program returned the wrong answer"
+                 * failure, present since v0.58 made indexing element-scaled. */
                 while (occ_accept("*")) { pptr++; psize = 8; }
                 if (occ_tk == T_IDENT) {
                     if (psidx >= 0 && pptr == 0)
@@ -1529,6 +2081,13 @@ static void occ_toplevel(void) {
                         for (int i = 0; i < OCC_NAMELEN; i++) L->name[i] = occ_txt[i];
                         occ_frame += 8; L->off = -occ_frame;
                         L->sidx = psidx; L->ptr = pptr; L->size = psize;
+                        L->esize = occ_elem_size(psidx, pptr, pbase);
+                        L->nelem = 0;
+                        /* v0.60: same split as v0.59's esize fix — the POINTER
+                         * is a word, but what it points AT keeps its own
+                         * signedness, so `u8 *p` gives p[i] an unsigned byte. */
+                        L->unsg  = pptr ? 0 : punsg;
+                        L->eunsg = occ_elem_unsg(psidx, pptr, punsg);
                         occ_nloc++;
                     }
                     np++;
@@ -1602,9 +2161,15 @@ static void occ_toplevel(void) {
         occ_syms[si].addr = occ_dlen;
         occ_syms[si].defined = 1;
         occ_syms[si].sidx = bsidx; occ_syms[si].ptr = dptr; occ_syms[si].size = dsize;
+        occ_syms[si].esize = occ_elem_size(bsidx, dptr, bsize);
+        occ_syms[si].unsg  = dptr ? 0 : bunsg;
+        occ_syms[si].eunsg = occ_elem_unsg(bsidx, dptr, bunsg);
         i64 init = 0;
         int cells = 1;
-        if (occ_accept("[")) { if (occ_tk == T_NUM) { cells = (int)occ_val; occ_next(); } occ_expect("]"); }
+        if (occ_accept("[")) { if (occ_tk == T_NUM) { cells = (int)occ_val; occ_next(); } occ_expect("]");
+                               occ_syms[si].nelem = cells;
+                               /* an array's "value size" is one element */
+                               occ_syms[si].size = occ_syms[si].esize; }
         if (occ_accept("=")) { if (occ_tk == T_NUM) { init = occ_val; occ_next(); }
                                else { occ_err("global initialiser must be a constant", nm); occ_next(); } }
         /* v0.57: reserve the type's REAL size per cell. An array of a 24-byte
@@ -1757,8 +2322,24 @@ static int occ_compile(const char **srcs, int nsrc, const char *outpath) {
 
     /* A tiny entry stub is emitted FIRST so the ELF entry point is offset 0:
      * it calls main and turns the return value into SYS_EXIT. This is the crt0
-     * of a compiled program, generated rather than linked. */
+     * of a compiled program, generated rather than linked.
+     *
+     * v0.58: IT NOW PASSES argc/argv/envp. The kernel already enters ring 3
+     * with RSP pointing at the SysV process-start block — /bin/init's
+     * hand-written crt0 has read it since v0.55 — but occ's stub called main
+     * with whatever happened to be in the argument registers, so an
+     * occ-compiled program could not be told anything at startup. Every
+     * compiled program was therefore a program with exactly one behaviour.
+     *
+     * Three instructions fix that, and they are the same three /bin/init's
+     * crt0 uses. They must come BEFORE the call, while RSP still points at the
+     * block. RSP is deliberately NOT realigned: occ emits no SSE, its frames
+     * are already rounded to 16, and moving RSP here would only make this stub
+     * differ from the one that has been working. */
     int main_sym = occ_sym_get("main", 0);
+    occ_emit(0x48); occ_emit(0x8B); occ_emit(0x3C); occ_emit(0x24);        /* mov (%rsp),%rdi      -> argc */
+    occ_emit(0x48); occ_emit(0x8D); occ_emit(0x74); occ_emit(0x24); occ_emit(0x08);  /* lea 8(%rsp),%rsi -> argv */
+    occ_emit(0x48); occ_emit(0x8D); occ_emit(0x54); occ_emit(0xFC); occ_emit(0x10);  /* lea 16(%rsp,%rdi,8),%rdx -> envp */
     occ_emit(0xE8);
     int entry_fix = occ_tlen; occ_emit32(0);
     occ_mov_rdi_rax();                                    /* exit status = main's return */

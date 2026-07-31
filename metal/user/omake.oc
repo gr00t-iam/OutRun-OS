@@ -1,0 +1,688 @@
+/* ============================================================================
+ * omake — the OutRun build utility.  WRITTEN IN occ's OWN SUBSET.
+ * ============================================================================
+ * Shipped into the VFS at /src/omake.c and compiled on the running system by
+ * /bin/occ. It reads a makefile, resolves a dependency graph, decides what is
+ * out of date, and forks the real compiler for the targets that are.
+ *
+ * WHAT MAKES A TARGET OUT OF DATE HERE IS NOT A TIMESTAMP.
+ * This filesystem is content-addressed and its dirents carry no mtime, so
+ * there is no clock to compare against and omake does not invent one. Instead
+ * SYS_STAT (61) returns a file's CONTENT HASH, and a target's dependency
+ * signature is the fold of its prerequisites' hashes. The signature that built
+ * a target is recorded in a stamp file; the target is rebuilt when the file is
+ * missing or when the fold no longer matches what is recorded.
+ *
+ * That is stronger than mtime in one way and weaker in another, and both are
+ * worth stating. Stronger: rewriting a file with identical bytes does not
+ * cause a rebuild, and restoring an old version DOES. Weaker: it costs one
+ * stamp file, and a stamp that is deleted forces one rebuild of everything.
+ *
+ * MAKEFILE SYNTAX UNDERSTOOD
+ *   # comment                     to end of line
+ *   NAME = text                   variable; $(NAME) expands in deps and recipes
+ *   target: dep dep               a rule
+ *   <tab>command args             a recipe line, belonging to the rule above it
+ *
+ * OPTIONS
+ *   -f FILE   the makefile (default /src/Makefile)
+ *   -s FILE   the stamp file (default /var/omake.stamp)
+ *   -q        question mode: run nothing, exit 1 if the goal is out of date
+ *
+ * COMMANDS UNDERSTOOD
+ *   occ <inputs> -o <output>      forked and exec'd as the real /bin/occ
+ *   echo <words>                  printed
+ * Anything else is REFUSED with a diagnostic rather than silently skipped:
+ * there is no shell on this system to hand an unknown command to, and a build
+ * tool that pretends to have run something is worse than one that admits it
+ * cannot.
+ *
+ * SUBSET RULES OBEYED (see /src/vedit.c for the same list at length): 64-bit
+ * `int`, no local arrays, at most 6 parameters and 32 locals, no ++ and no +=.
+ *
+ * v0.60 CORRECTS TWO CLAIMS THIS COMMENT USED TO MAKE.
+ *
+ *   "p[i] is a WORD" stopped being true in v0.58, which made indexing scale by
+ *   the ELEMENT size — `char *` steps one byte. The four word arrays below were
+ *   still declared `char *` and were silently truncating to 8 bits; see the
+ *   declaration comment on mk_ntok. Bytes still go through __ldb/__stb, but a
+ *   word array must now say `int *` and mean it.
+ *
+ *   "no break/continue/switch" stopped being true in v0.60, which added all
+ *   three. This file is deliberately NOT rewritten to use them: it is one of
+ *   the programs the toolchain suite compiles as a regression check, and
+ *   changing its shape and its type declarations in the same release would
+ *   make a failure ambiguous between the two.
+ * ==========================================================================*/
+
+int MK_SRCMAX;        /* makefile text                                       */
+int MK_MAXT;          /* rules                                               */
+int MK_NAMESZ;        /* bytes per target name                               */
+int MK_DEPSZ;         /* bytes per dependency list                           */
+int MK_MAXC;          /* recipe lines in total                               */
+int MK_CMDSZ;         /* bytes per recipe line                               */
+int MK_MAXV;          /* variables                                           */
+int MK_VNSZ;
+int MK_VVSZ;
+int MK_MAXTOK;        /* tokens per tokenised line                           */
+int MK_TOKSZ;
+int MK_SLOTS;         /* independent tokeniser slots (recursion depth + 1)   */
+int MK_MAXDEPTH;
+
+char *mk_src;
+char *mk_tn;          /* target names                                        */
+char *mk_td;          /* target dependency lists, unexpanded                 */
+char *mk_tc0;         /* words: index of a target's first recipe line        */
+char *mk_tnc;         /* words: how many recipe lines it has                 */
+char *mk_cmds;        /* recipe lines, unexpanded                            */
+char *mk_vn;
+char *mk_vv;
+char *mk_tok;         /* MK_SLOTS blocks of MK_MAXTOK tokens                 */
+/* v0.60: THESE FOUR ARE WORD ARRAYS AND MUST BE DECLARED AS SUCH.
+ *
+ * Every one of them is malloc'd with word sizing (`* 8` below) and indexed with
+ * `p[i]` meaning "the i'th WORD" — but they were declared `char *`, and since
+ * v0.58 made indexing ELEMENT-SCALED a `char *` steps ONE BYTE. So `p[i]`
+ * addressed byte i and stored through `mov [rdi],al`, keeping the low 8 bits of
+ * whatever was written.
+ *
+ * The damage differed per array, which is why it went unnoticed:
+ *   mk_ntok  token counts are small and both ends agreed on the wrong scale,
+ *            so it behaved — a latent bug rather than a live one.
+ *   mk_ss    build signatures truncated to 8 bits, so two different builds
+ *            collided once in 256 and omake reported "up to date" wrongly.
+ *   mk_st    SYS_STAT writes two 64-bit WORDS; reading mk_st[0] as a byte took
+ *            the low byte of the hash, and mk_st[1] would have read the hash's
+ *            second byte rather than the length.
+ *   mk_av    argv POINTERS truncated to their low byte, which is fatal: execve
+ *            received addresses like 0x48 and could never run the compiler.
+ *
+ * `int` is occ's 64-bit machine word, so `int *` is the honest type here. */
+int  *mk_ntok;        /* words: token count per slot                         */
+char *mk_line;        /* one raw makefile line                               */
+char *mk_exp;         /* one variable-expanded line                          */
+char *mk_nm;          /* one identifier                                      */
+int  *mk_st;          /* SYS_STAT result: [0] = content hash, [1] = length   */
+int  *mk_av;          /* argv vector handed to execve                        */
+char *mk_sn;          /* stamp: target names                                 */
+int  *mk_ss;          /* stamp: words, the signature recorded for each       */
+char *mk_txt;         /* stamp file text                                     */
+
+int mk_nt;
+int mk_nc;
+int mk_nv;
+int mk_ns;
+int mk_built;
+int mk_skipped;
+int mk_ran;
+int mk_rp;
+int mk_query;         /* -q: report what is out of date, run nothing         */
+int mk_needed;        /* -q found at least one target that would be rebuilt  */
+char *mk_ren;
+char *mk_stampath;
+
+/* ---- output. One SYS_WRITE per line, same reason as vedit's. ------------ */
+int ob_c(int c) { if (mk_rp < 240) { __stb(mk_ren, mk_rp, c); mk_rp = mk_rp + 1; } return 0; }
+int ob_s(char *s) { int i; i = 0; while (__ldb(s, i)) { ob_c(__ldb(s, i)); i = i + 1; } return 0; }
+int ob_d(int v) { int q; if (v < 0) { ob_c(45); v = 0 - v; } q = v / 10; if (q > 0) { ob_d(q); } ob_c(48 + v % 10); return 0; }
+int ob_out(void) { __stb(mk_ren, mk_rp, 10); __stb(mk_ren, mk_rp + 1, 0); puts(mk_ren); mk_rp = 0; return 0; }
+
+/* ---- 16 hex digits, written and read back. The stamp file is text, and a
+ * 64-bit signature does not survive a decimal round trip through anything
+ * this runtime has, so it is stored in the one base that is exact. -------- */
+int mk_puthex(char *dst, int at, int v) {
+  int i; int d;
+  i = 0;
+  while (i < 16) {
+    d = (v >> (60 - i * 4)) & 15;
+    if (d < 10) { __stb(dst, at + i, 48 + d); } else { __stb(dst, at + i, 87 + d); }
+    i = i + 1;
+  }
+  return at + 16;
+}
+
+int mk_gethex(char *s, int at) {
+  int i; int c; int v;
+  v = 0; i = 0;
+  while (i < 16) {
+    c = __ldb(s, at + i);
+    if (c >= 48 && c <= 57) { v = v * 16 + (c - 48); }
+    else { if (c >= 97 && c <= 102) { v = v * 16 + (c - 87); } }
+    i = i + 1;
+  }
+  return v;
+}
+
+/* ---- slabs -------------------------------------------------------------- */
+char *mk_tname(int i) { return mk_tn + i * MK_NAMESZ; }
+char *mk_tdeps(int i) { return mk_td + i * MK_DEPSZ; }
+char *mk_cmd(int i)   { return mk_cmds + i * MK_CMDSZ; }
+char *mk_vname(int i) { return mk_vn + i * MK_VNSZ; }
+char *mk_vval(int i)  { return mk_vv + i * MK_VVSZ; }
+char *mk_sname(int i) { return mk_sn + i * MK_NAMESZ; }
+char *mk_tokp(int slot, int i) { return mk_tok + (slot * MK_MAXTOK + i) * MK_TOKSZ; }
+
+int mk_findt(char *name) {
+  int i;
+  i = 0;
+  while (i < mk_nt) { if (!strcmp(mk_tname(i), name)) { return i; } i = i + 1; }
+  return 0 - 1;
+}
+
+int mk_findv(char *name) {
+  int i;
+  i = 0;
+  while (i < mk_nv) { if (!strcmp(mk_vname(i), name)) { return i; } i = i + 1; }
+  return 0 - 1;
+}
+
+int mk_finds(char *name) {
+  int i;
+  i = 0;
+  while (i < mk_ns) { if (!strcmp(mk_sname(i), name)) { return i; } i = i + 1; }
+  return 0 - 1;
+}
+
+/* Copy at most `max`-1 bytes and terminate. Every string that lands in a slab
+ * goes through this, so an over-long name truncates instead of writing past
+ * the cell it was given. */
+int mk_copyn(char *dst, char *src, int max) {
+  int i;
+  i = 0;
+  while (__ldb(src, i) && i < max - 1) { __stb(dst, i, __ldb(src, i)); i = i + 1; }
+  __stb(dst, i, 0);
+  return i;
+}
+
+/* ---- $(VAR) expansion --------------------------------------------------- */
+int mk_expand(char *dst, char *src, int max) {
+  int i; int o; int c; int j; int vi; int k; char *vp;
+  i = 0; o = 0;
+  while (__ldb(src, i) && o < max - 1) {
+    c = __ldb(src, i);
+    if (c == 36 && __ldb(src, i + 1) == 40) {              /* a $( opens a name */
+      i = i + 2;
+      j = 0;
+      while (__ldb(src, i) && __ldb(src, i) != 41 && j < MK_VNSZ - 1) {
+        __stb(mk_nm, j, __ldb(src, i)); j = j + 1; i = i + 1;
+      }
+      __stb(mk_nm, j, 0);
+      if (__ldb(src, i) == 41) { i = i + 1; }
+      vi = mk_findv(mk_nm);
+      /* An UNDEFINED variable expands to nothing, exactly as make does. It is
+       * not an error, and pretending otherwise would break the common
+       * "override this from outside or get the default" idiom. */
+      if (vi >= 0) {
+        vp = mk_vval(vi);
+        k = 0;
+        while (__ldb(vp, k) && o < max - 1) { __stb(dst, o, __ldb(vp, k)); o = o + 1; k = k + 1; }
+      }
+    } else {
+      __stb(dst, o, c); o = o + 1; i = i + 1;
+    }
+  }
+  __stb(dst, o, 0);
+  return o;
+}
+
+/* ---- whitespace-separated tokens into one slot -------------------------- */
+int mk_tokenize(char *line, int slot) {
+  int i; int n; int j; int c; char *t;
+  i = 0; n = 0;
+  while (__ldb(line, i) && n < MK_MAXTOK) {
+    c = __ldb(line, i);
+    while (c == 32 || c == 9) { i = i + 1; c = __ldb(line, i); }
+    if (c) {
+      t = mk_tokp(slot, n);
+      j = 0;
+      while (c && c != 32 && c != 9 && j < MK_TOKSZ - 1) {
+        __stb(t, j, c); j = j + 1; i = i + 1; c = __ldb(line, i);
+      }
+      __stb(t, j, 0);
+      n = n + 1;
+    }
+  }
+  mk_ntok[slot] = n;
+  return n;
+}
+
+/* ===========================================================================
+ * parsing
+ * ==========================================================================*/
+int mk_addtarget(char *name, char *deps) {
+  if (mk_nt >= MK_MAXT) { return 0 - 1; }
+  mk_copyn(mk_tname(mk_nt), name, MK_NAMESZ);
+  mk_copyn(mk_tdeps(mk_nt), deps, MK_DEPSZ);
+  mk_tc0[mk_nt] = mk_nc;
+  mk_tnc[mk_nt] = 0;
+  mk_nt = mk_nt + 1;
+  return mk_nt - 1;
+}
+
+int mk_addcmd(int ti, char *cmd) {
+  if (ti < 0 || mk_nc >= MK_MAXC) { return 0 - 1; }
+  mk_copyn(mk_cmd(mk_nc), cmd, MK_CMDSZ);
+  mk_nc = mk_nc + 1;
+  mk_tnc[ti] = mk_tnc[ti] + 1;
+  return 0;
+}
+
+int mk_addvar(char *name, char *val) {
+  int vi;
+  vi = mk_findv(name);
+  if (vi < 0) {
+    if (mk_nv >= MK_MAXV) { return 0 - 1; }
+    vi = mk_nv; mk_nv = mk_nv + 1;
+    mk_copyn(mk_vname(vi), name, MK_VNSZ);
+  }
+  mk_copyn(mk_vval(vi), val, MK_VVSZ);
+  return vi;
+}
+
+/* Trim trailing blanks in place, and report the first non-blank offset. */
+int mk_trim(char *s) {
+  int n; int i;
+  n = strlen(s);
+  while (n > 0 && (__ldb(s, n - 1) == 32 || __ldb(s, n - 1) == 9 || __ldb(s, n - 1) == 13)) {
+    n = n - 1; __stb(s, n, 0);
+  }
+  i = 0;
+  while (__ldb(s, i) == 32 || __ldb(s, i) == 9) { i = i + 1; }
+  return i;
+}
+
+int mk_parse(char *path) {
+  int fd; int n; int i; int j; int c; int cur; int col; int eq; int lead; char *L;
+
+  fd = open(path);
+  if (fd < 0) { return 0 - 1; }
+  n = read(fd, mk_src, MK_SRCMAX - 1);
+  close(fd);
+  if (n < 0) { return 0 - 2; }
+  __stb(mk_src, n, 0);
+
+  cur = 0 - 1;
+  i = 0;
+  while (i <= n) {
+    /* pull one line, dropping the comment tail */
+    j = 0;
+    c = __ldb(mk_src, i);
+    while (c && c != 10 && j < 250) {
+      if (c == 35) { while (__ldb(mk_src, i) && __ldb(mk_src, i) != 10) { i = i + 1; } c = 0; }
+      else { __stb(mk_line, j, c); j = j + 1; i = i + 1; c = __ldb(mk_src, i); }
+    }
+    __stb(mk_line, j, 0);
+    if (__ldb(mk_src, i) == 10) { i = i + 1; } else { i = n + 1; }
+
+    /* A recipe line is one that STARTS with whitespace, which is decided
+     * before trimming for exactly that reason. */
+    lead = 0;
+    if (__ldb(mk_line, 0) == 9 || __ldb(mk_line, 0) == 32) { lead = 1; }
+    L = mk_line + mk_trim(mk_line);
+
+    if (__ldb(L, 0)) {
+      if (lead) {
+        if (cur < 0) { ob_s("omake: recipe line with no target above it"); ob_out(); }
+        else { mk_addcmd(cur, L); }
+      } else {
+        col = 0 - 1; eq = 0 - 1;
+        j = 0;
+        while (__ldb(L, j)) {
+          if (__ldb(L, j) == 58 && col < 0) { col = j; }
+          if (__ldb(L, j) == 61 && eq < 0) { eq = j; }
+          j = j + 1;
+        }
+        if (eq >= 0 && (col < 0 || eq < col)) {            /* NAME = value */
+          mk_copyn(mk_nm, L, 250);
+          __stb(mk_nm, eq, 0);
+          mk_trim(mk_nm);
+          mk_addvar(mk_nm, L + eq + 1 + mk_trim(L + eq + 1));
+        } else {
+          if (col >= 0) {                                  /* target: deps */
+            mk_copyn(mk_nm, L, 250);
+            __stb(mk_nm, col, 0);
+            mk_trim(mk_nm);
+            /* v0.60: EXPAND THE TARGET NAME.
+             *
+             * Dependency lists (mk_build) and recipe lines (mk_run) were both
+             * expanded, but the target name was stored raw — so `$(OUT): ...`
+             * registered a rule literally named "$(OUT)", while `all: $(OUT)`
+             * expanded its dependency to /bin/hello.elf and then looked for a
+             * rule of that name. The two never met: "no rule to make target
+             * '/bin/hello.elf'", with the rule sitting right there.
+             *
+             * Expanding here is also what make itself does — target names are
+             * expanded immediately, when the line is read, which is why a
+             * variable used in a target has to be defined above it. */
+            mk_expand(mk_exp, mk_nm, 240);
+            cur = mk_addtarget(mk_exp, L + col + 1 + mk_trim(L + col + 1));
+            if (cur < 0) { ob_s("omake: too many rules"); ob_out(); }
+          } else {
+            ob_s("omake: cannot parse line: "); ob_s(L); ob_out();
+          }
+        }
+      }
+    }
+  }
+  return mk_nt;
+}
+
+/* ===========================================================================
+ * the stamp file — what signature built each target last time
+ * ==========================================================================*/
+int mk_stamp_load(char *path) {
+  int fd; int n; int i; int j; int c;
+  mk_ns = 0;
+  fd = open(path);
+  if (fd < 0) { return 0; }
+  n = read(fd, mk_txt, 4090);
+  close(fd);
+  if (n < 0) { return 0; }
+  __stb(mk_txt, n, 0);
+  i = 0;
+  while (i < n && mk_ns < MK_MAXT) {
+    j = 0;
+    c = __ldb(mk_txt, i);
+    while (c && c != 32 && c != 10 && j < MK_NAMESZ - 1) {
+      __stb(mk_sname(mk_ns), j, c); j = j + 1; i = i + 1; c = __ldb(mk_txt, i);
+    }
+    __stb(mk_sname(mk_ns), j, 0);
+    while (__ldb(mk_txt, i) == 32) { i = i + 1; }
+    if (j > 0 && __ldb(mk_txt, i)) {
+      mk_ss[mk_ns] = mk_gethex(mk_txt, i);
+      mk_ns = mk_ns + 1;
+      i = i + 16;
+    }
+    while (__ldb(mk_txt, i) && __ldb(mk_txt, i) != 10) { i = i + 1; }
+    if (__ldb(mk_txt, i) == 10) { i = i + 1; }
+  }
+  return mk_ns;
+}
+
+int mk_stamp_save(char *path) {
+  int fd; int i; int o; int k; char *nm;
+  o = 0;
+  i = 0;
+  while (i < mk_ns) {
+    nm = mk_sname(i);
+    k = 0;
+    while (__ldb(nm, k)) { __stb(mk_txt, o, __ldb(nm, k)); o = o + 1; k = k + 1; }
+    __stb(mk_txt, o, 32); o = o + 1;
+    o = mk_puthex(mk_txt, o, mk_ss[i]);
+    __stb(mk_txt, o, 10); o = o + 1;
+    i = i + 1;
+  }
+  __stb(mk_txt, o, 0);
+  fd = creat(path);
+  if (fd < 0) { return 0 - 1; }
+  write(fd, mk_txt, o + 1);
+  close(fd);
+  return o;
+}
+
+int mk_stamp_set(char *name, int sig) {
+  int si;
+  si = mk_finds(name);
+  if (si < 0) {
+    if (mk_ns >= MK_MAXT) { return 0 - 1; }
+    si = mk_ns; mk_ns = mk_ns + 1;
+    mk_copyn(mk_sname(si), name, MK_NAMESZ);
+  }
+  mk_ss[si] = sig;
+  return si;
+}
+
+/* ===========================================================================
+ * the dependency signature
+ * ===========================================================================
+ * The fold of every prerequisite's CONTENT HASH, in declaration order. A
+ * missing prerequisite folds in a distinct constant rather than being skipped,
+ * so "the dep was deleted" and "the dep is unchanged" cannot collide.        */
+int mk_exists(char *path) { return __syscall(61, path, mk_st, 0) == 0; }
+
+int mk_sig(int slot, int ndeps) {
+  int i; int sig; char *d;
+  sig = 5381;
+  i = 0;
+  while (i < ndeps) {
+    d = mk_tokp(slot, i);
+    if (__syscall(61, d, mk_st, 0) == 0) { sig = sig * 31 + mk_st[0]; }
+    else { sig = sig * 31 + 1315423911; }
+    i = i + 1;
+  }
+  return sig;
+}
+
+/* ===========================================================================
+ * running one recipe line
+ * ==========================================================================*/
+int mk_wait(int pid) {
+  int st; int spins;
+  st = 0 - 11;
+  spins = 0;
+  while (st == 0 - 11 && spins < 2000000) {
+    st = waitpid(pid, 0);
+    if (st == 0 - 11) { yield(); }
+    spins = spins + 1;
+  }
+  return st;
+}
+
+int mk_exec(char *cmd, int slot) {
+  int n; int i; int pid; int st; int *av;
+
+  n = mk_tokenize(cmd, slot);
+  if (n == 0) { return 0; }
+
+  ob_s("  omake> "); ob_s(cmd); ob_out();
+
+  if (!strcmp(mk_tokp(slot, 0), "echo")) {
+    mk_rp = 0;
+    i = 1;
+    while (i < n) { ob_s(mk_tokp(slot, i)); if (i + 1 < n) { ob_c(32); } i = i + 1; }
+    ob_out();
+    mk_ran = mk_ran + 1;
+    return 0;
+  }
+
+  if (strcmp(mk_tokp(slot, 0), "occ")) {
+    ob_s("omake: unsupported command '"); ob_s(mk_tokp(slot, 0));
+    ob_s("' (this system has no shell to hand it to)"); ob_out();
+    return 0 - 3;
+  }
+
+  /* Build the argv vector the kernel's execve expects: a NUL-terminated array
+   * of pointers. mk_av is an `int *`, i.e. a WORD array, so av[i] writes a full
+   * 64-bit pointer — see the declaration comment for what happened while it was
+   * a `char *`. */
+  av = mk_av;
+  av[0] = "/bin/occ";
+  i = 1;
+  while (i < n) { av[i] = mk_tokp(slot, i); i = i + 1; }
+  av[n] = 0;
+
+  pid = fork();
+  if (pid == 0) {
+    execp("/bin/occ", mk_av, 0);
+    exit(199);                                    /* exec failed */
+  }
+  if (pid < 0) { ob_s("omake: fork failed"); ob_out(); return 0 - 4; }
+  st = mk_wait(pid);
+  mk_ran = mk_ran + 1;
+  if (st != 0) {
+    ob_s("omake: *** ["); ob_s(mk_tokp(slot, n - 1));
+    ob_s("] compiler exit "); ob_d(st); ob_out();
+    return 0 - 5;
+  }
+  return 0;
+}
+
+/* ===========================================================================
+ * the build
+ * ===========================================================================
+ * Depth-first over the graph. `slot` is the tokeniser slot this level owns,
+ * which is what makes recursion safe without local arrays: level N tokenises
+ * its dependency list into slot N and it stays intact across the recursive
+ * calls that use slots N+1 and above.                                       */
+int mk_build(char *target, int depth) {
+  int ti; int nd; int i; int sig; int si; int r; int c0; int nc; int stale;
+
+  if (depth >= MK_MAXDEPTH) {
+    ob_s("omake: dependency chain too deep at '"); ob_s(target); ob_c(39); ob_out();
+    return 0 - 6;
+  }
+
+  ti = mk_findt(target);
+  if (ti < 0) {
+    /* No rule. That is fine if the file is already there — it is a source —
+     * and fatal if it is not. */
+    if (mk_exists(target)) { return 0; }
+    ob_s("omake: *** no rule to make target '"); ob_s(target); ob_c(39); ob_out();
+    return 0 - 4;
+  }
+
+  mk_expand(mk_exp, mk_tdeps(ti), 240);
+  nd = mk_tokenize(mk_exp, depth);
+
+  i = 0;
+  while (i < nd) {
+    r = mk_build(mk_tokp(depth, i), depth + 1);
+    if (r < 0) { return r; }
+    i = i + 1;
+  }
+
+  /* The dependency list was tokenised into THIS level's slot before the
+   * recursion, and the recursion only ever touched deeper slots, so it is
+   * still valid here. */
+  sig = mk_sig(depth, nd);
+  si = mk_finds(target);
+  stale = 1;
+  if (mk_exists(target) && si >= 0) { if (mk_ss[si] == sig) { stale = 0; } }
+
+  c0 = mk_tc0[ti];
+  nc = mk_tnc[ti];
+
+  if (!stale) {
+    ob_s("omake: '"); ob_s(target); ob_s("' is up to date"); ob_out();
+    mk_skipped = mk_skipped + 1;
+    return 0;
+  }
+
+  /* A rule with prerequisites and no recipe is a legitimate way to write an
+   * aggregate goal ("all: a b"), so it succeeds — but it is not recorded as
+   * built, because nothing was, and it is never REPORTED as out of date either:
+   * a goal with no recipe can never be brought up to date on its own, so
+   * answering "yes, work is needed" for it would make -q useless on every
+   * makefile whose default goal is a phony one. */
+  if (nc == 0) { return 0; }
+
+  /* Question mode. Real make's -q answers "would this build do anything?" with
+   * an exit status and no side effects, and that is exactly the question worth
+   * asking of a rebuild rule: it separates "the tool said it was done" from
+   * "the tool can still tell what is stale". Nothing runs and the stamp is not
+   * written, so asking does not change the answer. */
+  if (mk_query) {
+    ob_s("omake: '"); ob_s(target); ob_s("' is OUT OF DATE"); ob_out();
+    mk_needed = 1;
+    return 0;
+  }
+  i = 0;
+  while (i < nc) {
+    mk_expand(mk_exp, mk_cmd(c0 + i), 240);
+    r = mk_exec(mk_exp, MK_MAXDEPTH);
+    if (r < 0) { return r; }
+    i = i + 1;
+  }
+
+  if (!mk_exists(target)) {
+    ob_s("omake: *** '"); ob_s(target);
+    ob_s("' was not created by its recipe"); ob_out();
+    return 0 - 7;
+  }
+  mk_stamp_set(target, sig);
+  mk_built = mk_built + 1;
+  return 0;
+}
+
+/* ===========================================================================
+ * startup
+ * ==========================================================================*/
+int main(int argc, char **argv) {
+  int i; int r; int nt; char *a; char *mf; char *goal;
+
+  MK_SRCMAX = 8192; MK_MAXT = 12; MK_NAMESZ = 64; MK_DEPSZ = 192;
+  MK_MAXC = 32; MK_CMDSZ = 192; MK_MAXV = 12; MK_VNSZ = 32; MK_VVSZ = 128;
+  MK_MAXTOK = 12; MK_TOKSZ = 64; MK_MAXDEPTH = 6; MK_SLOTS = 8;
+
+  mk_src  = malloc(MK_SRCMAX);
+  mk_tn   = malloc(MK_MAXT * MK_NAMESZ);
+  mk_td   = malloc(MK_MAXT * MK_DEPSZ);
+  mk_tc0  = malloc(MK_MAXT * 8);
+  mk_tnc  = malloc(MK_MAXT * 8);
+  mk_cmds = malloc(MK_MAXC * MK_CMDSZ);
+  mk_vn   = malloc(MK_MAXV * MK_VNSZ);
+  mk_vv   = malloc(MK_MAXV * MK_VVSZ);
+  mk_tok  = malloc(MK_SLOTS * MK_MAXTOK * MK_TOKSZ);
+  mk_ntok = malloc(MK_SLOTS * 8);
+  mk_line = malloc(256);
+  mk_exp  = malloc(256);
+  mk_nm   = malloc(256);
+  mk_st   = malloc(32);
+  mk_av   = malloc((MK_MAXTOK + 2) * 8);
+  mk_sn   = malloc(MK_MAXT * MK_NAMESZ);
+  mk_ss   = malloc(MK_MAXT * 8);
+  mk_txt  = malloc(4096);
+  mk_ren  = malloc(256);
+  if (!mk_src || !mk_tok || !mk_txt || !mk_ren || !mk_av) {
+    puts("omake: out of memory\n");
+    return 6;
+  }
+
+  mk_nt = 0; mk_nc = 0; mk_nv = 0; mk_ns = 0;
+  mk_built = 0; mk_skipped = 0; mk_ran = 0; mk_rp = 0;
+  mk_query = 0; mk_needed = 0;
+
+  mf = "/src/Makefile";
+  goal = 0;
+  mk_stampath = "/var/omake.stamp";
+  i = 1;
+  while (i < argc) {
+    a = argv[i];
+    if (!strcmp(a, "-f")) { i = i + 1; if (i < argc) { mf = argv[i]; } }
+    else {
+      if (!strcmp(a, "-s")) { i = i + 1; if (i < argc) { mk_stampath = argv[i]; } }
+      else {
+        if (!strcmp(a, "-q")) { mk_query = 1; } else { goal = a; }
+      }
+    }
+    i = i + 1;
+  }
+
+  nt = mk_parse(mf);
+  if (nt == 0 - 1) { ob_s("omake: cannot open "); ob_s(mf); ob_out(); return 3; }
+  if (nt == 0 - 2) { ob_s("omake: cannot read "); ob_s(mf); ob_out(); return 3; }
+  if (nt == 0)     { ob_s("omake: no rules in "); ob_s(mf); ob_out(); return 4; }
+
+  if (!goal) { goal = mk_tname(0); }               /* default goal: the first rule */
+
+  mk_stamp_load(mk_stampath);
+
+  ob_s("omake: "); ob_s(mf); ob_s(": "); ob_d(nt); ob_s(" rule(s), ");
+  ob_d(mk_nv); ob_s(" variable(s); goal '"); ob_s(goal); ob_c(39); ob_out();
+
+  r = mk_build(goal, 0);
+
+  /* In question mode nothing was built, so recording a signature would be a
+   * lie that makes the next real build skip work it has not done. */
+  if (!mk_query) { mk_stamp_save(mk_stampath); }
+
+  ob_s("  [omake ] "); ob_d(mk_built); ob_s(" built, ");
+  ob_d(mk_skipped); ob_s(" up to date, ");
+  ob_d(mk_ran); ob_s(" command(s) run");
+  ob_out();
+
+  if (r < 0) { return 0 - r; }
+  /* make's own convention: -q exits 1 when the goal is out of date. */
+  if (mk_query && mk_needed) { return 1; }
+  return 0;
+}

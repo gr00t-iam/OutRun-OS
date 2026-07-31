@@ -1,0 +1,525 @@
+/* ============================================================================
+ * vedit — the OutRun terminal text editor.  WRITTEN IN occ's OWN SUBSET.
+ * ============================================================================
+ * This file is not compiled by the host toolchain. It is shipped into the VFS
+ * at /src/vedit.c and compiled ON the running system by /bin/occ, against the
+ * runtime in /usr/lib/libc.oc. The ELF that comes out is what you run.
+ *
+ * THE SUBSET RULES THIS FILE OBEYS (breaking any of them produces code that
+ * compiles and is wrong, so they are stated up front):
+ *
+ *   1. `int` is 64-BIT and there are no other integer types.
+ *   2. NO LOCAL ARRAYS. A local declaration is one 8-byte slot, so every
+ *      buffer here is heap memory reached through a global pointer.
+ *   3. p[i] means *(p + i*8) — a WORD, never a byte. Byte access goes through
+ *      the __ldb/__stb intrinsics, and every string walk below uses them.
+ *   4. NO break, NO continue, NO switch, NO ++ and NO +=. Loops end by their
+ *      own condition; that is why several of them set the induction variable
+ *      past the end instead of breaking.
+ *   5. At most 6 parameters, at most 32 locals (parameters included).
+ *
+ * WHERE THE KEYS COME FROM. Exactly one code path consumes keys — ve_getkey()
+ * — and it has two sources:
+ *
+ *   interactive  SYS_TTY_READ (60) drains the same keyboard/serial queue the
+ *                kernel shell reads. Non-blocking: it returns 0 bytes when
+ *                nothing is pending, and vedit yields rather than spinning.
+ *   scripted     -s FILE reads the keystrokes out of a VFS file, byte for
+ *                byte, through the SAME switchboard.
+ *
+ * That is deliberate and it is what makes this editor testable: the automated
+ * suite drives the real editor with real keystrokes, not a side door into the
+ * buffer functions.
+ *
+ * COMMANDS (modal, vi-shaped)
+ *   normal  h l k j  left/right/up/down      0 $   line start/end
+ *           g G      first/last line         i a   insert before/after cursor
+ *           o O      open a line below/above and insert
+ *           x        delete the character under the cursor
+ *           d        delete the current line
+ *           w        write the file          q     quit
+ *           Z        write and quit
+ *   insert  ESC leaves insert mode, Enter splits the line, backspace deletes
+ *           the character before the cursor, printable characters insert.
+ * ==========================================================================*/
+
+/* ---- geometry. Globals, because occ initialisers must be constants and
+ * these are the only "configuration" the editor has. -------------------- */
+int VE_COLS;                 /* bytes per line, including no terminator      */
+int VE_LINES;                /* maximum lines in the buffer                  */
+int VE_VIEW;                 /* text rows drawn per redraw                   */
+int VE_IOMAX;                /* file load/save scratch size                  */
+
+/* ---- the buffer. A fixed-pitch slab plus a length per line. That is the
+ * simplest representation that supports insert and delete in the middle
+ * without an allocator, and with no local arrays it is also the only one
+ * this subset can express clearly. ---------------------------------------- */
+char *ve_text;               /* VE_LINES * VE_COLS bytes                     */
+char *ve_len;                /* VE_LINES words: used length of each line     */
+char *ve_io;                 /* file bytes in and out                        */
+char *ve_ren;                /* one composed screen row                      */
+char *ve_kb;                 /* one byte of keyboard input                   */
+char *ve_esc;                /* ESC + a short CSI tail                       */
+
+int ve_n;                    /* lines in use (always >= 1)                   */
+int ve_cy;                   /* cursor line                                  */
+int ve_cx;                   /* cursor column                                */
+int ve_top;                  /* first line drawn                             */
+int ve_mode;                 /* 0 = normal, 1 = insert                       */
+int ve_dirty;                /* unsaved changes present                      */
+int ve_rp;                   /* render-buffer cursor                         */
+
+char *ve_path;               /* file being edited                            */
+char *ve_script;             /* scripted keystrokes, or 0 for interactive    */
+int ve_slen;
+int ve_spos;
+int ve_scripted;
+
+int ve_saves;                /* how many times the file was written          */
+int ve_edits;                /* how many keystrokes changed the buffer       */
+int ve_keys;                 /* how many keystrokes were consumed            */
+int ve_quiet;                /* -q: draw only the first and last frame       */
+
+/* ===========================================================================
+ * render buffer
+ * ===========================================================================
+ * SYS_WRITE takes ONE NUL-terminated string and truncates at 256 bytes, so a
+ * screen row is composed here and written with a single call. Composing it a
+ * character at a time through putchar() would be one syscall per glyph, which
+ * on a full redraw is the difference between a screen and a stall.          */
+int rb_reset(void) { ve_rp = 0; return 0; }
+
+int rb_c(int c) {
+  if (ve_rp < 240) { __stb(ve_ren, ve_rp, c); ve_rp = ve_rp + 1; }
+  return 0;
+}
+
+int rb_s(char *s) {
+  int i;
+  i = 0;
+  while (__ldb(s, i)) { rb_c(__ldb(s, i)); i = i + 1; }
+  return 0;
+}
+
+int rb_d(int v) {
+  int q;
+  if (v < 0) { rb_c(45); v = 0 - v; }
+  q = v / 10;
+  if (q > 0) { rb_d(q); }
+  rb_c(48 + v % 10);
+  return 0;
+}
+
+int rb_out(void) {
+  __stb(ve_ren, ve_rp, 0);
+  puts(ve_ren);
+  ve_rp = 0;
+  return 0;
+}
+
+/* ESC is not expressible as a string escape in occ's lexer, so the one place
+ * that needs it builds the sequence byte by byte. Both consoles understand
+ * these two: the serial line because it is a real terminal, and the VGA text
+ * console because v0.58 taught vga_putc to recognise CSI 2J and CSI H.      */
+int ve_csi(char *tail) {
+  int i;
+  __stb(ve_esc, 0, 27);
+  i = 0;
+  while (__ldb(tail, i)) { __stb(ve_esc, 1 + i, __ldb(tail, i)); i = i + 1; }
+  __stb(ve_esc, 1 + i, 0);
+  puts(ve_esc);
+  return 0;
+}
+
+/* ===========================================================================
+ * buffer primitives
+ * ==========================================================================*/
+char *ve_row(int i) { return ve_text + i * VE_COLS; }
+
+int ve_reset(void) {
+  int i;
+  i = 0;
+  while (i < VE_LINES) { ve_len[i] = 0; i = i + 1; }
+  ve_n = 1; ve_cy = 0; ve_cx = 0; ve_top = 0; ve_dirty = 0;
+  return 0;
+}
+
+/* Clamp the cursor to a column that exists on the current line. Called after
+ * every vertical move: without it, moving off a long line onto a short one
+ * leaves the cursor past the end and the next insert writes into the gap.  */
+int ve_clamp(void) {
+  int m;
+  if (ve_cy < 0) { ve_cy = 0; }
+  if (ve_cy >= ve_n) { ve_cy = ve_n - 1; }
+  m = ve_len[ve_cy];
+  if (ve_cx > m) { ve_cx = m; }
+  if (ve_cx < 0) { ve_cx = 0; }
+  return 0;
+}
+
+/* Insert an empty line at index `at`, shifting everything below down by one.
+ * Returns 0 if the buffer is full — a silent no-op would lose the user's
+ * keystroke and pretend it landed. */
+int ve_lopen(int at) {
+  int i; int j; int m; char *a; char *b;
+  if (ve_n >= VE_LINES) { return 0; }
+  i = ve_n;
+  while (i > at) {
+    a = ve_row(i); b = ve_row(i - 1); m = ve_len[i - 1];
+    j = 0;
+    while (j < m) { __stb(a, j, __ldb(b, j)); j = j + 1; }
+    ve_len[i] = m;
+    i = i - 1;
+  }
+  ve_len[at] = 0;
+  ve_n = ve_n + 1;
+  ve_dirty = 1;
+  return 1;
+}
+
+/* Delete line `at`. The last line is emptied rather than removed: a buffer
+ * with zero lines has no valid cursor position, so ve_n never drops below 1. */
+int ve_ldel(int at) {
+  int i; int j; int m; char *a; char *b;
+  if (ve_n <= 1) { ve_len[0] = 0; ve_cx = 0; ve_dirty = 1; return 1; }
+  i = at;
+  while (i < ve_n - 1) {
+    a = ve_row(i); b = ve_row(i + 1); m = ve_len[i + 1];
+    j = 0;
+    while (j < m) { __stb(a, j, __ldb(b, j)); j = j + 1; }
+    ve_len[i] = m;
+    i = i + 1;
+  }
+  ve_n = ve_n - 1;
+  if (ve_cy >= ve_n) { ve_cy = ve_n - 1; }
+  ve_dirty = 1;
+  return 1;
+}
+
+int ve_cins(int c) {
+  int m; int j; char *L;
+  L = ve_row(ve_cy);
+  m = ve_len[ve_cy];
+  if (m >= VE_COLS - 1) { return 0; }
+  j = m;
+  while (j > ve_cx) { __stb(L, j, __ldb(L, j - 1)); j = j - 1; }
+  __stb(L, ve_cx, c);
+  ve_len[ve_cy] = m + 1;
+  ve_cx = ve_cx + 1;
+  ve_dirty = 1;
+  return 1;
+}
+
+int ve_cdel(void) {
+  int m; int j; char *L;
+  L = ve_row(ve_cy);
+  m = ve_len[ve_cy];
+  if (ve_cx >= m) { return 0; }
+  j = ve_cx;
+  while (j < m - 1) { __stb(L, j, __ldb(L, j + 1)); j = j + 1; }
+  ve_len[ve_cy] = m - 1;
+  ve_dirty = 1;
+  return 1;
+}
+
+/* Split the current line at the cursor. The tail moves to a freshly opened
+ * line below and the cursor follows it, which is what Enter must do. */
+int ve_split(void) {
+  int m; int j; int k; char *L; char *N;
+  m = ve_len[ve_cy];
+  if (!ve_lopen(ve_cy + 1)) { return 0; }
+  L = ve_row(ve_cy);
+  N = ve_row(ve_cy + 1);
+  j = ve_cx; k = 0;
+  while (j < m) { __stb(N, k, __ldb(L, j)); k = k + 1; j = j + 1; }
+  ve_len[ve_cy + 1] = k;
+  ve_len[ve_cy] = ve_cx;
+  ve_cy = ve_cy + 1;
+  ve_cx = 0;
+  ve_dirty = 1;
+  return 1;
+}
+
+/* Backspace at column 0 joins this line onto the end of the previous one —
+ * the behaviour a user expects, and the only place two lines merge. */
+int ve_join_back(void) {
+  int p; int m; int k; int j; char *L; char *P;
+  if (ve_cy == 0) { return 0; }
+  p = ve_cy - 1;
+  P = ve_row(p); L = ve_row(ve_cy);
+  m = ve_len[p]; k = ve_len[ve_cy];
+  j = 0;
+  while (j < k && m + j < VE_COLS - 1) { __stb(P, m + j, __ldb(L, j)); j = j + 1; }
+  ve_len[p] = m + j;
+  ve_ldel(ve_cy);
+  ve_cy = p;
+  ve_cx = m;
+  ve_dirty = 1;
+  return 1;
+}
+
+/* ===========================================================================
+ * VFS file operations
+ * ==========================================================================*/
+int ve_load(char *path) {
+  int fd; int n; int i; int c; int col; char *L;
+  ve_reset();
+  fd = open(path);
+  if (fd < 0) { return 0 - 1; }            /* no such file: start empty, above */
+  n = read(fd, ve_io, VE_IOMAX - 2);
+  close(fd);
+  if (n < 0) { return 0 - 2; }
+  ve_n = 0; col = 0; L = ve_text;
+  i = 0;
+  while (i < n) {
+    c = __ldb(ve_io, i);
+    if (c == 0) { i = n; }                 /* a NUL ends the file: files this
+                                            * system writes are NUL-terminated */
+    else {
+      if (c == 10) {
+        ve_len[ve_n] = col;
+        ve_n = ve_n + 1;
+        col = 0;
+        L = ve_row(ve_n);
+        if (ve_n >= VE_LINES - 1) { i = n; }
+      } else {
+        if (c != 13 && col < VE_COLS - 1) { __stb(L, col, c); col = col + 1; }
+      }
+      i = i + 1;
+    }
+  }
+  if (col > 0) { ve_len[ve_n] = col; ve_n = ve_n + 1; }
+  if (ve_n == 0) { ve_len[0] = 0; ve_n = 1; }
+  ve_cy = 0; ve_cx = 0; ve_top = 0; ve_dirty = 0;
+  return ve_n;
+}
+
+/* Write the buffer back. The trailing NUL is written too, so the file reads
+ * back identically through both read() and the kernel's own string paths —
+ * and so occ can compile a source file this editor produced. */
+int ve_save(char *path) {
+  int fd; int i; int j; int m; int n; char *L;
+  n = 0;
+  i = 0;
+  while (i < ve_n) {
+    L = ve_row(i); m = ve_len[i];
+    j = 0;
+    while (j < m && n < VE_IOMAX - 3) { __stb(ve_io, n, __ldb(L, j)); n = n + 1; j = j + 1; }
+    __stb(ve_io, n, 10); n = n + 1;
+    i = i + 1;
+  }
+  __stb(ve_io, n, 0);
+  fd = creat(path);
+  if (fd < 0) { return 0 - 1; }
+  m = write(fd, ve_io, n + 1);
+  close(fd);
+  if (m < 0) { return 0 - 2; }
+  ve_dirty = 0;
+  ve_saves = ve_saves + 1;
+  return n;
+}
+
+/* ===========================================================================
+ * the screen
+ * ==========================================================================*/
+int ve_status(void) {
+  rb_reset();
+  rb_s("-- vedit -- ");
+  rb_s(ve_path);
+  rb_s("  line ");   rb_d(ve_cy + 1);
+  rb_c(47);          rb_d(ve_n);
+  rb_s("  col ");    rb_d(ve_cx + 1);
+  if (ve_mode) { rb_s("  INSERT"); } else { rb_s("  NORMAL"); }
+  if (ve_dirty) { rb_s("  [modified]"); }
+  rb_c(10);
+  rb_out();
+  return 0;
+}
+
+int ve_draw(void) {
+  int i; int last; int j; int m; char *L;
+  if (ve_cy < ve_top) { ve_top = ve_cy; }
+  if (ve_cy >= ve_top + VE_VIEW) { ve_top = ve_cy - VE_VIEW + 1; }
+  ve_csi("[2J");
+  ve_csi("[H");
+  i = ve_top;
+  last = ve_top + VE_VIEW;
+  if (last > ve_n) { last = ve_n; }
+  while (i < last) {
+    rb_reset();
+    if (i == ve_cy) { rb_c(62); } else { rb_c(32); }
+    rb_d(i + 1);
+    rb_s(" | ");
+    L = ve_row(i); m = ve_len[i];
+    j = 0;
+    /* The bytes drawn here are the bytes the buffer holds, with no
+     * substitution. This console is line-buffered rather than cursor-
+     * addressable, so the column is reported in the status bar instead of
+     * being pointed at on the row. */
+    while (j < m) { rb_c(__ldb(L, j)); j = j + 1; }
+    rb_c(10);
+    rb_out();
+    i = i + 1;
+  }
+  ve_status();
+  return 0;
+}
+
+/* ===========================================================================
+ * keys
+ * ===========================================================================
+ * Returns a key, or 0-1 when the input source is exhausted (which quits), or
+ * 0-2 when a key is merely not available yet (which yields).                */
+int ve_getkey(void) {
+  int n;
+  if (ve_scripted) {
+    if (ve_spos >= ve_slen) { return 0 - 1; }
+    n = __ldb(ve_script, ve_spos);
+    ve_spos = ve_spos + 1;
+    if (n == 0) { return 0 - 1; }
+    return n;
+  }
+  n = __syscall(60, ve_kb, 1, 0);          /* SYS_TTY_READ, non-blocking */
+  if (n < 1) { return 0 - 2; }
+  return __ldb(ve_kb, 0);
+}
+
+int ve_key_normal(int k) {
+  int m;
+  m = ve_len[ve_cy];
+  if (k == 104) { if (ve_cx > 0) { ve_cx = ve_cx - 1; } }              /* h */
+  else if (k == 108) { if (ve_cx < m) { ve_cx = ve_cx + 1; } }         /* l */
+  else if (k == 107) { if (ve_cy > 0) { ve_cy = ve_cy - 1; } ve_clamp(); }        /* k */
+  else if (k == 106) { if (ve_cy < ve_n - 1) { ve_cy = ve_cy + 1; } ve_clamp(); } /* j */
+  else if (k == 48)  { ve_cx = 0; }                                    /* 0 */
+  else if (k == 36)  { ve_cx = m; }                                    /* $ */
+  else if (k == 103) { ve_cy = 0; ve_cx = 0; }                         /* g */
+  else if (k == 71)  { ve_cy = ve_n - 1; ve_cx = 0; }                  /* G */
+  else if (k == 105) { ve_mode = 1; }                                  /* i */
+  else if (k == 97)  { ve_mode = 1; if (ve_cx < m) { ve_cx = ve_cx + 1; } }  /* a */
+  /* `o` and `O` only move the cursor if a line was actually opened. A full
+   * buffer must refuse the keystroke, not leave the cursor on a line that
+   * does not exist. */
+  else if (k == 111) { if (ve_lopen(ve_cy + 1)) { ve_cy = ve_cy + 1; ve_cx = 0; ve_mode = 1; ve_edits = ve_edits + 1; } }  /* o */
+  else if (k == 79)  { if (ve_lopen(ve_cy)) { ve_cx = 0; ve_mode = 1; ve_edits = ve_edits + 1; } }                          /* O */
+  else if (k == 120) { if (ve_cdel()) { ve_edits = ve_edits + 1; } ve_clamp(); }  /* x */
+  else if (k == 100) { ve_ldel(ve_cy); ve_clamp(); ve_edits = ve_edits + 1; }     /* d */
+  else if (k == 119) { ve_save(ve_path); }                             /* w */
+  else if (k == 113) { return 0; }                                     /* q */
+  else if (k == 90)  { ve_save(ve_path); return 0; }                   /* Z */
+  return 1;
+}
+
+int ve_key_insert(int k) {
+  if (k == 27) { ve_mode = 0; if (ve_cx > 0) { ve_cx = ve_cx - 1; } }
+  else if (k == 13 || k == 10) { ve_split(); ve_edits = ve_edits + 1; }
+  else if (k == 8 || k == 127) {
+    if (ve_cx > 0) { ve_cx = ve_cx - 1; ve_cdel(); ve_edits = ve_edits + 1; }
+    else { if (ve_join_back()) { ve_edits = ve_edits + 1; } }
+  }
+  else if (k == 9) { ve_cins(32); ve_cins(32); ve_edits = ve_edits + 1; }
+  else if (k >= 32 && k < 127) { ve_cins(k); ve_edits = ve_edits + 1; }
+  return 1;
+}
+
+int ve_run(void) {
+  int k; int live;
+  live = 1;
+  ve_draw();
+  while (live) {
+    k = ve_getkey();
+    if (k == 0 - 1) { live = 0; }
+    else {
+      if (k == 0 - 2) { yield(); }
+      else {
+        ve_keys = ve_keys + 1;
+        if (ve_mode) { live = ve_key_insert(k); } else { live = ve_key_normal(k); }
+        /* A real editor redraws on every keystroke and so does this one. -q
+         * suppresses the intermediate frames for automated runs, where forty
+         * full redraws of the same six lines is noise rather than evidence;
+         * the first and last frames are drawn either way. */
+        if (live && !ve_quiet) { ve_draw(); }
+      }
+    }
+  }
+  ve_draw();
+  return 0;
+}
+
+/* ===========================================================================
+ * startup
+ * ==========================================================================*/
+int ve_loadscript(char *path) {
+  int fd; int n;
+  fd = open(path);
+  if (fd < 0) { return 0 - 1; }
+  n = read(fd, ve_script, 4088);
+  close(fd);
+  if (n < 0) { return 0 - 2; }
+  ve_slen = n;
+  ve_spos = 0;
+  ve_scripted = 1;
+  return n;
+}
+
+int main(int argc, char **argv) {
+  int i; int r; char *a;
+
+  VE_COLS = 128; VE_LINES = 160; VE_VIEW = 12; VE_IOMAX = 24576;
+
+  ve_text = malloc(VE_LINES * VE_COLS);
+  ve_len  = malloc(VE_LINES * 8);
+  ve_io   = malloc(VE_IOMAX);
+  ve_ren  = malloc(256);
+  ve_kb   = malloc(16);
+  ve_esc  = malloc(16);
+  ve_script = malloc(4096);
+  if (!ve_text || !ve_len || !ve_io || !ve_ren || !ve_script) {
+    puts("vedit: out of memory\n");
+    return 6;
+  }
+
+  ve_path = 0; ve_scripted = 0; ve_slen = 0; ve_spos = 0;
+  ve_mode = 0; ve_saves = 0; ve_edits = 0; ve_keys = 0; ve_quiet = 0;
+  ve_reset();
+
+  i = 1;
+  while (i < argc) {
+    a = argv[i];
+    if (!strcmp(a, "-s")) {
+      i = i + 1;
+      if (i < argc) {
+        if (ve_loadscript(argv[i]) < 0) {
+          puts("vedit: cannot read the keystroke script\n");
+          return 5;
+        }
+      }
+    } else {
+      if (!strcmp(a, "-q")) { ve_quiet = 1; } else { ve_path = a; }
+    }
+    i = i + 1;
+  }
+
+  if (!ve_path) {
+    puts("usage: vedit [-s keyscript] [-q] <file>\n");
+    return 2;
+  }
+
+  r = ve_load(ve_path);
+  if (r == 0 - 2) { puts("vedit: cannot read "); puts(ve_path); puts("\n"); return 3; }
+  if (r == 0 - 1) { puts("vedit: new file "); puts(ve_path); puts("\n"); }
+
+  ve_run();
+
+  rb_reset();
+  rb_s("  [vedit ] ");
+  rb_s(ve_path);
+  rb_s(": ");     rb_d(ve_n);      rb_s(" line(s), ");
+  rb_d(ve_keys);  rb_s(" key(s), ");
+  rb_d(ve_edits); rb_s(" edit(s), ");
+  rb_d(ve_saves); rb_s(" save(s)");
+  if (ve_dirty) { rb_s("  UNSAVED"); }
+  rb_c(10);
+  rb_out();
+  return 0;
+}

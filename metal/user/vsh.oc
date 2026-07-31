@@ -1,0 +1,351 @@
+/* vsh.c — the OutRun native shell.
+ *
+ * Compiled BY occ, on the running system, against /usr/lib/libc.oc. There is
+ * no host toolchain in this program's history: `occ /src/vsh.c -o /bin/vsh`
+ * is the whole build, and the pipestrs suite performs exactly that build on
+ * every boot so this file cannot rot into something that no longer compiles.
+ *
+ * WHAT IT IS FOR. Until v0.59 the only command interpreter on this system was
+ * shell_exec() inside the kernel — ring 0, no processes, no descriptors, and
+ * therefore structurally incapable of `|`. vsh is an ordinary ring-3 program
+ * with no privileges beyond PCAP_FILESYSTEM and PCAP_CONSOLE. Everything it
+ * does, any compiled program could do.
+ *
+ * THE THREE MECHANISMS IT IS BUILT ON, all new in v0.59:
+ *   fork()      now hands the child the parent's open descriptors, so a pipe
+ *               end created here is usable over there.
+ *   pipe()      a kernel ring buffer with two descriptor ends.
+ *   setredir()  points a process's stdin/stdout at a descriptor, and — the
+ *               load-bearing part — SURVIVES execp(). The shell redirects a
+ *               program it has not launched yet; anything held in the child's
+ *               address space would be destroyed by the exec at exactly the
+ *               wrong moment.
+ *
+ * The sequence is always: pipe (if needed), fork, redirect IN THE CHILD, exec.
+ *
+ * SUBSET NOTES (occ is not C89 and the differences bite):
+ *   - `int` is 64 bits and is also what holds a pointer. vsh_av is `int *` so
+ *     that av[i] steps a WORD; a `char *` would step one byte and build an
+ *     argv vector of low bytes. (omake.oc has that bug — see the changelog.)
+ *   - locals must be declared before any statement in their block.
+ *   - there is no `switch`, no `sizeof`, and no `unsigned`.
+ */
+
+#define VSH_LINE      512
+#define VSH_MAXTOK     32
+#define VSH_TOKSZ      64
+#define VSH_MAXSTAGE    4
+#define VSH_MAXARG     16
+/* A local array's size must be a single NUMBER token — occ's declaration
+ * parser takes one T_NUM and does not evaluate a constant expression — so this
+ * is spelled out rather than written as VSH_TOKSZ + 8. */
+#define VSH_PATHSZ     72
+
+#define VSH_LT         60      /* '<' */
+#define VSH_GT         62      /* '>' */
+#define VSH_BAR       124      /* '|' */
+
+char *vsh_tok;        /* VSH_MAXTOK * VSH_TOKSZ bytes of token text     */
+int  *vsh_av;         /* VSH_MAXARG+1 WORDS: the argv vector for execp  */
+int   vsh_status;     /* exit status of the last pipeline               */
+
+char *vsh_tokp(int i) { return vsh_tok + i * VSH_TOKSZ; }
+
+int vsh_isspace(int c) {
+  if (c == 32) { return 1; }
+  if (c == 9)  { return 1; }
+  return 0;
+}
+int vsh_isop(int c) {
+  if (c == VSH_LT)  { return 1; }
+  if (c == VSH_GT)  { return 1; }
+  if (c == VSH_BAR) { return 1; }
+  return 0;
+}
+/* A token is exactly this one operator character. Checked as [0] and [1] so
+ * that a filename beginning with '>' is never mistaken for the operator. */
+int vsh_is_op_tok(char *t, int op) {
+  if (t[0] == op && t[1] == 0) { return 1; }
+  return 0;
+}
+
+/* Split a line into tokens. Operators are self-delimiting, so `ls>out` and
+ * `ls > out` tokenise identically — a shell that required the spaces would be
+ * quietly wrong on input every other shell accepts. */
+int vsh_tokenize(char *line) {
+  int n; int i; int j; char *t;
+  n = 0; i = 0;
+  while (line[i] && n < VSH_MAXTOK) {
+    while (line[i] && vsh_isspace(line[i])) { i = i + 1; }
+    if (!line[i]) { return n; }
+    t = vsh_tokp(n);
+    if (vsh_isop(line[i])) {
+      t[0] = line[i]; t[1] = 0;
+      i = i + 1; n = n + 1;
+    } else {
+      j = 0;
+      while (line[i] && !vsh_isspace(line[i]) && !vsh_isop(line[i]) && j < VSH_TOKSZ - 1) {
+        t[j] = line[i]; j = j + 1; i = i + 1;
+      }
+      t[j] = 0; n = n + 1;
+    }
+  }
+  return n;
+}
+
+/* A bare name is looked for in /bin, so `occ` means `/bin/occ`. Anything
+ * containing a '/' is taken as written. */
+char *vsh_resolve(char *name, char *buf) {
+  int i;
+  i = 0;
+  while (name[i]) {
+    if (name[i] == 47) { return name; }
+    i = i + 1;
+  }
+  strcpy(buf, "/bin/");
+  strcpy(buf + 5, name);
+  return buf;
+}
+
+/* SYS_WAITPID is NON-BLOCKING — it returns -11 (EAGAIN) while the child is
+ * still running and ignores any timeout argument. So a shell has to poll, and
+ * must yield between polls: on a uniprocessor the core sitting in this loop is
+ * the same core the child needs in order to finish. */
+int vsh_wait(int pid) {
+  int st; int spins;
+  st = 0 - 11;
+  spins = 0;
+  while (st == 0 - 11 && spins < 2000000) {
+    st = waitpid(pid, 0);
+    if (st == 0 - 11) { yield(); }
+    spins = spins + 1;
+  }
+  return st;
+}
+
+/* ---------------------------------------------------------------------------
+ * one pipeline stage, in the CHILD. Never returns.
+ *
+ * `extra` is the NEXT stage's read end, which this child inherited and must
+ * close. That close is not tidiness: a pipe reports end-of-file only when the
+ * last write end is gone, and a stray inherited descriptor keeps a pipeline
+ * waiting forever on a producer that has already finished.
+ */
+int vsh_child(int a, int b, int rin, int wout, int extra) {
+  int i; int j; int fd; char *t; char *path;
+  char pbuf[VSH_PATHSZ];
+
+  if (extra >= 0) { close(extra); }
+  if (rin  >= 0) { setredir(0, rin); }
+  if (wout >= 0) { setredir(1, wout); }
+
+  j = 0; i = a;
+  while (i < b) {
+    t = vsh_tokp(i);
+    if (vsh_is_op_tok(t, VSH_LT)) {
+      i = i + 1;
+      if (i >= b) { puts("vsh: '<' needs a filename\n"); exit(127); }
+      fd = open(vsh_tokp(i));
+      if (fd < 0) { puts("vsh: cannot open "); puts(vsh_tokp(i)); puts("\n"); exit(127); }
+      setredir(0, fd);
+    } else if (vsh_is_op_tok(t, VSH_GT)) {
+      i = i + 1;
+      if (i >= b) { puts("vsh: '>' needs a filename\n"); exit(127); }
+      /* TRUNCATE. A redirected write APPENDS (the store is content-addressed
+       * and its write primitive replaces a whole file, so the kernel stages
+       * and concatenates), and this filesystem has no truncate call — so `>`
+       * removes the name and recreates it. Without this, `cmd > f` twice would
+       * leave the second run's output glued onto the first run's. */
+      unlink(vsh_tokp(i));
+      fd = creat(vsh_tokp(i));
+      if (fd < 0) { puts("vsh: cannot create "); puts(vsh_tokp(i)); puts("\n"); exit(127); }
+      setredir(1, fd);
+    } else {
+      if (j < VSH_MAXARG) { vsh_av[j] = t; j = j + 1; }
+    }
+    i = i + 1;
+  }
+  vsh_av[j] = 0;
+  if (j == 0) { exit(0); }
+
+  path = vsh_resolve(vsh_av[0], pbuf);
+  execp(path, vsh_av, 0);
+  puts("vsh: not found: "); puts(path); puts("\n");
+  exit(127);
+  return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * run one pipeline. Returns the LAST stage's exit status, which is what a
+ * shell reports for `a | b`.
+ */
+int vsh_pipeline(int n) {
+  int i; int s; int nst; int pid; int rc;
+  int prev_read; int cur_write; int next_read;
+  int start[VSH_MAXSTAGE];
+  int end[VSH_MAXSTAGE];
+  int pids[VSH_MAXSTAGE];
+  int fds[2];
+  char *t;
+
+  nst = 0; start[0] = 0; i = 0;
+  while (i < n) {
+    t = vsh_tokp(i);
+    if (vsh_is_op_tok(t, VSH_BAR)) {
+      if (nst + 1 >= VSH_MAXSTAGE) { puts("vsh: pipeline too long\n"); return 0 - 1; }
+      end[nst] = i;
+      nst = nst + 1;
+      start[nst] = i + 1;
+    }
+    i = i + 1;
+  }
+  end[nst] = n;
+  nst = nst + 1;
+
+  s = 0;
+  while (s < nst) {
+    if (end[s] <= start[s]) { puts("vsh: empty pipeline stage\n"); return 0 - 1; }
+    s = s + 1;
+  }
+
+  prev_read = 0 - 1;
+  s = 0;
+  while (s < nst) {
+    cur_write = 0 - 1;
+    next_read = 0 - 1;
+    if (s + 1 < nst) {
+      if (pipe(fds) < 0) { puts("vsh: out of pipes\n"); return 0 - 1; }
+      next_read = fds[0];
+      cur_write = fds[1];
+    }
+    pid = fork();
+    if (pid == 0) { vsh_child(start[s], end[s], prev_read, cur_write, next_read); }
+    if (pid < 0) { puts("vsh: fork failed\n"); return 0 - 1; }
+    pids[s] = pid;
+    /* The PARENT drops its copies immediately. Holding either end open is the
+     * classic way to hang a pipeline: the reader would never see end-of-file
+     * because the shell itself still counts as a writer. */
+    if (prev_read >= 0) { close(prev_read); }
+    if (cur_write >= 0) { close(cur_write); }
+    prev_read = next_read;
+    s = s + 1;
+  }
+  if (prev_read >= 0) { close(prev_read); }
+
+  rc = 0;
+  s = 0;
+  while (s < nst) {
+    rc = vsh_wait(pids[s]);
+    s = s + 1;
+  }
+  return rc;
+}
+
+/* ---------------------------------------------------------------------------
+ * builtins. `exit` and `cd` have to be builtins in any shell — a forked child
+ * cannot change its parent's state — and here `cd` does not exist at all
+ * because this filesystem has no working directory, so vsh says so instead of
+ * pretending. Returns 1 if the line was handled.
+ */
+int vsh_builtin(int n) {
+  char *c;
+  if (n == 0) { return 1; }
+  c = vsh_tokp(0);
+  if (!strcmp(c, "exit")) { exit(0); }
+  if (!strcmp(c, "status")) { putdec(vsh_status); puts("\n"); return 1; }
+  if (!strcmp(c, "cd")) {
+    puts("vsh: no working directory on this system; use absolute paths\n");
+    return 1;
+  }
+  if (!strcmp(c, "help")) {
+    puts("vsh builtins: exit, status, help, cd (explains itself)\n");
+    puts("redirection:  cmd < in, cmd > out, a | b | c\n");
+    return 1;
+  }
+  return 0;
+}
+
+int vsh_exec_line(char *line) {
+  int n;
+  n = vsh_tokenize(line);
+  if (vsh_builtin(n)) { return 0; }
+  vsh_status = vsh_pipeline(n);
+  return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * SCRIPT MODE: `vsh /path/to/script`.
+ *
+ * This exists for a reason beyond convenience. Interactive input arrives via
+ * ttyread(), which returns 0 both for "no key has been pressed yet" and — once
+ * stdin is redirected — for "end of file". Those two are indistinguishable to
+ * the caller, so a shell driven by a redirected stdin could never tell a quiet
+ * keyboard from a finished script and would spin forever at the end of it.
+ * Reading the script file DIRECTLY sidesteps the ambiguity entirely, and it is
+ * what makes vsh testable in a headless boot: pipestrs runs a real script and
+ * checks what it produced.
+ */
+int vsh_script(char *path) {
+  int fd; int nread; int i; int j; char *buf; char line[VSH_LINE];
+  fd = open(path);
+  if (fd < 0) { puts("vsh: cannot open script "); puts(path); puts("\n"); return 1; }
+  buf = malloc(8192);
+  if (!buf) { puts("vsh: out of memory\n"); close(fd); return 1; }
+  nread = read(fd, buf, 8191);
+  close(fd);
+  if (nread < 0) { puts("vsh: cannot read script\n"); return 1; }
+  buf[nread] = 0;
+
+  i = 0;
+  while (i < nread) {
+    j = 0;
+    while (i < nread && buf[i] != 10 && j < VSH_LINE - 1) {
+      line[j] = buf[i]; j = j + 1; i = i + 1;
+    }
+    line[j] = 0;
+    while (i < nread && buf[i] != 10) { i = i + 1; }   /* drop an over-long tail */
+    i = i + 1;                                         /* step past the newline  */
+    /* '#' starts a comment, and an empty line is not an error. */
+    if (line[0] && line[0] != 35) { vsh_exec_line(line); }
+  }
+  return 0;
+}
+
+/* --------------------------------------------------------------------------- */
+int vsh_readline(char *buf, int max) {
+  int n; int r; int c; char ch[4];
+  n = 0;
+  while (1) {
+    r = ttyread(ch, 1);
+    if (r <= 0) {
+      yield();               /* nothing pending: give the machine back */
+    } else {
+      c = ch[0];
+      if (c == 13 || c == 10) { putchar(10); buf[n] = 0; return n; }
+      else if (c == 8 || c == 127) {
+        if (n > 0) { n = n - 1; putchar(8); putchar(32); putchar(8); }
+      }
+      else if (n < max - 1) { buf[n] = c; n = n + 1; putchar(c); }
+    }
+  }
+  return n;
+}
+
+int main(int argc, char **argv) {
+  char line[VSH_LINE];
+
+  vsh_tok = malloc(VSH_MAXTOK * VSH_TOKSZ);
+  vsh_av  = malloc((VSH_MAXARG + 1) * 8);
+  vsh_status = 0;
+  if (!vsh_tok || !vsh_av) { puts("vsh: out of memory\n"); return 1; }
+
+  if (argc > 1) { return vsh_script(argv[1]); }
+
+  puts("vsh — OutRun native shell (ring 3). 'help' for builtins, 'exit' to leave.\n");
+  while (1) {
+    puts("vsh$ ");
+    vsh_readline(line, VSH_LINE);
+    if (line[0]) { vsh_exec_line(line); }
+  }
+  return 0;
+}
