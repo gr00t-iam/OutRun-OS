@@ -91,6 +91,25 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
  * -1 for the console; it is kproc state, so it survives SYS_EXECVE_PATH. */
 #define SYS_PIPE                62
 #define SYS_SETREDIR            63
+/* v0.61: thread synchronisation. SYS_THREAD_CREATE gained a third argument
+ * (a caller-supplied stack top; 0 = "kernel, give me one"), which is a pure
+ * extension — the two-argument form still means exactly what it did.
+ *
+ * SYS_FUTEX_WAIT(uaddr, val, timeout_ticks) sleeps only if *uaddr == val, and
+ * that compare-and-sleep is atomic against SYS_FUTEX_WAKE. Without the kernel
+ * doing the comparison there is no way to close the window between reading the
+ * word and going to sleep, which is the entire reason a futex is a syscall.
+ * A parked thread occupies no core; before this the only way to wait was to
+ * spin or yield in a loop, and on a uniprocessor spinning for a sibling thread
+ * is simply a deadlock.
+ *
+ * Every wait is bounded: 0 means "the kernel's default", never "forever". */
+#define SYS_FUTEX_WAIT          64
+#define SYS_FUTEX_WAKE          65
+#define SYS_THREAD_JOIN         66
+#define SYS_GETTID              67
+#define EAGAIN_NEG    (-11)
+#define ETIMEDOUT_NEG (-62)
 /* Mirrors the kernel's HEAP_USER_V (kernel64.c is the master). */
 #define HEAP_USER_V_LO 0x0000570000000000ull
 
@@ -1611,6 +1630,98 @@ static int pthread_mutex_lock(pthread_mutex_t *m) {
 }
 static int pthread_mutex_unlock(pthread_mutex_t *m)   { __sync_synchronize(); m->v = 0; return 0; }
 
+/* ---- v0.61: futex-backed threads -----------------------------------------
+ * The v0.55 shim above is left exactly as it was, and role 31 still exercises
+ * it. That is deliberate: it is the regression gate proving the kernel-side
+ * rearchitecture (a thread is now a run-queue entity, not a BSP scheduler
+ * thread) is invisible to code written against the old API.
+ *
+ * What follows is the new surface — a kernel join and a real futex mutex —
+ * used by role 43.
+ *
+ * THE DIFFERENCE THAT MATTERS: the v0.55 mutex spins with oyield(), so a
+ * waiter keeps a core busy doing nothing and every acquisition costs a trip
+ * through the scheduler. This one sleeps. A thread blocked on fmutex_lock is
+ * in no run queue at all, and the unlock that releases it is a single syscall
+ * made only when somebody is actually waiting. */
+
+/* Drepper's three-state mutex. 0 = free, 1 = held uncontended, 2 = held with
+ * waiters. The third state is what keeps the uncontended path syscall-free:
+ * unlock only enters the kernel when it can see that someone is parked. */
+static void fmutex_lock(volatile u64 *m) {
+    u64 c = __sync_val_compare_and_swap(m, 0, 1);
+    if (c == 0) return;                           /* uncontended: no syscall  */
+    if (c != 2) c = __sync_lock_test_and_set(m, 2);
+    while (c != 0) {
+        /* Sleep only while the word still reads 2. If unlock ran in between,
+         * the kernel's compare fails, we get -EAGAIN back immediately and
+         * retry — no wakeup can be lost in that gap. */
+        sysc(SYS_FUTEX_WAIT, (u64)(void *)m, 2, 4000);
+        c = __sync_lock_test_and_set(m, 2);
+    }
+}
+static void fmutex_unlock(volatile u64 *m) {
+    if (__sync_fetch_and_sub(m, 1) != 1) {        /* was 2: someone is parked */
+        *m = 0;
+        __sync_synchronize();
+        sysc(SYS_FUTEX_WAKE, (u64)(void *)m, 1, 0);
+    }
+}
+
+/* Threads entered through RDI — the SysV first-argument register, which is
+ * what a C function actually reads. v0.55 had to use [rsp] because
+ * enter_user_thread set nothing but RIP and RSP; the kernel seeds a full
+ * context now, so the ordinary calling convention is available.             */
+#define KTHR_MAX 8
+struct kthr { u64 (*fn)(u64); u64 arg; };
+static struct kthr g_kthr[KTHR_MAX];
+static volatile int g_kthr_n = 0;
+
+u64 kthr_body(u64 i);                              /* called from the trampoline */
+u64 kthr_body(u64 i) {
+    if (i >= KTHR_MAX) return 0;
+    return g_kthr[i].fn(g_kthr[i].arg);
+}
+extern void kthr_tramp(void);
+__asm__(
+    ".text\n"
+    ".globl kthr_tramp\n"
+    "kthr_tramp:\n"
+    "  and $-16, %rsp\n"             /* SysV: 16-byte aligned before the call  */
+    "  call kthr_body\n"             /* RDI already holds our index            */
+    "  mov %rax, %rdi\n"             /* the body's return IS the exit code     */
+    "  mov $53, %rax\n"              /* SYS_THREAD_EXIT                        */
+    "  xor %esi, %esi\n"
+    "  xor %edx, %edx\n"
+    "  syscall\n"
+    "1: jmp 1b\n"
+);
+
+/* `stack_top` of 0 asks the kernel for a stack; anything else must be the TOP
+ * of memory this process already owns (the kernel checks it is writable, and
+ * will not free it at exit — it is the caller's). */
+static int kthread_create(u64 (*fn)(u64), u64 arg, u64 stack_top) {
+    int i = __sync_fetch_and_add(&g_kthr_n, 1);
+    if (i >= KTHR_MAX) { __sync_fetch_and_sub(&g_kthr_n, 1); return EAGAIN_NEG; }
+    g_kthr[i].fn = fn; g_kthr[i].arg = arg;
+    __sync_synchronize();
+    return (int)(i64)sysc(SYS_THREAD_CREATE, (u64)(void *)kthr_tramp, (u64)i, stack_top);
+}
+
+/* SYS_THREAD_JOIN answers -EAGAIN to mean "you slept, the state changed, ask
+ * again" — a woken task resumes with only RAX to carry a result, and the waker
+ * runs in a different address space and so cannot fill in *code on our behalf.
+ * The retry loop is the whole cost of that, and it is bounded so a join can
+ * fail rather than hang. */
+static int kthread_join(int tid, u64 *code) {
+    for (int k = 0; k < 20000; k++) {
+        i64 r = (i64)sysc(SYS_THREAD_JOIN, (u64)tid, (u64)(void *)code, 0);
+        if (r == EAGAIN_NEG) continue;
+        return (int)r;
+    }
+    return ETIMEDOUT_NEG;
+}
+
 /* Load sentinels into callee-saved regs, cross the SYSCALL boundary, and check  */
 /* they survive — proving the kernel preserves (and does not leak into) them.    */
 static int reg_preservation_ok(void) {
@@ -1784,6 +1895,125 @@ static void posix_thread_worker(void) {
     for (int i = 0; i < PW_THREADS; i++) if (!g_pw_ran[i]) sysc(SYS_EXIT, 904, 0, 0);
     if (g_pw_counter != (u64)PW_THREADS * PW_BUMPS)  sysc(SYS_EXIT, 903, 0, 0);
     sysc(SYS_EXIT, 900, 0, 0);
+}
+
+/* --- role 43: v0.61 threads — cross-core, futex-blocking, kernel join ------
+ *
+ * What separates this from role 31 is not "more threads": it is that these
+ * threads can SLEEP. Role 31's mutex spins through oyield(), so a contended
+ * lock keeps a core busy achieving nothing; here a waiter is parked in no run
+ * queue at all until the unlock that concerns it.
+ *
+ * Every assertion below is written so that the failure mode it guards against
+ * produces a WRONG ANSWER rather than a slow one — a counter that is short, a
+ * gate that was never observed, a wait that never expired. */
+#define TW_THREADS 4
+#define TW_BUMPS   150
+
+static volatile u64 g_tw_mutex   = 0;    /* the futex word: 0 free, 1 held, 2 contended */
+static volatile u64 g_tw_counter = 0;    /* guarded by g_tw_mutex                  */
+static volatile u64 g_tw_ran     = 0;    /* bit i = worker i executed              */
+static volatile u64 g_tw_gate    = 0;    /* futex word a thread parks on           */
+static volatile u64 g_tw_passed  = 0;    /* the gate thread's observation          */
+static volatile u64 g_tw_pid_bad = 0;    /* a thread saw a getpid() != the group's */
+static volatile u64 g_tw_pid     = 0;    /* the group's pid, sampled by main       */
+
+static u64 tw_body(u64 id) {
+    __sync_fetch_and_or(&g_tw_ran, 1ull << id);
+    /* POSIX: one pid per thread group, a distinct tid per thread. Both halves
+     * are checked, because reporting the slot's own pid from getpid() would
+     * make the answer depend on which thread asked. */
+    if (sysc(SYS_GETPID, 0, 0, 0) != g_tw_pid) g_tw_pid_bad = 1;
+    if (sysc(SYS_GETTID, 0, 0, 0) != id)       g_tw_pid_bad = 1;
+    for (int i = 0; i < TW_BUMPS; i++) {
+        fmutex_lock(&g_tw_mutex);
+        u64 v = g_tw_counter;
+        /* Read-modify-write ACROSS a reschedule. The point of the suite: if
+         * the critical section is not really exclusive, the final count comes
+         * out short and no amount of re-running hides it. */
+        if ((i & 15) == 0) oyield();
+        g_tw_counter = v + 1;
+        fmutex_unlock(&g_tw_mutex);
+    }
+    return 200 + id;
+}
+
+/* Parks until main opens the gate. This is the one that proves a wake actually
+ * reaches a SLEEPING thread — the mutex test alone could pass on a system
+ * where FUTEX_WAIT silently returned immediately every time. */
+static u64 tw_gate_body(u64 arg) {
+    (void)arg;
+    while (g_tw_gate == 0) sysc(SYS_FUTEX_WAIT, (u64)(void *)&g_tw_gate, 0, 6000);
+    g_tw_passed = 1;
+    __sync_synchronize();
+    return 300;
+}
+
+/* Runs on a stack this process allocated itself, not one the kernel handed
+ * out — the third argument to SYS_THREAD_CREATE. */
+static u64 tw_stack_body(u64 arg) {
+    u64 probe[16];
+    for (int i = 0; i < 16; i++) probe[i] = arg + i;   /* touch the caller's stack */
+    u64 s = 0;
+    for (int i = 0; i < 16; i++) s += probe[i];
+    return (s == arg * 16 + 120) ? arg + 1 : 0;
+}
+
+static void thread_stress_worker(void) {
+    g_tw_pid = sysc(SYS_GETPID, 0, 0, 0);
+    if (sysc(SYS_GETTID, 0, 0, 0) != 0) sysc(SYS_EXIT, 961, 0, 0);
+
+    int t[TW_THREADS];
+    for (int i = 0; i < TW_THREADS; i++) {
+        t[i] = kthread_create(tw_body, (u64)i, 0);
+        /* The kernel's tid allocator and the userland index allocator are
+         * independent, so their agreement is CHECKED rather than assumed —
+         * a mismatch would silently join the wrong thread. */
+        if (t[i] < 0 || t[i] != i) sysc(SYS_EXIT, 962, 0, 0);
+    }
+    for (int i = 0; i < TW_THREADS; i++) {
+        u64 code = 0;
+        if (kthread_join(t[i], &code) != 0) sysc(SYS_EXIT, 963, 0, 0);
+        if (code != (u64)(200 + i))         sysc(SYS_EXIT, 964, 0, 0);
+    }
+    if (g_tw_ran != ((1ull << TW_THREADS) - 1))          sysc(SYS_EXIT, 966, 0, 0);
+    if (g_tw_counter != (u64)TW_THREADS * TW_BUMPS)      sysc(SYS_EXIT, 965, 0, 0);
+    if (g_tw_pid_bad)                                    sysc(SYS_EXIT, 973, 0, 0);
+
+    /* A stack of our own. 16 KiB from the heap; the kernel must accept it,
+     * must NOT free it at thread exit, and the thread must actually run on it. */
+    u64 stk = (u64)omalloc(16384);
+    if (!stk) sysc(SYS_EXIT, 967, 0, 0);
+    u64 top = (stk + 16384) & ~15ull;
+    int ct = kthread_create(tw_stack_body, 0xC0DE, top);
+    if (ct < 0) sysc(SYS_EXIT, 967, 0, 0);
+    u64 sc = 0;
+    if (kthread_join(ct, &sc) != 0) sysc(SYS_EXIT, 968, 0, 0);
+    if (sc != 0xC0DE + 1)           sysc(SYS_EXIT, 968, 0, 0);
+
+    /* A wake that must reach a thread which is genuinely asleep. */
+    int gt = kthread_create(tw_gate_body, 0, 0);
+    if (gt < 0) sysc(SYS_EXIT, 969, 0, 0);
+    for (int i = 0; i < 300; i++) oyield();       /* let it get all the way parked */
+    if (g_tw_passed) sysc(SYS_EXIT, 970, 0, 0);   /* passed the gate before it opened */
+    g_tw_gate = 1;
+    __sync_synchronize();
+    sysc(SYS_FUTEX_WAKE, (u64)(void *)&g_tw_gate, 0, 0);   /* 0 = wake everyone */
+    u64 gc = 0;
+    if (kthread_join(gt, &gc) != 0)  sysc(SYS_EXIT, 970, 0, 0);
+    if (gc != 300 || !g_tw_passed)   sysc(SYS_EXIT, 970, 0, 0);
+
+    /* The two answers a futex must give WITHOUT sleeping forever. A kernel
+     * that got either of these wrong would hang the machine instead of
+     * failing a test, which is exactly why the timeout is not optional. */
+    {
+        static volatile u64 lonely = 7;
+        i64 r = (i64)sysc(SYS_FUTEX_WAIT, (u64)(void *)&lonely, 7, 400);
+        if (r != ETIMEDOUT_NEG) sysc(SYS_EXIT, 971, 0, 0);   /* nobody wakes it */
+        r = (i64)sysc(SYS_FUTEX_WAIT, (u64)(void *)&lonely, 8, 400);
+        if (r != EAGAIN_NEG)    sysc(SYS_EXIT, 972, 0, 0);   /* value mismatch  */
+    }
+    sysc(SYS_EXIT, 960, 0, 0);
 }
 
 /* --- roles 32/33: execve with argv + envp ---------------------------------*/
@@ -2889,6 +3119,7 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 38) { posix_selfhost_worker(); }        /* v0.56 author -> compile -> run, natively           */
     if (role == 40) { pipe_worker(); }                  /* v0.59 pipe mechanics: bounds, EOF, EPIPE, fork      */
     if (role == 41) { vsh_worker(); }                   /* v0.59 build /bin/vsh with occ and run a real script */
+    if (role == 43) { thread_stress_worker(); }        /* v0.61 futex threads, kernel join, own stack       */
     if (role == 42) { lang_stress_worker(); }           /* v0.60 sizeof/for-init/switch/unsigned + omake       */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
