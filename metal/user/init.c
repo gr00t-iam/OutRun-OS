@@ -2543,6 +2543,205 @@ static i64 cs_compile(const char **av) {
     return owaitpid((u32)pid, 250000);
 }
 
+/* --- role 40: LANGUAGE COMPLETENESS (the ring-3 half of `langstrs`) --------
+ * v0.60. compilerstrs interrogates types and linkage; this interrogates the
+ * four constructs v0.60 added — sizeof, declarations in a for-initialiser,
+ * switch/case/default, and the unsigned integer types — plus break/continue,
+ * which switch is useless without.
+ *
+ * Every unsigned check below is written so that SIGNED code generation gives
+ * the WRONG answer. That is deliberate and it is the whole value of the test:
+ * `big > 1` is true for an unsigned 0xFFFF...F and false for a signed -1, so a
+ * compiler that parsed `u64` and then emitted setg fails here rather than
+ * passing quietly and corrupting arithmetic somewhere far away. The signed
+ * block immediately after re-checks that plain `int` still uses setl/idiv/sar,
+ * because the failure mode of this work is not only "unsigned stayed signed"
+ * but also "everything became unsigned".
+ *
+ * The program returns the number of the check that failed, or 0. Exit 970 from
+ * the driver means every round passed.                                       */
+#define LANG_SRC \
+  "struct S1 { char a; int b; };\n" \
+  "int classify(int x) {\n" \
+  "  int r; r = 0;\n" \
+  "  switch (x) {\n" \
+  "    case 1: r = 10; break;\n" \
+  "    case 2: r = 20; break;\n" \
+  "    case 3:\n" \
+  "    case 4: r = 34; break;\n" \
+  "    default: r = 99;\n" \
+  "  }\n" \
+  "  return r;\n" \
+  "}\n" \
+  "int main() {\n" \
+  "  char buf[64]; int s; int i; int n;\n" \
+  "  u64 big; u8 b; u16 h; u32 w; u8 ub[4]; u8 *up;\n" \
+  "  /* ---- sizeof ---- */\n" \
+  "  if (sizeof(char) != 1) { return 1; }\n" \
+  "  if (sizeof(int)  != 8) { return 2; }\n" \
+  "  if (sizeof(u8)   != 1) { return 3; }\n" \
+  "  if (sizeof(u16)  != 2) { return 4; }\n" \
+  "  if (sizeof(u32)  != 4) { return 5; }\n" \
+  "  if (sizeof(u64)  != 8) { return 6; }\n" \
+  "  if (sizeof(struct S1) != 16) { return 7; }\n" \
+  "  if (sizeof(char *) != 8) { return 8; }\n" \
+  "  if (sizeof buf != 64) { return 9; }\n" \
+  "  /* ---- declaration in a for-initialiser, and its scope ---- */\n" \
+  "  s = 0;\n" \
+  "  for (int k = 0; k < 10; k = k + 1) { s = s + k; }\n" \
+  "  if (s != 45) { return 10; }\n" \
+  "  for (int k = 0; k < 5; k = k + 1) { s = s + 100; }\n" \
+  "  if (s != 545) { return 11; }\n" \
+  "  /* ---- switch / case / default, including fallthrough ---- */\n" \
+  "  if (classify(1) != 10) { return 20; }\n" \
+  "  if (classify(2) != 20) { return 21; }\n" \
+  "  if (classify(3) != 34) { return 22; }\n" \
+  "  if (classify(4) != 34) { return 23; }\n" \
+  "  if (classify(9) != 99) { return 24; }\n" \
+  "  /* ---- unsigned: each of these is WRONG under signed codegen ---- */\n" \
+  "  big = 0; big = big - 1;\n" \
+  "  if (big <= 1) { return 30; }\n" \
+  "  if (big / 2 <= 1000) { return 31; }\n" \
+  "  if ((big >> 60) != 15) { return 32; }\n" \
+  "  if (big % 10 != 5) { return 33; }\n" \
+  "  /* ---- signed must STAY signed ---- */\n" \
+  "  n = 0 - 1;\n" \
+  "  if (n >= 1) { return 34; }\n" \
+  "  if (n / 2 != 0) { return 35; }\n" \
+  "  if ((n >> 8) != 0 - 1) { return 36; }\n" \
+  "  /* ---- narrowing on store, zero-extension on load ---- */\n" \
+  "  b = 300;    if (b != 44) { return 40; }\n" \
+  "  h = 70000;  if (h != 4464) { return 41; }\n" \
+  "  w = 0; w = w - 1; if (w != 4294967295) { return 42; }\n" \
+  "  /* ---- break and continue ---- */\n" \
+  "  i = 0;\n" \
+  "  while (1) { i = i + 1; if (i == 5) { break; } }\n" \
+  "  if (i != 5) { return 50; }\n" \
+  "  s = 0;\n" \
+  "  for (int k = 0; k < 10; k = k + 1) { if (k % 2 == 0) { continue; } s = s + k; }\n" \
+  "  if (s != 25) { return 51; }\n" \
+  "  /* continue inside a switch belongs to the enclosing LOOP */\n" \
+  "  s = 0;\n" \
+  "  for (int k = 0; k < 6; k = k + 1) {\n" \
+  "    switch (k) { case 2: continue; case 4: break; default: s = s + 1000; }\n" \
+  "    s = s + 1;\n" \
+  "  }\n" \
+  "  if (s != 4005) { return 52; }\n" \
+  "  /* ---- an unsigned ELEMENT through a pointer ---- */\n" \
+  "  up = ub;\n" \
+  "  __stb(ub, 0, 200); __stb(ub, 1, 1);\n" \
+  "  if (up[0] != 200) { return 60; }\n" \
+  "  if (up[0] <= 100) { return 61; }\n" \
+  "  if (up[1] != 1)   { return 62; }\n" \
+  "  return 0;\n" \
+  "}\n"
+
+/* Two programs that MUST be refused. Both are new failure modes that only
+ * exist because v0.60 added the constructs, so neither could be caught by the
+ * refusal round compilerstrs already runs. */
+#define LANG_N1 "int main() { break; return 0; }\n"
+#define LANG_N2 "int main() { switch (1) { default: ; default: ; } return 0; }\n"
+
+static void lang_stress_worker(void) {
+    if (selfhost_author("/src/lang.c", LANG_SRC) < 0) sysc(SYS_EXIT, 971, 0, 0);
+
+    /* ---- the language round ---- */
+    { static const char *av[] = { "/bin/occ", "/src/lang.c", "-o", "/bin/lang.elf", 0 };
+      i64 st = cs_compile(av);
+      if (st == -11) sysc(SYS_EXIT, 972, 0, 0);
+      if (st != 0)   sysc(SYS_EXIT, 973, 0, 0);
+    }
+    { i64 pid = ofork();
+      if (pid == 0) {
+          static const char *av2[] = { "/bin/lang.elf", 0 };
+          static const char *ev2[] = { 0 };
+          oexecve("/bin/lang.elf", av2, ev2);
+          sysc(SYS_EXIT, 198, 0, 0);
+      }
+      if (pid < 0) sysc(SYS_EXIT, 974, 0, 0);
+      i64 rst = owaitpid((u32)pid, 250000);
+      if (rst == -11) sysc(SYS_EXIT, 975, 0, 0);
+      if (rst != 0) {
+          oputs("  [lang  ] the compiled program failed check ");
+          sysc(SYS_WRITEHEX, (u64)rst, 0, 0);
+          oputs(" hex\n");
+          sysc(SYS_EXIT, 976, 0, 0);
+      }
+      oputs("  [lang  ] sizeof, for-init scope, switch/case, unsigned arithmetic and break/continue all verified\n");
+    }
+
+    /* ---- refusals ---- */
+    { static const char *n1[] = { "/bin/occ", "/src/lang_n.c", "-o", "/bin/lang_n.elf", 0 };
+      static const char *bodies[2] = { LANG_N1, LANG_N2 };
+      for (int i = 0; i < 2; i++) {
+          ounlink("/bin/lang_n.elf");
+          if (selfhost_author("/src/lang_n.c", bodies[i]) < 0) sysc(SYS_EXIT, 977, 0, 0);
+          i64 st = cs_compile(n1);
+          if (st == -11) sysc(SYS_EXIT, 978 + i, 0, 0);
+          if (st == 0)   sysc(SYS_EXIT, 980 + i, 0, 0);   /* WRONGLY accepted */
+          { int t = oopen("/bin/lang_n.elf");
+            if (t >= 0) { oclose(t); sysc(SYS_EXIT, 982 + i, 0, 0); } }
+      }
+      oputs("  [lang  ] a stray break and a duplicated default were both REFUSED\n");
+    }
+
+    /* Release the sources now that they have been consumed. The VFS root
+     * directory holds VFS_MAXFILES (64) entries and this suite runs LAST in the
+     * boot sequence, so it inherits every file every earlier suite created —
+     * without this the omake round below cannot create its output and occ
+     * reports "cannot open output" from a directory that is simply full.
+     * /bin/lang.elf is deliberately kept: the kernel half audits it after the
+     * driver exits, and a test that deleted its own evidence would be checking
+     * nothing. */
+    ounlink("/src/lang.c");
+    ounlink("/src/lang_n.c");
+
+    /* ---- the toolchain round: build omake, then let omake drive occ ----
+     * This is what the argv fix is for. omake hands execve an array of
+     * POINTERS; while that array was declared `char *` every entry was
+     * truncated to its low byte, so the compiler could never be launched. A
+     * test that only compiled omake would not have noticed — it has to RUN it
+     * and check that the target it was asked for actually appeared. */
+    { static const char *av[] = { "/bin/occ", "/src/omake.c", "-o", "/bin/omake", 0 };
+      i64 st = cs_compile(av);
+      if (st == -11) sysc(SYS_EXIT, 984, 0, 0);
+      if (st != 0)   sysc(SYS_EXIT, 985, 0, 0);
+    }
+    ounlink("/bin/hello.elf");
+    ounlink("/var/omake.stamp");
+    { i64 pid = ofork();
+      if (pid == 0) {
+          static const char *av2[] = { "/bin/omake", "-f", "/src/demo.mk", 0 };
+          static const char *ev2[] = { "PATH=/usr/lib", 0 };
+          oexecve("/bin/omake", av2, ev2);
+          sysc(SYS_EXIT, 198, 0, 0);
+      }
+      if (pid < 0) sysc(SYS_EXIT, 986, 0, 0);
+      i64 rst = owaitpid((u32)pid, 400000);
+      if (rst == -11) sysc(SYS_EXIT, 987, 0, 0);
+      if (rst != 0)   sysc(SYS_EXIT, 988, 0, 0);
+      { int t = oopen("/bin/hello.elf");
+        if (t < 0) sysc(SYS_EXIT, 989, 0, 0);            /* omake claimed success
+                                                          * but built nothing   */
+        oclose(t); }
+      oputs("  [lang  ] omake parsed a makefile and drove occ to build /bin/hello.elf\n");
+    }
+    /* Run what omake built: hello_sum(37, 5) == 42. */
+    { i64 pid = ofork();
+      if (pid == 0) {
+          static const char *av2[] = { "/bin/hello.elf", 0 };
+          static const char *ev2[] = { 0 };
+          oexecve("/bin/hello.elf", av2, ev2);
+          sysc(SYS_EXIT, 198, 0, 0);
+      }
+      if (pid < 0) sysc(SYS_EXIT, 990, 0, 0);
+      i64 rst = owaitpid((u32)pid, 250000);
+      if (rst == -11) sysc(SYS_EXIT, 991, 0, 0);
+      if (rst != 42)  sysc(SYS_EXIT, 992, 0, 0);
+    }
+    sysc(SYS_EXIT, 970, 0, 0);
+}
+
 static void compiler_stress_worker(void) {
     if (selfhost_author("/src/cs_hdr.h", CS_HDR) < 0) sysc(SYS_EXIT, 951, 0, 0);
     if (selfhost_author("/src/cs_a.c",   CS_A)   < 0) sysc(SYS_EXIT, 952, 0, 0);
@@ -2690,6 +2889,7 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 38) { posix_selfhost_worker(); }        /* v0.56 author -> compile -> run, natively           */
     if (role == 40) { pipe_worker(); }                  /* v0.59 pipe mechanics: bounds, EOF, EPIPE, fork      */
     if (role == 41) { vsh_worker(); }                   /* v0.59 build /bin/vsh with occ and run a real script */
+    if (role == 42) { lang_stress_worker(); }           /* v0.60 sizeof/for-init/switch/unsigned + omake       */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");

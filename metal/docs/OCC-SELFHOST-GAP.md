@@ -1,13 +1,33 @@
 # What `occ` still cannot compile: `occ.c`
 
-**Status: deferred out of Milestone 59, deliberately.** This document records
-exactly what stands between `occ` and compiling its own source, so the decision
-is auditable and the next milestone has a work list rather than an aspiration.
+**Status at v0.60: four of the eight blockers are CLOSED.** `occ` still cannot
+compile its own source. This document records exactly what stands between it and
+that, so the decision is auditable and the next milestone has a work list rather
+than an aspiration.
 
-Every count below was taken from the tree at v0.59 with `grep`, and the command
-is given so it can be re-run rather than trusted.
+Every count below was re-taken from the tree at **v0.60** with `grep`, and the
+command is given so it can be re-run rather than trusted. The counts went UP for
+the constructs that were closed, because closing them meant occ.c could use them
+more freely — that is expected, and it is why the counts are re-measured rather
+than carried forward.
 
-## Why it is deferred rather than attempted
+## What v0.60 closed
+
+| # | Construct | Status |
+| --- | --- | --- |
+| 1 | `unsigned` types (`u8`/`u16`/`u32`/`u64`) | **done** — built-in primitives, with `div`/`shr`/`setb` codegen and 1/2/4/8-byte narrowing |
+| 2 | `sizeof` | **done** — `sizeof(TYPE)` and `sizeof EXPR`, the latter by parsing for the type and rewinding the output cursors |
+| 3 | declaration in a `for` initialiser | **done** — shares the ordinary local-declaration parser, with a scope |
+| 10 | `switch` / `case` | **done** — dispatch emitted after the body, so every arm offset is already known |
+
+`break` and `continue` came with `switch`, for loops as well as switches.
+
+See `CHANGELOG-0.60.0.md` for why `unsigned` is a code-generation change rather
+than a parsing one, and for the table of which opcode each signedness selects.
+
+## What is still in the way
+
+### Why the rest was deferred rather than attempted
 
 M59's job was process plumbing and a real shell. A compiler that can compile
 itself but has no shell to drive it, no pipes to compose it with, and no
@@ -43,18 +63,18 @@ a blocker for self-hosting. It is removed from the list below.
 `occ.c` is 1,995 lines and is `#include`d into `user/init.c` (see
 `Makefile:97`), so "compiling occ" means compiling that combination.
 
-| # | Construct | Count in `occ.c` | How to reproduce | Blocking? |
+| # | Construct | Count in `occ.c` at v0.60 | How to reproduce | Blocking? |
 | --- | --- | --- | --- | --- |
-| 1 | `unsigned` integer types (`u8`/`u16`/`u32`/`u64`) | 70 uses | `grep -oE '\bu(8\|16\|32\|64)\b' user/occ.c \| wc -l` | **yes** |
-| 2 | `sizeof` | 21 | `grep -c 'sizeof' user/occ.c` | **yes** |
-| 3 | declaration in a `for` initialiser | 64 | `grep -cE 'for \((int\|i64\|u64) ' user/occ.c` | **yes** |
+| 1 | `unsigned` integer types (`u8`/`u16`/`u32`/`u64`) | 105 uses | `grep -oE '\bu(8\|16\|32\|64)\b' user/occ.c \| wc -l` | **CLOSED in v0.60** |
+| 2 | `sizeof` | 36 | `grep -c 'sizeof' user/occ.c` | **CLOSED in v0.60** |
+| 3 | declaration in a `for` initialiser | 71 | `grep -cE 'for \((int\|i64\|u64) ' user/occ.c` | **CLOSED in v0.60** |
 | 4 | `enum` | 1 declaration (6 token kinds) | `grep -n '\benum\b' user/occ.c` | **yes** |
-| 5 | multi-dimensional array with initialiser | 1 (`u8 sr[6][3]`, line 1717) | `grep -nE '\[[0-9]+\]\[[0-9]+\]' user/occ.c` | **yes** |
+| 5 | multi-dimensional array with initialiser | 1 (`u8 sr[6][3]`) | `grep -nE '\[[0-9]+\]\[[0-9]+\]' user/occ.c` | **yes** |
 | 6 | aggregate initialisers (`= { ... }`) | 5 | `grep -cE '= *\{' user/occ.c` | **yes** |
 | 7 | constant *expression* as an array size | pervasive | — | **yes** |
-| 8 | struct assignment / passing by value | used in `init.c` | `occ.c:1673` refuses it explicitly | **yes** |
+| 8 | struct assignment / passing by value | used in `init.c` | occ refuses it explicitly | **yes** |
 | 9 | function pointers | 0 in `occ.c` | `grep -cE '\(\*[a-z_]+\)\(' user/occ.c` | no |
-| 10 | `switch` / `case` | **0** | `grep -c 'switch (' user/occ.c` | **no — see correction above** |
+| 10 | `switch` / `case` | **0** | `grep -c 'switch (' user/occ.c` | **CLOSED in v0.60**, though it was never a blocker — see the correction above |
 
 ### 1. Unsigned types — the largest single item
 
@@ -122,20 +142,28 @@ Supporting it means a real memory-to-memory copy at assignment and argument
 setup, plus a calling-convention decision for aggregates. Refusing loudly is
 the right behaviour for now; silently passing a pointer would be a miscompile.
 
-## Suggested order for a future milestone
+## Suggested order for the NEXT milestone
 
-Roughly cheapest-first, with each step independently verifiable:
+The v0.59 list is reproduced with the finished items struck out, so the ordering
+argument stays visible:
 
-1. **`enum`** — a constant table; no codegen change.
-2. **Declarations in `for`-init** — parser and scope only.
-3. **Constant-expression folding** — unblocks array sizes, and is a
-   prerequisite for `sizeof`.
-4. **`sizeof`** — the type data already exists.
+1. ~~**`enum`**~~ — still open. A constant table; no codegen change. Now the
+   cheapest remaining item.
+2. ~~**Declarations in `for`-init**~~ — done in v0.60.
+3. **Constant-expression folding** — still open, and now the most valuable
+   remaining item: it unblocks array sizes (`char buf[N + 8]`), and `sizeof` can
+   already supply operands to it.
+4. ~~**`sizeof`**~~ — done in v0.60.
 5. **Aggregate initialisers** (1-D), then **multi-dimensional arrays**.
-6. **`unsigned` types** — the big one: division, comparison, narrowing. This
-   deserves its own suite of arithmetic-identity tests, in the shape
-   `compilerstrs` already uses.
+6. ~~**`unsigned` types**~~ — done in v0.60, with the arithmetic-identity suite
+   the v0.59 note asked for. It is `langstrs`, and every unsigned assertion in it
+   is written so that signed codegen gives the wrong answer.
 7. **Struct by value.**
+
+A note on tooling for whoever picks this up: `tools/occhost.c` compiles `occ.c`
+on a Linux host and runs what it produces in-process, so a codegen change costs
+seconds instead of a boot. Every rule in v0.60's unsigned table was validated
+through it before the first boot was attempted.
 
 Only after all of these is "compile `occ.c`" a meaningful target — and the
 honest test of it is not that the compile *succeeds* but that the resulting
