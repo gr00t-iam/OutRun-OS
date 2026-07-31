@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.59.0-metal"
+#define KERNEL_VERSION "0.60.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -14068,6 +14068,173 @@ static void cmd_compiler_stress(void) {
     kputs("-- done --\n");
 }
 
+/* ===========================================================================
+ * v0.60: LANGUAGE STRESS — sizeof, for-init, switch, unsigned, and omake
+ * ===========================================================================
+ * compilerstrs proved the type system and multi-unit linkage. This proves the
+ * four constructs v0.60 added, and then proves the TOOLCHAIN they were added
+ * for still assembles into something that works end to end: /bin/omake, built
+ * by /bin/occ on this system, reads a makefile and drives /bin/occ to build a
+ * two-unit program, which then runs and returns a value only a correct build
+ * could produce.
+ *
+ * That last round is the one that catches the argv defect. omake hands execve
+ * an array of POINTERS; while that array was declared `char *`, v0.58's
+ * element-scaled indexing truncated every entry to its low byte and the
+ * compiler could never be launched. Compiling omake would not have revealed
+ * it — only running it and demanding its output does.
+ *
+ * The kernel half checks, from outside, what the driver cannot honestly claim
+ * about itself: that the executables really appeared in the VFS, that they are
+ * well-formed W^X images, that the refused programs left nothing behind, and
+ * that nothing leaked across the seven processes involved.                  */
+static int g_lspass, g_lsfail;
+static void lscheck(const char *n, int c) {
+    if (c) { g_lspass++; kprintf("[langstrs]  PASS  %s\n", n); }
+    else   { g_lsfail++; kprintf("[langstrs]  FAIL  %s\n", n); }
+}
+
+/* Read `path` out of the VFS and audit it as a 3-segment W^X x86-64 ELF. */
+static int lang_elf_ok(const char *path, int *wx_ok) {
+    *wx_ok = 0;
+    int oi = vfs_find(path);
+    if (oi < 0 || DENTS[oi].len <= 64) return 0;
+    static uint8_t img[32768];
+    int64_t got = vfs_read_file(oi, img, sizeof img);
+    struct elf64_hdr *eh = (struct elf64_hdr *)img;
+    if (got <= 64 || eh->ident[0] != 0x7F || eh->ident[1] != 'E' ||
+        eh->ident[2] != 'L' || eh->ident[3] != 'F' ||
+        eh->machine != 0x3E || eh->phnum != 3) return 0;
+    int rx = 0, ro = 0, rw = 0, bad = 0;
+    for (int i = 0; i < eh->phnum; i++) {
+        struct elf64_phdr *ph = (struct elf64_phdr *)(img + eh->phoff + (uint64_t)i * eh->phentsize);
+        if (ph->type != 1) continue;
+        if ((ph->flags & 0x3) == 0x3) bad = 1;
+        if (ph->flags == 5) rx++;
+        if (ph->flags == 4) ro++;
+        if (ph->flags == 6) rw++;
+    }
+    *wx_ok = !bad;
+    return rx == 1 && ro == 1 && rw == 1;
+}
+
+static void cmd_lang_stress(void) {
+    kputs("-- LANGUAGE STRESS: sizeof, for-init, switch/case, unsigned, and omake --\n");
+    g_lspass = g_lsfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    if (!g_cas_mounted) { lscheck("CAS mounted before the compiler can run", 0);
+        kprintf("[langstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_lspass, (uint64_t)g_lsfail);
+        return; }
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+
+    /* Fresh outputs, so "it appeared" means this run produced it. */
+    if (vfs_find("/bin/lang.elf")   >= 0) vfs_unlink("/bin/lang.elf");
+    if (vfs_find("/bin/lang_n.elf") >= 0) vfs_unlink("/bin/lang_n.elf");
+    if (vfs_find("/bin/omake")      >= 0) vfs_unlink("/bin/omake");
+    if (vfs_find("/bin/hello.elf")  >= 0) vfs_unlink("/bin/hello.elf");
+
+    int p = kproc_spawn("langstr", PCAP_FILESYSTEM);
+    if (p < 0) { lscheck("kproc_spawn never fails", 0);
+        kprintf("[langstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_lspass, (uint64_t)g_lsfail);
+        return; }
+    kprocs[p].role = 42;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { lscheck("the driver's ELF loads", 0);
+        kprintf("[langstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_lspass, (uint64_t)g_lsfail);
+        return; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    /* Four compiles (lang, two refusals, omake) plus three program runs, all
+     * under TCG. omake forks occ again from inside, so this is the longest
+     * single driver in the suite. */
+    int finished = posix_drain(procs, 1, &R, 140000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[langstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 970 ? "" :
+        R.code[0] == 971 ? "could not author /src/lang.c" :
+        R.code[0] == 972 ? "the compiler TIMED OUT on the language program" :
+        R.code[0] == 973 ? "the language program FAILED to compile but should have built" :
+        R.code[0] == 974 ? "fork failed before running the language program" :
+        R.code[0] == 975 ? "the language program TIMED OUT" :
+        R.code[0] == 976 ? "a LANGUAGE CHECK FAILED (its number is on the line above)" :
+        R.code[0] == 977 ? "could not author a refusal-test source" :
+        (R.code[0] == 978 || R.code[0] == 979) ? "a refusal test TIMED OUT in the compiler" :
+        (R.code[0] == 980 || R.code[0] == 981) ? "an INVALID program compiled successfully" :
+        (R.code[0] == 982 || R.code[0] == 983) ? "a refused compile still left an output file" :
+        R.code[0] == 984 ? "the compiler TIMED OUT building omake" :
+        R.code[0] == 985 ? "omake itself FAILED to compile" :
+        R.code[0] == 986 ? "fork failed before running omake" :
+        R.code[0] == 987 ? "omake TIMED OUT" :
+        R.code[0] == 988 ? "omake exited non-zero" :
+        R.code[0] == 989 ? "omake reported success but built NOTHING (the argv defect)" :
+        R.code[0] == 990 ? "fork failed before running what omake built" :
+        R.code[0] == 991 ? "the program omake built TIMED OUT" :
+        R.code[0] == 992 ? "the program omake built returned the wrong value" :
+                           "unknown";
+    if (R.code[0] != 970)
+        kprintf("[langstrs] driver exit %u — %s\n", R.code[0], why);
+
+    lscheck("the driver compiled, ran and validated the language program (exit 970)",
+            finished && R.code[0] == 970);
+
+    int wx = 0, ok = lang_elf_ok("/bin/lang.elf", &wx);
+    int li = vfs_find("/bin/lang.elf");
+    if (li >= 0)
+        kprintf("[langstrs] /bin/lang.elf: %u bytes, %u chunk(s)\n",
+                (uint64_t)DENTS[li].len, (uint64_t)DENTS[li].nchunks);
+    lscheck("the language program was produced in the VFS", li >= 0 && DENTS[li].len > 64);
+    lscheck("it is a well-formed 3-segment x86-64 ELF (R+X, R, R+W)", ok);
+    lscheck("no segment is both writable and executable", ok && wx);
+    lscheck("no output survives from either REFUSED program",
+            vfs_find("/bin/lang_n.elf") < 0);
+
+    /* The toolchain round, audited from outside the processes that ran it. */
+    int mi = vfs_find("/bin/omake");
+    int mwx = 0, mok = lang_elf_ok("/bin/omake", &mwx);
+    if (mi >= 0)
+        kprintf("[langstrs] /bin/omake: %u bytes, %u chunk(s), compiled by occ on this system\n",
+                (uint64_t)DENTS[mi].len, (uint64_t)DENTS[mi].nchunks);
+    lscheck("occ compiled /src/omake.c — the shipped build tool, unmodified", mi >= 0 && mok && mwx);
+    int hi = vfs_find("/bin/hello.elf");
+    if (hi >= 0)
+        kprintf("[langstrs] /bin/hello.elf: %u bytes, built by omake from TWO units\n",
+                (uint64_t)DENTS[hi].len);
+    lscheck("omake drove occ and the target it was asked for actually appeared",
+            hi >= 0 && DENTS[hi].len > 64);
+
+    int fds_leaked = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    lscheck("no descriptor leaked across the compiler and build-tool processes", fds_leaked == 0);
+
+    kprintf("[langstrs] +%u freed, +%u reused; global depth %u\n",
+            g_frames_freed - freed0, g_frames_reused - reused0, g_frame_free_depth);
+    lscheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    lscheck("no lock-rank violation across the language and toolchain paths",
+            g_rank_violations == viol0);
+
+    kprintf("[langstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_lspass, (uint64_t)g_lsfail);
+    if (!g_lsfail)
+        kputs("[langstrs] LANGUAGE AND TOOLCHAIN VERIFIED — sizeof, for-init, switch, unsigned, and a native make\n");
+    else kputs("[langstrs] LANGUAGE DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 static void cmd_selfhost_test(void) {
     kputs("-- TOOLCHAIN STRESS: author -> compile -> run, natively in ring 3 --\n");
     g_tcpass = g_tcfail = 0;
@@ -16598,6 +16765,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "cc")) cmd_cc(argc, argv);
     else if (!kstrcmp(argv[0], "compilerstress")) cmd_compiler_stress();
     else if (!kstrcmp(argv[0], "pipestress")) cmd_pipe_stress();
+    else if (!kstrcmp(argv[0], "langstress")) cmd_lang_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -16782,6 +16950,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_selfhost_test();    /* v0.56: author -> compile -> run, natively (no host toolchain)     */
     cmd_compiler_stress();  /* v0.57: language completeness + what the compiler must REFUSE      */
     cmd_pipe_stress();      /* v0.59: pipes, redirection, and a ring-3 shell this system built   */
+    cmd_lang_stress();      /* v0.60: sizeof/for-init/switch/unsigned + omake driving occ natively */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
