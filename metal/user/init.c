@@ -82,6 +82,17 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_GETPPID             55
 #define SYS_WAITPID             56
 #define SYS_SIGUNMASK           57
+#define SYS_BRK                 58
+#define SYS_EXECVE_PATH         59
+#define SYS_TTY_READ            60
+#define SYS_STAT                61
+/* v0.59. SYS_PIPE fills TWO 64-BIT WORDS: out[0] read end, out[1] write end.
+ * SYS_SETREDIR(which, fd) points stdin (0) or stdout (1) at a descriptor, or
+ * -1 for the console; it is kproc state, so it survives SYS_EXECVE_PATH. */
+#define SYS_PIPE                62
+#define SYS_SETREDIR            63
+/* Mirrors the kernel's HEAP_USER_V (kernel64.c is the master). */
+#define HEAP_USER_V_LO 0x0000570000000000ull
 
 #define SIGINT   2
 #define SIGKILL  9
@@ -1029,7 +1040,12 @@ static void app_sysmon(int frames) {
 }
 
 /* ---- APP 3: FILE INSPECTOR — VFS browser + hex/bitmap view ----------------- */
-struct rd_ent { u32 len, used; char name[32]; };
+/* Mirrors the kernel's SYS_READDIR output record exactly (kernel64.c case 45 is
+ * the master). v0.56 widened it from 32 to 64 name bytes for hierarchical paths,
+ * so this MUST move in lockstep — a stale 40-byte struct here would have the
+ * kernel write 72 bytes into it. */
+#define VFS_NAME_MAX 64
+struct rd_ent { u32 len, used; char name[VFS_NAME_MAX]; };
 
 static void app_filer(int frames) {
     struct app_win W;
@@ -1295,8 +1311,15 @@ static void oyield(void)              { sysc(SYS_YIELD, 0, 0, 0); }
  * child resumes at this very instruction with everything else identical. No
  * userland continuation trampoline is involved. */
 static i64 ofork(void)                { return (i64)sysc(SYS_FORK, 0, 0, 0); }
-static i64 oexecve(const char **argv, const char **envp, u64 role) {
+/* v0.55's exec: re-run THIS SAME boot image under a different role. It predates
+ * being able to load anything else and every v0.55 suite still uses it. */
+static i64 oexec_role(const char **argv, const char **envp, u64 role) {
     return (i64)sysc(SYS_EXECVE, (u64)argv, (u64)envp, role);
+}
+/* v0.56: the real POSIX-shaped exec — replace this image with an ARBITRARY ELF
+ * loaded from the VFS by path. Returns only on failure. */
+static i64 oexecve(const char *path, const char **argv, const char **envp) {
+    return (i64)sysc(SYS_EXECVE_PATH, (u64)path, (u64)argv, (u64)envp);
 }
 /* Non-blocking: -11 = still running, -10 = not our child. See the changelog —
  * this kernel has no ring-3 sleep/wake queue yet, so waiters poll + yield. */
@@ -1330,13 +1353,19 @@ static void stdio_init(void) {
     for (int i = 0; i < OFD_MAX; i++) g_ofd[i] = -1;
     g_ofd[STDIN_FILENO] = g_ofd[STDOUT_FILENO] = g_ofd[STDERR_FILENO] = OFD_CONSOLE;
 }
-static int oopen(const char *path) {
-    i64 k = (i64)sysc(SYS_OPEN, (u64)path, 0, 0);
+/* v0.56: O_CREAT is bit 0 of the flags word. Creation is explicit — plain
+ * oopen() still fails on a missing name, which is what every pre-existing
+ * "prove this file is gone" check depends on. */
+#define O_CREAT 1
+static int oopen_flags(const char *path, u64 flags) {
+    i64 k = (i64)sysc(SYS_OPEN, (u64)path, flags, 0);
     if (k < 0) return (int)k;
     for (int i = 3; i < OFD_MAX; i++) if (g_ofd[i] == -1) { g_ofd[i] = (int)k; return i; }
     sysc(SYS_CLOSE, (u64)k, 0, 0);
     return -24;                                          /* EMFILE */
 }
+static int oopen(const char *path)  { return oopen_flags(path, 0); }
+static int ocreat(const char *path) { return oopen_flags(path, O_CREAT); }
 static i64 owrite(int fd, const char *buf, u64 n) {
     if (fd < 0 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;          /* EBADF */
     if (g_ofd[fd] == OFD_CONSOLE) {
@@ -1360,6 +1389,109 @@ static int oclose(int fd) {
     sysc(SYS_CLOSE, (u64)g_ofd[fd], 0, 0);
     g_ofd[fd] = -1;
     return 0;
+}
+
+/* ---- heap: sbrk + malloc/free/realloc --------------------------------------
+ * Ring 3 had no heap at all before v0.56 — every buffer in this file was a
+ * static or a stack array. The compiler needs real dynamic allocation (symbol
+ * tables, a token buffer, the output image), so here is the smallest allocator
+ * that is actually correct: a first-fit free list over a brk-grown arena, with
+ * boundary tags so free() can coalesce with its neighbours.
+ *
+ * Blocks are 16-byte aligned and carry an 8-byte header holding the payload
+ * size plus a "in use" bit. Coalescing is forward-only against the next block,
+ * which is enough to keep the compiler's alloc/free churn from fragmenting the
+ * arena while staying small enough to audit by eye.                          */
+static u64 obrk(u64 want) { return sysc(SYS_BRK, want, 0, 0); }
+
+#define OH_USED 1ull
+/* The header is padded to 16 bytes ON PURPOSE. Payload sizes are rounded up to
+ * 16, and the arena starts page-aligned, so a 16-byte header keeps EVERY block's
+ * payload 16-byte aligned by induction. An 8-byte header would have alternated
+ * between 8- and 16-aligned payloads (caught live: exit 984). */
+struct oblk { u64 size; u64 _pad; };  /* payload size | OH_USED; payload follows */
+static u8 *g_heap_lo, *g_heap_hi;     /* arena bounds: [lo, hi) of block space   */
+
+static void *osbrk(u64 inc) {
+    u64 cur = obrk(0);
+    if (!g_heap_lo) g_heap_lo = g_heap_hi = (u8 *)cur;
+    if (!inc) return g_heap_hi;
+    u64 got = obrk(cur + inc);
+    if (got < cur + inc) return 0;    /* kernel could not map it: honest failure */
+    u8 *old = g_heap_hi;
+    g_heap_hi = (u8 *)got;
+    return old;
+}
+
+static void *omalloc(u64 n) {
+    if (!n) return 0;
+    n = (n + 15) & ~15ull;                        /* 16-byte payload alignment   */
+    if (!g_heap_lo) osbrk(0);
+    /* first fit over the block chain */
+    for (u8 *p = g_heap_lo; p + sizeof(struct oblk) <= g_heap_hi; ) {
+        struct oblk *b = (struct oblk *)p;
+        u64 sz = b->size & ~OH_USED;
+        if (!sz) break;                            /* uninitialised tail          */
+        if (!(b->size & OH_USED) && sz >= n) {
+            /* split when the remainder can hold a header plus a 16-byte payload */
+            if (sz >= n + sizeof(struct oblk) + 16) {
+                struct oblk *nx = (struct oblk *)(p + sizeof(struct oblk) + n);
+                nx->size = sz - n - sizeof(struct oblk);
+                b->size = n;
+            }
+            b->size |= OH_USED;
+            return p + sizeof(struct oblk);
+        }
+        p += sizeof(struct oblk) + sz;
+    }
+    /* nothing reusable: extend the arena. Grow in 64 KiB steps so a compiler
+     * doing many small allocations does not make a syscall per allocation.   */
+    u64 need = sizeof(struct oblk) + n;
+    u64 step = need > 65536 ? need : 65536;
+    u8 *base = (u8 *)osbrk(step);
+    if (!base) return 0;
+    struct oblk *b = (struct oblk *)base;
+    b->size = n | OH_USED;
+    if (step >= need + sizeof(struct oblk) + 16) { /* park the remainder as free */
+        struct oblk *nx = (struct oblk *)(base + sizeof(struct oblk) + n);
+        nx->size = step - need - sizeof(struct oblk);
+    }
+    return base + sizeof(struct oblk);
+}
+
+static void ofree(void *q) {
+    if (!q) return;
+    struct oblk *b = (struct oblk *)((u8 *)q - sizeof(struct oblk));
+    b->size &= ~OH_USED;
+    /* forward coalesce: absorb the next block while it is also free */
+    for (;;) {
+        u8 *nxp = (u8 *)b + sizeof(struct oblk) + (b->size & ~OH_USED);
+        if (nxp + sizeof(struct oblk) > g_heap_hi) break;
+        struct oblk *nx = (struct oblk *)nxp;
+        if (nx->size & OH_USED) break;
+        u64 nsz = nx->size & ~OH_USED;
+        if (!nsz) break;
+        b->size = (b->size & ~OH_USED) + sizeof(struct oblk) + nsz;
+    }
+}
+
+static void *ocalloc(u64 cnt, u64 sz) {
+    u64 n = cnt * sz;
+    u8 *q = (u8 *)omalloc(n);
+    if (q) for (u64 i = 0; i < n; i++) q[i] = 0;
+    return q;
+}
+
+static void *orealloc(void *q, u64 n) {
+    if (!q) return omalloc(n);
+    struct oblk *b = (struct oblk *)((u8 *)q - sizeof(struct oblk));
+    u64 old = b->size & ~OH_USED;
+    if (old >= n) return q;
+    u8 *nq = (u8 *)omalloc(n);
+    if (!nq) return 0;
+    for (u64 i = 0; i < old; i++) nq[i] = ((u8 *)q)[i];
+    ofree(q);
+    return nq;
 }
 
 /* ---- argc / argv / envp ---------------------------------------------------*/
@@ -1658,7 +1790,7 @@ static void posix_thread_worker(void) {
 static void posix_exec_parent(void) {
     static const char *argv[] = { "posix-exec", "MARKER-55", 0 };
     static const char *envp[] = { "OUTRUN_EXEC=yes", "STAGE=exec", 0 };
-    oexecve(argv, envp, 33);                         /* becomes role 33; never returns */
+    oexec_role(argv, envp, 33);                      /* becomes role 33; never returns */
     sysc(SYS_EXIT, 921, 0, 0);                       /* execve failed */
 }
 static void posix_exec_child(void) {
@@ -1695,28 +1827,38 @@ static void posix_fd_worker(void) {
 
     int fd = oopen("motd");
     if (fd >= 0 && fd < 3) sysc(SYS_EXIT, 961, 0, 0);   /* collided with the std three */
+    char buf[64]; i64 pn = 0;
     if (fd >= 3) {
-        char buf[64];
-        if (oread(fd, buf, sizeof buf - 1) <= 0) sysc(SYS_EXIT, 964, 0, 0);
+        pn = oread(fd, buf, sizeof buf - 1);
+        if (pn <= 0) sysc(SYS_EXIT, 964, 0, 0);
     }
 
     i64 r = ofork();
     if (r == 0) {                                       /* ---- CHILD ---- */
         /* The userland table is ordinary process memory, so fork inherits it
          * byte for byte: the child sees the same fd numbers bound the same way,
-         * and the console-backed std three work immediately. The KERNEL
-         * descriptor underneath is deliberately NOT duplicated (each kernel fd
-         * has exactly one owning kproc, which is what lets the teardown hooks
-         * guarantee no leaks) — so a read through an inherited FILE fd must be
-         * DENIED cleanly rather than silently reading another process's file.
-         * That containment is the property asserted here. */
+         * and the console-backed std three work immediately.
+         *
+         * v0.59 INVERTED THE ASSERTION BELOW, deliberately. Through v0.58 the
+         * kernel descriptor under an inherited fd was NOT duplicated — each
+         * kernel fd had exactly one owning kproc — so this test required a read
+         * through an inherited FILE fd to be DENIED, and called that
+         * containment. With ofile.owner_mask the child is a genuine co-owner,
+         * so the read must now SUCCEED and return the same bytes the parent
+         * saw. That is POSIX behaviour and the thing pipelines are built on;
+         * the leak guarantee it used to protect is now kept by refcounting
+         * (the entry survives until BOTH owners drop it) rather than by
+         * forbidding the share. */
         if (g_ofd[STDOUT_FILENO] != OFD_CONSOLE) sysc(SYS_EXIT, 963, 0, 0);
         if (g_ofd[STDERR_FILENO] != OFD_CONSOLE) sysc(SYS_EXIT, 963, 0, 0);
         oputs("  [posix ] child wrote through the inherited stdout mapping\n");
         if (fd >= 3) {
             char b2[64];
             if (g_ofd[fd] < 0) sysc(SYS_EXIT, 963, 0, 0);        /* table not inherited */
-            if (oread(fd, b2, sizeof b2 - 1) >= 0) sysc(SYS_EXIT, 969, 0, 0);  /* must be denied */
+            i64 cn = oread(fd, b2, sizeof b2 - 1);
+            if (cn != pn) sysc(SYS_EXIT, 969, 0, 0);   /* inherited fd must READ, and read the same */
+            for (i64 k = 0; k < cn; k++)
+                if (b2[k] != buf[k]) sysc(SYS_EXIT, 969, 0, 0);
         }
         sysc(SYS_EXIT, 42, 0, 0);
     }
@@ -1726,6 +1868,929 @@ static void posix_fd_worker(void) {
     if (fd >= 3 && oclose(fd) != 0)   sysc(SYS_EXIT, 966, 0, 0);
     if (oclose(STDOUT_FILENO) == 0)   sysc(SYS_EXIT, 967, 0, 0);  /* stdout is not closable */
     sysc(SYS_EXIT, 960, 0, 0);
+}
+
+/* --- role 35: the ring-3 heap ---------------------------------------------
+ * Exit codes: 980 = every check passed. The individual failures are numbered so
+ * a boot log names the exact property that broke rather than just "the heap". */
+static void posix_heap_worker(void) {
+    /* sbrk(0) must report a break inside the heap window before anything is
+     * allocated, and must not move on its own. */
+    u64 b0 = obrk(0);
+    if (b0 != HEAP_USER_V_LO)            sysc(SYS_EXIT, 981, 0, 0);
+    if (obrk(0) != b0)                   sysc(SYS_EXIT, 982, 0, 0);
+
+    /* Allocations must be distinct, 16-byte aligned, and independently writable
+     * — the last part is what actually proves the pages are mapped RW. */
+    #define NB 24
+    u8 *v[NB];
+    for (int i = 0; i < NB; i++) {
+        v[i] = (u8 *)omalloc((u64)(i + 1) * 37);
+        if (!v[i])                       sysc(SYS_EXIT, 983, 0, 0);
+        if (((u64)v[i] & 15) != 0)       sysc(SYS_EXIT, 984, 0, 0);
+        for (u64 k = 0; k < (u64)(i + 1) * 37; k++) v[i][k] = (u8)(i + 1);
+    }
+    for (int i = 0; i < NB; i++)          /* no allocation overlapped another  */
+        for (u64 k = 0; k < (u64)(i + 1) * 37; k++)
+            if (v[i][k] != (u8)(i + 1))  sysc(SYS_EXIT, 985, 0, 0);
+
+    if (obrk(0) <= b0)                   sysc(SYS_EXIT, 986, 0, 0);  /* brk grew */
+
+    /* free + realloc: freed space must be reusable, and realloc must preserve
+     * contents when it relocates. */
+    for (int i = 0; i < NB; i += 2) ofree(v[i]);
+    u8 *big = (u8 *)omalloc(4096);
+    if (!big)                            sysc(SYS_EXIT, 987, 0, 0);
+    for (int k = 0; k < 4096; k++) big[k] = (u8)(k & 0xFF);
+    u8 *grown = (u8 *)orealloc(big, 16384);
+    if (!grown)                          sysc(SYS_EXIT, 988, 0, 0);
+    for (int k = 0; k < 4096; k++)
+        if (grown[k] != (u8)(k & 0xFF))  sysc(SYS_EXIT, 989, 0, 0);
+
+    /* Churn: many alloc/free cycles must not walk the break upward without
+     * bound — that is the difference between a free list and a leak. */
+    u64 before = obrk(0);
+    for (int r = 0; r < 400; r++) {
+        u8 *t = (u8 *)omalloc(512);
+        if (!t)                          sysc(SYS_EXIT, 990, 0, 0);
+        t[0] = 1; t[511] = 2;
+        ofree(t);
+    }
+    if (obrk(0) != before)               sysc(SYS_EXIT, 991, 0, 0);  /* reused! */
+
+    /* The kernel must refuse a break outside the window rather than map wild. */
+    if (obrk(1) != obrk(0))              sysc(SYS_EXIT, 992, 0, 0);
+
+    sysc(SYS_EXIT, 980, 0, 0);
+}
+
+/* ============================================================================
+ * v0.56 Stage E: the native compiler is part of this image (see user/occ.c).
+ * Included rather than linked because the Makefile builds exactly one ring-3
+ * translation unit; occ uses this file's heap, fd table and string helpers.
+ * ==========================================================================*/
+#include "occ.c"
+
+/* --- role 37: run occ ------------------------------------------------------
+ * argv is the command line: occ <source.c> <output.elf>. Diagnostics go to
+ * stderr, so a compile error lands in the Cyber-Terminal like any other
+ * program's output. Exit status is 0 on success. */
+#define OCC_MAXINPUT 8
+
+/* v0.57: the command line accepts SEVERAL sources.
+ *
+ *     occ a.c b.c c.c -o out.elf     explicit output
+ *     occ a.c out.elf                the legacy two-argument form
+ *
+ * The `-o` form is the real one. The positional form is kept because every
+ * existing caller uses it — including the self-hosting driver and the `cc`
+ * shell command — and silently changing what the last argument means would
+ * turn a working invocation into one that overwrites its own source. When no
+ * -o is given the LAST argument is the output, which is why a bare
+ * `occ a.c b.c` is rejected rather than guessed at: with no -o there is no way
+ * to tell a second input from an output path. */
+static void occ_main(int argc, const char **argv) {
+    const char *srcs[OCC_MAXINPUT];
+    int nsrc = 0;
+    const char *out = 0;
+
+    for (int i = 1; i < argc && argv[i]; i++) {
+        if (ostrneq(argv[i], "-o", 3)) {
+            if (i + 1 < argc && argv[i + 1]) out = argv[++i];
+            else { oputs("occ: -o needs a path\n"); sysc(SYS_EXIT, 902, 0, 0); }
+            continue;
+        }
+        if (nsrc < OCC_MAXINPUT) srcs[nsrc++] = argv[i];
+        else { oputs("occ: too many input files\n"); sysc(SYS_EXIT, 903, 0, 0); }
+    }
+
+    if (!out) {
+        /* legacy positional form: the last argument is the output */
+        if (nsrc < 2) {
+            oputs("usage: occ <source.c>... -o <output.elf>\n");
+            sysc(SYS_EXIT, 904, 0, 0);
+        }
+        out = srcs[--nsrc];
+    }
+    if (!nsrc) { oputs("occ: no input files\n"); sysc(SYS_EXIT, 905, 0, 0); }
+
+    int r = occ_compile(srcs, nsrc, out);
+    if (r == 0) oputs("  [occ   ] compiled OK\n");
+    sysc(SYS_EXIT, r == 0 ? 0 : (u64)(900 + (-r)), 0, 0);
+}
+
+/* --- role 36: execve BY PATH ----------------------------------------------
+ * Replaces this image with /bin/init loaded out of the VFS. The exec'd copy is
+ * the same program, so it must be told what to do through argv rather than
+ * through its role — which is exactly the point: it proves the path-loaded
+ * image received a real argv and envp built by the kernel on its new stack.
+ * The child (see main() below) exits 970. */
+static void posix_execpath_worker(void) {
+    static const char *argv[] = { "/bin/init", "exec-child", 0 };
+    static const char *envp[] = { "EXECD_BY=path", 0 };
+    oexecve("/bin/init", argv, envp);          /* never returns on success */
+    sysc(SYS_EXIT, 971, 0, 0);                 /* execve failed */
+}
+
+/* --- role 38: SELF-HOSTING ------------------------------------------------
+ * The whole point of the milestone in one worker: author a C source file from
+ * ring 3, compile it with the native compiler running as a separate process,
+ * then run the binary that compiler produced. Nothing here touches a host
+ * toolchain, and the only thing linking the three steps is the filesystem.
+ *
+ * v0.56 Stage F: the program it authors now CALLS THE SDK — strlen, strcmp,
+ * strcpy, atoi, malloc, putdec and puts all come from /usr/lib/libc.oc, which
+ * occ prepends to the translation unit. That is deliberate: it is the only
+ * check that can tell a real /usr/lib from a directory of props. Nothing in
+ * this source defines those names, so if the prelude were not being read the
+ * compile would fail with "undefined function" and this worker would exit 944
+ * rather than quietly passing.
+ *
+ * The expected answer is built from pieces that each prove a different thing:
+ *     0+1+..+7 = 28   the for loop and local arithmetic
+ *     fib(10)  = 55   recursion through the fixup table
+ *     strlen   =  6   byte addressing via __ldb (a[i] alone cannot do this)
+ *     atoi     = 11   byte addressing plus the digit loop
+ *     (1<<4)|3 = 19   the shift and bitwise-or levels
+ *     BONUS    =  7   v0.57: an object-like #define
+ *     ADD(1,2) =  3   v0.57: a function-like #define with arguments
+ *     PPOK     =  5   v0.57: #ifdef took the taken branch (the other is 999,
+ *                     so picking wrong is unmissable rather than off-by-one)
+ *     GUARD_OK =  2   v0.57: #ifndef — the shape every header guard uses
+ *     n1.in.a+b =  7   v0.57: NESTED struct member reads through two levels
+ *     helper2(2) = 4   v0.57: a CROSS-UNIT call into /src/lib2.c, which itself
+ *                     calls fib() back in this file — 2 + fib(3) = 4
+ *                ---
+ *                147
+ *
+ * The struct block also returns 910-918 on specific failures rather than a
+ * wrong total, so a broken offset says WHICH property broke. The two that
+ * matter most:
+ *   n1.tag = 300 then n1.tag == 44  — a `char` member is stored ONE byte
+ *     wide (300 & 0xFF == 44). A qword store here would also flatten val,
+ *     which is why n1.val is re-checked immediately after.
+ *   u.word = 0; u.byte = 7; u.word == 7  — a union really overlays its
+ *     members at offset 0.
+ *
+ * Exit 940 = the produced binary ran and returned exactly that. */
+/* v0.57: the source now starts with REAL preprocessing. Every line above main()
+ * is load-bearing: the three #includes are resolved against /usr/include on the
+ * VFS and their prototypes are parsed, SYS_WRITE comes from outrun_abi.h rather
+ * than a hardcoded 0, ADD is a function-like macro, and the #ifdef/#else pair
+ * proves conditional compilation picks the taken branch and discards the other.
+ * If any of that silently did nothing, the arithmetic below stops adding up. */
+/* v0.57 Stage C: a header shared by BOTH units, authored next to them so the
+ * quoted #include form has to resolve it relative to /src/ rather than
+ * /usr/include. Because each unit is preprocessed with a fresh macro table,
+ * this header's guard is fresh too and its text really is pasted into both —
+ * which is exactly why occ accepts a struct redefinition whose layout is
+ * identical and rejects one whose layout is not. */
+#define SELF_HDR \
+  "#ifndef SHARED_H\n" \
+  "#define SHARED_H 1\n" \
+  "struct Inner { int a; int b; };\n" \
+  "struct Outer { char tag; int val; struct Inner in; struct Outer *next; };\n" \
+  "union U { int word; char byte; };\n" \
+  "typedef struct Outer Node;\n" \
+  "int helper2(int x);\n" \
+  "int fib(int n);\n" \
+  "#endif\n"
+
+/* The SECOND translation unit. It calls fib(), which is defined in the FIRST
+ * one, and is itself called from the first — so a single compile has to resolve
+ * a reference in each direction: backward to an already-emitted function, and
+ * forward through the fixup table to one that does not exist yet. It also uses
+ * Node, proving the shared header reached this unit too. */
+#define SELF_SRC2 \
+  "#include \"shared.h\"\n" \
+  "int helper2(int x) { return x + fib(3); }\n" \
+  "int tag_of(Node *p) { return p->tag; }\n"
+
+#define SELF_SRC \
+  "#include <stdio.h>\n" \
+  "#include <string.h>\n" \
+  "#include <outrun_abi.h>\n" \
+  "#define BONUS 7\n" \
+  "#define ADD(a,b) ((a) + (b))\n" \
+  "#define WANT_PP 1\n" \
+  "#ifdef WANT_PP\n" \
+  "#define PPOK 5\n" \
+  "#else\n" \
+  "#define PPOK 999\n" \
+  "#endif\n" \
+  "#ifndef NOT_DEFINED\n" \
+  "#define GUARD_OK 2\n" \
+  "#endif\n" \
+  "#include \"shared.h\"\n" \
+  "int bump(Node *p) { p->val = p->val + 1; return p->val; }\n" \
+  "int fib(int n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }\n" \
+  "int main() {\n" \
+  "  int s; int i; char *p;\n" \
+  "  s = 0;\n" \
+  "  for (i = 0; i < 8; i = i + 1) { s = s + i; }\n" \
+  "  s = s + fib(10);\n" \
+  "  s = s + strlen(\"outrun\");\n" \
+  "  s = s + atoi(\"11\");\n" \
+  "  if (strcmp(\"abc\", \"abc\") != 0) { return 901; }\n" \
+  "  if (strcmp(\"abc\", \"abd\") == 0) { return 902; }\n" \
+  "  p = malloc(64);\n" \
+  "  if (p == 0) { return 903; }\n" \
+  "  strcpy(p, \"sdk\");\n" \
+  "  if (strlen(p) != 3) { return 904; }\n" \
+  "  if (__ldb(p, 0) != 115) { return 905; }\n" \
+  "  s = s + ((1 << 4) | 3);\n" \
+  "  s = s + BONUS;\n" \
+  "  s = s + ADD(1, 2);\n" \
+  "  s = s + PPOK;\n" \
+  "  s = s + GUARD_OK;\n" \
+  "  { Node n1; Node n2; union U u;\n" \
+  "    n1.tag = 65; n1.val = 10; n1.in.a = 3; n1.in.b = 4; n1.next = &n2;\n" \
+  "    n2.tag = 66; n2.val = 20; n2.in.a = 0; n2.in.b = 0; n2.next = 0;\n" \
+  "    if (n1.tag != 65) { return 910; }\n" \
+  "    if (n1.in.a + n1.in.b != 7) { return 911; }\n" \
+  "    if (n1.next->val != 20) { return 912; }\n" \
+  "    if (bump(&n2) != 21) { return 913; }\n" \
+  "    if (n1.next->val != 21) { return 914; }\n" \
+  "    n1.next->in.b = 9;\n" \
+  "    if (n2.in.b != 9) { return 915; }\n" \
+  "    u.word = 0; u.byte = 7;\n" \
+  "    if (u.word != 7) { return 916; }\n" \
+  "    n1.tag = 300;\n" \
+  "    if (n1.tag != 44) { return 917; }\n" \
+  "    if (n1.val != 10) { return 918; }\n" \
+  "    if (tag_of(&n1) != 44) { return 919; }\n" \
+  "    { char cb[8]; int iv[4]; int j;\n" \
+  "      strcpy(cb, \"abc\");\n" \
+  "      if (strlen(cb) != 3) { return 920; }\n" \
+  "      if (cb[0] != 97) { return 921; }\n" \
+  "      if (cb[2] != 99) { return 922; }\n" \
+  "      cb[1] = 90;\n" \
+  "      if (cb[1] != 90) { return 923; }\n" \
+  "      if (cb[0] != 97) { return 924; }\n" \
+  "      if (cb[2] != 99) { return 925; }\n" \
+  "      j = 0; while (j < 4) { iv[j] = j * 100; j = j + 1; }\n" \
+  "      if (iv[0] != 0) { return 926; }\n" \
+  "      if (iv[3] != 300) { return 927; }\n" \
+  "      if ((&cb[1]) - (&cb[0]) != 1) { return 928; }\n" \
+  "      if ((&iv[1]) - (&iv[0]) != 8) { return 929; }\n" \
+  "    }\n" \
+  "    s = s + n1.in.a + n1.in.b;\n" \
+  "    s = s + helper2(2);\n" \
+  "  }\n" \
+  "  __syscall(SYS_WRITE, \"  [a.out ] SYS_WRITE came from <outrun_abi.h>\\n\", 0, 0);\n" \
+  "  puts(\"  [a.out ] compiled by occ against /usr/lib/libc.oc; main returns \");\n" \
+  "  putdec(s); puts(\"\\n\");\n" \
+  "  return s;\n" \
+  "}\n"
+
+static int ounlink(const char *path) { return (int)(i64)sysc(SYS_VFS_UNLINK, (u64)path, 0, 0); }
+
+/* Author one file into the VFS; returns 0 on success. */
+static int selfhost_author(const char *path, const char *text) {
+    int fd = ocreat(path);
+    if (fd < 0) return -1;
+    if (owrite(fd, text, ostrlen(text) + 1) <= 0) { oclose(fd); return -2; }
+    oclose(fd);
+    return 0;
+}
+
+/* --- role 40: pipe mechanics (the ring-3 half of `pipestrs`) ---------------
+ *
+ * Works on RAW kernel descriptors rather than through g_ofd[], because a pipe
+ * end IS a kernel descriptor and layering the userland table over it would
+ * only put a second mapping between the assertion and the thing asserted.
+ *
+ * Exit codes name the broken property, in the 95x family:
+ *   950 all assertions held      955 EOF not reported once the last writer left
+ *   951 SYS_PIPE failed          956 EPIPE not reported with no reader left
+ *   952 round trip corrupted     957 cross-process transfer failed
+ *   953 EAGAIN not reported      958 redirection failed
+ *   954 buffer bound wrong       959 fork failed
+ */
+static void pipe_worker(void) {
+    u64 fds[2];
+    char buf[128];
+    int i;
+    const char *msg = "outrun-pipe";
+    u64 mlen = ostrlen(msg);
+
+    /* 1. a pipe hands back two DISTINCT descriptors. */
+    if ((i64)sysc(SYS_PIPE, (u64)fds, 0, 0) != 0)          sysc(SYS_EXIT, 951, 0, 0);
+    int rfd = (int)fds[0], wfd = (int)fds[1];
+    if (rfd < 0 || wfd < 0 || rfd == wfd)                  sysc(SYS_EXIT, 951, 0, 0);
+
+    /* 2. bytes survive the round trip, in order. */
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)wfd, (u64)msg, mlen) != (i64)mlen)
+                                                           sysc(SYS_EXIT, 952, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, sizeof buf) != (i64)mlen)
+                                                           sysc(SYS_EXIT, 952, 0, 0);
+    for (i = 0; i < (int)mlen; i++) if (buf[i] != msg[i])   sysc(SYS_EXIT, 952, 0, 0);
+
+    /* 3. EMPTY but a writer still exists: that is "not yet" (EAGAIN), NOT end
+     *    of file. A reader that confuses the two exits early on a slow
+     *    producer, which is the single most common way to break a pipeline. */
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, 8) != -11)  sysc(SYS_EXIT, 953, 0, 0);
+
+    /* 4. the buffer is FINITE, and says so honestly: a write larger than the
+     *    free space is SHORT (never a silent truncation), and a write with no
+     *    space at all is EAGAIN. The exact capacity is deliberately not
+     *    asserted here — only that the bound exists and is reported. */
+    static char big[4096];
+    for (i = 0; i < 4096; i++) big[i] = (char)('a' + (i % 26));
+    i64 w = (i64)sysc(SYS_WRITE_FILE, (u64)wfd, (u64)big, 4096);
+    if (w <= 0 || w >= 4096)                                sysc(SYS_EXIT, 954, 0, 0);
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)wfd, (u64)big, 8) != -11)
+                                                            sysc(SYS_EXIT, 954, 0, 0);
+    u64 drained = 0;
+    while (drained < (u64)w) {
+        i64 n = (i64)sysc(SYS_READ, (u64)rfd, (u64)buf, sizeof buf);
+        if (n <= 0)                                         sysc(SYS_EXIT, 954, 0, 0);
+        drained += (u64)n;
+    }
+    if (drained != (u64)w)                                  sysc(SYS_EXIT, 954, 0, 0);
+
+    /* 5. the LAST writer closing turns the same empty read into a real EOF. */
+    sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, 8) != 0)    sysc(SYS_EXIT, 955, 0, 0);
+    sysc(SYS_CLOSE, (u64)rfd, 0, 0);
+
+    /* 6. writing with no reader left can never succeed, so it must fail loudly
+     *    rather than block forever. */
+    if ((i64)sysc(SYS_PIPE, (u64)fds, 0, 0) != 0)           sysc(SYS_EXIT, 951, 0, 0);
+    rfd = (int)fds[0]; wfd = (int)fds[1];
+    sysc(SYS_CLOSE, (u64)rfd, 0, 0);
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)wfd, (u64)msg, mlen) != -32)
+                                                            sysc(SYS_EXIT, 956, 0, 0);
+    sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+
+    /* 7. ACROSS A FORK — the property the whole milestone exists for. The
+     *    child inherits both ends, writes through its own, and closes it. The
+     *    parent drops its write end FIRST, so the EOF the parent finally sees
+     *    can only have come from the child's close: that is what proves the
+     *    refcount is per-DESCRIPTOR and not per-process. */
+    const char *cmsg = "child-says-hi";
+    u64 clen = ostrlen(cmsg);
+    if ((i64)sysc(SYS_PIPE, (u64)fds, 0, 0) != 0)           sysc(SYS_EXIT, 951, 0, 0);
+    rfd = (int)fds[0]; wfd = (int)fds[1];
+    i64 r = ofork();
+    if (r == 0) {
+        sysc(SYS_CLOSE, (u64)rfd, 0, 0);                    /* not the child's end */
+        sysc(SYS_WRITE_FILE, (u64)wfd, (u64)cmsg, clen);
+        sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+        sysc(SYS_EXIT, 43, 0, 0);
+    }
+    if (r < 0)                                              sysc(SYS_EXIT, 959, 0, 0);
+    sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+    u64 tot = 0; int spins = 0;
+    while (tot < clen && spins < 200000) {
+        i64 n = (i64)sysc(SYS_READ, (u64)rfd, (u64)(buf + tot), sizeof buf - tot);
+        if (n > 0) tot += (u64)n;
+        else if (n == 0) break;                             /* EOF before the payload */
+        else if (n == -11) { sysc(SYS_YIELD, 0, 0, 0); spins++; }
+        else                                                sysc(SYS_EXIT, 957, 0, 0);
+    }
+    if (tot != clen)                                        sysc(SYS_EXIT, 957, 0, 0);
+    for (i = 0; i < (int)clen; i++) if (buf[i] != cmsg[i])  sysc(SYS_EXIT, 957, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, 8) != 0)    sysc(SYS_EXIT, 957, 0, 0);
+    sysc(SYS_CLOSE, (u64)rfd, 0, 0);
+    if (owaitpid((u32)r, 30000) != 43)                      sysc(SYS_EXIT, 957, 0, 0);
+
+    /* 8. REDIRECTION into a pipe: an ordinary SYS_WRITE, which knows nothing
+     *    about any of this, lands in the pipe instead of on the console. */
+    if ((i64)sysc(SYS_PIPE, (u64)fds, 0, 0) != 0)           sysc(SYS_EXIT, 951, 0, 0);
+    rfd = (int)fds[0]; wfd = (int)fds[1];
+    if ((i64)sysc(SYS_SETREDIR, 1, (u64)(i64)wfd, 0) != 0)  sysc(SYS_EXIT, 958, 0, 0);
+    sysc(SYS_WRITE, (u64)"redirected", 0, 0);
+    sysc(SYS_SETREDIR, 1, (u64)(i64)-1, 0);                 /* back to the console */
+    sysc(SYS_CLOSE, (u64)wfd, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, sizeof buf) != 10)
+                                                            sysc(SYS_EXIT, 958, 0, 0);
+    for (i = 0; i < 10; i++) if (buf[i] != "redirected"[i]) sysc(SYS_EXIT, 958, 0, 0);
+    sysc(SYS_CLOSE, (u64)rfd, 0, 0);
+
+    /* 9. REDIRECTION into a FILE, twice, to prove the write APPENDS. A
+     *    redirected stdout is a stream of writes and the store's write
+     *    primitive replaces whole files, so this is the case that would
+     *    silently keep only the last line if the append staging were wrong. */
+    i64 k = (i64)sysc(SYS_OPEN, (u64)"tmp/redir.txt", 1, 0);   /* O_CREAT */
+    if (k < 0)                                              sysc(SYS_EXIT, 958, 0, 0);
+    if ((i64)sysc(SYS_SETREDIR, 1, (u64)k, 0) != 0)         sysc(SYS_EXIT, 958, 0, 0);
+    sysc(SYS_WRITE, (u64)"one:", 0, 0);
+    sysc(SYS_WRITE, (u64)"two", 0, 0);
+    sysc(SYS_SETREDIR, 1, (u64)(i64)-1, 0);
+    sysc(SYS_CLOSE, (u64)k, 0, 0);
+    k = (i64)sysc(SYS_OPEN, (u64)"tmp/redir.txt", 0, 0);
+    if (k < 0)                                              sysc(SYS_EXIT, 958, 0, 0);
+    i64 fn = (i64)sysc(SYS_READ, (u64)k, (u64)buf, sizeof buf);
+    sysc(SYS_CLOSE, (u64)k, 0, 0);
+    if (fn != 7)                                            sysc(SYS_EXIT, 958, 0, 0);
+    for (i = 0; i < 7; i++) if (buf[i] != "one:two"[i])     sysc(SYS_EXIT, 958, 0, 0);
+
+    /* 10. THE HEAP SURVIVES FORK. Not strictly a pipe property, but it is the
+     *     other half of what a shell needs from fork and it was silently
+     *     missing until v0.59: the heap sits above the window boundary that
+     *     vm_clone_user used as its upper bound, so a forked child faulted on
+     *     its first access to malloc'd memory. Nothing caught it because no
+     *     suite forked and then used the heap — this one does. */
+    char *hp = (char *)omalloc(256);
+    if (!hp)                                                sysc(SYS_EXIT, 959, 0, 0);
+    for (i = 0; i < 256; i++) hp[i] = (char)(i & 0x7F);
+    i64 hr = ofork();
+    if (hr == 0) {
+        for (int k = 0; k < 256; k++)
+            if (hp[k] != (char)(k & 0x7F)) sysc(SYS_EXIT, 949, 0, 0);
+        hp[0] = 'X';                                        /* private, not shared */
+        sysc(SYS_EXIT, 44, 0, 0);
+    }
+    if (hr < 0)                                             sysc(SYS_EXIT, 959, 0, 0);
+    if (owaitpid((u32)hr, 30000) != 44)                     sysc(SYS_EXIT, 949, 0, 0);
+    if (hp[0] != 0)                                         sysc(SYS_EXIT, 949, 0, 0);  /* copy, not alias */
+
+    oputs("  [pipe  ] bounds, EAGAIN/EOF/EPIPE, fork inheritance, redirection "
+          "and heap-across-fork all hold\n");
+    sysc(SYS_EXIT, 950, 0, 0);
+}
+
+/* --- role 41: build /bin/vsh with occ, then run a real script through it ---
+ *
+ * This is the end-to-end claim of the milestone: the shell is COMPILED on the
+ * running system out of /src/vsh.c by /bin/occ, and then executes a script
+ * that uses `>` and `|` against programs that were themselves compiled the
+ * same way. Nothing here was built by a host toolchain.
+ *
+ * Two tiny filters are authored and compiled alongside it, because a pipeline
+ * needs something to pipe: /bin/emit writes a known string, /bin/wcx counts
+ * the bytes arriving on its stdin. wcx is the piece that proves a REDIRECTED
+ * READER works — it calls ttyread() exactly as an interactive program would,
+ * and gets the upstream stage's bytes instead of the keyboard.
+ *
+ * Exit codes, 96x family:
+ *   960 all good        963 authoring a source failed
+ *   961 a compile failed 964 vsh itself did not run
+ *   962 fork failed
+ */
+#define VSH_EMIT_SRC \
+  "int main() { puts(\"PIPEDATA\"); return 0; }\n"
+
+/* Counts stdin bytes and prints the count. The EAGAIN/EOF distinction is the
+ * whole subtlety: 0 means the upstream writer is gone for good, negative means
+ * "nothing yet, try again". Treating EAGAIN as EOF would report 0 bytes on any
+ * producer that was not already finished. */
+#define VSH_WCX_SRC \
+  "int main() {\n" \
+  "  int n; int t; char b[64];\n" \
+  "  t = 0;\n" \
+  "  while (1) {\n" \
+  "    n = ttyread(b, 64);\n" \
+  "    if (n == 0) { putdec(t); return 0; }\n" \
+  "    if (n < 0) { yield(); } else { t = t + n; }\n" \
+  "  }\n" \
+  "  return 0;\n" \
+  "}\n"
+
+#define VSH_SCRIPT \
+  "# generated by pipestrs\n" \
+  "/bin/emit > tmp/one.txt\n" \
+  "/bin/emit | /bin/wcx > tmp/two.txt\n"
+
+static int vsh_compile(const char *src, const char *out) {
+    i64 pid = ofork();
+    if (pid == 0) {
+        const char *av[] = { "/bin/occ", src, "-o", out, 0 };
+        const char *ev[] = { "STAGE=compile", 0 };
+        oexecve("/bin/occ", av, ev);
+        sysc(SYS_EXIT, 199, 0, 0);
+    }
+    if (pid < 0) return -1;
+    i64 st = owaitpid((u32)pid, 250000);
+    return st == 0 ? 0 : -1;
+}
+
+static void vsh_worker(void) {
+    if (selfhost_author("/src/emit.c", VSH_EMIT_SRC) < 0)  sysc(SYS_EXIT, 963, 0, 0);
+    if (selfhost_author("/src/wcx.c",  VSH_WCX_SRC)  < 0)  sysc(SYS_EXIT, 963, 0, 0);
+    if (selfhost_author("/src/t.vsh",  VSH_SCRIPT)   < 0)  sysc(SYS_EXIT, 963, 0, 0);
+
+    /* /src/vsh.c is published by the kernel's SDK, not authored here — the
+     * point is that the shipped source compiles, unmodified. */
+    if (vsh_compile("/src/vsh.c",  "/bin/vsh") < 0)        sysc(SYS_EXIT, 961, 0, 0);
+    if (vsh_compile("/src/emit.c", "/bin/emit") < 0)       sysc(SYS_EXIT, 961, 0, 0);
+    if (vsh_compile("/src/wcx.c",  "/bin/wcx") < 0)        sysc(SYS_EXIT, 961, 0, 0);
+    oputs("  [vsh   ] occ built /bin/vsh, /bin/emit and /bin/wcx from source\n");
+
+    i64 pid = ofork();
+    if (pid == 0) {
+        const char *av[] = { "/bin/vsh", "/src/t.vsh", 0 };
+        const char *ev[] = { "OUTRUN=1", 0 };
+        oexecve("/bin/vsh", av, ev);
+        sysc(SYS_EXIT, 199, 0, 0);
+    }
+    if (pid < 0)                                           sysc(SYS_EXIT, 962, 0, 0);
+    if (owaitpid((u32)pid, 250000) != 0)                   sysc(SYS_EXIT, 964, 0, 0);
+
+    oputs("  [vsh   ] /bin/vsh ran a script using '>' and '|'\n");
+    sysc(SYS_EXIT, 960, 0, 0);
+}
+
+static void posix_selfhost_worker(void) {
+    static const char *csrc  = SELF_SRC;
+    static const char *csrc2 = SELF_SRC2;
+    static const char *chdr  = SELF_HDR;
+    /* 1. author a shared header and TWO translation units into the VFS */
+    if (selfhost_author("/src/shared.h", chdr) < 0) sysc(SYS_EXIT, 941, 0, 0);
+    if (selfhost_author("/src/t.c",      csrc) < 0) sysc(SYS_EXIT, 942, 0, 0);
+    if (selfhost_author("/src/lib2.c",   csrc2) < 0) sysc(SYS_EXIT, 949, 0, 0);
+
+    /* 2. compile BOTH units in one invocation, in a separate process running
+     *    the real compiler. -o is the explicit output form. */
+    i64 pid = ofork();
+    if (pid == 0) {
+        static const char *av[] = { "/bin/occ", "/src/t.c", "/src/lib2.c",
+                                    "-o", "/bin/t.elf", 0 };
+        static const char *ev[] = { "STAGE=compile", 0 };
+        oexecve("/bin/occ", av, ev);
+        sysc(SYS_EXIT, 199, 0, 0);                /* exec failed */
+    }
+    if (pid < 0)                                  sysc(SYS_EXIT, 943, 0, 0);
+    /* v0.56 Stage F: the budget went from 60000 to 250000 spins, and a timeout
+     * now has its OWN exit code. With the SDK prelude in front of it the
+     * compiler has ~4 KiB more source to get through and emits an image nine
+     * times larger, and under TCG that pushed it past the old budget — the
+     * parent gave up while the child was still working, then reported the
+     * generic "child failed" 944 even though the compile went on to succeed
+     * and print "compiled OK". A wait that times out and a child that fails
+     * are different events and must not share an exit code. */
+    i64 cst = owaitpid((u32)pid, 250000);
+    if (cst == -11)                               sysc(SYS_EXIT, 947, 0, 0);
+    if (cst != 0)                                 sysc(SYS_EXIT, 944, 0, 0);
+
+    /* 3. run what the compiler produced */
+    pid = ofork();
+    if (pid == 0) {
+        static const char *av2[] = { "/bin/t.elf", 0 };
+        static const char *ev2[] = { 0 };
+        oexecve("/bin/t.elf", av2, ev2);
+        sysc(SYS_EXIT, 198, 0, 0);
+    }
+    if (pid < 0)                                  sysc(SYS_EXIT, 945, 0, 0);
+    i64 rst = owaitpid((u32)pid, 250000);
+    if (rst == -11)                               sysc(SYS_EXIT, 948, 0, 0);
+    /* 28 + 55 + 6 + 11 + 19 + 7 (BONUS) + 3 (ADD) + 5 (PPOK) + 2 (GUARD_OK)
+     * — see the SELF_SRC comment for what each proves.
+     * The value is PRINTED on failure: "the program returned the wrong answer"
+     * is not actionable, but "it returned 100" points straight at which of the
+     * five contributions above did not happen. */
+    if (rst != 147) {
+        oputs("  [self  ] the compiled program returned ");
+        sysc(SYS_WRITEHEX, (u64)rst, 0, 0);
+        oputs(" hex (want 93 hex = 147)\n");
+        sysc(SYS_EXIT, 946, 0, 0);
+    }
+
+    oputs("  [self  ] authored, compiled and RAN a program without a host toolchain\n");
+    sysc(SYS_EXIT, 940, 0, 0);
+}
+
+/* --- role 39: COMPILER COMPLETENESS (the ring-3 half of `compilerstrs`) ----
+ * Where role 38 proves the self-hosting LOOP works, this one interrogates the
+ * LANGUAGE. It authors a small project, compiles it, runs it, and then proves
+ * the compiler REJECTS four things it must reject — because a compiler that
+ * accepts everything is not a compiler that understands anything.
+ *
+ * The positive program checks its own struct offsets from the inside, using
+ * `&s.member - &s`. That is the strongest form this test can take: it is not
+ * comparing against numbers the compiler reported, it is measuring the
+ * addresses the compiler actually generated.
+ *
+ * Exit 950 = everything passed. Anything else names the step that failed.  */
+#define CS_HDR \
+  "#ifndef CS_HDR_H\n" \
+  "#define CS_HDR_H 1\n" \
+  "#define CS_ONE 1\n" \
+  "#define CS_TWO (CS_ONE + 1)\n" \
+  "#define CS_MUL(a,b) ((a) * (b))\n" \
+  "#ifdef CS_HDR_H\n" \
+  "#define CS_GUARDED 4\n" \
+  "#else\n" \
+  "#define CS_GUARDED 999\n" \
+  "#endif\n" \
+  "struct S1 { char a; int b; };\n" \
+  "struct S2 { char a; char b; int c; };\n" \
+  "struct N  { char t; struct S1 s; };\n" \
+  "union  U  { int w; char b; };\n" \
+  "typedef struct N Nest;\n" \
+  "int cs_sum(Nest *p);\n" \
+  "int cs_off_b(void);\n" \
+  "#endif\n"
+
+/* Unit A: main, plus a helper the OTHER unit calls back into. */
+#define CS_A \
+  "#include \"cs_hdr.h\"\n" \
+  "int cs_off_b(void) { struct S1 s; int base; int m; base = &s; m = &s.b; return m - base; }\n" \
+  "int main() {\n" \
+  "  struct S1 s1; struct S2 s2; Nest n; union U u;\n" \
+  "  int base;\n" \
+  "  if (CS_TWO != 2) { return 1; }\n" \
+  "  if (CS_MUL(3,4) != 12) { return 2; }\n" \
+  "  if (CS_GUARDED != 4) { return 3; }\n" \
+  "  base = &s1;\n" \
+  "  if ((&s1.a) - base != 0) { return 10; }\n" \
+  "  if ((&s1.b) - base != 8) { return 11; }\n" \
+  "  base = &s2;\n" \
+  "  if ((&s2.a) - base != 0) { return 12; }\n" \
+  "  if ((&s2.b) - base != 1) { return 13; }\n" \
+  "  if ((&s2.c) - base != 8) { return 14; }\n" \
+  "  base = &n;\n" \
+  "  if ((&n.t) - base != 0) { return 15; }\n" \
+  "  if ((&n.s) - base != 8) { return 16; }\n" \
+  "  if ((&n.s.b) - base != 16) { return 17; }\n" \
+  "  base = &u;\n" \
+  "  if ((&u.w) - base != 0) { return 18; }\n" \
+  "  if ((&u.b) - base != 0) { return 19; }\n" \
+  "  s2.a = 0; s2.b = 0; s2.c = 7;\n" \
+  "  s2.a = 300;\n" \
+  "  if (s2.a != 44) { return 20; }\n" \
+  "  if (s2.b != 0)  { return 21; }\n" \
+  "  if (s2.c != 7)  { return 22; }\n" \
+  "  n.t = 5; n.s.a = 2; n.s.b = 30;\n" \
+  "  if (cs_sum(&n) != 37) { return 23; }\n" \
+  "  if (cs_off_b() != 8)  { return 24; }\n" \
+  "  return 0;\n" \
+  "}\n"
+
+/* Unit B: reads a nested struct through a pointer, and is reached only if the
+ * shared header laid the type out identically in both units. */
+#define CS_B \
+  "#include \"cs_hdr.h\"\n" \
+  "int cs_sum(Nest *p) { return p->t + p->s.a + p->s.b; }\n"
+
+/* Four programs that MUST NOT compile. */
+#define CS_N1 "#include \"cs_hdr.h\"\nint main() { struct S1 *p; return p.a; }\n"
+#define CS_N2 "int main() { return 0; }\nint main() { return 1; }\n"
+#define CS_N3 "struct Q { int a; };\nstruct Q { char a; };\nint main() { return 0; }\n"
+#define CS_N4 "#include \"cs_hdr.h\"\nint main() { struct S1 s; return s.zzz; }\n"
+
+/* Compile `srcs` and return the compiler's exit status, or -1 if it could not
+ * be run at all. Used for both the positive and the negative rounds. */
+static i64 cs_compile(const char **av) {
+    i64 pid = ofork();
+    if (pid == 0) {
+        static const char *ev[] = { "STAGE=compilerstrs", 0 };
+        oexecve("/bin/occ", av, ev);
+        sysc(SYS_EXIT, 199, 0, 0);
+    }
+    if (pid < 0) return -1;
+    return owaitpid((u32)pid, 250000);
+}
+
+/* --- role 40: LANGUAGE COMPLETENESS (the ring-3 half of `langstrs`) --------
+ * v0.60. compilerstrs interrogates types and linkage; this interrogates the
+ * four constructs v0.60 added — sizeof, declarations in a for-initialiser,
+ * switch/case/default, and the unsigned integer types — plus break/continue,
+ * which switch is useless without.
+ *
+ * Every unsigned check below is written so that SIGNED code generation gives
+ * the WRONG answer. That is deliberate and it is the whole value of the test:
+ * `big > 1` is true for an unsigned 0xFFFF...F and false for a signed -1, so a
+ * compiler that parsed `u64` and then emitted setg fails here rather than
+ * passing quietly and corrupting arithmetic somewhere far away. The signed
+ * block immediately after re-checks that plain `int` still uses setl/idiv/sar,
+ * because the failure mode of this work is not only "unsigned stayed signed"
+ * but also "everything became unsigned".
+ *
+ * The program returns the number of the check that failed, or 0. Exit 970 from
+ * the driver means every round passed.                                       */
+#define LANG_SRC \
+  "struct S1 { char a; int b; };\n" \
+  "int classify(int x) {\n" \
+  "  int r; r = 0;\n" \
+  "  switch (x) {\n" \
+  "    case 1: r = 10; break;\n" \
+  "    case 2: r = 20; break;\n" \
+  "    case 3:\n" \
+  "    case 4: r = 34; break;\n" \
+  "    default: r = 99;\n" \
+  "  }\n" \
+  "  return r;\n" \
+  "}\n" \
+  "int main() {\n" \
+  "  char buf[64]; int s; int i; int n;\n" \
+  "  u64 big; u8 b; u16 h; u32 w; u8 ub[4]; u8 *up;\n" \
+  "  /* ---- sizeof ---- */\n" \
+  "  if (sizeof(char) != 1) { return 1; }\n" \
+  "  if (sizeof(int)  != 8) { return 2; }\n" \
+  "  if (sizeof(u8)   != 1) { return 3; }\n" \
+  "  if (sizeof(u16)  != 2) { return 4; }\n" \
+  "  if (sizeof(u32)  != 4) { return 5; }\n" \
+  "  if (sizeof(u64)  != 8) { return 6; }\n" \
+  "  if (sizeof(struct S1) != 16) { return 7; }\n" \
+  "  if (sizeof(char *) != 8) { return 8; }\n" \
+  "  if (sizeof buf != 64) { return 9; }\n" \
+  "  /* ---- declaration in a for-initialiser, and its scope ---- */\n" \
+  "  s = 0;\n" \
+  "  for (int k = 0; k < 10; k = k + 1) { s = s + k; }\n" \
+  "  if (s != 45) { return 10; }\n" \
+  "  for (int k = 0; k < 5; k = k + 1) { s = s + 100; }\n" \
+  "  if (s != 545) { return 11; }\n" \
+  "  /* ---- switch / case / default, including fallthrough ---- */\n" \
+  "  if (classify(1) != 10) { return 20; }\n" \
+  "  if (classify(2) != 20) { return 21; }\n" \
+  "  if (classify(3) != 34) { return 22; }\n" \
+  "  if (classify(4) != 34) { return 23; }\n" \
+  "  if (classify(9) != 99) { return 24; }\n" \
+  "  /* ---- unsigned: each of these is WRONG under signed codegen ---- */\n" \
+  "  big = 0; big = big - 1;\n" \
+  "  if (big <= 1) { return 30; }\n" \
+  "  if (big / 2 <= 1000) { return 31; }\n" \
+  "  if ((big >> 60) != 15) { return 32; }\n" \
+  "  if (big % 10 != 5) { return 33; }\n" \
+  "  /* ---- signed must STAY signed ---- */\n" \
+  "  n = 0 - 1;\n" \
+  "  if (n >= 1) { return 34; }\n" \
+  "  if (n / 2 != 0) { return 35; }\n" \
+  "  if ((n >> 8) != 0 - 1) { return 36; }\n" \
+  "  /* ---- narrowing on store, zero-extension on load ---- */\n" \
+  "  b = 300;    if (b != 44) { return 40; }\n" \
+  "  h = 70000;  if (h != 4464) { return 41; }\n" \
+  "  w = 0; w = w - 1; if (w != 4294967295) { return 42; }\n" \
+  "  /* ---- break and continue ---- */\n" \
+  "  i = 0;\n" \
+  "  while (1) { i = i + 1; if (i == 5) { break; } }\n" \
+  "  if (i != 5) { return 50; }\n" \
+  "  s = 0;\n" \
+  "  for (int k = 0; k < 10; k = k + 1) { if (k % 2 == 0) { continue; } s = s + k; }\n" \
+  "  if (s != 25) { return 51; }\n" \
+  "  /* continue inside a switch belongs to the enclosing LOOP */\n" \
+  "  s = 0;\n" \
+  "  for (int k = 0; k < 6; k = k + 1) {\n" \
+  "    switch (k) { case 2: continue; case 4: break; default: s = s + 1000; }\n" \
+  "    s = s + 1;\n" \
+  "  }\n" \
+  "  if (s != 4005) { return 52; }\n" \
+  "  /* ---- an unsigned ELEMENT through a pointer ---- */\n" \
+  "  up = ub;\n" \
+  "  __stb(ub, 0, 200); __stb(ub, 1, 1);\n" \
+  "  if (up[0] != 200) { return 60; }\n" \
+  "  if (up[0] <= 100) { return 61; }\n" \
+  "  if (up[1] != 1)   { return 62; }\n" \
+  "  return 0;\n" \
+  "}\n"
+
+/* Two programs that MUST be refused. Both are new failure modes that only
+ * exist because v0.60 added the constructs, so neither could be caught by the
+ * refusal round compilerstrs already runs. */
+#define LANG_N1 "int main() { break; return 0; }\n"
+#define LANG_N2 "int main() { switch (1) { default: ; default: ; } return 0; }\n"
+
+static void lang_stress_worker(void) {
+    if (selfhost_author("/src/lang.c", LANG_SRC) < 0) sysc(SYS_EXIT, 971, 0, 0);
+
+    /* ---- the language round ---- */
+    { static const char *av[] = { "/bin/occ", "/src/lang.c", "-o", "/bin/lang.elf", 0 };
+      i64 st = cs_compile(av);
+      if (st == -11) sysc(SYS_EXIT, 972, 0, 0);
+      if (st != 0)   sysc(SYS_EXIT, 973, 0, 0);
+    }
+    { i64 pid = ofork();
+      if (pid == 0) {
+          static const char *av2[] = { "/bin/lang.elf", 0 };
+          static const char *ev2[] = { 0 };
+          oexecve("/bin/lang.elf", av2, ev2);
+          sysc(SYS_EXIT, 198, 0, 0);
+      }
+      if (pid < 0) sysc(SYS_EXIT, 974, 0, 0);
+      i64 rst = owaitpid((u32)pid, 250000);
+      if (rst == -11) sysc(SYS_EXIT, 975, 0, 0);
+      if (rst != 0) {
+          oputs("  [lang  ] the compiled program failed check ");
+          sysc(SYS_WRITEHEX, (u64)rst, 0, 0);
+          oputs(" hex\n");
+          sysc(SYS_EXIT, 976, 0, 0);
+      }
+      oputs("  [lang  ] sizeof, for-init scope, switch/case, unsigned arithmetic and break/continue all verified\n");
+    }
+
+    /* ---- refusals ---- */
+    { static const char *n1[] = { "/bin/occ", "/src/lang_n.c", "-o", "/bin/lang_n.elf", 0 };
+      static const char *bodies[2] = { LANG_N1, LANG_N2 };
+      for (int i = 0; i < 2; i++) {
+          ounlink("/bin/lang_n.elf");
+          if (selfhost_author("/src/lang_n.c", bodies[i]) < 0) sysc(SYS_EXIT, 977, 0, 0);
+          i64 st = cs_compile(n1);
+          if (st == -11) sysc(SYS_EXIT, 978 + i, 0, 0);
+          if (st == 0)   sysc(SYS_EXIT, 980 + i, 0, 0);   /* WRONGLY accepted */
+          { int t = oopen("/bin/lang_n.elf");
+            if (t >= 0) { oclose(t); sysc(SYS_EXIT, 982 + i, 0, 0); } }
+      }
+      oputs("  [lang  ] a stray break and a duplicated default were both REFUSED\n");
+    }
+
+    /* Release the sources now that they have been consumed. The VFS root
+     * directory holds VFS_MAXFILES (64) entries and this suite runs LAST in the
+     * boot sequence, so it inherits every file every earlier suite created —
+     * without this the omake round below cannot create its output and occ
+     * reports "cannot open output" from a directory that is simply full.
+     * /bin/lang.elf is deliberately kept: the kernel half audits it after the
+     * driver exits, and a test that deleted its own evidence would be checking
+     * nothing. */
+    ounlink("/src/lang.c");
+    ounlink("/src/lang_n.c");
+
+    /* ---- the toolchain round: build omake, then let omake drive occ ----
+     * This is what the argv fix is for. omake hands execve an array of
+     * POINTERS; while that array was declared `char *` every entry was
+     * truncated to its low byte, so the compiler could never be launched. A
+     * test that only compiled omake would not have noticed — it has to RUN it
+     * and check that the target it was asked for actually appeared. */
+    { static const char *av[] = { "/bin/occ", "/src/omake.c", "-o", "/bin/omake", 0 };
+      i64 st = cs_compile(av);
+      if (st == -11) sysc(SYS_EXIT, 984, 0, 0);
+      if (st != 0)   sysc(SYS_EXIT, 985, 0, 0);
+    }
+    ounlink("/bin/hello.elf");
+    ounlink("/var/omake.stamp");
+    { i64 pid = ofork();
+      if (pid == 0) {
+          static const char *av2[] = { "/bin/omake", "-f", "/src/demo.mk", 0 };
+          static const char *ev2[] = { "PATH=/usr/lib", 0 };
+          oexecve("/bin/omake", av2, ev2);
+          sysc(SYS_EXIT, 198, 0, 0);
+      }
+      if (pid < 0) sysc(SYS_EXIT, 986, 0, 0);
+      i64 rst = owaitpid((u32)pid, 400000);
+      if (rst == -11) sysc(SYS_EXIT, 987, 0, 0);
+      if (rst != 0)   sysc(SYS_EXIT, 988, 0, 0);
+      { int t = oopen("/bin/hello.elf");
+        if (t < 0) sysc(SYS_EXIT, 989, 0, 0);            /* omake claimed success
+                                                          * but built nothing   */
+        oclose(t); }
+      oputs("  [lang  ] omake parsed a makefile and drove occ to build /bin/hello.elf\n");
+    }
+    /* Run what omake built: hello_sum(37, 5) == 42. */
+    { i64 pid = ofork();
+      if (pid == 0) {
+          static const char *av2[] = { "/bin/hello.elf", 0 };
+          static const char *ev2[] = { 0 };
+          oexecve("/bin/hello.elf", av2, ev2);
+          sysc(SYS_EXIT, 198, 0, 0);
+      }
+      if (pid < 0) sysc(SYS_EXIT, 990, 0, 0);
+      i64 rst = owaitpid((u32)pid, 250000);
+      if (rst == -11) sysc(SYS_EXIT, 991, 0, 0);
+      if (rst != 42)  sysc(SYS_EXIT, 992, 0, 0);
+    }
+    sysc(SYS_EXIT, 970, 0, 0);
+}
+
+static void compiler_stress_worker(void) {
+    if (selfhost_author("/src/cs_hdr.h", CS_HDR) < 0) sysc(SYS_EXIT, 951, 0, 0);
+    if (selfhost_author("/src/cs_a.c",   CS_A)   < 0) sysc(SYS_EXIT, 952, 0, 0);
+    if (selfhost_author("/src/cs_b.c",   CS_B)   < 0) sysc(SYS_EXIT, 953, 0, 0);
+
+    /* ---- positive round: two units, one ELF, run it ---- */
+    { static const char *av[] = { "/bin/occ", "/src/cs_a.c", "/src/cs_b.c",
+                                  "-o", "/bin/cs.elf", 0 };
+      i64 st = cs_compile(av);
+      if (st == -11) sysc(SYS_EXIT, 954, 0, 0);           /* compiler timed out */
+      if (st != 0)   sysc(SYS_EXIT, 955, 0, 0);           /* should have built  */
+    }
+    { i64 pid = ofork();
+      if (pid == 0) {
+          static const char *av2[] = { "/bin/cs.elf", 0 };
+          static const char *ev2[] = { 0 };
+          oexecve("/bin/cs.elf", av2, ev2);
+          sysc(SYS_EXIT, 198, 0, 0);
+      }
+      if (pid < 0) sysc(SYS_EXIT, 956, 0, 0);
+      i64 rst = owaitpid((u32)pid, 250000);
+      if (rst == -11) sysc(SYS_EXIT, 957, 0, 0);
+      if (rst != 0) {
+          /* the program returns the number of the check that failed */
+          oputs("  [compst] the compiled program failed check ");
+          sysc(SYS_WRITEHEX, (u64)rst, 0, 0);
+          oputs(" hex\n");
+          sysc(SYS_EXIT, 958, 0, 0);
+      }
+      oputs("  [compst] offsets, alignment, nesting and cross-unit calls all verified\n");
+    }
+
+    /* ---- negative rounds: each of these MUST be refused ----
+     * The output is unlinked first, so "the compiler failed" and "the compiler
+     * silently produced something anyway" are distinguishable. */
+    { static const char *n1[] = { "/bin/occ", "/src/cs_n.c", "-o", "/bin/cs_n.elf", 0 };
+      static const char *bodies[4] = { CS_N1, CS_N2, CS_N3, CS_N4 };
+      for (int i = 0; i < 4; i++) {
+          ounlink("/bin/cs_n.elf");
+          if (selfhost_author("/src/cs_n.c", bodies[i]) < 0) sysc(SYS_EXIT, 959, 0, 0);
+          i64 st = cs_compile(n1);
+          if (st == -11)      sysc(SYS_EXIT, 960 + i, 0, 0);   /* timed out      */
+          if (st == 0)        sysc(SYS_EXIT, 964 + i, 0, 0);   /* WRONGLY built  */
+          { int t = oopen("/bin/cs_n.elf");
+            if (t >= 0) { oclose(t); sysc(SYS_EXIT, 968 + i, 0, 0); } }  /* left output */
+      }
+      oputs("  [compst] all four invalid programs were REFUSED, and none left an output file\n");
+    }
+    sysc(SYS_EXIT, 950, 0, 0);
 }
 
 int main(int argc, const char **argv, const char **envp);
@@ -1763,7 +2828,25 @@ int crt0_main(int argc, const char **argv, const char **envp) {
 }
 
 int main(int argc, const char **argv, const char **envp) {
-    (void)argc; (void)argv; (void)envp;
+    (void)envp;
+    /* v0.56: an image exec'd BY PATH is this same program, so it cannot be
+     * distinguished by role — argv is how it learns what it is. Checked before
+     * the role dispatch precisely so the path-loaded copy takes this branch
+     * instead of re-running whatever role its kproc still carries (which would
+     * exec itself forever). */
+    /* v0.56: a path-exec'd image is dispatched by ARGV[0], the way a real system
+     * dispatches a multi-call binary. /bin/occ and /bin/init are the same ELF;
+     * what differs is the name it was invoked under. */
+    if (argc >= 1 && argv && argv[0] && ostrneq(argv[0], "/bin/occ", 9)) {
+        occ_main(argc, argv);
+    }
+    if (argc >= 2 && argv && argv[1] && ostrneq(argv[1], "exec-child", 11)) {
+        if (!ostrneq(argv[0], "/bin/init", 10))            sysc(SYS_EXIT, 972, 0, 0);
+        const char *v = ogetenv("EXECD_BY");
+        if (!v || !ostrneq(v, "path", 5))                  sysc(SYS_EXIT, 973, 0, 0);
+        oputs("  [posix ] /bin/init re-exec'd FROM THE VFS BY PATH, argv+envp intact\n");
+        sysc(SYS_EXIT, 970, 0, 0);
+    }
     u64 role = sysc(SYS_ROLE, 0, 0, 0);
     if (role == 1) { nic_driver();  sysc(SYS_EXIT, 0, 0, 0); }
     if (role == 2) { surface_app(); sysc(SYS_EXIT, 0, 0, 0); }
@@ -1799,6 +2882,14 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 32) { posix_exec_parent(); }            /* v0.55 execve into role 33 with argv/envp           */
     if (role == 33) { posix_exec_child(); }             /* v0.55 the exec'd image: verifies argc/argv/envp    */
     if (role == 34) { posix_fd_worker(); }              /* v0.55 std fd table + inheritance across fork       */
+    if (role == 35) { posix_heap_worker(); }            /* v0.56 ring-3 heap: sbrk/malloc/free/realloc        */
+    if (role == 36) { posix_execpath_worker(); }        /* v0.56 execve /bin/init BY PATH from the VFS        */
+    if (role == 37) { occ_main(argc, argv); }           /* v0.56 the native C compiler                        */
+    if (role == 39) { compiler_stress_worker(); }       /* v0.57 language completeness + refusal checks        */
+    if (role == 38) { posix_selfhost_worker(); }        /* v0.56 author -> compile -> run, natively           */
+    if (role == 40) { pipe_worker(); }                  /* v0.59 pipe mechanics: bounds, EOF, EPIPE, fork      */
+    if (role == 41) { vsh_worker(); }                   /* v0.59 build /bin/vsh with occ and run a real script */
+    if (role == 42) { lang_stress_worker(); }           /* v0.60 sizeof/for-init/switch/unsigned + omake       */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
                                 : "  [elf:r3] callee-saved regs survive SYSCALL: FAIL\n");

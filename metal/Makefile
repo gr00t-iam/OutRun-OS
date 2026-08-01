@@ -20,7 +20,7 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-VERSION := 0.55.0
+VERSION := 0.60.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean
@@ -48,7 +48,26 @@ $(BUILD)/switch.o: boot/switch.asm | $(BUILD)
 # EXTRA lets a fast-iteration build add -D flags without editing this file, e.g.
 #   make EXTRA=-DPOSIX_ITER   -> boot straight into cmd_posix_stress (see kernel64.c)
 EXTRA   ?=
-$(BUILD)/kernel64.o: kernel/kernel64.c | $(BUILD)
+
+# v0.58: the userland tools the kernel publishes into /src are REAL PROGRAMS,
+# not decoration, so they live as ordinary editable files under user/ and are
+# converted to C string literals at build time. Keeping several hundred lines of
+# occ-subset C as escaped quotes inside kernel64.c would make them unreadable
+# and, worse, unreviewable.
+SDK_SRCS := user/vedit.oc user/omake.oc user/vsh.oc user/demo.mk \
+            user/hello.h user/hello_a.oc user/hello_b.oc
+$(BUILD)/sdk_sources.h: $(SDK_SRCS) tools/mkstr.py | $(BUILD)
+	python3 tools/mkstr.py $@ \
+	  SDK_VEDIT_C=user/vedit.oc \
+	  SDK_OMAKE_C=user/omake.oc \
+	  SDK_VSH_C=user/vsh.oc \
+	  SDK_DEMO_MK=user/demo.mk \
+	  SDK_HELLO_H=user/hello.h \
+	  SDK_HELLO_A=user/hello_a.oc \
+	  SDK_HELLO_B=user/hello_b.oc
+	@echo "  sdk sources: $@ ($(words $(SDK_SRCS)) files embedded)"
+
+$(BUILD)/kernel64.o: kernel/kernel64.c $(BUILD)/sdk_sources.h | $(BUILD)
 	$(CC) $(CFLAGS) $(EXTRA) -c $< -o $@
 
 # ---- polyglot: Rust (no_core) + C++ (freestanding) linked into the kernel ---
@@ -70,7 +89,12 @@ $(BUILD)/ipc_ring.o: cpp/ipc_ring.cpp | $(BUILD)
 # ---- userland: a standalone ring-3 ELF shipped as a boot module ------------
 UCFLAGS := -ffreestanding -O2 -Wall -mcmodel=large -fno-pic -fno-stack-protector -fno-builtin \
            -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -msoft-float
-$(BUILD)/user_init.o: user/init.c | $(BUILD)
+# v0.57: occ.c is #included by init.c, so it is a real prerequisite. Without it
+# listed here, `make` reported success while silently shipping the PREVIOUS
+# compiler — an edit to occ.c alone never reached the image, which cost a full
+# boot cycle to notice. A header-style dependency that make cannot see is worse
+# than a slow build.
+$(BUILD)/user_init.o: user/init.c user/occ.c | $(BUILD)
 	$(CC) $(UCFLAGS) -c $< -o $@
 $(BUILD)/user_init.elf: $(BUILD)/user_init.o user/user.ld
 	$(LD) -n -T user/user.ld $< -o $@
