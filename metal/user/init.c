@@ -136,6 +136,7 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define EPOLL_CTL_ADD 1
 #define EPOLL_CTL_DEL 2
 #define EPOLL_CTL_MOD 3
+#define EPOLL_TTY_FD  (-2)   /* the console: it has no descriptor */
 
 struct epoll_event { u32 events; u32 _pad; u64 data; };
 
@@ -2446,6 +2447,28 @@ static void shm_stress_worker(void) {
  * Phase 1 driver. Every check is written so the failure mode is a WRONG
  * ANSWER: a readiness bit that should not be set, a cookie that came back
  * altered, a counter that did not drain. */
+static volatile int g_ew_fd = -1;
+/* Posts the eventfd after a delay long enough for the waiter to be genuinely
+ * parked rather than still on its way there. The delay is yields, not ticks:
+ * on a uniprocessor the waiter can only reach the park if this thread gives
+ * the core back, so yielding IS the thing that lets the race resolve. */
+/* The delay exists to lose a race deliberately: the main thread has to reach
+ * its park BEFORE this write lands, or it finds the event already waiting,
+ * returns without sleeping, and the kernel's park counter never moves — the
+ * one thing this round is for. It must not be so long that the waiter's
+ * deadline beats it, which is what happened on the first run: 4000 yields
+ * outlasted a 3 s park under TCG, the wait timed out, and the poster's write
+ * never appeared in the kernel's tally at all. Fewer yields here, a far larger
+ * backstop on the wait there — the timeout is a safety net, not the thing the
+ * test is racing. */
+static u64 ew_poster(u64 arg) {
+    (void)arg;
+    for (int i = 0; i < 600; i++) oyield();
+    u64 one = 1;
+    sysc(SYS_WRITE_FILE, (u64)g_ew_fd, (u64)(void *)&one, 8);
+    return 555;
+}
+
 static void epoll_stress_worker(void) {
     /* (1) An eventfd accumulates writes and drains on read. */
     int ef = oeventfd(0, 0);
@@ -2491,7 +2514,56 @@ static void epoll_stress_worker(void) {
     n = oepoll_wait(ep, evs, 4, 0);
     if (n != 1 || !(evs[0].events & EPOLLIN)) sysc(SYS_EXIT, 943, 0, 0);
     if (!(evs[0].events & EPOLLHUP))          sysc(SYS_EXIT, 944, 0, 0);
+    /* Close the read end WITHOUT removing its watch first. The kernel must
+     * purge the watch, or a watch left behind on a dead descriptor answers
+     * EPOLLERR — which is reported whether or not it was asked for — on every
+     * subsequent wait, forever. */
     sysc(SYS_CLOSE, (u64)rd, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 962, 0, 0);
+
+    /* (5) EDGE vs LEVEL. Re-arm the eventfd, this time edge-triggered: one
+     * report per transition, not one per call. Level triggering would answer
+     * the second wait identically to the first, which is exactly the
+     * distinction being checked. */
+    if (oeventfd_write(ef, 1) != 8) sysc(SYS_EXIT, 945, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, ef, EPOLLIN | EPOLLET, 0xEE) != 0) sysc(SYS_EXIT, 946, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 1) sysc(SYS_EXIT, 947, 0, 0);   /* the edge */
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 948, 0, 0);   /* no second edge */
+    if (oepoll_ctl(ep, EPOLL_CTL_MOD, ef, EPOLLIN, 0xEE) != 0) sysc(SYS_EXIT, 949, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 1) sysc(SYS_EXIT, 950, 0, 0);   /* level: still ready */
+    if (oeventfd_read(ef, &v) != 8)      sysc(SYS_EXIT, 951, 0, 0);   /* drain it */
+    if (oepoll_ctl(ep, EPOLL_CTL_DEL, ef, 0, 0) != 0) sysc(SYS_EXIT, 952, 0, 0);
+
+    /* (6) An idle console is NOT readable. The kernel half injects a keystroke
+     * and re-checks, which is the half this process cannot do for itself. */
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, EPOLL_TTY_FD, EPOLLIN, 0x77) != 0) sysc(SYS_EXIT, 953, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 954, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_DEL, EPOLL_TTY_FD, 0, 0) != 0) sysc(SYS_EXIT, 955, 0, 0);
+
+    /* (7) THE PARK. A worker thread posts the eventfd only after this thread
+     * has had time to fall asleep on it. The point is not that the event
+     * arrives — round 2 proved that — but that the waiter got there by
+     * SLEEPING: the kernel half checks its park counter moved, which it cannot
+     * if this loop merely span. */
+    g_ew_fd = ef;
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, ef, EPOLLIN, 0x99) != 0) sysc(SYS_EXIT, 956, 0, 0);
+    int wt = kthread_create(ew_poster, 0, 0);
+    if (wt < 0) sysc(SYS_EXIT, 957, 0, 0);
+    /* 30 s is a BACKSTOP, not an expectation: the wake should arrive in
+     * milliseconds. A tight timeout here would make the round a race between
+     * the poster and the clock, and the answer it gave would depend on how
+     * loaded the host running QEMU happened to be.
+     *
+     * No retry loop: SYS_EPOLL_WAIT restarts itself across a wake and returns
+     * POSIX's answer. The loop that used to be here is what proved the Phase 1
+     * -EAGAIN contract was the wrong shape — every caller had to know. */
+    int got = oepoll_wait(ep, evs, 4, 30000);
+    if (got != 1)                   sysc(SYS_EXIT, 958, 0, 0);
+    if (evs[0].data != 0x99)        sysc(SYS_EXIT, 959, 0, 0);
+    u64 wc = 0;
+    if (kthread_join(wt, &wc) != 0) sysc(SYS_EXIT, 960, 0, 0);
+    if (wc != 555)                  sysc(SYS_EXIT, 961, 0, 0);
+
     sysc(SYS_CLOSE, (u64)ep, 0, 0);
     sysc(SYS_CLOSE, (u64)ef, 0, 0);
     sysc(SYS_EXIT, 920, 0, 0);
