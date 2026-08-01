@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.61.0-metal"
+#define KERNEL_VERSION "0.62.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -1554,6 +1554,13 @@ struct kproc {
     uint64_t sigframe_sp;
     volatile uint64_t alarm_deadline;      /* g_ticks value at which SIGALRM fires (0 = off) */
     int      ppid_slot;           /* parent kproc slot, for SIGCHLD (-1 = none)     */
+    /* v0.62: PROCESS GROUP. Job control needs a name for "this pipeline" that
+     * outlives the individual processes in it and that the console can signal
+     * as a unit — which is exactly what a process group is, and why Ctrl+C
+     * reaching only the foreground job (and not the shell) is a property of the
+     * kernel rather than something a shell can fake. A thread inherits its
+     * leader's group: a thread is not separately signallable from a terminal. */
+    int      pgid;                /* 0 = unset (treated as this process's own pid)  */
     /* Thread group. Several uthreads may share ONE kproc (= one address space);
      * the address space may only be torn down when the LAST of them exits, so
      * every exit path decrements this and only the 0-transition tears down. */
@@ -1668,7 +1675,7 @@ static void kproc_reset(struct kproc *p) {
      * one thread in the group, per-thread stacks start below the main stack. */
     for (int sg = 0; sg < NSIG; sg++) p->sig_handler[sg] = 0;
     p->sig_pending = 0; p->sig_mask = 0; p->sigframe_sp = 0;
-    p->alarm_deadline = 0; p->ppid_slot = -1;
+    p->alarm_deadline = 0; p->ppid_slot = -1; p->pgid = 0;
     p->nthreads = 1; p->ustack_next = 0; p->argc = 0; p->exit_authoritative = 0;
     /* v0.61: a fresh slot is its OWN thread-group leader. kproc_spawn fixes up
      * tg_leader to the real index right after this returns (kproc_reset takes a
@@ -1762,6 +1769,7 @@ static int kproc_spawn(const char *name, uint64_t caps) {
     kprocs[i].caps = caps;
     kprocs[i].cr3  = create_address_space();
     kprocs[i].tg_leader = i;              /* v0.61: leader of its own group */
+    kprocs[i].pgid = (int)pid;            /* v0.62: leads its own process group */
     kprocs[i].used = true;
     if (g_debug_kproc_lifetime)
         kprintf("[dbgkpr ] spawn: slot %d %s -> pid %u '%s' caps %X\n",
@@ -1821,6 +1829,7 @@ static int kproc_spawn_thread(const char *name, int leader, int tid) {
     kprocs[i].redir_in  = kprocs[leader].redir_in;
     kprocs[i].redir_out = kprocs[leader].redir_out;
     kprocs[i].ppid_slot = kprocs[leader].ppid_slot;
+    kprocs[i].pgid      = kprocs[leader].pgid;   /* v0.62: threads share the group */
     kprocs[i].tg_leader = leader;
     kprocs[i].tg_tid    = tid;
     kprocs[i].nthreads  = 0;                     /* the LEADER holds the count */
@@ -6493,7 +6502,16 @@ static volatile uint64_t g_sig_raised = 0, g_sig_delivered = 0, g_sig_returned =
 /* Post a signal to a process. Returns 0 on success, negative if the target is
  * gone. SIGKILL is never blockable and never handled in ring 3. */
 static int sig_raise(int slot, int signo) {
-    if (slot < 0 || slot >= n_kproc || !kprocs[slot].used || kprocs[slot].exited) return -1;
+    if (slot < 0 || slot >= n_kproc || !kprocs[slot].used) return -1;
+    /* v0.62: a signal is posted to the PROCESS, so it lands on the thread-group
+     * leader and any member may run the handler. POSIX splits this exactly
+     * here: DISPOSITIONS and PENDING are process-wide, MASKS and signal FRAMES
+     * are per-thread — a thread has its own stack, so its frame cannot be
+     * anywhere else. Raising on the caller's own slot instead would mean a
+     * signal sent to a process could be answered only by whichever thread
+     * happened to be named, which is not what kill(2) means. */
+    slot = tg_of(slot);
+    if (kprocs[slot].exited) return -1;
     if (signo <= 0 || signo >= NSIG) return -1;
     __sync_fetch_and_or(&kprocs[slot].sig_pending, 1u << signo);
     g_sig_raised++;
@@ -6505,7 +6523,12 @@ static int sig_raise(int slot, int signo) {
 
 /* Pick the lowest-numbered deliverable signal, or 0. Caller must hold nothing. */
 static int sig_next(int slot) {
-    uint32_t p = kprocs[slot].sig_pending & ~kprocs[slot].sig_mask;
+    /* v0.62: process-wide pending (the leader's) union anything posted directly
+     * to this thread, minus THIS thread's own mask — which is what makes
+     * per-thread blocking meaningful: one thread can block a signal while a
+     * sibling stays able to take it. */
+    int L = tg_of(slot);
+    uint32_t p = (kprocs[L].sig_pending | kprocs[slot].sig_pending) & ~kprocs[slot].sig_mask;
     if (!p) return 0;
     for (int sg = 1; sg < NSIG; sg++) if (p & (1u << sg)) return sg;
     return 0;
@@ -6519,7 +6542,13 @@ static int sig_next(int slot) {
  * action / ignore), and -1 if the process must die. */
 static int sig_deliver(int slot, int signo, struct uctx *regs) {
     struct kproc *k = &kprocs[slot];
-    uint64_t h = k->sig_handler[signo];
+    /* v0.62: the HANDLER is the process's (the leader's) — installing one in a
+     * thread must affect the whole program, as POSIX requires. The FRAME and
+     * the mask update below stay on `k`, this thread, because the frame is
+     * written to this thread's own stack. */
+    struct kproc *KL = &kprocs[tg_of(slot)];
+    uint64_t h = KL->sig_handler[signo];
+    __sync_fetch_and_and(&KL->sig_pending, ~(1u << signo));
     __sync_fetch_and_and(&k->sig_pending, ~(1u << signo));
 
     if (signo == SIGKILL || (h == 0 && (signo == SIGSEGV || signo == SIGINT || signo == SIGKILL)))
@@ -6568,6 +6597,52 @@ static int sig_return(int slot, struct uctx *regs) {
     g_sig_returned++;
     if (g_debug_posix) kprintf("[dbgposix] sigreturn pid %u -> rip %X\n", k->pid, regs->rip);
     return 1;
+}
+
+/* ===========================================================================
+ * v0.62: PROCESS GROUPS AND THE TERMINAL INTERRUPT
+ * ===========================================================================
+ * Ctrl+C must reach the job and NOT the shell. That is not something a shell
+ * can arrange for itself — whatever mechanism delivers the interrupt has to
+ * already know which processes are "the current job", and the shell is not one
+ * of them. A process group is that name, and the foreground group is which one
+ * the console is currently talking to.
+ *
+ * The shell's side of the bargain is two calls: put each job in its own group,
+ * and hand that group the terminal for as long as the job runs. Then it does
+ * not need a SIGINT handler at all — it is simply not in the group being
+ * signalled. That matters here beyond elegance: /bin/vsh is compiled by occ,
+ * which cannot produce a function pointer, so a shell that needed a handler to
+ * survive Ctrl+C could not be written in this system's own C.               */
+static volatile int g_fg_pgid = 0;        /* process group owning the console */
+static volatile uint32_t g_tty_intrs = 0; /* interrupts delivered to a group  */
+
+/* Raise `signo` on every live member of `pgid`. Returns how many got it.
+ * Threads are skipped: a thread inherits its leader's group, and delivering to
+ * both would post the same signal twice to one process. */
+static int sig_raise_pgrp(int pgid, int signo) {
+    int n = 0;
+    if (!pgid) return 0;
+    for (int i = 0; i < n_kproc; i++) {
+        if (!kprocs[i].used || kprocs[i].exited || kprocs[i].torn_down) continue;
+        if (kprocs[i].pgid != pgid) continue;
+        if (tg_of(i) != i) continue;                  /* leaders only */
+        if (sig_raise(i, signo) == 0) n++;
+    }
+    return n;
+}
+
+/* The interrupt character arrived on the console. One function, two callers:
+ * the tty input path when it sees 0x03, and `sigstrs`, which drives it
+ * directly — a headless boot has no one to press Ctrl+C, and a suite that
+ * tested a different code path from the real one would be testing nothing. */
+static int tty_intr(void) {
+    int n = sig_raise_pgrp(g_fg_pgid, SIGINT);
+    if (n) __sync_fetch_and_add(&g_tty_intrs, 1);
+    if (g_debug_posix)
+        kprintf("[dbgposix] tty INTR -> pgid %d, %d process(es) signalled\n",
+                (uint64_t)(int64_t)g_fg_pgid, (uint64_t)(int64_t)n);
+    return n;
 }
 
 /* Fire SIGALRM for any process whose deadline has passed. Called from the
@@ -8846,6 +8921,7 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
     kprocs[ch].heap_brk  = kprocs[par].heap_brk;
     kprocs[ch].entry     = kprocs[par].entry;
     kprocs[ch].affinity  = kprocs[par].affinity;
+    kprocs[ch].pgid      = kprocs[par].pgid;     /* v0.62: fork stays in the job */
     for (int sg = 0; sg < NSIG; sg++) kprocs[ch].sig_handler[sg] = kprocs[par].sig_handler[sg];
     kprocs[ch].sig_pending = 0;                         /* POSIX: pending set is NOT inherited */
     kprocs[ch].sig_mask    = 0;
@@ -10376,7 +10452,9 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     }
     case 49: {   /* SYS_SIGACTION(signo, handler) -> previous handler, or negative.
                   * handler: 0 = SIG_DFL, 1 = SIG_IGN, else a ring-3 entry point. */
-        int p = (int)current_proc_idx;
+        /* v0.62: dispositions are PROCESS-wide, so this writes the leader's
+         * table — a handler installed by any thread governs the program. */
+        int p = tg_of((int)current_proc_idx);
         int sg = (int)(int64_t)a0;
         if (sg <= 0 || sg >= NSIG) return (uint64_t)-1;
         if (sg == SIGKILL) return (uint64_t)-1;        /* never catchable, never ignorable */
@@ -10630,6 +10708,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             int c = kbd_getc_nonblock();
             if (c < 0) c = serial_getc_nonblock();
             if (c < 0) break;
+            /* v0.62: 0x03 is the INTERRUPT CHARACTER, not input. It is consumed
+             * here rather than handed to the reader, and it signals the
+             * foreground process group — which is why it reaches the job and
+             * not the shell that is sitting in this very read. */
+            if (c == 0x03) { tty_intr(); continue; }
             dst[n++] = (char)c;
         }
         return n;
@@ -10723,6 +10806,86 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         return sys_futex_wake(a0, a1);
     case 66:     /* SYS_THREAD_JOIN(tid, uint64_t *out_code) */
         return sys_thread_join(0, a0, a1);
+    case 68: {   /* SYS_SETPGID(pid, pgid, foreground) -> 0 ok, negative.
+                  *   pid  0 = the caller.  pgid 0 = "use the target's own pid",
+                  *   which is how a job leader creates its group.
+                  *   foreground != 0 additionally hands that group the console.
+                  *
+                  * The third argument folds tcsetpgrp(3) in rather than spending
+                  * another syscall number on a one-line operation that is never
+                  * useful separately: a shell that creates a job group and does
+                  * not give it the terminal has created a background job, which
+                  * it expresses by simply not passing the flag. */
+        int me = (int)current_proc_idx, meL = tg_of(me);
+        int tgt = meL;
+        if (a0) {
+            tgt = -1;
+            for (int i = 0; i < n_kproc; i++)
+                if (kprocs[i].used && !kprocs[i].exited && kprocs[i].pid == (uint32_t)a0 &&
+                    tg_of(i) == i) { tgt = i; break; }
+            if (tgt < 0) return (uint64_t)-3;                 /* ESRCH */
+            /* Containment, as SYS_KILL has it: a process may place ITSELF or a
+             * CHILD in a group, never an unrelated process — otherwise any task
+             * could drag another into a group it then signals. */
+            if (tgt != meL && kprocs[tgt].ppid_slot != meL) return (uint64_t)-13;  /* EPERM */
+        }
+        int g = (int)(int64_t)a1;
+        if (g < 0) return (uint64_t)-1;
+        if (!g) g = (int)kprocs[tgt].pid;
+        kprocs[tgt].pgid = g;
+        /* Threads follow their leader: a group is a property of the process. */
+        for (int i = 0; i < n_kproc; i++)
+            if (kprocs[i].used && kprocs[i].tg_leader == tgt && i != tgt) kprocs[i].pgid = g;
+        if (a2) g_fg_pgid = g;
+        if (g_debug_posix)
+            kprintf("[dbgposix] setpgid pid %u -> pgid %d%s\n",
+                    kprocs[tgt].pid, (uint64_t)(int64_t)g, a2 ? " (foreground)" : "");
+        return 0;
+    }
+    case 69: {   /* SYS_KILLPG(pgid, signo) -> processes signalled, or negative.
+                  * pgid 0 means the caller's own group. */
+        int me = (int)current_proc_idx, meL = tg_of(me);
+        int sg = (int)(int64_t)a1;
+        int g  = (int)(int64_t)a0;
+        if (sg <= 0 || sg >= NSIG) return (uint64_t)-1;
+        if (!g) g = kprocs[meL].pgid;
+        if (!g) return (uint64_t)-3;                          /* ESRCH */
+        /* Same containment rule as SYS_KILL, applied per member: the caller's
+         * own group, or a group made up of its children. A shell satisfies the
+         * second clause for every job it started, and nothing else satisfies
+         * either — so this cannot be used to signal across the system. */
+        int n = 0;
+        for (int i = 0; i < n_kproc; i++) {
+            if (!kprocs[i].used || kprocs[i].exited || kprocs[i].torn_down) continue;
+            if (kprocs[i].pgid != g || tg_of(i) != i) continue;
+            if (i != meL && kprocs[i].ppid_slot != meL && kprocs[i].pgid != kprocs[meL].pgid)
+                continue;                                     /* not ours to signal */
+            if (sig_raise(i, sg) == 0) n++;
+        }
+        return (uint64_t)(int64_t)n;
+    }
+    case 70: {   /* SYS_SIGPROCMASK(how, mask) -> the PREVIOUS mask.
+                  *   how 0 = block (OR), 1 = unblock (AND NOT), 2 = set.
+                  *
+                  * PER-THREAD, deliberately: this is the half of the signal
+                  * state POSIX does not share across a thread group, and it is
+                  * what lets one thread take a signal while a sibling is inside
+                  * a critical section that must not be interrupted.
+                  * SIGKILL can never be blocked, so it is masked out of any
+                  * request rather than the call being refused — a program that
+                  * blocks "everything" should still be killable, not rejected. */
+        int me = (int)current_proc_idx;
+        uint32_t old = kprocs[me].sig_mask;
+        uint32_t m = (uint32_t)a1 & ~(1u << SIGKILL);
+        if (a0 == 0)      kprocs[me].sig_mask |= m;
+        else if (a0 == 1) kprocs[me].sig_mask &= ~m;
+        else if (a0 == 2) kprocs[me].sig_mask = m;
+        else return (uint64_t)-1;
+        if (g_debug_posix)
+            kprintf("[dbgposix] sigprocmask pid %u how %u mask %x -> %x\n",
+                    kprocs[me].pid, a0, m, (uint64_t)kprocs[me].sig_mask);
+        return old;
+    }
     case 67:     /* SYS_GETTID() -> this THREAD's own id.
                   * 0 for a process that never called SYS_THREAD_CREATE, so
                   * single-threaded code sees a stable, meaningful value rather
@@ -13060,6 +13223,14 @@ static const char SDK_UNISTD_H[] =
 "int fork(void);                  /* returns twice: 0 in the child           */\n"
 "int waitpid(int pid, int timeout);\n"
 "int yield(void);\n"
+"/* v0.62: process groups. A shell puts each pipeline in its own group and\n"
+" * gives that group the terminal for as long as it runs; the interrupt\n"
+" * character then reaches the job and leaves the shell alone. This is why\n"
+" * /bin/vsh survives Ctrl+C without installing a signal handler — which\n"
+" * matters, because occ cannot produce a function pointer to install. */\n"
+"int setpgid(int pid, int pgid, int fg);   /* pid 0 = self, pgid 0 = own pid  */\n"
+"int killpg(int pgid, int sig);\n"
+"int sigprocmask(int how, int mask);       /* 0 block, 1 unblock, 2 set       */\n"
 "int unlink(char *path);\n"
 "/* v0.58: execp() replaces this image with an ELF loaded BY PATH out of the\n"
 " * VFS. `argv` is a WORD array of pointers terminated by a 0 — which is what\n"
@@ -13258,6 +13429,13 @@ static const char SDK_LIBC_OC[] =
 "int waitpid(int pid, int timeout) { return __syscall(56, pid, timeout, 0); }\n"
 "int yield(void)   { return __syscall(15, 0, 0, 0); }\n"
 "int kill(int pid, int sig) { return __syscall(50, pid, sig, 0); }\n"
+"/* v0.62: JOB CONTROL. setpgid names a group of processes; the third argument\n"
+" * additionally hands that group the console, so the interrupt character\n"
+" * reaches the job and not the shell waiting on it. pid 0 = me, pgid 0 = my\n"
+" * own pid (which is how a job leader creates its group). */\n"
+"int setpgid(int pid, int pgid, int fg) { return __syscall(68, pid, pgid, fg); }\n"
+"int killpg(int pgid, int sig) { return __syscall(69, pgid, sig, 0); }\n"
+"int sigprocmask(int how, int mask) { return __syscall(70, how, mask, 0); }\n"
 "int exit(int status) { __syscall(2, status, 0, 0); return 0; }\n"
 "/* v0.58: run another program, and read the console. These three are what turn\n"
 " * a compiled program from something that computes into something that can\n"
@@ -15143,6 +15321,184 @@ static void cmd_thread_stress(void) {
     if (!g_utfail)
         kputs("[threadstrs] RING-3 THREADS VERIFIED — scheduled on every core, blocking without spinning\n");
     else kputs("[threadstrs] THREADING DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.62: PTHREADS_SMP — mutex contention and a condition variable
+ * =========================================================================== */
+static int g_pspass = 0, g_psfail = 0;
+static void pscheck(const char *what, int ok) {
+    if (ok) { g_pspass++; kprintf("[pthreads_smp] PASS: %s\n", what); }
+    else    { g_psfail++; kprintf("[pthreads_smp] FAIL: %s\n", what); }
+}
+
+static void cmd_pthreads_smp(void) {
+    kputs("-- PTHREADS SMP: mutex contention and a condition variable across cores --\n");
+    g_pspass = g_psfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations, waits0 = g_futex_waits, wakes0 = g_futex_wakes;
+    g_thr_ran_mask = 0; g_thr_released = 0; g_thr_stk_pages = 0;
+
+    int p = kproc_spawn("pthreadsmp", PCAP_FILESYSTEM);
+    if (p < 0) { pscheck("kproc_spawn never fails", 0);
+        kprintf("[pthreads_smp] RESULT: %d passed, %d failed\n", (uint64_t)g_pspass, (uint64_t)g_psfail);
+        return; }
+    kprocs[p].role = 44;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { pscheck("the driver's ELF loads", 0);
+        kprintf("[pthreads_smp] RESULT: %d passed, %d failed\n", (uint64_t)g_pspass, (uint64_t)g_psfail);
+        return; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 200000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[pthreads_smp] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 940 ? "" :
+        R.code[0] == 938 ? "pthread_cond_signal released the WRONG NUMBER of waiters" :
+        R.code[0] == 939 ? "pthread_self() disagreed with the thread's own index" :
+        R.code[0] == 941 ? "a fresh mutex was not acquirable exactly once" :
+        R.code[0] == 942 ? "pthread_create failed" :
+        R.code[0] == 943 ? "not every worker reached the condition variable" :
+        R.code[0] == 944 ? "a worker passed the predicate BEFORE it was ever set" :
+        R.code[0] == 945 ? "pthread_join failed or timed out" :
+        R.code[0] == 946 ? "a thread's return value came back wrong" :
+        R.code[0] == 947 ? "not every worker ran" :
+        R.code[0] == 948 ? "THE COUNTER CAME OUT SHORT — the mutex is not mutually exclusive" :
+        R.code[0] == 949 ? "a broadcast failed to release every sleeper" :
+                           "unknown";
+    if (R.code[0] != 940) kprintf("[pthreads_smp] driver exit %u — %s\n", R.code[0], why);
+
+    pscheck("mutex contention, condvar broadcast and joins all behaved (exit 940)",
+            finished && R.code[0] == 940);
+    kprintf("[pthreads_smp] threads released %u, stack pages %u, ran_on mask %x; futex +%u parked, +%u woken\n",
+            g_thr_released, g_thr_stk_pages, (uint64_t)g_thr_ran_mask,
+            g_futex_waits - waits0, g_futex_wakes - wakes0);
+    pscheck("every worker thread released its own slot and stack",
+            g_thr_released == 4 && g_thr_stk_pages == 4u * THR_STK_PAGES);
+    /* A condvar that never actually parked anyone would still let the tally
+     * come out right — the workers would simply spin until the predicate
+     * flipped. This is what separates the two. */
+    pscheck("threads PARKED on the mutex and the condvar rather than spinning",
+            g_futex_waits > waits0 && g_futex_wakes > wakes0);
+    int cores = 0;
+    for (int c = 0; c < MAX_CPUS; c++) if (g_thr_ran_mask & (1u << c)) cores++;
+    if (n > 1) pscheck("worker threads were dispatched on MORE THAN ONE core", cores >= 2);
+    else       pscheck("on a uniprocessor every worker ran on cpu 0", g_thr_ran_mask == 1u);
+    pscheck("free-frame count reconciles (no leak across the thread group)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    pscheck("no lock-rank violation across the pthread paths", g_rank_violations == viol0);
+    kprintf("[pthreads_smp] +%u freed, +%u reused; global depth %u\n",
+            g_frames_freed - freed0, g_frames_reused - reused0, g_frame_free_depth);
+    kprintf("[pthreads_smp] RESULT: %d passed, %d failed\n", (uint64_t)g_pspass, (uint64_t)g_psfail);
+    if (!g_psfail) kputs("[pthreads_smp] POSIX THREADS VERIFIED — exclusive under contention, and able to sleep\n");
+    else kputs("[pthreads_smp] PTHREAD DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.62: SIGSTRS — masks, dispositions, and process-group delivery
+ * =========================================================================== */
+static int g_sgpass = 0, g_sgfail = 0;
+static void sgcheck(const char *what, int ok) {
+    if (ok) { g_sgpass++; kprintf("[sigstrs] PASS: %s\n", what); }
+    else    { g_sgfail++; kprintf("[sigstrs] FAIL: %s\n", what); }
+}
+
+static void cmd_sig_stress(void) {
+    kputs("-- SIGSTRS: signal masks, dispositions, and process-group delivery --\n");
+    g_sgpass = g_sgfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t raised0 = g_sig_raised, delivered0 = g_sig_delivered, returned0 = g_sig_returned;
+
+    int p = kproc_spawn("sigstr", PCAP_FILESYSTEM);
+    if (p < 0) { sgcheck("kproc_spawn never fails", 0);
+        kprintf("[sigstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_sgpass, (uint64_t)g_sgfail);
+        return; }
+    kprocs[p].role = 45;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { sgcheck("the driver's ELF loads", 0);
+        kprintf("[sigstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_sgpass, (uint64_t)g_sgfail);
+        return; }
+    kprocs[p].entry = e;
+
+    /* ---- the terminal interrupt path, tested against the real function ----
+     * A headless boot has nobody to press Ctrl+C, so the console's own
+     * tty_intr() is called directly here. That is deliberately the SAME
+     * function the tty read path calls when it sees 0x03 — a suite that
+     * exercised a parallel code path would be testing something the machine
+     * does not do. Run BEFORE the driver starts, so it is deterministic; the
+     * pending bit is cleared afterwards so the driver is not killed by it. */
+    int saved_fg = g_fg_pgid;
+    g_fg_pgid = 0;
+    sgcheck("an interrupt with NO foreground group signals nobody", tty_intr() == 0);
+    g_fg_pgid = kprocs[p].pgid;
+    int hit = tty_intr();
+    int pend = (kprocs[p].sig_pending & (1u << SIGINT)) != 0;
+    sgcheck("the console interrupt reaches the foreground process group", hit == 1 && pend);
+    __sync_fetch_and_and(&kprocs[p].sig_pending, ~(1u << SIGINT));   /* let it live */
+    g_fg_pgid = saved_fg;
+    sgcheck("a process leads its own group by default",
+            kprocs[p].pgid == (int)kprocs[p].pid);
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 200000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[sigstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 950 ? "" :
+        R.code[0] == 951 ? "a raised signal never reached its handler" :
+        R.code[0] == 952 ? "the handler was called with the wrong signal number" :
+        R.code[0] == 953 ? "SIGRETURN did not restore the interrupted context" :
+        R.code[0] == 954 ? "A BLOCKED SIGNAL WAS DELIVERED ANYWAY" :
+        R.code[0] == 955 ? "a blocked signal was DROPPED instead of held until unblock" :
+        R.code[0] == 956 ? "SIGPROCMASK(SETMASK) did not replace the mask" :
+        R.code[0] == 957 ? "SIG_IGN did not discard the signal" :
+        R.code[0] == 958 ? "fork failed before the process-group round" :
+        R.code[0] == 959 ? "SYS_SETPGID refused a child of the caller" :
+        R.code[0] == 960 ? "SYS_KILLPG did not reach every member of the group" :
+        R.code[0] == 961 ? "a group member did not take the DEFAULT action for SIGINT" :
+                           "unknown";
+    if (R.code[0] != 950) kprintf("[sigstrs] driver exit %u — %s\n", R.code[0], why);
+
+    sgcheck("handlers, masks, SIG_IGN and group delivery all behaved (exit 950)",
+            finished && R.code[0] == 950);
+    kprintf("[sigstrs] signals: +%u raised, +%u delivered, +%u returned; %u tty interrupt(s)\n",
+            g_sig_raised - raised0, g_sig_delivered - delivered0,
+            g_sig_returned - returned0, g_tty_intrs);
+    /* Every delivery must be matched by a sigreturn, or a handler ran and the
+     * interrupted context was never put back — which is a silent corruption,
+     * not a crash, and would otherwise go unnoticed. */
+    sgcheck("every delivered signal was answered by a SIGRETURN",
+            (g_sig_delivered - delivered0) == (g_sig_returned - returned0));
+    sgcheck("signals were actually delivered (the suite is not vacuously passing)",
+            g_sig_delivered > delivered0);
+    sgcheck("no lock-rank violation across the signal paths", g_rank_violations == viol0);
+    kprintf("[sigstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_sgpass, (uint64_t)g_sgfail);
+    if (!g_sgfail) kputs("[sigstrs] SIGNALS VERIFIED — masks hold, groups deliver, contexts come back\n");
+    else kputs("[sigstrs] SIGNAL DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -17678,6 +18034,8 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "pipestress")) cmd_pipe_stress();
     else if (!kstrcmp(argv[0], "langstress")) cmd_lang_stress();
     else if (!kstrcmp(argv[0], "threadstress")) cmd_thread_stress();
+    else if (!kstrcmp(argv[0], "pthreadsmp")) cmd_pthreads_smp();
+    else if (!kstrcmp(argv[0], "sigstress")) cmd_sig_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -17864,6 +18222,8 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_pipe_stress();      /* v0.59: pipes, redirection, and a ring-3 shell this system built   */
     cmd_lang_stress();      /* v0.60: sizeof/for-init/switch/unsigned + omake driving occ natively */
     cmd_thread_stress();    /* v0.61: ring-3 threads across cores, futex blocking, kernel join     */
+    cmd_pthreads_smp();     /* v0.62: pthread mutex contention + condition variable across cores   */
+    cmd_sig_stress();       /* v0.62: signal masks, dispositions, process-group delivery           */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();

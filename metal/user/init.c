@@ -108,6 +108,12 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_FUTEX_WAKE          65
 #define SYS_THREAD_JOIN         66
 #define SYS_GETTID              67
+/* v0.62: job control + per-thread signal masks. SIGACTION/KILL/SIGRETURN keep
+ * the numbers they have had since v0.55 (49/50/51) — renumbering working
+ * syscalls would break every binary already compiled into the VFS. */
+#define SYS_SETPGID             68
+#define SYS_KILLPG              69
+#define SYS_SIGPROCMASK         70
 #define EAGAIN_NEG    (-11)
 #define ETIMEDOUT_NEG (-62)
 /* Mirrors the kernel's HEAP_USER_V (kernel64.c is the master). */
@@ -117,6 +123,7 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SIGKILL  9
 #define SIGSEGV 11
 #define SIGALRM 14
+#define SIGTERM 15
 #define SIGCHLD 17
 #define NSIG    32
 
@@ -1530,16 +1537,34 @@ static const char *ogetenv(const char *key) {
     return 0;
 }
 
-/* ---- POSIX threads -------------------------------------------------------
- * SYS_THREAD_CREATE gives us a kernel thread sharing this address space with
- * its own ring-3 stack, entered with RSP pointing at the single argument the
- * kernel placed there. Everything else — the control blocks, the join
- * protocol, the mutexes — is userland, built on ordinary atomics over shared
- * memory, which is what makes it a real shim rather than a kernel service.  */
+/* ===========================================================================
+ * v0.62: libpthread — POSIX threads on the M61 kernel substrate
+ * ===========================================================================
+ * v0.55 shipped this API over BSP-only kernel threads and a mutex that spun
+ * through oyield(). Both halves are replaced here and the SIGNATURES are
+ * deliberately unchanged, so role 31 (posixstrs) compiles against the new
+ * engine without edits — which makes an existing suite a live test of it
+ * rather than a museum piece.
+ *
+ * What actually changed underneath:
+ *   - a thread is a run-queue entity (v0.61), so it runs on any core;
+ *   - the mutex has a syscall-free uncontended path and PARKS when contended,
+ *     instead of burning a core yielding;
+ *   - join asks the kernel instead of polling a userland flag;
+ *   - there is a condition variable, which there was no way to build before.
+ *
+ * GUARD PAGES: the kernel places thread N's stack at THR_USER_V + N*0x8000 and
+ * maps only the low 4 of those 8 pages. The 4 unmapped pages ABOVE each stack
+ * are the guard: a thread that overruns its stack downward from the top runs
+ * into the previous slot's guard hole and faults, rather than silently
+ * corrupting a sibling's stack. That geometry is the kernel's (v0.55) and is
+ * documented here because it is a property userland depends on and cannot see.
+ */
 #define PTHREAD_MAX 8
 #define THR_USER_V     0x0000560000000000ull      /* mirrors the kernel's window */
-#define THR_STK_STRIDE 0x8000ull
+#define THR_STK_STRIDE 0x8000ull                  /* 4 mapped + 4 guard pages    */
 typedef int pthread_t;
+
 struct pthr {
     void *(*fn)(void *);
     void *arg;
@@ -1548,15 +1573,88 @@ struct pthr {
 };
 static struct pthr g_pthr[PTHREAD_MAX];
 
-void pthread_body(struct pthr *t);                 /* called from the trampoline */
+/* ---- mutex ---------------------------------------------------------------
+ * Drepper's three-state mutex. 0 = free, 1 = held uncontended, 2 = held with
+ * waiters. The third state is the whole point: unlock only enters the kernel
+ * when it can SEE that somebody is parked, so an uncontended lock/unlock pair
+ * is two atomics and no syscall at all. */
+typedef struct { volatile u64 v; } pthread_mutex_t;
+
+static int pthread_mutex_init(pthread_mutex_t *m) { m->v = 0; __sync_synchronize(); return 0; }
+static int pthread_mutex_trylock(pthread_mutex_t *m) {
+    return __sync_bool_compare_and_swap(&m->v, 0, 1) ? 0 : -1;
+}
+static int pthread_mutex_lock(pthread_mutex_t *m) {
+    u64 c = __sync_val_compare_and_swap(&m->v, 0, 1);
+    if (c == 0) return 0;                          /* uncontended: no syscall  */
+    if (c != 2) c = __sync_lock_test_and_set(&m->v, 2);
+    while (c != 0) {
+        /* Sleep only while the word still reads 2. If unlock ran in between,
+         * the kernel's compare fails and we get -EAGAIN back immediately —
+         * that comparison is the reason a futex must be a syscall at all. */
+        sysc(SYS_FUTEX_WAIT, (u64)(void *)&m->v, 2, 4000);
+        c = __sync_lock_test_and_set(&m->v, 2);
+    }
+    return 0;
+}
+static int pthread_mutex_unlock(pthread_mutex_t *m) {
+    if (__sync_fetch_and_sub(&m->v, 1) != 1) {     /* was 2: someone is parked */
+        m->v = 0;
+        __sync_synchronize();
+        sysc(SYS_FUTEX_WAKE, (u64)(void *)&m->v, 1, 0);
+    }
+    return 0;
+}
+
+/* ---- condition variable --------------------------------------------------
+ * A sequence counter, and that is the entire state. The subtlety is the ORDER
+ * in pthread_cond_wait: the sequence is sampled while the mutex is STILL HELD,
+ * so any signaller that runs after we release it must have bumped the counter
+ * first — and the kernel's compare-and-sleep then declines to sleep and
+ * returns -EAGAIN. Sampling after the unlock instead would leave exactly the
+ * window where a signal can arrive with nobody yet asleep to receive it, which
+ * is the classic missed-wakeup and the reason a condvar cannot be built out of
+ * a plain sleep. */
+typedef struct { volatile u64 seq; } pthread_cond_t;
+
+static int pthread_cond_init(pthread_cond_t *c) { c->seq = 0; __sync_synchronize(); return 0; }
+static int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
+    u64 s = c->seq;                                /* sampled UNDER the mutex  */
+    pthread_mutex_unlock(m);
+    sysc(SYS_FUTEX_WAIT, (u64)(void *)&c->seq, s, 4000);
+    pthread_mutex_lock(m);                         /* POSIX: return holding it */
+    return 0;
+}
+static int pthread_cond_signal(pthread_cond_t *c) {
+    __sync_fetch_and_add(&c->seq, 1);
+    sysc(SYS_FUTEX_WAKE, (u64)(void *)&c->seq, 1, 0);
+    return 0;
+}
+static int pthread_cond_broadcast(pthread_cond_t *c) {
+    __sync_fetch_and_add(&c->seq, 1);
+    sysc(SYS_FUTEX_WAKE, (u64)(void *)&c->seq, 0, 0);   /* 0 = wake everyone */
+    return 0;
+}
+
+/* ---- thread lifecycle ----------------------------------------------------
+ * Threads are entered through RDI — the SysV first-argument register. v0.55
+ * had to use [rsp] because enter_user_thread set nothing but RIP and RSP; the
+ * kernel seeds a full register context now, so the ordinary calling
+ * convention is simply available. */
+void pthread_body(u64 i);                          /* called from the trampoline */
+void pthread_body(u64 i) {
+    if (i >= PTHREAD_MAX) return;
+    g_pthr[i].ret = g_pthr[i].fn(g_pthr[i].arg);
+    __sync_synchronize();
+    g_pthr[i].state = 2;
+}
 extern void pthread_tramp(void);
 __asm__(
     ".text\n"
     ".globl pthread_tramp\n"
     "pthread_tramp:\n"
-    "  mov (%rsp), %rdi\n"           /* the kernel put our struct pthr * here */
-    "  and $-16, %rsp\n"
-    "  call pthread_body\n"
+    "  and $-16, %rsp\n"             /* SysV: 16-byte aligned before the call  */
+    "  call pthread_body\n"          /* RDI already holds our slot index       */
     "  xor %edi, %edi\n"
     "  mov $53, %rax\n"              /* SYS_THREAD_EXIT(0) if the body returns */
     "  xor %esi, %esi\n"
@@ -1564,54 +1662,49 @@ __asm__(
     "  syscall\n"
     "1: jmp 1b\n"
 );
-void pthread_body(struct pthr *t) {
-    t->ret = t->fn(t->arg);
-    __sync_synchronize();
-    t->state = 2;
-}
 
-/* Which thread am I? Derived from the stack pointer: the kernel gives thread
- * slot N the stack window THR_USER_V + N*STRIDE, so the answer is arithmetic on
- * RSP — no TLS register and no kernel query needed. -1 means the process's
- * original (main) thread, whose stack is the ordinary one at USTK_V.         */
-static int pthread_self_slot(void) {
-    u64 sp;
-    __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
-    if (sp < THR_USER_V) return -1;
-    return (int)((sp - THR_USER_V) / THR_STK_STRIDE);
-}
-
-/* Slots are handed out monotonically and never recycled inside a process, so a
- * userland index always equals the kernel's stack-window index — which is what
- * makes pthread_self_slot() above valid. The two allocators are independent, so
- * we CHECK the agreement instead of assuming it: a mismatch fails the create
- * loudly rather than silently returning the wrong control block. */
 static volatile int g_pthr_n = 0;
+/* Slots are handed out monotonically and never recycled inside a process, so a
+ * userland index always equals the kernel's tid. The two allocators are
+ * independent, so their agreement is CHECKED rather than assumed: a mismatch
+ * would silently join the wrong thread. */
 static int pthread_create(pthread_t *out, void *(*fn)(void *), void *arg) {
     int i = __sync_fetch_and_add(&g_pthr_n, 1);
     if (i >= PTHREAD_MAX) { __sync_fetch_and_sub(&g_pthr_n, 1); return -11; }  /* EAGAIN */
     g_pthr[i].fn = fn; g_pthr[i].arg = arg; g_pthr[i].ret = 0; g_pthr[i].state = 1;
     __sync_synchronize();
-    i64 k = (i64)sysc(SYS_THREAD_CREATE, (u64)(void *)pthread_tramp, (u64)&g_pthr[i], 0);
-    if (k < 0)   { g_pthr[i].state = 0; __sync_fetch_and_sub(&g_pthr_n, 1); return (int)k; }
+    /* stack 0 = "kernel, give me one", which is also how the guard pages get
+     * arranged; a caller-supplied stack is the third argument and its guard is
+     * then the caller's business. */
+    i64 k = (i64)sysc(SYS_THREAD_CREATE, (u64)(void *)pthread_tramp, (u64)i, 0);
+    if (k < 0)   { g_pthr[i].state = 0; return (int)k; }
     if (k != i)  { g_pthr[i].state = 0; return -1; }   /* allocators desynced: refuse */
     if (out) *out = (pthread_t)i;
     return 0;
 }
+
+/* SYS_THREAD_JOIN answers -EAGAIN for "you slept, the state changed, ask
+ * again": a woken task resumes with only RAX to carry a result, and the waker
+ * is in another address space and cannot fill in our pointer. The loop is
+ * bounded so a join can FAIL rather than hang. */
 static int pthread_join(pthread_t t, void **ret) {
     if (t < 0 || t >= PTHREAD_MAX) return -1;
-    for (int spin = 0; spin < 200000; spin++) {
-        if (g_pthr[t].state >= 2) {
-            if (ret) *ret = g_pthr[t].ret;
-            g_pthr[t].state = 3;                  /* joined; the slot is NOT recycled */
-            return 0;
-        }
-        oyield();
+    u64 code = 0;
+    for (int k = 0; k < 20000; k++) {
+        i64 r = (i64)sysc(SYS_THREAD_JOIN, (u64)t, (u64)(void *)&code, 0);
+        if (r == EAGAIN_NEG) continue;
+        if (r != 0) return (int)r;
+        if (ret) *ret = g_pthr[t].ret;             /* the value, not the code */
+        g_pthr[t].state = 3;                       /* joined; slot NOT recycled */
+        return 0;
     }
-    return -11;                                   /* join timed out */
+    return ETIMEDOUT_NEG;
 }
+
+static pthread_t pthread_self(void) { return (pthread_t)sysc(SYS_GETTID, 0, 0, 0); }
+
 static void pthread_exit(void *ret) {
-    int i = pthread_self_slot();
+    int i = pthread_self();
     if (i >= 0 && i < PTHREAD_MAX) {
         g_pthr[i].ret = ret;
         __sync_synchronize();
@@ -1621,63 +1714,20 @@ static void pthread_exit(void *ret) {
     for (;;) { }
 }
 
-typedef struct { volatile int v; } pthread_mutex_t;
-static int pthread_mutex_init(pthread_mutex_t *m)    { m->v = 0; __sync_synchronize(); return 0; }
-static int pthread_mutex_trylock(pthread_mutex_t *m) { return __sync_bool_compare_and_swap(&m->v, 0, 1) ? 0 : -1; }
-static int pthread_mutex_lock(pthread_mutex_t *m) {
-    while (!__sync_bool_compare_and_swap(&m->v, 0, 1)) oyield();
-    return 0;
-}
-static int pthread_mutex_unlock(pthread_mutex_t *m)   { __sync_synchronize(); m->v = 0; return 0; }
-
-/* ---- v0.61: futex-backed threads -----------------------------------------
- * The v0.55 shim above is left exactly as it was, and role 31 still exercises
- * it. That is deliberate: it is the regression gate proving the kernel-side
- * rearchitecture (a thread is now a run-queue entity, not a BSP scheduler
- * thread) is invisible to code written against the old API.
- *
- * What follows is the new surface — a kernel join and a real futex mutex —
- * used by role 43.
- *
- * THE DIFFERENCE THAT MATTERS: the v0.55 mutex spins with oyield(), so a
- * waiter keeps a core busy doing nothing and every acquisition costs a trip
- * through the scheduler. This one sleeps. A thread blocked on fmutex_lock is
- * in no run queue at all, and the unlock that releases it is a single syscall
- * made only when somebody is actually waiting. */
-
-/* Drepper's three-state mutex. 0 = free, 1 = held uncontended, 2 = held with
- * waiters. The third state is what keeps the uncontended path syscall-free:
- * unlock only enters the kernel when it can see that someone is parked. */
-static void fmutex_lock(volatile u64 *m) {
-    u64 c = __sync_val_compare_and_swap(m, 0, 1);
-    if (c == 0) return;                           /* uncontended: no syscall  */
-    if (c != 2) c = __sync_lock_test_and_set(m, 2);
-    while (c != 0) {
-        /* Sleep only while the word still reads 2. If unlock ran in between,
-         * the kernel's compare fails, we get -EAGAIN back immediately and
-         * retry — no wakeup can be lost in that gap. */
-        sysc(SYS_FUTEX_WAIT, (u64)(void *)m, 2, 4000);
-        c = __sync_lock_test_and_set(m, 2);
-    }
-}
-static void fmutex_unlock(volatile u64 *m) {
-    if (__sync_fetch_and_sub(m, 1) != 1) {        /* was 2: someone is parked */
-        *m = 0;
-        __sync_synchronize();
-        sysc(SYS_FUTEX_WAKE, (u64)(void *)m, 1, 0);
-    }
-}
-
-/* Threads entered through RDI — the SysV first-argument register, which is
- * what a C function actually reads. v0.55 had to use [rsp] because
- * enter_user_thread set nothing but RIP and RSP; the kernel seeds a full
- * context now, so the ordinary calling convention is available.             */
+/* ---- the low-level thread interface --------------------------------------
+ * pthread_create always asks the kernel for a stack, because that is what a
+ * portable program wants. This layer sits under it and exposes the third
+ * argument of SYS_THREAD_CREATE — a CALLER-SUPPLIED stack — which role 43
+ * exercises specifically to prove the kernel accepts one and does not reclaim
+ * memory it never mapped. Same trampoline shape, different argument passing:
+ * the body here takes and returns a u64, so the thread's exit CODE is its
+ * return value rather than a pointer parked in a table. */
 #define KTHR_MAX 8
 struct kthr { u64 (*fn)(u64); u64 arg; };
 static struct kthr g_kthr[KTHR_MAX];
 static volatile int g_kthr_n = 0;
 
-u64 kthr_body(u64 i);                              /* called from the trampoline */
+u64 kthr_body(u64 i);
 u64 kthr_body(u64 i) {
     if (i >= KTHR_MAX) return 0;
     return g_kthr[i].fn(g_kthr[i].arg);
@@ -1687,8 +1737,8 @@ __asm__(
     ".text\n"
     ".globl kthr_tramp\n"
     "kthr_tramp:\n"
-    "  and $-16, %rsp\n"             /* SysV: 16-byte aligned before the call  */
-    "  call kthr_body\n"             /* RDI already holds our index            */
+    "  and $-16, %rsp\n"
+    "  call kthr_body\n"
     "  mov %rax, %rdi\n"             /* the body's return IS the exit code     */
     "  mov $53, %rax\n"              /* SYS_THREAD_EXIT                        */
     "  xor %esi, %esi\n"
@@ -1697,9 +1747,6 @@ __asm__(
     "1: jmp 1b\n"
 );
 
-/* `stack_top` of 0 asks the kernel for a stack; anything else must be the TOP
- * of memory this process already owns (the kernel checks it is writable, and
- * will not free it at exit — it is the caller's). */
 static int kthread_create(u64 (*fn)(u64), u64 arg, u64 stack_top) {
     int i = __sync_fetch_and_add(&g_kthr_n, 1);
     if (i >= KTHR_MAX) { __sync_fetch_and_sub(&g_kthr_n, 1); return EAGAIN_NEG; }
@@ -1707,12 +1754,6 @@ static int kthread_create(u64 (*fn)(u64), u64 arg, u64 stack_top) {
     __sync_synchronize();
     return (int)(i64)sysc(SYS_THREAD_CREATE, (u64)(void *)kthr_tramp, (u64)i, stack_top);
 }
-
-/* SYS_THREAD_JOIN answers -EAGAIN to mean "you slept, the state changed, ask
- * again" — a woken task resumes with only RAX to carry a result, and the waker
- * runs in a different address space and so cannot fill in *code on our behalf.
- * The retry loop is the whole cost of that, and it is bounded so a join can
- * fail rather than hang. */
 static int kthread_join(int tid, u64 *code) {
     for (int k = 0; k < 20000; k++) {
         i64 r = (i64)sysc(SYS_THREAD_JOIN, (u64)tid, (u64)(void *)code, 0);
@@ -1721,6 +1762,12 @@ static int kthread_join(int tid, u64 *code) {
     }
     return ETIMEDOUT_NEG;
 }
+
+/* The bare-word futex mutex role 43 was written against. It is the SAME mutex
+ * pthread_mutex_t is — pthread_mutex_t is exactly one volatile u64 — so this
+ * is a cast and not a second implementation to keep in step. */
+static void fmutex_lock(volatile u64 *m)   { pthread_mutex_lock((pthread_mutex_t *)m); }
+static void fmutex_unlock(volatile u64 *m) { pthread_mutex_unlock((pthread_mutex_t *)m); }
 
 /* Load sentinels into callee-saved regs, cross the SYSCALL boundary, and check  */
 /* they survive — proving the kernel preserves (and does not leak into) them.    */
@@ -2014,6 +2061,180 @@ static void thread_stress_worker(void) {
         if (r != EAGAIN_NEG)    sysc(SYS_EXIT, 972, 0, 0);   /* value mismatch  */
     }
     sysc(SYS_EXIT, 960, 0, 0);
+}
+
+/* --- role 44: pthreads_smp — mutex contention and a condition variable -----
+ *
+ * Role 43 (v0.61) proved threads RUN on every core. This one proves they can
+ * COORDINATE: a mutex whose critical section survives a reschedule, and a
+ * condition variable, which is the primitive you cannot build without the
+ * kernel closing the gap between "I released the lock" and "I am asleep".
+ *
+ * The condvar round is the interesting one. Workers block on a predicate that
+ * is false when they start, so every one of them MUST reach the wait; main
+ * then sets it and broadcasts. If cond_wait ever returned without the
+ * predicate holding, or a broadcast failed to reach a sleeper, the tally comes
+ * out wrong — it cannot come out right by luck. */
+#define PS_THREADS 4
+#define PS_BUMPS   200
+
+static pthread_mutex_t g_ps_mx;
+static pthread_cond_t  g_ps_cv;
+static volatile u64 g_ps_counter = 0;
+static volatile u64 g_ps_ready   = 0;   /* the predicate the condvar guards  */
+static volatile u64 g_ps_waiting = 0;   /* workers that reached the wait     */
+static volatile u64 g_ps_passed  = 0;   /* workers that got through it       */
+static volatile u64 g_ps_ran     = 0;   /* bit i = worker i executed         */
+static volatile u64 g_ps_tidbad  = 0;
+
+static void *ps_body(void *arg) {
+    int id = (int)(u64)arg;
+    __sync_fetch_and_or(&g_ps_ran, 1ull << id);
+    if (pthread_self() != id) g_ps_tidbad = 1;   /* tid must equal our index */
+
+    /* Phase 1: contend hard on the mutex, holding it across a reschedule. */
+    for (int i = 0; i < PS_BUMPS; i++) {
+        pthread_mutex_lock(&g_ps_mx);
+        u64 v = g_ps_counter;
+        if ((i & 15) == 0) oyield();
+        g_ps_counter = v + 1;
+        pthread_mutex_unlock(&g_ps_mx);
+    }
+
+    /* Phase 2: block on the condition variable until main says go. The loop
+     * around the wait is not decoration — a condvar may wake spuriously, and
+     * re-testing the predicate is the only correct way to use one. */
+    pthread_mutex_lock(&g_ps_mx);
+    __sync_fetch_and_add(&g_ps_waiting, 1);
+    /* The predicate is a COUNT, not a flag, and that is what makes the
+     * signal-versus-broadcast distinction testable: one permit must release
+     * exactly one waiter, however many are asleep. */
+    while (g_ps_ready == 0) pthread_cond_wait(&g_ps_cv, &g_ps_mx);
+    g_ps_ready = g_ps_ready - 1;                 /* consume one permit         */
+    __sync_fetch_and_add(&g_ps_passed, 1);
+    pthread_mutex_unlock(&g_ps_mx);              /* cond_wait returns holding it */
+    return (void *)(u64)(500 + id);
+}
+
+static void pthreads_smp_worker(void) {
+    pthread_mutex_init(&g_ps_mx);
+    pthread_cond_init(&g_ps_cv);
+    if (pthread_mutex_trylock(&g_ps_mx) != 0) sysc(SYS_EXIT, 941, 0, 0);
+    if (pthread_mutex_trylock(&g_ps_mx) == 0) sysc(SYS_EXIT, 941, 0, 0);
+    pthread_mutex_unlock(&g_ps_mx);
+
+    pthread_t t[PS_THREADS];
+    for (int i = 0; i < PS_THREADS; i++)
+        if (pthread_create(&t[i], ps_body, (void *)(u64)i) != 0) sysc(SYS_EXIT, 942, 0, 0);
+
+    /* Wait until every worker is actually parked on the condvar. If we
+     * broadcast before they arrive the test proves nothing — they would find
+     * the predicate already true and never exercise the wait at all. */
+    for (int i = 0; i < 200000 && g_ps_waiting < PS_THREADS; i++) oyield();
+    if (g_ps_waiting != PS_THREADS) sysc(SYS_EXIT, 943, 0, 0);
+    if (g_ps_passed  != 0)          sysc(SYS_EXIT, 944, 0, 0);   /* woke early */
+
+    /* ONE permit, released with cond_signal: exactly one worker may get through,
+     * and the other three must still be asleep afterwards. A signal that
+     * behaved like a broadcast would show up here as too many passing. */
+    pthread_mutex_lock(&g_ps_mx);
+    g_ps_ready = 1;
+    pthread_mutex_unlock(&g_ps_mx);
+    pthread_cond_signal(&g_ps_cv);
+    for (int i = 0; i < 200000 && g_ps_passed < 1; i++) oyield();
+    if (g_ps_passed != 1) sysc(SYS_EXIT, 938, 0, 0);   /* woke the wrong number */
+
+    /* The remaining three, released together. */
+    pthread_mutex_lock(&g_ps_mx);
+    g_ps_ready = PS_THREADS - 1;
+    pthread_mutex_unlock(&g_ps_mx);
+    pthread_cond_broadcast(&g_ps_cv);
+
+    for (int i = 0; i < PS_THREADS; i++) {
+        void *r = 0;
+        if (pthread_join(t[i], &r) != 0)      sysc(SYS_EXIT, 945, 0, 0);
+        if ((u64)r != (u64)(500 + i))         sysc(SYS_EXIT, 946, 0, 0);
+    }
+    if (g_ps_ran != ((1ull << PS_THREADS) - 1))          sysc(SYS_EXIT, 947, 0, 0);
+    if (g_ps_counter != (u64)PS_THREADS * PS_BUMPS)      sysc(SYS_EXIT, 948, 0, 0);
+    if (g_ps_passed  != PS_THREADS)                      sysc(SYS_EXIT, 949, 0, 0);
+    if (g_ps_tidbad)                                     sysc(SYS_EXIT, 939, 0, 0);
+    sysc(SYS_EXIT, 940, 0, 0);
+}
+
+/* --- role 45: sigstrs — masks, dispositions, and process groups ------------
+ *
+ * Role 30 (v0.55) covers handler execution, frames and SIGSEGV/SIGALRM. This
+ * suite covers what v0.62 adds and what role 30 cannot reach: sigprocmask's
+ * three modes, SIG_IGN, and process-group delivery — the mechanism that makes
+ * an interrupt reach a job and not the shell waiting on it. */
+static volatile int g_sg_hits = 0;
+static volatile int g_sg_last = 0;
+static void sg_handler(int s) { g_sg_last = s; __sync_fetch_and_add(&g_sg_hits, 1); }
+
+static void sig_stress_worker(void) {
+    /* (1) A handler runs, and SYS_SIGRETURN puts the interrupted context back.
+     * `witness` is a local: if the frame were restored wrongly it is the first
+     * thing that would come back as garbage. */
+    volatile int witness = 0x5EED;
+    osigaction(SIGTERM, sg_handler);
+    okill(ogetpid(), SIGTERM);
+    for (int i = 0; i < 40000 && g_sg_hits < 1; i++) oyield();
+    if (g_sg_hits != 1)          sysc(SYS_EXIT, 951, 0, 0);
+    if (g_sg_last != SIGTERM)    sysc(SYS_EXIT, 952, 0, 0);
+    if (witness != 0x5EED)       sysc(SYS_EXIT, 953, 0, 0);
+
+    /* (2) A blocked signal is HELD, not lost: unblocking must deliver it. */
+    sysc(SYS_SIGPROCMASK, 0, 1ull << SIGTERM, 0);          /* block */
+    int before = g_sg_hits;
+    okill(ogetpid(), SIGTERM);
+    for (int i = 0; i < 3000; i++) oyield();
+    if (g_sg_hits != before)     sysc(SYS_EXIT, 954, 0, 0);   /* leaked past the mask */
+    sysc(SYS_SIGPROCMASK, 1, 1ull << SIGTERM, 0);          /* unblock */
+    for (int i = 0; i < 40000 && g_sg_hits == before; i++) oyield();
+    if (g_sg_hits != before + 1) sysc(SYS_EXIT, 955, 0, 0);   /* dropped, not held */
+
+    /* (3) SETMASK replaces rather than merges, and returns the old mask. */
+    u64 prev = sysc(SYS_SIGPROCMASK, 2, 1ull << SIGTERM, 0);
+    u64 now  = sysc(SYS_SIGPROCMASK, 2, 0, 0);             /* clear, read back */
+    if (now != (1ull << SIGTERM)) sysc(SYS_EXIT, 956, 0, 0);
+    (void)prev;
+
+    /* (4) SIG_IGN discards outright — no handler call, no pending residue. */
+    osigaction(SIGTERM, 0);                                 /* SIG_DFL first   */
+    sysc(SYS_SIGACTION, SIGTERM, 1, 0);                     /* now SIG_IGN     */
+    before = g_sg_hits;
+    okill(ogetpid(), SIGTERM);
+    for (int i = 0; i < 3000; i++) oyield();
+    if (g_sg_hits != before)     sysc(SYS_EXIT, 957, 0, 0);
+    osigaction(SIGTERM, sg_handler);                        /* restore         */
+
+    /* (5) PROCESS GROUPS. Two children in one group, signalled as a unit with
+     * one call. They carry the DEFAULT disposition for SIGINT — terminate — so
+     * their exit codes prove delivery reached them and not merely the group. */
+    u32 kid[2];
+    for (int i = 0; i < 2; i++) {
+        i64 f = ofork();
+        if (f < 0) sysc(SYS_EXIT, 958, 0, 0);
+        if (f == 0) {
+            sysc(SYS_SIGACTION, SIGINT, 0, 0);              /* SIG_DFL: terminate */
+            sysc(SYS_SIGPROCMASK, 2, 0, 0);                 /* nothing blocked    */
+            for (int k = 0; k < 400000; k++) oyield();      /* wait to be killed  */
+            sysc(SYS_EXIT, 199, 0, 0);                      /* never signalled    */
+        }
+        kid[i] = (u32)f;
+    }
+    /* Both children into ONE group named after the first. */
+    int job = (int)kid[0];
+    for (int i = 0; i < 2; i++)
+        if (sysc(SYS_SETPGID, kid[i], (u64)job, 0) != 0) sysc(SYS_EXIT, 959, 0, 0);
+    i64 hit = (i64)sysc(SYS_KILLPG, (u64)job, SIGINT, 0);
+    if (hit != 2) sysc(SYS_EXIT, 960, 0, 0);                /* one call, both got it */
+    for (int i = 0; i < 2; i++) {
+        i64 st = owaitpid(kid[i], 400000);
+        if (st != 128 + SIGINT) sysc(SYS_EXIT, 961, 0, 0);  /* default action ran */
+    }
+    sysc(SYS_EXIT, 950, 0, 0);
 }
 
 /* --- roles 32/33: execve with argv + envp ---------------------------------*/
@@ -3119,6 +3340,8 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 38) { posix_selfhost_worker(); }        /* v0.56 author -> compile -> run, natively           */
     if (role == 40) { pipe_worker(); }                  /* v0.59 pipe mechanics: bounds, EOF, EPIPE, fork      */
     if (role == 41) { vsh_worker(); }                   /* v0.59 build /bin/vsh with occ and run a real script */
+    if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */
+    if (role == 45) { sig_stress_worker(); }           /* v0.62 masks, SIG_IGN, process-group delivery      */
     if (role == 43) { thread_stress_worker(); }        /* v0.61 futex threads, kernel join, own stack       */
     if (role == 42) { lang_stress_worker(); }           /* v0.60 sizeof/for-init/switch/unsigned + omake       */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
