@@ -8847,7 +8847,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     /* --- v0.46: capability-bound IPC (require CAP_IPC) --------------------- */
     case 18: {   /* SYS_IPC_SEND(msg_ptr) — capability-gated, zero-copy handle/frame transfer */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_IPC)) return (uint64_t)-13;
-        if (!access_ok(kprocs[current_proc_idx].cr3, a0, sizeof(struct ipc_msg), 0)) return (uint64_t)-14;
+        if (!access_ok(kprocs[current_proc_idx].cr3, a0, sizeof(struct ipc_msg), 1)) return (uint64_t)-14; /* read+write — sender_pid/xfer_id written back */
         struct ipc_msg kmsg;
         { const volatile uint8_t *s = (const volatile uint8_t *)a0; uint8_t *d = (uint8_t *)&kmsg;
           for (uint64_t i = 0; i < sizeof kmsg; i++) d[i] = s[i]; }
