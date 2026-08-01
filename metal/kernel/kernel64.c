@@ -4699,6 +4699,8 @@ static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
 #define VOL_TMP  1
 #define VOL_DEV  2
 #define VOL_PIPE 3   /* v0.59: not a store at all — a live channel, see g_pipes */
+#define VOL_EPOLL 4  /* v0.64: an epoll instance; g_epoll[ofile.ep]            */
+#define VOL_EVFD  5  /* v0.64: an eventfd counter; g_evfd[ofile.efd]           */
 
 #define TMP_MAXFILES 4                 /* small, ephemeral, RAM-only scratch area */
 #define TMP_MAXBYTES 512
@@ -4789,7 +4791,13 @@ static int64_t dev_read_file(void *buf, uint32_t max) {
  * that every `switch (volume)` in the read/write paths has to account for it
  * explicitly rather than silently treating a pipe as a ROOT file.           */
 struct ofile { int used; int dirent; uint64_t off; uint64_t owner_mask; int volume;
-               int pipe; int pipe_w; };
+               int pipe; int pipe_w;
+               /* v0.64: an epoll instance and an eventfd are DESCRIPTORS, which
+                * is not decoration — it is what gives them fork inheritance,
+                * SYS_CLOSE, owner-mask refcounting and force-close-on-exit for
+                * free, from machinery that is already tested. A side table keyed
+                * by process would have had to reimplement all four. */
+               int ep; int efd; };
 static struct ofile g_ofiles[16];
 
 /* ===========================================================================
@@ -4839,6 +4847,175 @@ static void pipe_unref_locked(int pi, int is_w) {
         g_pipes[pi].used = 0;        /* last end closed: the buffer is garbage */
 }
 
+/* ===========================================================================
+ * v0.64: EVENTFD AND EPOLL — readiness, and how to wait for it
+ * ===========================================================================
+ * Everything that could block in this kernel has, until now, been polled: the
+ * shell polls the tty, vsh polls waitpid, a pipe reader yields and retries.
+ * That works and it is honest, but it means a process waiting on two things at
+ * once has to spin between them, and on a uniprocessor spinning is how you
+ * starve the very task that would make progress.
+ *
+ * epoll answers "which of these is ready", and eventfd is the thing you can
+ * make ready on purpose. Together they are what let a thread sleep on several
+ * sources and be woken by whichever fires.
+ *
+ * BOTH ARE DESCRIPTORS, deliberately. An epoll instance and an eventfd live in
+ * g_ofiles like a file or a pipe end, which is what gives them fork
+ * inheritance, SYS_CLOSE, owner-mask refcounting and force-close-on-exit
+ * without writing any of it again — all four already exist and are tested by
+ * pipestrs. A private table keyed by process would have had to reimplement
+ * every one of them, and would have been the fifth place in this kernel that
+ * knows how a process releases things when it dies.
+ *
+ * READINESS IS COMPUTED, NOT CACHED. ep_poll_fd() asks the source directly
+ * every time rather than maintaining a ready-list updated by hooks. With eight
+ * descriptors and four epoll instances the scan is trivial, and the property
+ * bought is worth more than the cycles: a cached ready-bit that disagrees with
+ * the source is a hang (missed event) or a spin (phantom event), and both are
+ * exactly the bugs that are hardest to reproduce. Nothing can drift from a
+ * value that is never stored. */
+#define MAX_EPOLL      4
+#define EPOLL_MAXWATCH 8
+#define MAX_EVENTFD    8
+
+/* Event masks — the Linux values, so the constants a reader already knows mean
+ * what they normally mean. */
+#define EPOLLIN   0x001u
+#define EPOLLOUT  0x004u
+#define EPOLLERR  0x008u
+#define EPOLLHUP  0x010u
+#define EPOLLET   0x80000000u
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+
+struct epwatch {
+    int      used;
+    int      fd;
+    uint32_t events;      /* what the caller asked to hear about        */
+    uint64_t data;        /* opaque cookie handed back verbatim         */
+    uint32_t seen;        /* edge-triggered: the mask last reported     */
+};
+struct kepoll {
+    int used;
+    struct epwatch w[EPOLL_MAXWATCH];
+};
+static struct kepoll g_epoll[MAX_EPOLL];
+
+struct keventfd {
+    int      used;
+    uint64_t counter;
+    int      semaphore;   /* EFD_SEMAPHORE: a read takes 1, not the lot */
+};
+static struct keventfd g_evfd[MAX_EVENTFD];
+
+static volatile uint64_t g_epoll_creates = 0, g_epoll_waits = 0, g_epoll_parks = 0;
+static volatile uint64_t g_evfd_creates = 0, g_evfd_writes = 0, g_evfd_reads = 0;
+
+/* An epoll instance's park key, in the same tagged space join keys use. */
+#define EPOLL_WAIT_KEY(epi) (0xE000000000000000ull | (uint64_t)(epi))
+static int futex_wake_key(uint64_t key, int n, uint64_t rv);   /* fwd: v0.61 */
+
+/* What is `fd` ready for RIGHT NOW? Caller holds g_ofile_lock.
+ *
+ * The pipe rules are the ones with content, and they are the same distinctions
+ * v0.59 had to get right for read(): data means readable, but so does EOF —
+ * a reader must be woken to *learn* there is nothing more coming, or a
+ * pipeline hangs at its last byte instead of finishing. */
+static uint32_t ep_poll_fd_locked(int fd) {
+    if (fd < 0 || fd >= 16 || !g_ofiles[fd].used) return EPOLLERR;
+    struct ofile *o = &g_ofiles[fd];
+    uint32_t r = 0;
+    if (o->volume == VOL_PIPE) {
+        int pi = o->pipe;
+        if (pi < 0 || pi >= MAX_PIPES || !g_pipes[pi].used) return EPOLLERR | EPOLLHUP;
+        if (o->pipe_w) {
+            if (g_pipes[pi].readers == 0) r |= EPOLLERR;      /* nobody will ever read */
+            else if (g_pipes[pi].count < PIPE_CAP) r |= EPOLLOUT;
+        } else {
+            if (g_pipes[pi].count > 0) r |= EPOLLIN;
+            if (g_pipes[pi].writers == 0) r |= EPOLLIN | EPOLLHUP;  /* EOF is readable */
+        }
+        return r;
+    }
+    if (o->volume == VOL_EVFD) {
+        int ei = o->efd;
+        if (ei < 0 || ei >= MAX_EVENTFD || !g_evfd[ei].used) return EPOLLERR;
+        if (g_evfd[ei].counter > 0) r |= EPOLLIN;
+        if (g_evfd[ei].counter < 0xFFFFFFFFFFFFFFFEull) r |= EPOLLOUT;
+        return r;
+    }
+    if (o->volume == VOL_EPOLL) {
+        /* Watching an epoll fd with epoll is legal in POSIX and pointless
+         * here; report it as never-ready rather than pretending to nest. */
+        return 0;
+    }
+    /* A stored file is always ready both ways — POSIX says so, and it is true:
+     * a read or write on one completes without waiting for anything. */
+    return EPOLLIN | EPOLLOUT;
+}
+
+/* Something happened on `fd`: wake any thread parked in epoll_wait on an
+ * instance watching it. Scanning every instance is cheap at MAX_EPOLL = 4, and
+ * it means a notifier does not have to maintain a reverse index that could go
+ * stale — the same reason readiness itself is computed rather than cached. */
+static void ep_notify_fd(int fd) {
+    for (int i = 0; i < MAX_EPOLL; i++) {
+        if (!g_epoll[i].used) continue;
+        for (int k = 0; k < EPOLL_MAXWATCH; k++) {
+            if (!g_epoll[i].w[k].used || g_epoll[i].w[k].fd != fd) continue;
+            futex_wake_key(EPOLL_WAIT_KEY(i), MAX_KPROC, (uint64_t)-11);
+            break;
+        }
+    }
+}
+
+/* v0.64: an eventfd behaves as a FILE holding one 64-bit counter, so it is
+ * read and written through the ordinary SYS_READ / SYS_WRITE_FILE paths rather
+ * than through calls of its own. That is the point of making it a descriptor:
+ * anything that already knows how to write to an fd can signal one.
+ *
+ * A read DRAINS the counter and returns what it held; in semaphore mode it
+ * takes exactly 1. Reading zero is EAGAIN rather than a short read, because
+ * "no events" is a state to wait on, not an end of file. */
+static int64_t evfd_read_fd(int fd, void *dst, uint32_t len) {
+    if (len < 8) return -22;                                  /* EINVAL */
+    klock_acquire(&g_ofile_lock);
+    int ei = (fd >= 0 && fd < 16 && g_ofiles[fd].used) ? g_ofiles[fd].efd : -1;
+    if (ei < 0 || ei >= MAX_EVENTFD || !g_evfd[ei].used) { klock_release(&g_ofile_lock); return -9; }
+    uint64_t v = g_evfd[ei].counter;
+    int64_t r;
+    if (!v) r = -11;                                          /* EAGAIN: nothing posted */
+    else {
+        if (g_evfd[ei].semaphore) { g_evfd[ei].counter -= 1; v = 1; }
+        else                        g_evfd[ei].counter = 0;
+        *(uint64_t *)dst = v;
+        r = 8;
+    }
+    klock_release(&g_ofile_lock);
+    if (r == 8) __sync_fetch_and_add(&g_evfd_reads, 1);
+    return r;
+}
+
+/* A write ADDS to the counter and wakes anything parked in epoll_wait on it.
+ * The wake happens after the lock is released: waking takes run-queue locks,
+ * and the ordering discipline puts those outside the descriptor lock. */
+static int64_t evfd_write_fd(int fd, const void *src, uint32_t len) {
+    if (len < 8) return -22;
+    klock_acquire(&g_ofile_lock);
+    int ei = (fd >= 0 && fd < 16 && g_ofiles[fd].used) ? g_ofiles[fd].efd : -1;
+    if (ei < 0 || ei >= MAX_EVENTFD || !g_evfd[ei].used) { klock_release(&g_ofile_lock); return -9; }
+    uint64_t add = *(const uint64_t *)src;
+    int64_t r;
+    if (add == 0xFFFFFFFFFFFFFFFFull) r = -22;                /* reserved, as Linux has it */
+    else if (g_evfd[ei].counter + add < g_evfd[ei].counter) r = -11;   /* would wrap: EAGAIN */
+    else { g_evfd[ei].counter += add; r = 8; }
+    klock_release(&g_ofile_lock);
+    if (r == 8) { __sync_fetch_and_add(&g_evfd_writes, 1); ep_notify_fd(fd); }
+    return r;
+}
+
 static int ofile_claim(int owner, int volume, int dirent) {
     klock_acquire(&g_ofile_lock);
     for (int fd = 0; fd < 16; fd++)
@@ -4848,6 +5025,7 @@ static int ofile_claim(int owner, int volume, int dirent) {
             g_ofiles[fd].owner_mask = 1ull << owner;
             g_ofiles[fd].volume = volume;
             g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
+            g_ofiles[fd].ep = -1;   g_ofiles[fd].efd = -1;
             klock_release(&g_ofile_lock);
             return fd;
         }
@@ -4880,7 +5058,22 @@ static int ofile_drop_locked(int fd, int slot) {
      * once the entry itself is gone. */
     if (kprocs[slot].redir_in  == fd) kprocs[slot].redir_in  = -1;
     if (kprocs[slot].redir_out == fd) kprocs[slot].redir_out = -1;
+    /* v0.64: an epoll instance and an eventfd belong to the DESCRIPTOR, not to
+     * any one owner, so they are released exactly when the entry itself goes —
+     * unlike a pipe end above, whose refcount is per owner because fork takes
+     * a reference per owner. Getting these two the same way round would either
+     * free an instance a forked sibling still holds, or never free it at all. */
     if (g_ofiles[fd].owner_mask) return 0;             /* other owners remain */
+    if (g_ofiles[fd].ep >= 0 && g_ofiles[fd].ep < MAX_EPOLL) {
+        g_epoll[g_ofiles[fd].ep].used = 0;
+        for (int k = 0; k < EPOLL_MAXWATCH; k++) g_epoll[g_ofiles[fd].ep].w[k].used = 0;
+        g_ofiles[fd].ep = -1;
+    }
+    if (g_ofiles[fd].efd >= 0 && g_ofiles[fd].efd < MAX_EVENTFD) {
+        g_evfd[g_ofiles[fd].efd].used = 0;
+        g_evfd[g_ofiles[fd].efd].counter = 0;
+        g_ofiles[fd].efd = -1;
+    }
     for (int s = 0; s < n_kproc; s++) {
         if (kprocs[s].redir_in  == fd) kprocs[s].redir_in  = -1;
         if (kprocs[s].redir_out == fd) kprocs[s].redir_out = -1;
@@ -4953,6 +5146,20 @@ static int64_t pipe_write_fd(int fd, const void *src, uint32_t len) {
         }
     }
     klock_release(&g_ofile_lock);
+    /* v0.64: bytes landed in the pipe, so anything parked in epoll_wait on the
+     * READ end is now runnable. Notified after the lock is released, because
+     * waking takes the run-queue locks and the ordering discipline puts those
+     * outside the descriptor lock, never inside it.
+     *
+     * The read end is a DIFFERENT descriptor from this one, so the notify has
+     * to name the pipe rather than the fd that was written — a reader watches
+     * its own end, and nobody is watching the writer's. */
+    if (r > 0) {
+        int pi = g_ofiles[fd].pipe;
+        for (int q = 0; q < 16; q++)
+            if (g_ofiles[q].used && g_ofiles[q].volume == VOL_PIPE &&
+                g_ofiles[q].pipe == pi && !g_ofiles[q].pipe_w) ep_notify_fd(q);
+    }
     return r;
 }
 
@@ -9459,6 +9666,85 @@ static uint64_t sys_futex_wait(struct sysframe *sf, uint64_t uaddr, uint64_t val
     block_ring3(sf, p, key, timeout);         /* never returns */
 }
 
+/* SYS_EPOLL_WAIT(epfd, events, maxevents_and_timeout) -> ready count, or negative.
+ *
+ * The third argument packs maxevents in the low half and the timeout in
+ * milliseconds in the high half, for the same reason epoll_ctl packs its
+ * fourth: three argument registers, and a struct read on the hot path buys
+ * nothing. The userland wrapper presents the ordinary four-argument shape.
+ *
+ * Returns:
+ *   > 0          that many events were written to `events`
+ *   0            timeout was 0 and nothing was ready — a poll, not a wait
+ *   -EAGAIN(-11) we slept, something happened, CALL AGAIN. Same retry contract
+ *                as SYS_THREAD_JOIN and for the same reason: a woken task
+ *                resumes with only RAX, and the waker is in another address
+ *                space and cannot fill in the caller's array.
+ *   -ETIMEDOUT   the deadline passed with nothing ready.
+ *
+ * EDGE TRIGGERING is per watch, and `seen` is what makes it edge rather than
+ * level: a watch registered with EPOLLET reports a mask only when it DIFFERS
+ * from what it last reported. Clearing `seen` on EPOLL_CTL_MOD re-arms it,
+ * which is what a caller changing the mask expects.                        */
+struct uepoll_event { uint32_t events; uint32_t _pad; uint64_t data; };
+
+static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, uint64_t a2) {
+    int p = tg_of((int)current_proc_idx);
+    int epfd = (int)(int64_t)a0;
+    int maxev = (int)(a2 & 0xFFFFFFFFu);
+    int64_t tmo_ms = (int64_t)(int32_t)(a2 >> 32);
+    if (epfd < 0 || epfd >= 16 || maxev <= 0) return (uint64_t)-22;
+    if (maxev > EPOLL_MAXWATCH) maxev = EPOLL_MAXWATCH;
+    if (!access_ok(kprocs[p].cr3, a1, (uint64_t)maxev * sizeof(struct uepoll_event), 1))
+        return (uint64_t)-14;
+
+    klock_acquire(&g_ofile_lock);
+    if (!g_ofiles[epfd].used || g_ofiles[epfd].volume != VOL_EPOLL ||
+        !(g_ofiles[epfd].owner_mask & (1ull << p))) {
+        klock_release(&g_ofile_lock); return (uint64_t)-9;
+    }
+    int epi = g_ofiles[epfd].ep;
+    if (epi < 0 || epi >= MAX_EPOLL || !g_epoll[epi].used) {
+        klock_release(&g_ofile_lock); return (uint64_t)-9;
+    }
+    struct kepoll *E = &g_epoll[epi];
+    struct uepoll_event *out = (struct uepoll_event *)a1;
+    int n = 0;
+    for (int k = 0; k < EPOLL_MAXWATCH && n < maxev; k++) {
+        if (!E->w[k].used) continue;
+        /* EPOLLERR and EPOLLHUP are reported whether or not they were asked
+         * for — POSIX requires it, and a caller that only asked for EPOLLIN
+         * still has to learn that its peer is gone or it waits forever. */
+        uint32_t want = E->w[k].events | EPOLLERR | EPOLLHUP;
+        uint32_t got = ep_poll_fd_locked(E->w[k].fd) & want;
+        if (!got) { E->w[k].seen = 0; continue; }
+        if ((E->w[k].events & EPOLLET) && got == E->w[k].seen) continue;  /* no edge */
+        E->w[k].seen = got;
+        out[n].events = got; out[n]._pad = 0; out[n].data = E->w[k].data;
+        n++;
+    }
+    klock_release(&g_ofile_lock);
+    __sync_fetch_and_add(&g_epoll_waits, 1);
+    if (n > 0) return (uint64_t)(int64_t)n;
+    if (tmo_ms == 0) return 0;                       /* a poll: nothing ready */
+
+    /* Nothing ready and the caller is willing to wait. Park on this instance's
+     * key using the v0.61 protocol, so the thread leaves the run queue rather
+     * than spinning — which on a uniprocessor is the difference between
+     * waiting and preventing the event from ever happening. */
+    if (!sf || !can_park()) {
+        uint64_t dl = g_ticks + (tmo_ms < 0 ? FUTEX_DEFAULT_TICKS : (uint64_t)tmo_ms / 10 + 1);
+        while (g_ticks < dl) { sched_yield(); }
+        return WAIT_RV_TIMEDOUT;
+    }
+    __sync_fetch_and_add(&g_epoll_parks, 1);
+    /* PIT is 100 Hz, so a tick is 10 ms; a negative timeout means "wait", which
+     * here is still bounded by the kernel default — no park in this system is
+     * unbounded, for the reason set out with the futex. */
+    uint64_t ticks = (tmo_ms < 0) ? FUTEX_DEFAULT_TICKS : ((uint64_t)tmo_ms / 10 + 1);
+    block_ring3(sf, (int)current_proc_idx, EPOLL_WAIT_KEY(epi), ticks);  /* never returns */
+}
+
 /* SYS_FUTEX_WAKE(uaddr, n) -> how many waiters were released (0 is normal and
  * not an error: waking an uncontended futex is the common case). */
 static uint64_t sys_futex_wake(uint64_t uaddr, uint64_t n) {
@@ -9613,6 +9899,7 @@ static int64_t redirect_write_bytes(int fd, const void *data, uint32_t len) {
     int di = ofile_deref(fd, &vol);
     if (di < 0) return -9;                                  /* EBADF */
     if (vol == VOL_PIPE) return pipe_write_fd(fd, data, len);
+    if (vol == VOL_EVFD) return evfd_write_fd(fd, data, len);
     if (vol == VOL_DEV)  return -13;                        /* read-only volume */
     if (!len) return 0;
 
@@ -9750,6 +10037,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             if (vol == VOL_ROOT)      n = vfs_read_file(di, (void *)a1, len);
             else if (vol == VOL_TMP)  n = tmp_read_file(di, (void *)a1, len);
             else if (vol == VOL_PIPE) n = pipe_read_fd(fd, (void *)a1, len);   /* v0.59 */
+            else if (vol == VOL_EVFD) n = evfd_read_fd(fd, (void *)a1, len);   /* v0.64 */
             else /* VOL_DEV */        n = dev_read_file((void *)a1, len);
         }
         fs_witness_leave();
@@ -9768,6 +10056,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             if (vol == VOL_ROOT)      r = vfs_write_by_dirent(di, (const void *)a1, len);  /* COW */
             else if (vol == VOL_TMP)  r = tmp_write_file(di, (const void *)a1, len);
             else if (vol == VOL_PIPE) r = pipe_write_fd(fd, (const void *)a1, len);        /* v0.59 */
+            else if (vol == VOL_EVFD) r = evfd_write_fd(fd, (const void *)a1, len);        /* v0.64 */
             else /* VOL_DEV */        r = -13;              /* read-only volume: capability-style denial */
         }
         fs_witness_leave();
@@ -11160,6 +11449,113 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         return sys_futex_wake(a0, a1);
     case 66:     /* SYS_THREAD_JOIN(tid, uint64_t *out_code) */
         return sys_thread_join(0, a0, a1);
+    case 78:     /* SYS_EPOLL_WAIT — normally intercepted by syscall_trap, which
+                  * has the `sf` needed to park. Reaching here means no user
+                  * context, so it runs the bounded yield fallback. */
+        return sys_epoll_wait(0, a0, a1, a2);
+    case 76: {   /* SYS_EPOLL_CREATE(flags) -> an epoll descriptor, or negative. */
+        int p = tg_of((int)current_proc_idx);
+        (void)a0;                                    /* no flags defined yet */
+        klock_acquire(&g_ofile_lock);
+        int epi = -1;
+        for (int i = 0; i < MAX_EPOLL; i++) if (!g_epoll[i].used) { epi = i; break; }
+        if (epi < 0) { klock_release(&g_ofile_lock); return (uint64_t)-11; }
+        int fd = -1;
+        for (int i = 0; i < 16; i++) if (!g_ofiles[i].used) { fd = i; break; }
+        if (fd < 0) { klock_release(&g_ofile_lock); return (uint64_t)-24; }   /* EMFILE */
+        g_epoll[epi].used = 1;
+        for (int k = 0; k < EPOLL_MAXWATCH; k++) g_epoll[epi].w[k].used = 0;
+        /* dirent carries the INSTANCE INDEX, exactly as a pipe end carries its
+         * pipe index. ofile_deref returns this field and every read/write path
+         * gates on `di >= 0`, so a descriptor with dirent -1 is unusable — it
+         * dereferences as EBADF no matter how well-formed the rest of it is. */
+        g_ofiles[fd].used = 1; g_ofiles[fd].dirent = epi; g_ofiles[fd].off = 0;
+        g_ofiles[fd].owner_mask = 1ull << p; g_ofiles[fd].volume = VOL_EPOLL;
+        g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
+        g_ofiles[fd].ep = epi; g_ofiles[fd].efd = -1;
+        klock_release(&g_ofile_lock);
+        __sync_fetch_and_add(&g_epoll_creates, 1);
+        if (g_debug_posix)
+            kprintf("[dbgep  ] epoll_create pid %u -> fd %d (instance %d)\n",
+                    kprocs[p].pid, (uint64_t)(int64_t)fd, (uint64_t)(int64_t)epi);
+        return (uint64_t)(int64_t)fd;
+    }
+    case 77: {   /* SYS_EPOLL_CTL(epfd, op, fd, events_and_data)
+                  *
+                  * The fourth argument is (events | data<<32) packed into one
+                  * word rather than a pointer to a struct. This syscall ABI has
+                  * three argument registers, and a struct pointer would have
+                  * meant a user-memory read on a path whose whole job is to be
+                  * cheap; the userland wrapper below presents the ordinary
+                  * struct epoll_event shape over it. */
+        int p = tg_of((int)current_proc_idx);
+        int epfd = (int)(int64_t)a0;
+        int op   = (int)((a1 >> 32) & 0xFFFF);
+        int fd   = (int)(int32_t)(a1 & 0xFFFFFFFFu);
+        uint32_t evmask = (uint32_t)(a2 & 0xFFFFFFFFu);
+        uint64_t cookie = a2 >> 32;
+        if (epfd < 0 || epfd >= 16 || fd < 0 || fd >= 16) return (uint64_t)-9;   /* EBADF */
+        klock_acquire(&g_ofile_lock);
+        if (!g_ofiles[epfd].used || g_ofiles[epfd].volume != VOL_EPOLL ||
+            !(g_ofiles[epfd].owner_mask & (1ull << p))) {
+            klock_release(&g_ofile_lock); return (uint64_t)-9;
+        }
+        int epi = g_ofiles[epfd].ep;
+        if (epi < 0 || epi >= MAX_EPOLL || !g_epoll[epi].used) {
+            klock_release(&g_ofile_lock); return (uint64_t)-9;
+        }
+        struct kepoll *E = &g_epoll[epi];
+        int slot = -1, freeslot = -1;
+        for (int k = 0; k < EPOLL_MAXWATCH; k++) {
+            if (E->w[k].used && E->w[k].fd == fd) { slot = k; break; }
+            if (!E->w[k].used && freeslot < 0) freeslot = k;
+        }
+        int64_t rc = 0;
+        if (op == EPOLL_CTL_ADD) {
+            if (slot >= 0) rc = -17;                        /* EEXIST */
+            else if (!g_ofiles[fd].used) rc = -9;
+            else if (freeslot < 0) rc = -28;                /* ENOSPC */
+            else {
+                E->w[freeslot].used = 1; E->w[freeslot].fd = fd;
+                E->w[freeslot].events = evmask; E->w[freeslot].data = cookie;
+                E->w[freeslot].seen = 0;
+            }
+        } else if (op == EPOLL_CTL_DEL) {
+            if (slot < 0) rc = -2;                          /* ENOENT */
+            else E->w[slot].used = 0;
+        } else if (op == EPOLL_CTL_MOD) {
+            if (slot < 0) rc = -2;
+            else { E->w[slot].events = evmask; E->w[slot].data = cookie;
+                   E->w[slot].seen = 0; }                   /* re-arm the edge  */
+        } else rc = -22;                                    /* EINVAL */
+        klock_release(&g_ofile_lock);
+        return (uint64_t)rc;
+    }
+    case 79: {   /* SYS_EVENTFD(initval, flags) -> an eventfd descriptor.
+                  * flags bit 0 = EFD_SEMAPHORE. */
+        int p = tg_of((int)current_proc_idx);
+        klock_acquire(&g_ofile_lock);
+        int ei = -1;
+        for (int i = 0; i < MAX_EVENTFD; i++) if (!g_evfd[i].used) { ei = i; break; }
+        if (ei < 0) { klock_release(&g_ofile_lock); return (uint64_t)-11; }
+        int fd = -1;
+        for (int i = 0; i < 16; i++) if (!g_ofiles[i].used) { fd = i; break; }
+        if (fd < 0) { klock_release(&g_ofile_lock); return (uint64_t)-24; }
+        g_evfd[ei].used = 1;
+        g_evfd[ei].counter = a0;
+        g_evfd[ei].semaphore = (a1 & 1) ? 1 : 0;
+        g_ofiles[fd].used = 1; g_ofiles[fd].dirent = ei; g_ofiles[fd].off = 0;
+        g_ofiles[fd].owner_mask = 1ull << p; g_ofiles[fd].volume = VOL_EVFD;
+        g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
+        g_ofiles[fd].ep = -1; g_ofiles[fd].efd = ei;
+        klock_release(&g_ofile_lock);
+        __sync_fetch_and_add(&g_evfd_creates, 1);
+        if (g_debug_posix)
+            kprintf("[dbgep  ] eventfd pid %u -> fd %d (counter %u%s)\n",
+                    kprocs[p].pid, (uint64_t)(int64_t)fd, a0,
+                    g_evfd[ei].semaphore ? ", semaphore" : "");
+        return (uint64_t)(int64_t)fd;
+    }
     case 74: {   /* SYS_SHM_CREATE(size) -> shm id, or negative.
                   * Frames are allocated and ZEROED up front, not on demand:
                   * a shared segment's whole point is that another process can
@@ -11447,6 +11843,9 @@ uint64_t syscall_trap(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
      * are handled at this level. Both may never return. */
     else if (num == 64) r = sys_futex_wait(sf, a0, a1, a2);
     else if (num == 66) r = sys_thread_join(sf, a0, a1);
+    /* v0.64: epoll_wait parks like the other two, so it needs `sf` for the
+     * same reason — the complete interrupted context exists nowhere else. */
+    else if (num == 78) r = sys_epoll_wait(sf, a0, a1, a2);
     else if (num == 15) {
         /* Deliver pending signals BEFORE yielding. sys_yield_ring3 unwinds
          * through resume_kernel and never returns, so for a queued ring-3 task
@@ -13800,6 +14199,21 @@ static const char SDK_UNISTD_H[] =
 "int setpgid(int pid, int pgid, int fg);   /* pid 0 = self, pgid 0 = own pid  */\n"
 "int killpg(int pgid, int sig);\n"
 "int sigprocmask(int how, int mask);       /* 0 block, 1 unblock, 2 set       */\n"
+"/* v0.64: epoll and eventfd. epoll_wait fills `events` with PAIRS of words —\n"
+" * mask then cookie, 16 bytes per entry — and returns how many it wrote, or\n"
+" * -11 meaning \"you slept, ask again\", the same retry contract thread_join\n"
+" * has. An eventfd is read and written as an ordinary 8-byte descriptor. */\n"
+"#define EPOLLIN  1\n"
+"#define EPOLLOUT 4\n"
+"#define EPOLLERR 8\n"
+"#define EPOLLHUP 16\n"
+"#define EPOLL_CTL_ADD 1\n"
+"#define EPOLL_CTL_DEL 2\n"
+"#define EPOLL_CTL_MOD 3\n"
+"int epoll_create(int flags);\n"
+"int epoll_ctl(int epfd, int op, int fd, int events, int cookie);\n"
+"int epoll_wait(int epfd, int *events, int maxevents, int timeout_ms);\n"
+"int eventfd(int initval, int flags);\n"
 "int unlink(char *path);\n"
 "/* v0.58: execp() replaces this image with an ELF loaded BY PATH out of the\n"
 " * VFS. `argv` is a WORD array of pointers terminated by a 0 — which is what\n"
@@ -14005,6 +14419,18 @@ static const char SDK_LIBC_OC[] =
 "int setpgid(int pid, int pgid, int fg) { return __syscall(68, pid, pgid, fg); }\n"
 "int killpg(int pgid, int sig) { return __syscall(69, pgid, sig, 0); }\n"
 "int sigprocmask(int how, int mask) { return __syscall(70, how, mask, 0); }\n"
+"/* v0.64: event-driven I/O. The kernel ABI has three argument registers, so\n"
+" * epoll_ctl and epoll_wait PACK their extra arguments; these wrappers present\n"
+" * the ordinary shapes over that. An epoll_event here is two words: the mask\n"
+" * and an opaque cookie handed back verbatim. */\n"
+"int epoll_create(int flags) { return __syscall(76, flags, 0, 0); }\n"
+"int epoll_ctl(int epfd, int op, int fd, int events, int cookie) {\n"
+"  return __syscall(77, epfd, (op << 32) | (fd & 4294967295), (cookie << 32) | (events & 4294967295));\n"
+"}\n"
+"int epoll_wait(int epfd, int *events, int maxevents, int timeout_ms) {\n"
+"  return __syscall(78, epfd, events, (timeout_ms << 32) | (maxevents & 4294967295));\n"
+"}\n"
+"int eventfd(int initval, int flags) { return __syscall(79, initval, flags, 0); }\n"
 "int exit(int status) { __syscall(2, status, 0, 0); return 0; }\n"
 "/* v0.58: run another program, and read the console. These three are what turn\n"
 " * a compiled program from something that computes into something that can\n"
@@ -16236,6 +16662,98 @@ out:
     kprintf("[shmstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_shpass, (uint64_t)g_shfail);
     if (!g_shfail) kputs("[shmstrs] COW AND SHARED MEMORY VERIFIED — forks are cheap, sharing is real\n");
     else kputs("[shmstrs] MEMORY SHARING DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.64: EPOLLSTRS — readiness reported, and the descriptors given back
+ * =========================================================================== */
+static int g_eppass = 0, g_epfail = 0;
+static void epcheck(const char *what, int ok) {
+    if (ok) { g_eppass++; kprintf("[epollstrs] PASS: %s\n", what); }
+    else    { g_epfail++; kprintf("[epollstrs] FAIL: %s\n", what); }
+}
+
+static void cmd_epoll_stress(void) {
+    kputs("-- EPOLLSTRS: event-driven readiness, eventfd counters, and EOF --\n");
+    g_eppass = g_epfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t ec0 = g_epoll_creates, ew0 = g_epoll_waits;
+    uint64_t vc0 = g_evfd_creates, vw0 = g_evfd_writes, vr0 = g_evfd_reads;
+
+    int p = kproc_spawn("epollstr", PCAP_FILESYSTEM);
+    if (p < 0) { epcheck("kproc_spawn never fails", 0); goto out; }
+    kprocs[p].role = 48;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { epcheck("the driver's ELF loads", 0); goto out; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 160000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[epollstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 920 ? "" :
+        R.code[0] == 921 ? "eventfd creation failed" :
+        R.code[0] == 922 ? "reading an empty eventfd did not answer EAGAIN" :
+        (R.code[0] == 923 || R.code[0] == 924) ? "writing an eventfd failed" :
+        R.code[0] == 925 ? "reading a posted eventfd failed" :
+        R.code[0] == 926 ? "EVENTFD WRITES DID NOT ACCUMULATE (7 + 5 was not 12)" :
+        R.code[0] == 927 ? "the eventfd did not drain on read" :
+        R.code[0] == 928 ? "epoll_create failed" :
+        R.code[0] == 929 ? "EPOLL_CTL_ADD failed" :
+        R.code[0] == 930 ? "AN UNPOSTED EVENTFD WAS REPORTED READY" :
+        R.code[0] == 931 ? "posting the eventfd failed" :
+        R.code[0] == 932 ? "a posted eventfd was NOT reported ready" :
+        R.code[0] == 933 ? "the ready event did not carry EPOLLIN" :
+        R.code[0] == 934 ? "the caller's cookie came back altered" :
+        R.code[0] == 935 ? "EPOLL_CTL_DEL failed" :
+        R.code[0] == 936 ? "a DELETED watch still reported events" :
+        R.code[0] == 937 ? "SYS_PIPE failed" :
+        R.code[0] == 938 ? "EPOLL_CTL_ADD on a pipe failed" :
+        R.code[0] == 939 ? "AN EMPTY PIPE WAS REPORTED READABLE" :
+        R.code[0] == 940 ? "writing the pipe failed" :
+        R.code[0] == 941 ? "a written pipe was not reported readable" :
+        R.code[0] == 942 ? "draining the pipe failed" :
+        R.code[0] == 943 ? "END OF FILE WAS NOT REPORTED READABLE (a pipeline would hang)" :
+        R.code[0] == 944 ? "end of file did not carry EPOLLHUP" :
+                           "unknown";
+    if (R.code[0] != 920) kprintf("[epollstrs] driver exit %u — %s\n", R.code[0], why);
+
+    epcheck("readiness, cookies, deletion and end-of-file all behaved (exit 920)",
+            finished && R.code[0] == 920);
+    kprintf("[epollstrs] epoll: %u created, %u waits (%u parked); eventfd: %u created, %u writes, %u reads\n",
+            g_epoll_creates - ec0, g_epoll_waits - ew0, g_epoll_parks,
+            g_evfd_creates - vc0, g_evfd_writes - vw0, g_evfd_reads - vr0);
+    epcheck("the epoll and eventfd paths were actually exercised",
+            g_epoll_creates > ec0 && g_epoll_waits > ew0 && g_evfd_writes > vw0);
+
+    /* Both are descriptors, so the proof they were released is the one the
+     * descriptor layer already knows how to give: nothing left in the table. */
+    int fds_leaked = 0, ep_live = 0, ev_live = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    for (int i = 0; i < MAX_EPOLL; i++)   if (g_epoll[i].used) ep_live++;
+    for (int i = 0; i < MAX_EVENTFD; i++) if (g_evfd[i].used)  ev_live++;
+    epcheck("no descriptor leaked across the suite", fds_leaked == 0);
+    epcheck("every epoll instance and eventfd was reclaimed with its descriptor",
+            ep_live == 0 && ev_live == 0);
+    epcheck("no lock-rank violation across the epoll paths", g_rank_violations == viol0);
+out:
+    kprintf("[epollstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_eppass, (uint64_t)g_epfail);
+    if (!g_epfail) kputs("[epollstrs] EVENT-DRIVEN I/O VERIFIED — readiness is computed, not remembered\n");
+    else kputs("[epollstrs] EVENT I/O DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -18775,6 +19293,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "sigstress")) cmd_sig_stress();
     else if (!kstrcmp(argv[0], "mmapstress")) cmd_mmap_stress();
     else if (!kstrcmp(argv[0], "shmstress")) cmd_shm_stress();
+    else if (!kstrcmp(argv[0], "epollstress")) cmd_epoll_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -18965,6 +19484,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_sig_stress();       /* v0.62: signal masks, dispositions, process-group delivery           */
     cmd_mmap_stress();      /* v0.63: demand-zero paging, mprotect, munmap                         */
     cmd_shm_stress();       /* v0.63: copy-on-write fork and zero-copy shared memory               */
+    cmd_epoll_stress();     /* v0.64: event-driven readiness, eventfd counters, EOF reporting      */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();

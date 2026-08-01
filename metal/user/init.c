@@ -121,6 +121,46 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_MPROTECT            73
 #define SYS_SHM_CREATE          74
 #define SYS_SHM_MAP             75
+/* v0.64: event-driven I/O. epoll_ctl and epoll_wait PACK their extra arguments
+ * because the syscall ABI has three argument registers; the wrappers below
+ * present the ordinary shapes over that. */
+#define SYS_EPOLL_CREATE        76
+#define SYS_EPOLL_CTL           77
+#define SYS_EPOLL_WAIT          78
+#define SYS_EVENTFD             79
+#define EPOLLIN   0x001u
+#define EPOLLOUT  0x004u
+#define EPOLLERR  0x008u
+#define EPOLLHUP  0x010u
+#define EPOLLET   0x80000000u
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+
+struct epoll_event { u32 events; u32 _pad; u64 data; };
+
+static int oepoll_create(void) { return (int)(i64)sysc(SYS_EPOLL_CREATE, 0, 0, 0); }
+static int oepoll_ctl(int epfd, int op, int fd, u32 events, u64 cookie) {
+    return (int)(i64)sysc(SYS_EPOLL_CTL, (u64)epfd,
+                          ((u64)op << 32) | (u32)fd,
+                          (cookie << 32) | events);
+}
+/* Returns the number of events written, or -11 meaning "you slept and
+ * something changed — call again", the same retry contract SYS_THREAD_JOIN
+ * has and for the same reason: a woken task resumes with only RAX. */
+static int oepoll_wait(int epfd, struct epoll_event *ev, int maxev, int timeout_ms) {
+    return (int)(i64)sysc(SYS_EPOLL_WAIT, (u64)epfd, (u64)(void *)ev,
+                          ((u64)(u32)timeout_ms << 32) | (u32)maxev);
+}
+static int oeventfd(u64 initval, int flags) {
+    return (int)(i64)sysc(SYS_EVENTFD, initval, (u64)flags, 0);
+}
+static i64 oeventfd_write(int fd, u64 v) {
+    return (i64)sysc(SYS_WRITE_FILE, (u64)fd, (u64)(void *)&v, 8);
+}
+static i64 oeventfd_read(int fd, u64 *out) {
+    return (i64)sysc(SYS_READ, (u64)fd, (u64)(void *)out, 8);
+}
 #define PROT_READ  0x1
 #define PROT_WRITE 0x2
 #define PROT_EXEC  0x4
@@ -2401,6 +2441,62 @@ static void shm_stress_worker(void) {
     sysc(SYS_EXIT, 970, 0, 0);
 }
 
+/* --- role 48: epollstrs — readiness, edges, and end-of-file ----------------
+ *
+ * Phase 1 driver. Every check is written so the failure mode is a WRONG
+ * ANSWER: a readiness bit that should not be set, a cookie that came back
+ * altered, a counter that did not drain. */
+static void epoll_stress_worker(void) {
+    /* (1) An eventfd accumulates writes and drains on read. */
+    int ef = oeventfd(0, 0);
+    if (ef < 0) sysc(SYS_EXIT, 921, 0, 0);
+    u64 v = 0;
+    if (oeventfd_read(ef, &v) != -11) sysc(SYS_EXIT, 922, 0, 0);   /* empty = EAGAIN */
+    if (oeventfd_write(ef, 7) != 8)   sysc(SYS_EXIT, 923, 0, 0);
+    if (oeventfd_write(ef, 5) != 8)   sysc(SYS_EXIT, 924, 0, 0);
+    if (oeventfd_read(ef, &v) != 8)   sysc(SYS_EXIT, 925, 0, 0);
+    if (v != 12)                      sysc(SYS_EXIT, 926, 0, 0);   /* writes ACCUMULATE */
+    if (oeventfd_read(ef, &v) != -11) sysc(SYS_EXIT, 927, 0, 0);   /* drained */
+
+    /* (2) epoll reports the eventfd readable only once it has been posted. */
+    int ep = oepoll_create();
+    if (ep < 0) sysc(SYS_EXIT, 928, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, ef, EPOLLIN, 0xAB) != 0) sysc(SYS_EXIT, 929, 0, 0);
+    struct epoll_event evs[4];
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 930, 0, 0);  /* nothing posted */
+    if (oeventfd_write(ef, 1) != 8)      sysc(SYS_EXIT, 931, 0, 0);
+    int n = oepoll_wait(ep, evs, 4, 0);
+    if (n != 1)                     sysc(SYS_EXIT, 932, 0, 0);
+    if (!(evs[0].events & EPOLLIN)) sysc(SYS_EXIT, 933, 0, 0);
+    if (evs[0].data != 0xAB)        sysc(SYS_EXIT, 934, 0, 0);     /* cookie verbatim */
+
+    /* (3) EPOLL_CTL_DEL really removes the watch. */
+    if (oepoll_ctl(ep, EPOLL_CTL_DEL, ef, 0, 0) != 0) sysc(SYS_EXIT, 935, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0)              sysc(SYS_EXIT, 936, 0, 0);
+
+    /* (4) A PIPE — the source epoll exists for. Empty is not readable; written
+     * is; and the read end must STILL report readable at END OF FILE, which is
+     * what stops a pipeline hanging on its last byte. */
+    u64 pfd[2];
+    if (sysc(SYS_PIPE, (u64)(void *)pfd, 0, 0) != 0) sysc(SYS_EXIT, 937, 0, 0);
+    int rd = (int)pfd[0], wr = (int)pfd[1];
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, rd, EPOLLIN, 0xCD) != 0) sysc(SYS_EXIT, 938, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 939, 0, 0);   /* empty pipe */
+    if (sysc(SYS_WRITE_FILE, (u64)wr, (u64)(void *)"hello", 5) != 5) sysc(SYS_EXIT, 940, 0, 0);
+    n = oepoll_wait(ep, evs, 4, 0);
+    if (n != 1 || !(evs[0].events & EPOLLIN) || evs[0].data != 0xCD) sysc(SYS_EXIT, 941, 0, 0);
+    char sink[8];
+    if (sysc(SYS_READ, (u64)rd, (u64)(void *)sink, 5) != 5) sysc(SYS_EXIT, 942, 0, 0);
+    sysc(SYS_CLOSE, (u64)wr, 0, 0);
+    n = oepoll_wait(ep, evs, 4, 0);
+    if (n != 1 || !(evs[0].events & EPOLLIN)) sysc(SYS_EXIT, 943, 0, 0);
+    if (!(evs[0].events & EPOLLHUP))          sysc(SYS_EXIT, 944, 0, 0);
+    sysc(SYS_CLOSE, (u64)rd, 0, 0);
+    sysc(SYS_CLOSE, (u64)ep, 0, 0);
+    sysc(SYS_CLOSE, (u64)ef, 0, 0);
+    sysc(SYS_EXIT, 920, 0, 0);
+}
+
 /* --- roles 32/33: execve with argv + envp ---------------------------------*/
 static void posix_exec_parent(void) {
     static const char *argv[] = { "posix-exec", "MARKER-55", 0 };
@@ -3504,6 +3600,7 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 38) { posix_selfhost_worker(); }        /* v0.56 author -> compile -> run, natively           */
     if (role == 40) { pipe_worker(); }                  /* v0.59 pipe mechanics: bounds, EOF, EPIPE, fork      */
     if (role == 41) { vsh_worker(); }                   /* v0.59 build /bin/vsh with occ and run a real script */
+    if (role == 48) { epoll_stress_worker(); }         /* v0.64 epoll readiness, edges, eventfd, EOF        */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
     if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
     if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */
