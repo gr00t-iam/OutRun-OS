@@ -114,6 +114,20 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_SETPGID             68
 #define SYS_KILLPG              69
 #define SYS_SIGPROCMASK         70
+/* v0.63: dynamic virtual memory. mmap is ANONYMOUS ONLY here — there is no
+ * file-backed paging, and the kernel refuses rather than returning zeroes. */
+#define SYS_MMAP                71
+#define SYS_MUNMAP              72
+#define SYS_MPROTECT            73
+#define SYS_SHM_CREATE          74
+#define SYS_SHM_MAP             75
+#define PROT_READ  0x1
+#define PROT_WRITE 0x2
+#define PROT_EXEC  0x4
+#define MAP_SHARED    0x01
+#define MAP_PRIVATE   0x02
+#define MAP_ANONYMOUS 0x20
+#define MAP_FAILED ((u64)-1)
 #define EAGAIN_NEG    (-11)
 #define ETIMEDOUT_NEG (-62)
 /* Mirrors the kernel's HEAP_USER_V (kernel64.c is the master). */
@@ -1449,9 +1463,31 @@ static void *osbrk(u64 inc) {
     return old;
 }
 
+/* v0.63: allocations this large go straight to the kernel instead of through
+ * the heap. Two reasons, and the second is the one that matters: a multi-
+ * hundred-KiB block carved out of a first-fit arena leaves a hole almost
+ * nothing can reuse, and — because mmap is demand-zero — a big request that
+ * is only partly touched never costs the frames it did not use. Freeing one
+ * returns its address space outright rather than parking it on a free list. */
+#define OMMAP_MIN (128u * 1024u)
+#define OMMAP_MAGIC 0x4D4D4150ull                  /* "MMAP" */
+struct ommap_hdr { u64 magic; u64 len; };
+
 static void *omalloc(u64 n) {
     if (!n) return 0;
     n = (n + 15) & ~15ull;                        /* 16-byte payload alignment   */
+    if (n >= OMMAP_MIN) {
+        u64 total = n + sizeof(struct ommap_hdr);
+        u64 r = sysc(SYS_MMAP, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+        if (r == MAP_FAILED || (i64)r < 0) return 0;
+        /* The header is what lets ofree tell an mmap block from a heap block
+         * without a side table — and the magic is what stops it mistaking a
+         * heap block's bytes for one. */
+        struct ommap_hdr *h = (struct ommap_hdr *)r;
+        h->magic = OMMAP_MAGIC;
+        h->len = total;
+        return (void *)(r + sizeof(struct ommap_hdr));
+    }
     if (!g_heap_lo) osbrk(0);
     /* first fit over the block chain */
     for (u8 *p = g_heap_lo; p + sizeof(struct oblk) <= g_heap_hi; ) {
@@ -1487,6 +1523,19 @@ static void *omalloc(u64 n) {
 
 static void ofree(void *q) {
     if (!q) return;
+    /* v0.63: an mmap block carries its own header and is released to the
+     * kernel outright. Checked FIRST and by magic, because the alternative —
+     * treating every pointer as a heap block — would read a size field out of
+     * whatever happens to precede an mmap payload. */
+    {
+        struct ommap_hdr *h = (struct ommap_hdr *)((u8 *)q - sizeof(struct ommap_hdr));
+        if (h->magic == OMMAP_MAGIC) {
+            u64 len = h->len;
+            h->magic = 0;                       /* poison: catch a double free  */
+            sysc(SYS_MUNMAP, (u64)(void *)h, len, 0);
+            return;
+        }
+    }
     struct oblk *b = (struct oblk *)((u8 *)q - sizeof(struct oblk));
     b->size &= ~OH_USED;
     /* forward coalesce: absorb the next block while it is also free */
@@ -2235,6 +2284,121 @@ static void sig_stress_worker(void) {
         if (st != 128 + SIGINT) sysc(SYS_EXIT, 961, 0, 0);  /* default action ran */
     }
     sysc(SYS_EXIT, 950, 0, 0);
+}
+
+/* --- role 46: mmapstrs — demand paging, protection, and release ------------
+ *
+ * The interesting assertion is the one about frames: a 1 MiB mapping that is
+ * never touched must cost NOTHING. That is checked from the kernel side, where
+ * the allocator's counters can see it; here the driver's job is to touch a
+ * known number of pages so the kernel has an exact number to expect. */
+#define MM_BIG (1024u * 1024u)                 /* 256 pages */
+#define MM_TOUCH 8                             /* ...of which we touch 8       */
+
+static struct ojmp g_mm_jb;
+static volatile int g_mm_segv = 0;
+static void mm_on_segv(int s) { (void)s; __sync_fetch_and_add(&g_mm_segv, 1); olongjmp(&g_mm_jb, 1); }
+
+static void mmap_stress_worker(void) {
+    /* (1) A large anonymous mapping succeeds and reads back as ZERO. Demand
+     * paging must not hand out a frame with somebody else's data in it. */
+    u64 a = sysc(SYS_MMAP, MM_BIG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (a == MAP_FAILED || (i64)a < 0) sysc(SYS_EXIT, 981, 0, 0);
+    if (a & 0xFFF)                     sysc(SYS_EXIT, 982, 0, 0);   /* not page aligned */
+    volatile u64 *p = (volatile u64 *)a;
+    for (int i = 0; i < MM_TOUCH; i++) if (p[i * 512] != 0) sysc(SYS_EXIT, 983, 0, 0);
+
+    /* (2) Write to exactly MM_TOUCH pages, then read them back. */
+    for (int i = 0; i < MM_TOUCH; i++) p[i * 512] = 0xA5A50000ull + i;
+    for (int i = 0; i < MM_TOUCH; i++)
+        if (p[i * 512] != 0xA5A50000ull + (u64)i) sysc(SYS_EXIT, 984, 0, 0);
+
+    /* (3) W^X is refused at the source, not discovered later. */
+    u64 wx = sysc(SYS_MMAP, 0x1000, PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (wx != MAP_FAILED && (i64)wx >= 0) sysc(SYS_EXIT, 985, 0, 0);
+
+    /* (4) mprotect to read-only, then a write must raise SIGSEGV — and the
+     * handler must be able to recover, which is what makes this a protection
+     * test rather than a crash test. */
+    u64 ro = sysc(SYS_MMAP, 0x2000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (ro == MAP_FAILED || (i64)ro < 0) sysc(SYS_EXIT, 986, 0, 0);
+    volatile u64 *rp = (volatile u64 *)ro;
+    rp[0] = 0x1234;                                        /* fault it in, writable */
+    if (sysc(SYS_MPROTECT, ro, 0x2000, PROT_READ) != 0) sysc(SYS_EXIT, 987, 0, 0);
+    if (rp[0] != 0x1234) sysc(SYS_EXIT, 988, 0, 0);        /* still readable        */
+    osigaction(SIGSEGV, mm_on_segv);
+    if (osetjmp(&g_mm_jb) == 0) {
+        rp[0] = 0xDEAD;                                    /* -> SIGSEGV            */
+        sysc(SYS_EXIT, 989, 0, 0);                         /* write to RO succeeded */
+    }
+    if (g_mm_segv != 1) sysc(SYS_EXIT, 990, 0, 0);
+    /* (5) ...and mprotect back to writable makes it work again. */
+    if (sysc(SYS_MPROTECT, ro, 0x2000, PROT_READ | PROT_WRITE) != 0) sysc(SYS_EXIT, 991, 0, 0);
+    rp[0] = 0xBEEF;
+    if (rp[0] != 0xBEEF) sysc(SYS_EXIT, 992, 0, 0);
+
+    /* (6) Release both. The kernel checks the frames actually came back. */
+    if (sysc(SYS_MUNMAP, a, MM_BIG, 0) != 0)   sysc(SYS_EXIT, 993, 0, 0);
+    if (sysc(SYS_MUNMAP, ro, 0x2000, 0) != 0)  sysc(SYS_EXIT, 994, 0, 0);
+
+    /* (7) malloc over the threshold must route through mmap, and free it. */
+    void *big = omalloc(OMMAP_MIN + 4096);
+    if (!big) sysc(SYS_EXIT, 995, 0, 0);
+    volatile u8 *bp = (volatile u8 *)big;
+    bp[0] = 7; bp[OMMAP_MIN] = 9;
+    if (bp[0] != 7 || bp[OMMAP_MIN] != 9) sysc(SYS_EXIT, 996, 0, 0);
+    ofree(big);
+    sysc(SYS_EXIT, 980, 0, 0);
+}
+
+/* --- role 47: shmstrs — zero copy between processes, and COW --------------- */
+#define SH_BYTES 8192
+
+static void shm_stress_worker(void) {
+    /* (1) COW: a value written BEFORE the fork is visible to the child; a value
+     * written by the child afterwards must NOT be visible to the parent. That
+     * second half is what proves the copy actually happened on write — a
+     * broken COW that simply shared the page would let the child's store
+     * through. */
+    static volatile u64 cow_probe = 0;
+    cow_probe = 0x1111;
+    i64 f = ofork();
+    if (f < 0) sysc(SYS_EXIT, 971, 0, 0);
+    if (f == 0) {
+        if (cow_probe != 0x1111) sysc(SYS_EXIT, 101, 0, 0);   /* pre-fork value lost */
+        cow_probe = 0x2222;                                   /* private from here on */
+        if (cow_probe != 0x2222) sysc(SYS_EXIT, 102, 0, 0);
+        sysc(SYS_EXIT, 100, 0, 0);
+    }
+    i64 st = owaitpid((u32)f, 400000);
+    if (st != 100)          sysc(SYS_EXIT, 972, 0, 0);
+    if (cow_probe != 0x1111) sysc(SYS_EXIT, 973, 0, 0);        /* child leaked through */
+
+    /* (2) Zero-copy shared memory between two distinct processes. */
+    i64 id = (i64)sysc(SYS_SHM_CREATE, SH_BYTES, 0, 0);
+    if (id < 0) sysc(SYS_EXIT, 974, 0, 0);
+    u64 base = sysc(SYS_SHM_MAP, (u64)id, 1, 0);
+    if ((i64)base < 0) sysc(SYS_EXIT, 975, 0, 0);
+    volatile u64 *sp = (volatile u64 *)base;
+    for (int i = 0; i < 8; i++) if (sp[i] != 0) sysc(SYS_EXIT, 976, 0, 0);  /* zeroed */
+    sp[0] = 0xC0FFEE;
+
+    i64 g = ofork();
+    if (g < 0) sysc(SYS_EXIT, 977, 0, 0);
+    if (g == 0) {
+        /* The child maps the SAME segment by id. It is not inherited — an
+         * attachment is explicit — so this is a genuine second mapper. */
+        u64 cb = sysc(SYS_SHM_MAP, (u64)id, 1, 0);
+        if ((i64)cb < 0) sysc(SYS_EXIT, 111, 0, 0);
+        volatile u64 *cp = (volatile u64 *)cb;
+        if (cp[0] != 0xC0FFEE) sysc(SYS_EXIT, 112, 0, 0);     /* parent's write unseen */
+        cp[1] = 0xBEEFBEEF;                                    /* reply, zero copy     */
+        sysc(SYS_EXIT, 110, 0, 0);
+    }
+    st = owaitpid((u32)g, 400000);
+    if (st != 110)            sysc(SYS_EXIT, 978, 0, 0);
+    if (sp[1] != 0xBEEFBEEF)  sysc(SYS_EXIT, 979, 0, 0);      /* child's write unseen */
+    sysc(SYS_EXIT, 970, 0, 0);
 }
 
 /* --- roles 32/33: execve with argv + envp ---------------------------------*/
@@ -3340,6 +3504,8 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 38) { posix_selfhost_worker(); }        /* v0.56 author -> compile -> run, natively           */
     if (role == 40) { pipe_worker(); }                  /* v0.59 pipe mechanics: bounds, EOF, EPIPE, fork      */
     if (role == 41) { vsh_worker(); }                   /* v0.59 build /bin/vsh with occ and run a real script */
+    if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
+    if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
     if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */
     if (role == 45) { sig_stress_worker(); }           /* v0.62 masks, SIG_IGN, process-group delivery      */
     if (role == 43) { thread_stress_worker(); }        /* v0.61 futex threads, kernel join, own stack       */

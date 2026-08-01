@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.62.0-metal"
+#define KERNEL_VERSION "0.63.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -582,6 +582,7 @@ static volatile int g_debug_posix = 0;          /* DEBUG_POSIX: fork/exec/signal
 
 static void handle_cpl3_fault(struct isr_frame *f);      /* defined after process globals */
 static int  posix_try_fault_signal(struct isr_frame *f);  /* v0.55: catchable SIGSEGV (signal core) */
+static int  vm_fault_handle(struct isr_frame *f);        /* v0.63: demand-zero / copy-on-write     */
 static void sweep_tick(void);                            /* incremental PTE integrity audit */
 static void smp_ipi_dispatch(uint64_t vec);              /* v0.35: LAPIC IPI handlers      */
 static void smp_preempt_ipi(struct isr_frame *f);        /* v0.39: vector 50 (may not return) */
@@ -627,6 +628,12 @@ void isr_dispatch(struct isr_frame *f) {
          * BEFORE handle_cpl3_fault, which both switches off the faulting address
          * space (so the user stack would no longer be writable) and never
          * returns. If no handler is installed we fall through and die as before. */
+        /* v0.63: a demand-zero or copy-on-write fault is the mapping being
+         * COMPLETED, not a program error — resolve it and iretq so the
+         * faulting instruction simply re-executes. Must come before the signal
+         * path, which would otherwise deliver SIGSEGV for an access that is
+         * entirely legitimate. */
+        if (f->vector == 14 && (f->cs & 3) == 3 && vm_fault_handle(f)) return;
         if ((f->cs & 3) == 3 && posix_try_fault_signal(f)) return;
         /* A fault from ring 3 must never take down the kernel — terminate the    */
         /* offending task (guard-page hit = stack overflow).                      */
@@ -909,12 +916,81 @@ static inline int frame_in_pool(uint64_t pa) {
 #define FRAME_DBG_MAX ((256ull * 1024 * 1024) / 0x1000)
 static uint8_t g_frame_dbg_isfree[FRAME_DBG_MAX];
 
+/* ===========================================================================
+ * v0.63: PHYSICAL FRAME REFERENCE COUNTS
+ * ===========================================================================
+ * Copy-on-write and shared memory both need one thing this allocator has never
+ * had: a frame that outlives the first owner to let go of it. Until now every
+ * mapped frame had exactly one owner, so page_free_tree could free whatever it
+ * walked; with COW a parent and child point at the SAME frame, and whichever
+ * exits first must not pull it out from under the other.
+ *
+ * ZERO MEANS SOLE OWNER, not "no owners". That is deliberate: every frame in
+ * the system already exists and is singly owned, so the default-initialised
+ * array is already correct for all of them and no existing path has to learn
+ * about refcounts to stay right. Only sharing touches this.
+ *
+ * free_frame() therefore decrements while extra owners remain and returns 0 —
+ * "not reclaimed by me". That keeps the invariant every suite asserts,
+ * g_frame_free_depth == g_frames_freed - g_frames_reused, exactly true: the
+ * counters only ever move when a frame really goes on or off the list.
+ *
+ * The existing double-free shadow bit is what makes this safe to get wrong
+ * loudly rather than silently: a refcount bug that frees a still-shared frame
+ * halts the machine at the second free with the offending address, instead of
+ * handing live memory to a second owner. */
+static uint16_t g_frame_ref[FRAME_DBG_MAX];
+static volatile uint64_t g_frames_shared = 0;    /* share operations, lifetime */
+static volatile uint64_t g_frames_cow_copied = 0;/* COW faults that duplicated */
+
+static inline int64_t frame_ref_idx(uint64_t pa) {
+    pa &= ADDR_MASK;
+    if (pa < FRAME_POOL_BASE) return -1;
+    uint64_t i = (pa - FRAME_POOL_BASE) / 0x1000;
+    return i < FRAME_DBG_MAX ? (int64_t)i : -1;
+}
+
+/* Claim one more owner for `pa`. Returns 1 if the frame is refcountable (in
+ * the pool and inside the shadow window), 0 otherwise — a device MMIO alias or
+ * an out-of-window frame is not ours to count, and callers that map one are
+ * responsible for not freeing it either, which frame_is_device_mmio already
+ * guarantees on every teardown path. */
+static int frame_share(uint64_t pa) {
+    int64_t i = frame_ref_idx(pa);
+    if (i < 0 || !frame_in_pool(pa)) return 0;
+    frame_lock();
+    g_frame_ref[i]++;
+    frame_unlock();
+    __sync_fetch_and_add(&g_frames_shared, 1);
+    return 1;
+}
+
+/* How many owners besides the first. 0 = sole owner, so a COW fault on a frame
+ * reading 0 can simply take the page writable instead of copying it — the last
+ * process holding a COW page should not pay for a copy nobody else wants. */
+static uint16_t frame_refs(uint64_t pa) {
+    int64_t i = frame_ref_idx(pa);
+    if (i < 0) return 0;
+    return g_frame_ref[i];
+}
+
 /* Return one 4 KiB frame to the pool. Returns 1 if it was actually reclaimed,
  * 0 if the address was out of the managed window (and thus ignored) — the
  * caller uses that to count exactly how many frames came back. */
 static int free_frame(uint64_t pa) {
     pa &= ADDR_MASK;
     if (!frame_in_pool(pa)) return 0;
+    /* v0.63: a shared frame loses an owner, not its contents. Checked BEFORE
+     * anything touches the free list, so a still-shared frame never reaches
+     * the list at all and the double-free detector below stays meaningful. */
+    {
+        int64_t ri = frame_ref_idx(pa);
+        if (ri >= 0) {
+            frame_lock();
+            if (g_frame_ref[ri]) { g_frame_ref[ri]--; frame_unlock(); return 0; }
+            frame_unlock();
+        }
+    }
     frame_lock();
     if (pa == g_frame_freelist) {
         frame_unlock();
@@ -1061,6 +1137,68 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
     return (pt[i1] & PTE_PRESENT) ? pt[i1] : 0;
 }
 
+/* ===========================================================================
+ * v0.63: SOFTWARE PTE BITS — demand-zero and copy-on-write, with no VMA list
+ * ===========================================================================
+ * x86-64 ignores PTE bits 9-11 entirely, and when PRESENT is clear it ignores
+ * every other bit too. That is enough to record what a page IS without a
+ * parallel VMA structure: the page table becomes the map.
+ *
+ * This kernel has never had VMA objects, and adding them for two page kinds
+ * would mean a second description of the address space that has to be kept
+ * consistent with the first — the classic way for an unmap to free a frame the
+ * other structure still believes is live. The PTE is already authoritative;
+ * this keeps it that way.
+ *
+ *   PTE_ZFOD   PRESENT=0. "Anonymous mapping, not yet backed." The intended
+ *              permissions ride along in the same word, which is free precisely
+ *              because the hardware is not looking at a non-present entry.
+ *   PTE_COW    PRESENT=1, WRITE=0. "Writable, but the frame is shared — a
+ *              write must copy first."
+ *   PTE_SHM    PRESENT=1. "Shared-memory frame: never copy, never demand-zero."
+ *              Distinguishes a genuinely shared writable page from a COW one,
+ *              which otherwise look identical the moment COW clears WRITE.  */
+/* Counters for the lazy-paging paths. Declared here, next to the bits they
+ * describe, because both the fault handler and access_ok's kernel-side
+ * resolver bump them and the two live far apart in this file. */
+static volatile uint64_t g_zfod_faults = 0, g_cow_faults = 0;
+static volatile uint64_t g_mmap_calls = 0, g_munmap_calls = 0, g_mprotect_calls = 0;
+
+#define PTE_ZFOD (1ull << 9)
+#define PTE_COW  (1ull << 10)
+#define PTE_SHM  (1ull << 11)
+
+/* Locate the PTE SLOT (not its value) so a fault can rewrite it in place.
+ * Returns 0 if any level above it is absent — nothing to fix up. */
+static uint64_t *pte_slot(uint64_t pml4_phys, uint64_t vaddr) {
+    uint64_t i4 = (vaddr >> 39) & 0x1FF, i3 = (vaddr >> 30) & 0x1FF;
+    uint64_t i2 = (vaddr >> 21) & 0x1FF, i1 = (vaddr >> 12) & 0x1FF;
+    uint64_t *pml4 = (uint64_t *)(pml4_phys & ADDR_MASK);
+    if (!(pml4[i4] & PTE_PRESENT)) return 0;
+    uint64_t *pdpt = (uint64_t *)(pml4[i4] & ADDR_MASK);
+    if (!(pdpt[i3] & PTE_PRESENT) || (pdpt[i3] & PTE_HUGE)) return 0;
+    uint64_t *pd = (uint64_t *)(pdpt[i3] & ADDR_MASK);
+    if (!(pd[i2] & PTE_PRESENT) || (pd[i2] & PTE_HUGE)) return 0;
+    uint64_t *pt = (uint64_t *)(pd[i2] & ADDR_MASK);
+    return &pt[i1];
+}
+
+/* v0.63: install a non-present PTE that PROMISES a page. The permissions live
+ * in the same word: the hardware ignores every bit of a non-present entry, so
+ * the entry can carry its own future without a parallel structure to consult.
+ * Builds the intermediate tables by mapping a dummy present entry and then
+ * rewriting the leaf, which reuses map_page's table construction rather than
+ * duplicating a second, subtly different walker. */
+static int vm_reserve_zfod(uint64_t cr3, uint64_t va, uint64_t prot_flags) {
+    /* map_page returns 0 unconditionally — it is not a status — so the check
+     * that matters is whether the leaf slot actually materialised. */
+    map_page(cr3, va, 0, PTE_USER);
+    uint64_t *slot = pte_slot(cr3, va);
+    if (!slot) return 0;
+    *slot = PTE_ZFOD | PTE_USER | prot_flags;      /* PRESENT deliberately clear */
+    return 1;
+}
+
 /* ---- user-space address range + pointer validation ------------------------- */
 #define USER_VMIN 0x400000000000ull
 #define USER_VMAX 0x600000000000ull
@@ -1070,6 +1208,9 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
 #define WIN_USER_V  0x0000550000000000ull   /* v0.53: ring-3 WIMP window content thumbnail */
 #define THR_USER_V  0x0000560000000000ull   /* v0.55: per-POSIX-thread ring-3 stacks       */
 #define HEAP_USER_V 0x0000570000000000ull   /* v0.56: ring-3 heap (SYS_BRK grows it upward) */
+#define MMAP_USER_V 0x0000580000000000ull   /* v0.63: SYS_MMAP anonymous regions, bump upward */
+#define SHM_USER_V  0x0000590000000000ull   /* v0.63: SYS_SHM_MAP attachments                 */
+#define MMAP_MAX_BYTES (64u * 1024u * 1024u)  /* per-process mmap window ceiling             */
 #define HEAP_MAX_BYTES (4u * 1024u * 1024u) /* per-process heap ceiling: 4 MiB              */
 /* Everything at or above DMA_USER_V is a WINDOW the kernel grants explicitly
  * (device DMA, shared pixels, per-thread stacks); only the region below it is
@@ -1095,11 +1236,76 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
 /* mapped USER-present (and USER-writable if need_write). Defends every syscall   */
 /* that touches a ring-3-supplied pointer. (Uniprocessor: the process's own page  */
 /* tables can't change mid-syscall, so this check is not subject to TOCTOU here.) */
+/* v0.63: resolve a lazy page ON BEHALF OF THE KERNEL.
+ *
+ * Demand-zero and copy-on-write are transparent to ring 3 because the CPU
+ * faults and vm_fault_handle fixes it up. The kernel gets no such courtesy: it
+ * writes to user memory through the process's own mapping while in ring 0, and
+ * CR0.WP is not set — so a ring-0 store to a read-only COW page does NOT fault.
+ * It succeeds, silently, straight into a frame another process is still using.
+ *
+ * That is the real hazard this function exists for, and it is worse than the
+ * one that made it visible. What surfaced first was the opposite failure:
+ * access_ok saw a COW page as not-writable and refused, so sig_deliver could
+ * not build a signal frame on a forked process's stack and killed it with
+ * "no stack" — every fork-heavy suite failed at once with exit 145
+ * (128 + SIGCHLD). The refusal was loud. The silent write would not have been.
+ *
+ * Both are fixed in the same place, because access_ok is the ONE gate every
+ * kernel path already passes through before touching user memory: resolve the
+ * page here, and by the time any caller has permission it also has a private,
+ * genuinely writable frame. */
+static int vm_touch(uint64_t cr3, uint64_t va, int need_write) {
+    uint64_t *slot = pte_slot(cr3, va & ~0xFFFull);
+    if (!slot) return 0;
+    uint64_t e = *slot;
+
+    if (!(e & PTE_PRESENT) && (e & PTE_ZFOD)) {      /* back a promised page */
+        uint64_t nf = alloc_frame();
+        if (!nf) return 0;
+        *slot = (nf & ADDR_MASK) | (e & (PTE_USER | PTE_WRITE | PTE_NX)) | PTE_PRESENT;
+        __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+        __sync_fetch_and_add(&g_zfod_faults, 1);
+        e = *slot;
+    }
+    if (!(e & PTE_PRESENT) || !(e & PTE_USER)) return 0;
+    if (!need_write) return 1;
+
+    if (e & PTE_COW) {                               /* take a private copy  */
+        uint64_t old = e & ADDR_MASK;
+        uint64_t keep = (e & (PTE_USER | PTE_NX)) | PTE_WRITE | PTE_PRESENT;
+        if (frame_refs(old) == 0) {
+            *slot = old | keep;
+        } else {
+            uint64_t nf = alloc_frame();
+            if (!nf) return 0;
+            const uint8_t *s = (const uint8_t *)old;
+            uint8_t *d = (uint8_t *)nf;
+            for (int b = 0; b < 0x1000; b++) d[b] = s[b];
+            *slot = (nf & ADDR_MASK) | keep;
+            free_frame(old);
+            __sync_fetch_and_add(&g_frames_cow_copied, 1);
+        }
+        __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+        __sync_fetch_and_add(&g_cow_faults, 1);
+        return 1;
+    }
+    return (*slot & PTE_WRITE) ? 1 : 0;
+}
+
 static int access_ok(uint64_t cr3, uint64_t ptr, uint64_t len, int need_write) {
     if (len == 0) return 1;
     if (ptr < USER_VMIN || ptr + len < ptr || ptr + len > USER_VMAX) return 0;
     for (uint64_t p = ptr & ~0xFFFull; p <= ((ptr + len - 1) & ~0xFFFull); p += 0x1000) {
         uint64_t pte = walk_pte(cr3, p);
+        /* Lazy page? Resolve it and re-read. A page that is merely PROMISED is
+         * as valid as one already backed — refusing it here would make mmap'd
+         * memory unusable as a syscall buffer until userland had touched it,
+         * which is not a property any caller could reasonably know about. */
+        if (!(pte & PTE_PRESENT) || (need_write && !(pte & PTE_WRITE))) {
+            if (!vm_touch(cr3, p, need_write)) return 0;
+            pte = walk_pte(cr3, p);
+        }
         if (!(pte & PTE_PRESENT) || !(pte & PTE_USER)) return 0;
         if (need_write && !(pte & PTE_WRITE)) return 0;
     }
@@ -1616,6 +1822,14 @@ struct kproc {
      * needs to know about it — the pages are ordinary USER mappings, so
      * page_free_tree reclaims them at exit exactly like the stack. */
     uint64_t heap_brk;
+    /* v0.63: bump cursors for the two new windows. Bump-only, never a free
+     * list: munmap punches holes that are reusable by ADDRESS but this kernel
+     * does not attempt to re-pack them, because a 64 MiB window is far past
+     * anything the system allocates and a first-fit scan would be code with no
+     * consumer. Stated rather than left to be discovered. */
+    uint64_t mmap_next;
+    uint64_t shm_next;
+    uint32_t shm_attached;        /* bit i = attached to shared segment i  */
     /* v0.49: leaf spinlock serializing this ONE process's own VMA/page-table
      * mutations (map_page + smp_slot_phys bookkeeping) against itself. In
      * this kernel's one-thread-per-kproc execution model only the single
@@ -1687,6 +1901,9 @@ static void kproc_reset(struct kproc *p) {
     p->wait_key = 0; p->wait_deadline = 0;
     p->wait_armed = 0; p->parked = 0; p->wake_pending = 0; p->wait_rv = 0;
     p->heap_brk = HEAP_USER_V;
+    p->mmap_next = MMAP_USER_V;
+    p->shm_next = SHM_USER_V;
+    p->shm_attached = 0;
     p->finish_seq = 0;
     p->dispatches = 0;
     p->frames_freed = 0;
@@ -6969,6 +7186,139 @@ static void thread_slot_release(int p, uint64_t code) {
     kprocs[p].torn_down = 1;                 /* NOW the slot may be reused   */
 }
 
+/* ===========================================================================
+ * v0.63: SHARED MEMORY — a registry of frames, not of processes
+ * ===========================================================================
+ * v0.46 already gave this kernel shared memory, but it is IPC-COUPLED: an
+ * ipc_shmem is granted as part of a message, lives in a fixed 16-slot table
+ * sized to one page each, and is reachable only through SYS_IPC_*. That is the
+ * right shape for what it does and is not being replaced.
+ *
+ * This is the general form the v0.46 one deliberately was not: an object with
+ * its own lifetime, created by size, named by an integer any process may map,
+ * and mapped at a per-process address rather than a system-wide fixed one. Two
+ * processes that never exchange a message can share memory through it.
+ *
+ * The frames are refcounted like any other, so the segment outlives whichever
+ * mapper exits first and dies with the last — the same mechanism COW uses, not
+ * a second lifetime scheme bolted on beside it. */
+#define MAX_SHM      8
+#define SHM_MAX_PAGES 64                     /* 256 KiB per segment */
+struct shm_seg {
+    int      used;
+    uint32_t owner_pid;                      /* creator, for the audit log only */
+    uint32_t npages;
+    uint32_t mappers;                        /* processes currently attached    */
+    uint64_t frames[SHM_MAX_PAGES];
+};
+static struct shm_seg g_shm[MAX_SHM];
+static volatile int g_shm_lock = 0;
+static volatile uint64_t g_shm_creates = 0, g_shm_maps = 0;
+
+static inline void shm_lock(void)   { while (__sync_lock_test_and_set(&g_shm_lock, 1)) __asm__ volatile("pause"); }
+static inline void shm_unlock(void) { __sync_lock_release(&g_shm_lock); }
+
+/* Release every attachment `proc_idx` holds. Called from the process exit
+ * paths alongside the other teardowns: a segment whose mappers all die must
+ * not keep its frames, and a process that exits without detaching is the
+ * normal case rather than an error. */
+static void shm_teardown_kproc(int proc_idx) {
+    if (proc_idx < 0 || proc_idx >= n_kproc) return;
+    /* The mappings themselves are ordinary user PTEs, so page_free_tree has
+     * already dropped this process's reference to each frame by the time the
+     * slot is recycled. What is left is the segment's own bookkeeping: when the
+     * last mapper is gone the creation reference goes too, and the frames
+     * return to the pool. */
+    shm_lock();
+    for (int i = 0; i < MAX_SHM; i++) {
+        if (!g_shm[i].used) continue;
+        if (kprocs[proc_idx].shm_attached & (1u << i)) {
+            kprocs[proc_idx].shm_attached &= ~(1u << i);
+            if (g_shm[i].mappers) g_shm[i].mappers--;
+            if (!g_shm[i].mappers) {
+                for (uint32_t k = 0; k < g_shm[i].npages; k++) free_frame(g_shm[i].frames[k]);
+                g_shm[i].used = 0;
+                if (g_debug_posix)
+                    kprintf("[dbgvm  ] shm %d destroyed — last mapper gone\n", (uint64_t)(int64_t)i);
+            }
+        }
+    }
+    shm_unlock();
+}
+
+/* ===========================================================================
+ * v0.63: THE RING-3 PAGE FAULT ENGINE
+ * ===========================================================================
+ * Runs BEFORE the SIGSEGV path, because a demand-zero or copy-on-write fault
+ * is not a program error — it is the mapping being completed. Returns 1 if the
+ * fault was resolved, and the caller simply iretqs: the faulting instruction
+ * re-executes and now succeeds. Returns 0 for anything it does not own, which
+ * then falls through to catchable SIGSEGV and, failing that, termination.
+ *
+ * Error code bits: 0 = present (0 means not-present), 1 = write, 4 = instruction
+ * fetch. Only the two that change the decision are read.
+ *
+ * This runs in the FAULTING address space with interrupts as the trap left
+ * them, and touches only this process's own page tables plus the frame
+ * allocator — both of which are already safe from any core. */
+
+static int vm_fault_handle(struct isr_frame *f) {
+    if (f->vector != 14) return 0;
+    if ((f->cs & 3) != 3) return 0;                 /* ring-3 faults only */
+    uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    if (cr2 < USER_VMIN || cr2 >= USER_VMAX) return 0;
+    int slot = (int)current_proc_idx;
+    if (slot < 0 || slot >= n_kproc || !kprocs[slot].used || kprocs[slot].exited) return 0;
+    uint64_t cr3 = kprocs[slot].cr3;
+    uint64_t *pte = pte_slot(cr3, cr2 & ~0xFFFull);
+    if (!pte) return 0;                             /* nothing mapped this far */
+    uint64_t e = *pte;
+    int is_write = (f->error & 2) != 0;
+
+    /* ---- demand zero ------------------------------------------------------
+     * A page promised by mmap but never touched. The permissions were parked
+     * in the non-present entry at mmap time, so honouring them here needs no
+     * lookup — the entry IS the record. */
+    if (!(e & PTE_PRESENT) && (e & PTE_ZFOD)) {
+        uint64_t nf = alloc_frame();
+        if (!nf) return 0;                          /* out of memory: let it be a fault */
+        uint64_t keep = e & (PTE_USER | PTE_WRITE | PTE_NX);
+        *pte = (nf & ADDR_MASK) | keep | PTE_PRESENT;
+        __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
+        __sync_fetch_and_add(&g_zfod_faults, 1);
+        return 1;
+    }
+
+    /* ---- copy on write ----------------------------------------------------
+     * Only a WRITE to a present, non-writable, COW-marked page. A read of such
+     * a page never faults, which is the entire economy of the scheme.
+     *
+     * The refcount decides whether a copy is needed at all: if no other owner
+     * remains, the last holder simply takes the page writable. Without that
+     * check a parent whose children have all exited keeps paying copy costs
+     * forever on pages nobody else can see. */
+    if ((e & PTE_PRESENT) && (e & PTE_COW) && is_write) {
+        uint64_t old = e & ADDR_MASK;
+        uint64_t keep = (e & (PTE_USER | PTE_NX)) | PTE_WRITE | PTE_PRESENT;
+        if (frame_refs(old) == 0) {                 /* sole owner: no copy needed */
+            *pte = old | keep;
+        } else {
+            uint64_t nf = alloc_frame();
+            if (!nf) return 0;
+            const uint8_t *s = (const uint8_t *)old;
+            uint8_t *d = (uint8_t *)nf;
+            for (int b = 0; b < 0x1000; b++) d[b] = s[b];
+            *pte = (nf & ADDR_MASK) | keep;
+            free_frame(old);                        /* drops OUR reference only */
+            __sync_fetch_and_add(&g_frames_cow_copied, 1);
+        }
+        __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
+        __sync_fetch_and_add(&g_cow_faults, 1);
+        return 1;
+    }
+    return 0;                                        /* not ours: SIGSEGV path */
+}
+
 /* Ring-3 memory fault -> catchable SIGSEGV. Called from isr_dispatch while the
  * FAULTING address space is still loaded in CR3 (so the user stack is writable)
  * and before handle_cpl3_fault, which never returns. Returns 1 if the trap frame
@@ -7166,6 +7516,7 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     net_teardown_kproc(L);        /* v0.52: release any sockets this process owns */
     wimp_teardown_kproc(L);       /* v0.53: destroy any windows this process owns */
     ipc_teardown_kproc(L);        /* v0.46: release IPC mailbox/shmem FIRST */
+    shm_teardown_kproc(L);        /* v0.63: drop shared-segment attachments */
     descriptor_teardown_kproc(L); /* v0.45: force-close any leaked fd FIRST */
     dma_teardown_kproc(L);        /* v0.44: revoke DMA/IOMMU grants FIRST */
     kprocs[L].frames_freed = page_free_tree(kprocs[L].cr3);
@@ -7843,6 +8194,7 @@ static void cpu_exec_proc(int c, int p) {
         net_teardown_kproc(L);                 /* v0.52: release any sockets this process owns */
         wimp_teardown_kproc(L);                /* v0.53: destroy any windows this process owns */
         ipc_teardown_kproc(L);                 /* v0.46: release IPC mailbox/shmem FIRST */
+        shm_teardown_kproc(L);                 /* v0.63: drop shared-segment attachments */
         descriptor_teardown_kproc(L);          /* v0.45: force-close any leaked fd FIRST */
         dma_teardown_kproc(L);                 /* v0.44: revoke DMA/IOMMU grants FIRST */
         kprocs[L].frames_freed = page_free_tree(kprocs[L].cr3);
@@ -8922,6 +9274,8 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
     kprocs[ch].entry     = kprocs[par].entry;
     kprocs[ch].affinity  = kprocs[par].affinity;
     kprocs[ch].pgid      = kprocs[par].pgid;     /* v0.62: fork stays in the job */
+    kprocs[ch].mmap_next = kprocs[par].mmap_next;  /* v0.63: inherited mmap regions */
+    kprocs[ch].shm_next  = SHM_USER_V;             /* shm attachments are NOT inherited */
     for (int sg = 0; sg < NSIG; sg++) kprocs[ch].sig_handler[sg] = kprocs[par].sig_handler[sg];
     kprocs[ch].sig_pending = 0;                         /* POSIX: pending set is NOT inherited */
     kprocs[ch].sig_mask    = 0;
@@ -10806,6 +11160,176 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         return sys_futex_wake(a0, a1);
     case 66:     /* SYS_THREAD_JOIN(tid, uint64_t *out_code) */
         return sys_thread_join(0, a0, a1);
+    case 74: {   /* SYS_SHM_CREATE(size) -> shm id, or negative.
+                  * Frames are allocated and ZEROED up front, not on demand:
+                  * a shared segment's whole point is that another process can
+                  * already see it, so deferring the backing would mean two
+                  * processes faulting independently on the same page and
+                  * racing to install different frames for it. */
+        int p = tg_of((int)current_proc_idx);
+        if (!rust_cap_check(kprocs[p].caps, PCAP_IPC)) return (uint64_t)-13;
+        uint64_t pages = (a0 + 0xFFFull) / 0x1000;
+        if (!pages || pages > SHM_MAX_PAGES) return (uint64_t)-1;
+        shm_lock();
+        int id = -1;
+        for (int i = 0; i < MAX_SHM; i++) if (!g_shm[i].used) { id = i; break; }
+        if (id < 0) { shm_unlock(); return (uint64_t)-11; }        /* EAGAIN */
+        g_shm[id].npages = 0;
+        for (uint64_t k = 0; k < pages; k++) {
+            uint64_t f = alloc_frame();
+            if (!f) {                                              /* unwind cleanly */
+                for (uint32_t j = 0; j < g_shm[id].npages; j++) free_frame(g_shm[id].frames[j]);
+                shm_unlock();
+                return (uint64_t)-12;                              /* ENOMEM */
+            }
+            g_shm[id].frames[g_shm[id].npages++] = f;
+        }
+        g_shm[id].used = 1;
+        g_shm[id].owner_pid = kprocs[p].pid;
+        g_shm[id].mappers = 0;
+        shm_unlock();
+        __sync_fetch_and_add(&g_shm_creates, 1);
+        if (g_debug_posix)
+            kprintf("[dbgvm  ] shm %d created by pid %u: %u page(s)\n",
+                    (uint64_t)(int64_t)id, kprocs[p].pid, pages);
+        return (uint64_t)(int64_t)id;
+    }
+    case 75: {   /* SYS_SHM_MAP(id, writable) -> vaddr, or negative.
+                  * Installs THIS process's own view of the segment's frames.
+                  * Marked PTE_SHM so neither COW nor demand-zero ever touches
+                  * them: a shared page must not be copied on write — copying is
+                  * precisely the behaviour sharing exists to avoid. */
+        int p = tg_of((int)current_proc_idx);
+        if (!rust_cap_check(kprocs[p].caps, PCAP_IPC)) return (uint64_t)-13;
+        int id = (int)(int64_t)a0;
+        if (id < 0 || id >= MAX_SHM) return (uint64_t)-1;
+        shm_lock();
+        if (!g_shm[id].used) { shm_unlock(); return (uint64_t)-3; }        /* ESRCH */
+        uint32_t np = g_shm[id].npages;
+        uint64_t base = kprocs[p].shm_next;
+        if (base + (uint64_t)np * 0x1000 > SHM_USER_V + 0x1000000ull) {
+            shm_unlock(); return (uint64_t)-12;
+        }
+        uint64_t flags = PTE_USER | PTE_NX | PTE_SHM | (a1 ? PTE_WRITE : 0);
+        for (uint32_t k = 0; k < np; k++) {
+            /* Each mapper takes its own reference, so page_free_tree dropping
+             * this process's view at exit decrements rather than frees. */
+            frame_share(g_shm[id].frames[k]);
+            map_page(kprocs[p].cr3, base + (uint64_t)k * 0x1000, g_shm[id].frames[k], flags);
+        }
+        kprocs[p].shm_next = base + (uint64_t)np * 0x1000;
+        if (!(kprocs[p].shm_attached & (1u << id))) {
+            kprocs[p].shm_attached |= (1u << id);
+            g_shm[id].mappers++;
+        }
+        shm_unlock();
+        __sync_fetch_and_add(&g_shm_maps, 1);
+        if (g_debug_posix)
+            kprintf("[dbgvm  ] shm %d mapped by pid %u at %X (%u page(s), %s)\n",
+                    (uint64_t)(int64_t)id, kprocs[p].pid, base, np, a1 ? "rw" : "ro");
+        return base;
+    }
+    case 71: {   /* SYS_MMAP(length, prot, flags) -> base vaddr, or MAP_FAILED (-1).
+                  *   prot : 1 READ, 2 WRITE, 4 EXEC
+                  *   flags: 0x01 SHARED, 0x02 PRIVATE, 0x20 ANONYMOUS
+                  *
+                  * ANONYMOUS ONLY, and the kernel says so rather than accepting
+                  * a file descriptor it would ignore: there is no file-backed
+                  * paging here, and a mmap that silently returned zeroes for a
+                  * file would be worse than a refusal.
+                  *
+                  * Nothing is allocated. The range is RESERVED as non-present
+                  * PTEs carrying their own permissions, and the frames arrive
+                  * one fault at a time — which is what makes a large mapping
+                  * cheap and is the whole point of the call. */
+        int p = tg_of((int)current_proc_idx);
+        uint64_t len = (a0 + 0xFFFull) & ~0xFFFull;
+        uint64_t prot = a1, flags = a2;
+        if (!len || len > MMAP_MAX_BYTES) return (uint64_t)-1;
+        if (!(flags & 0x20)) return (uint64_t)-1;            /* anonymous only */
+        if (prot & ~0x7ull) return (uint64_t)-1;
+        /* W^X, enforced here exactly as elf_load enforces it on images: a
+         * mapping may be writable or executable, never both. A JIT would have
+         * to mprotect between the two, which is the discipline this system
+         * applies to every other executable page. */
+        if ((prot & 0x2) && (prot & 0x4)) return (uint64_t)-1;
+        uint64_t base = kprocs[p].mmap_next;
+        if (base + len > MMAP_USER_V + MMAP_MAX_BYTES) return (uint64_t)-1;
+        uint64_t pf = PTE_USER;
+        if (prot & 0x2) pf |= PTE_WRITE;
+        if (!(prot & 0x4)) pf |= PTE_NX;
+        if (flags & 0x01) pf |= PTE_SHM;   /* MAP_SHARED: never COW on fork */
+        for (uint64_t off = 0; off < len; off += 0x1000)
+            if (!vm_reserve_zfod(kprocs[p].cr3, base + off, pf)) return (uint64_t)-1;
+        kprocs[p].mmap_next = base + len;
+        __sync_fetch_and_add(&g_mmap_calls, 1);
+        if (g_debug_posix)
+            kprintf("[dbgvm  ] mmap pid %u %X bytes prot %x -> %X (reserved, not backed)\n",
+                    kprocs[p].pid, len, prot, base);
+        return base;
+    }
+    case 72: {   /* SYS_MUNMAP(addr, length) -> 0 ok, negative.
+                  * Frees whatever is actually backed, leaves untouched
+                  * reservations costing nothing, and shoots the range down on
+                  * every other core before the frames can be handed out again. */
+        int p = tg_of((int)current_proc_idx);
+        uint64_t va = a0 & ~0xFFFull;
+        uint64_t len = (a1 + 0xFFFull) & ~0xFFFull;
+        if (!len) return (uint64_t)-1;
+        if (va < MMAP_USER_V || va + len > MMAP_USER_V + MMAP_MAX_BYTES) return (uint64_t)-1;
+        uint64_t released = 0;
+        for (uint64_t off = 0; off < len; off += 0x1000) {
+            uint64_t *slot = pte_slot(kprocs[p].cr3, va + off);
+            if (!slot) continue;
+            uint64_t e = *slot;
+            *slot = 0;
+            if (e & PTE_PRESENT) released += (uint64_t)free_frame(e & ADDR_MASK);
+        }
+        /* The mapping is gone locally; a sibling core still holding a stale
+         * translation would be writing into memory the allocator has already
+         * handed to somebody else. */
+        thread_tlb_release(va, (uint32_t)(len / 0x1000));
+        for (uint64_t off = 0; off < len; off += 0x1000)
+            __asm__ volatile("invlpg (%0)" :: "r"(va + off) : "memory");
+        __sync_fetch_and_add(&g_munmap_calls, 1);
+        if (g_debug_posix)
+            kprintf("[dbgvm  ] munmap pid %u %X..%X — %u frame(s) returned\n",
+                    kprocs[p].pid, va, va + len, released);
+        return 0;
+    }
+    case 73: {   /* SYS_MPROTECT(addr, length, prot) -> 0 ok, negative.
+                  * Rewrites permissions on backed pages AND on reservations
+                  * that have not faulted yet — the promise has to change too,
+                  * or the first touch would install the old permissions. */
+        int p = tg_of((int)current_proc_idx);
+        uint64_t va = a0 & ~0xFFFull;
+        uint64_t len = (a1 + 0xFFFull) & ~0xFFFull;
+        uint64_t prot = a2;
+        if (!len || (prot & ~0x7ull)) return (uint64_t)-1;
+        if ((prot & 0x2) && (prot & 0x4)) return (uint64_t)-1;      /* W^X */
+        if (va < MMAP_USER_V || va + len > MMAP_USER_V + MMAP_MAX_BYTES) return (uint64_t)-1;
+        uint64_t pf = PTE_USER;
+        if (prot & 0x2) pf |= PTE_WRITE;
+        if (!(prot & 0x4)) pf |= PTE_NX;
+        for (uint64_t off = 0; off < len; off += 0x1000) {
+            uint64_t *slot = pte_slot(kprocs[p].cr3, va + off);
+            if (!slot || !*slot) continue;
+            uint64_t e = *slot;
+            if (e & PTE_PRESENT) {
+                /* A COW page losing write permission keeps its COW mark: the
+                 * frame is still shared, and a later mprotect back to writable
+                 * must still copy rather than scribble on a sibling. */
+                *slot = (e & (ADDR_MASK | PTE_COW | PTE_SHM)) | pf | PTE_PRESENT;
+                if (e & PTE_COW) *slot &= ~PTE_WRITE;
+            } else if (e & PTE_ZFOD) {
+                *slot = PTE_ZFOD | pf;
+            }
+            __asm__ volatile("invlpg (%0)" :: "r"(va + off) : "memory");
+        }
+        thread_tlb_release(va, (uint32_t)(len / 0x1000));
+        __sync_fetch_and_add(&g_mprotect_calls, 1);
+        return 0;
+    }
     case 68: {   /* SYS_SETPGID(pid, pgid, foreground) -> 0 ok, negative.
                   *   pid  0 = the caller.  pgid 0 = "use the target's own pid",
                   *   which is how a job leader creates its group.
@@ -11040,8 +11564,15 @@ static uint64_t uargs_default(uint64_t cr3, const char *name) {
 static inline int va_is_forkable(uint64_t va) {
     if (va < UPRIVATE_VMAX) return 1;
     if (va >= HEAP_USER_V && va < HEAP_USER_V + HEAP_MAX_BYTES) return 1;
+    /* v0.63: anonymous mmap regions are ordinary private memory and inherit
+     * across fork exactly as the heap does. SHM deliberately does NOT: a
+     * shared segment is attached by an explicit SYS_SHM_MAP, and silently
+     * duplicating the attachment would give a child a mapping it never asked
+     * for and whose reference nobody would think to drop. */
+    if (va >= MMAP_USER_V && va < MMAP_USER_V + MMAP_MAX_BYTES) return 1;
     return 0;
 }
+
 
 static int vm_clone_user(uint64_t src_cr3, uint64_t dst_cr3) {
     uint64_t *pml4 = (uint64_t *)src_cr3;
@@ -11061,14 +11592,46 @@ static int vm_clone_user(uint64_t src_cr3, uint64_t dst_cr3) {
                     if (pte & PTE_PCD) continue;         /* device/DMA alias: never clone */
                     uint64_t va = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
                     if (!va_is_forkable(va)) continue;
-                    uint64_t nf = alloc_frame();
-                    if (!nf) return -1;
-                    const uint8_t *s = (const uint8_t *)(pte & ADDR_MASK);
-                    uint8_t *d = (uint8_t *)nf;
-                    for (int b = 0; b < 0x1000; b++) d[b] = s[b];
-                    /* identical permissions: a read-only text page stays R+X in
-                     * the child, so the child obeys the same W^X policy.       */
-                    map_page(dst_cr3, va, nf, pte & (PTE_USER | PTE_WRITE | PTE_NX));
+                    uint64_t frame = pte & ADDR_MASK;
+                    /* v0.63: COPY-ON-WRITE. The frame is SHARED, not copied,
+                     * and both sides lose write permission so the first write
+                     * from either traps and duplicates just that page.
+                     *
+                     * A read-only page (text) needs no COW mark at all — it can
+                     * never be written, so it can be shared outright and stays
+                     * R+X in the child, preserving W^X exactly as before.
+                     *
+                     * The PARENT's entry is rewritten too, and that is the part
+                     * that is easy to get wrong: if only the child were made
+                     * read-only, the parent would keep writing through to a
+                     * frame the child can still see, and the child would
+                     * observe changes made after the fork. */
+                    if (!frame_share(frame)) continue;   /* not refcountable: skip */
+                    uint64_t perms = pte & (PTE_USER | PTE_NX);
+                    if (pte & PTE_SHM) {
+                        /* MAP_SHARED: the whole point is that writes stay
+                         * visible on both sides, so this must NOT become COW —
+                         * copying it would silently turn shared memory into two
+                         * private copies at the first write. */
+                        map_page(dst_cr3, va, frame, perms | (pte & PTE_WRITE) | PTE_SHM);
+                    } else if ((pte & PTE_WRITE) || (pte & PTE_COW)) {
+                        /* Writable, OR ALREADY COW FROM AN EARLIER FORK. That
+                         * second clause is not defensive tidiness — without it a
+                         * process that forks TWICE is broken: the first fork
+                         * leaves these pages read-only-plus-COW, so the second
+                         * fork sees no PTE_WRITE, mistakes them for read-only
+                         * text, and shares them with the COW mark STRIPPED. The
+                         * page is then permanently unwritable by anyone, and the
+                         * fault handler declines it because nothing left says it
+                         * may be copied. Found live: vsh forks once per pipeline
+                         * stage, so `a | b` killed its second stage while a
+                         * single-stage command worked perfectly. */
+                        pt[i1] = frame | perms | PTE_COW | PTE_PRESENT;   /* parent */
+                        map_page(dst_cr3, va, frame, perms | PTE_COW);    /* child  */
+                        __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+                    } else {
+                        map_page(dst_cr3, va, frame, perms);   /* genuinely read-only */
+                    }
                     copied++;
                 }
             }
@@ -11104,8 +11667,13 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         kprintf("\n[guard  ] STACK OVERFLOW: ring-3 pid %u hit guard page @ %X — task terminated\n",
                 kprocs[current_proc_idx].pid, cr2);
     } else {
-        kprintf("\n[fault  ] ring-3 pid %u fault (vec %u) cr2=%X rip=%X — task terminated\n",
-                kprocs[current_proc_idx].pid, f->vector, cr2, f->rip);
+        /* v0.63: the PTE is the single most useful datum at a ring-3 fault now
+         * that a page can be lazily backed — it distinguishes "never mapped"
+         * (0) from "promised but unbacked" (ZFOD) from "present but protected",
+         * three different bugs that otherwise look identical from outside. */
+        uint64_t fpte = walk_pte(kprocs[current_proc_idx].cr3, cr2 & ~0xFFFull);
+        kprintf("\n[fault  ] ring-3 pid %u fault (vec %u) cr2=%X rip=%X err=%x pte=%X — task terminated\n",
+                kprocs[current_proc_idx].pid, f->vector, cr2, f->rip, f->error, fpte);
     }
     if (cpu_idx() == 0 && curthr->uthread) {
         /* First-class BSP thread: reap it in place and reschedule. The kernel  */
@@ -11157,6 +11725,7 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         net_teardown_kproc(L);
         wimp_teardown_kproc(L);
         ipc_teardown_kproc(L);
+        shm_teardown_kproc(L);      /* v0.63 */
         descriptor_teardown_kproc(L);
         dma_teardown_kproc(L);      /* v0.44: revoke DMA/IOMMU grants FIRST */
         kprocs[L].frames_freed = page_free_tree(kprocs[L].cr3);
@@ -15502,6 +16071,174 @@ static void cmd_sig_stress(void) {
     kputs("-- done --\n");
 }
 
+/* ===========================================================================
+ * v0.63: MMAPSTRS — demand paging audited from the allocator's side
+ * =========================================================================== */
+static int g_mmpass = 0, g_mmfail = 0;
+static void mmcheck(const char *what, int ok) {
+    if (ok) { g_mmpass++; kprintf("[mmapstrs] PASS: %s\n", what); }
+    else    { g_mmfail++; kprintf("[mmapstrs] FAIL: %s\n", what); }
+}
+
+static void cmd_mmap_stress(void) {
+    kputs("-- MMAPSTRS: demand-zero paging, mprotect, and munmap --\n");
+    g_mmpass = g_mmfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t zf0 = g_zfod_faults, mm0 = g_mmap_calls, mu0 = g_munmap_calls, mp0 = g_mprotect_calls;
+    uint64_t inuse0 = g_next_frame / 0x1000 - g_frame_free_depth;
+
+    int p = kproc_spawn("mmapstr", PCAP_FILESYSTEM);
+    if (p < 0) { mmcheck("kproc_spawn never fails", 0); goto out; }
+    kprocs[p].role = 46;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { mmcheck("the driver's ELF loads", 0); goto out; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 200000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[mmapstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 980 ? "" :
+        R.code[0] == 981 ? "a 1 MiB anonymous mmap failed outright" :
+        R.code[0] == 982 ? "mmap returned an address that is not page aligned" :
+        R.code[0] == 983 ? "A DEMAND-ZERO PAGE CAME BACK NON-ZERO (stale frame contents)" :
+        R.code[0] == 984 ? "a written page did not read back" :
+        R.code[0] == 985 ? "mmap ACCEPTED a WRITE+EXEC mapping — W^X was not enforced" :
+        R.code[0] == 986 ? "a small mmap failed" :
+        R.code[0] == 987 ? "mprotect to read-only failed" :
+        R.code[0] == 988 ? "a read-only page stopped being readable" :
+        R.code[0] == 989 ? "A WRITE TO A READ-ONLY PAGE SUCCEEDED" :
+        R.code[0] == 990 ? "the write fault did not raise exactly one SIGSEGV" :
+        R.code[0] == 991 ? "mprotect back to writable failed" :
+        R.code[0] == 992 ? "the page did not become writable again" :
+        (R.code[0] == 993 || R.code[0] == 994) ? "munmap failed" :
+        R.code[0] == 995 ? "a >128 KiB malloc failed (the mmap path)" :
+        R.code[0] == 996 ? "an mmap-backed malloc block did not hold its data" :
+                           "unknown";
+    if (R.code[0] != 980) kprintf("[mmapstrs] driver exit %u — %s\n", R.code[0], why);
+
+    mmcheck("mapping, demand-zero, protection changes and release all behaved (exit 980)",
+            finished && R.code[0] == 980);
+    kprintf("[mmapstrs] mmap %u, munmap %u, mprotect %u; %u demand-zero fault(s)\n",
+            g_mmap_calls - mm0, g_munmap_calls - mu0, g_mprotect_calls - mp0,
+            g_zfod_faults - zf0);
+    /* THE POINT OF DEMAND PAGING. The driver maps 1 MiB (256 pages) and touches
+     * 8. If mapping allocated eagerly the fault count would be ~0 and the
+     * frame count would jump by 256; both numbers say otherwise. */
+    uint64_t zf = g_zfod_faults - zf0;
+    mmcheck("pages were backed ON FAULT, not at mmap time (some faults, far fewer than mapped)",
+            zf > 0 && zf < 64);
+    mmcheck("mmap/munmap/mprotect were all actually exercised",
+            g_mmap_calls > mm0 && g_munmap_calls > mu0 && g_mprotect_calls > mp0);
+    uint64_t inuse1 = g_next_frame / 0x1000 - g_frame_free_depth;
+    kprintf("[mmapstrs] frames in use %u -> %u (delta %d)\n",
+            inuse0, inuse1, (uint64_t)(int64_t)(inuse1 - inuse0));
+    mmcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    mmcheck("no lock-rank violation across the VM paths", g_rank_violations == viol0);
+    kprintf("[mmapstrs] +%u freed, +%u reused\n", g_frames_freed - freed0, g_frames_reused - reused0);
+out:
+    kprintf("[mmapstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_mmpass, (uint64_t)g_mmfail);
+    if (!g_mmfail) kputs("[mmapstrs] VIRTUAL MEMORY VERIFIED — mapped lazily, protected, and given back\n");
+    else kputs("[mmapstrs] VIRTUAL MEMORY DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.63: SHMSTRS — copy-on-write, and sharing that really is zero copy
+ * =========================================================================== */
+static int g_shpass = 0, g_shfail = 0;
+static void shcheck(const char *what, int ok) {
+    if (ok) { g_shpass++; kprintf("[shmstrs] PASS: %s\n", what); }
+    else    { g_shfail++; kprintf("[shmstrs] FAIL: %s\n", what); }
+}
+
+static void cmd_shm_stress(void) {
+    kputs("-- SHMSTRS: copy-on-write fork and zero-copy shared memory --\n");
+    g_shpass = g_shfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t sh0 = g_frames_shared, cw0 = g_frames_cow_copied, cf0 = g_cow_faults;
+    uint64_t cr0 = g_shm_creates, mp0 = g_shm_maps;
+
+    int p = kproc_spawn("shmstr", PCAP_FILESYSTEM | PCAP_IPC);
+    if (p < 0) { shcheck("kproc_spawn never fails", 0); goto out; }
+    kprocs[p].role = 47;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { shcheck("the driver's ELF loads", 0); goto out; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 2; for (int c = 0; c < 7; c++) R.cgot[c] = 0;
+    R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 200000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[shmstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 970 ? "" :
+        R.code[0] == 971 ? "fork failed before the COW round" :
+        R.code[0] == 972 ? "the COW child exited wrong (its own checks failed)" :
+        R.code[0] == 973 ? "THE CHILD'S WRITE LEAKED INTO THE PARENT — COW did not copy" :
+        R.code[0] == 974 ? "SYS_SHM_CREATE failed" :
+        R.code[0] == 975 ? "SYS_SHM_MAP failed in the creator" :
+        R.code[0] == 976 ? "a fresh shared segment was not zeroed" :
+        R.code[0] == 977 ? "fork failed before the sharing round" :
+        R.code[0] == 978 ? "the sharing child exited wrong (it could not see the segment)" :
+        R.code[0] == 979 ? "THE CHILD'S WRITE WAS NOT VISIBLE — the mapping is not shared" :
+                           "unknown";
+    if (R.code[0] != 970) kprintf("[shmstrs] driver exit %u — %s\n", R.code[0], why);
+
+    shcheck("COW fork and zero-copy sharing both behaved (exit 970)",
+            finished && R.code[0] == 970);
+    kprintf("[shmstrs] frames shared +%u, COW faults +%u (of which copied %u); shm created %u, mapped %u\n",
+            g_frames_shared - sh0, g_cow_faults - cf0, g_frames_cow_copied - cw0,
+            g_shm_creates - cr0, g_shm_maps - mp0);
+    /* fork must SHARE rather than copy — that is the change this milestone
+     * makes to fork, and a fork that still copied eagerly would show no shares. */
+    shcheck("fork SHARED its pages instead of copying them up front",
+            g_frames_shared > sh0);
+    shcheck("a write after fork actually triggered copy-on-write",
+            g_cow_faults > cf0 && g_frames_cow_copied > cw0);
+    shcheck("shared segments were created and mapped by more than one process",
+            g_shm_creates > cr0 && (g_shm_maps - mp0) >= 2);
+    /* Every segment must be gone: the last mapper's exit destroys it. A leaked
+     * segment would hold its frames for the rest of the boot. */
+    int live = 0;
+    for (int i = 0; i < MAX_SHM; i++) if (g_shm[i].used) live++;
+    shcheck("no shared segment outlived its last mapper", live == 0);
+    shcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    shcheck("no lock-rank violation across the COW and shm paths", g_rank_violations == viol0);
+    kprintf("[shmstrs] +%u freed, +%u reused; global depth %u\n",
+            g_frames_freed - freed0, g_frames_reused - reused0, g_frame_free_depth);
+out:
+    kprintf("[shmstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_shpass, (uint64_t)g_shfail);
+    if (!g_shfail) kputs("[shmstrs] COW AND SHARED MEMORY VERIFIED — forks are cheap, sharing is real\n");
+    else kputs("[shmstrs] MEMORY SHARING DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 static void cmd_selfhost_test(void) {
     kputs("-- TOOLCHAIN STRESS: author -> compile -> run, natively in ring 3 --\n");
     g_tcpass = g_tcfail = 0;
@@ -18036,6 +18773,8 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "threadstress")) cmd_thread_stress();
     else if (!kstrcmp(argv[0], "pthreadsmp")) cmd_pthreads_smp();
     else if (!kstrcmp(argv[0], "sigstress")) cmd_sig_stress();
+    else if (!kstrcmp(argv[0], "mmapstress")) cmd_mmap_stress();
+    else if (!kstrcmp(argv[0], "shmstress")) cmd_shm_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -18224,6 +18963,8 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_thread_stress();    /* v0.61: ring-3 threads across cores, futex blocking, kernel join     */
     cmd_pthreads_smp();     /* v0.62: pthread mutex contention + condition variable across cores   */
     cmd_sig_stress();       /* v0.62: signal masks, dispositions, process-group delivery           */
+    cmd_mmap_stress();      /* v0.63: demand-zero paging, mprotect, munmap                         */
+    cmd_shm_stress();       /* v0.63: copy-on-write fork and zero-copy shared memory               */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
