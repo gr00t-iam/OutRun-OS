@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.60.0-metal"
+#define KERNEL_VERSION "0.63.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -582,6 +582,7 @@ static volatile int g_debug_posix = 0;          /* DEBUG_POSIX: fork/exec/signal
 
 static void handle_cpl3_fault(struct isr_frame *f);      /* defined after process globals */
 static int  posix_try_fault_signal(struct isr_frame *f);  /* v0.55: catchable SIGSEGV (signal core) */
+static int  vm_fault_handle(struct isr_frame *f);        /* v0.63: demand-zero / copy-on-write     */
 static void sweep_tick(void);                            /* incremental PTE integrity audit */
 static void smp_ipi_dispatch(uint64_t vec);              /* v0.35: LAPIC IPI handlers      */
 static void smp_preempt_ipi(struct isr_frame *f);        /* v0.39: vector 50 (may not return) */
@@ -627,6 +628,12 @@ void isr_dispatch(struct isr_frame *f) {
          * BEFORE handle_cpl3_fault, which both switches off the faulting address
          * space (so the user stack would no longer be writable) and never
          * returns. If no handler is installed we fall through and die as before. */
+        /* v0.63: a demand-zero or copy-on-write fault is the mapping being
+         * COMPLETED, not a program error — resolve it and iretq so the
+         * faulting instruction simply re-executes. Must come before the signal
+         * path, which would otherwise deliver SIGSEGV for an access that is
+         * entirely legitimate. */
+        if (f->vector == 14 && (f->cs & 3) == 3 && vm_fault_handle(f)) return;
         if ((f->cs & 3) == 3 && posix_try_fault_signal(f)) return;
         /* A fault from ring 3 must never take down the kernel — terminate the    */
         /* offending task (guard-page hit = stack overflow).                      */
@@ -909,12 +916,81 @@ static inline int frame_in_pool(uint64_t pa) {
 #define FRAME_DBG_MAX ((256ull * 1024 * 1024) / 0x1000)
 static uint8_t g_frame_dbg_isfree[FRAME_DBG_MAX];
 
+/* ===========================================================================
+ * v0.63: PHYSICAL FRAME REFERENCE COUNTS
+ * ===========================================================================
+ * Copy-on-write and shared memory both need one thing this allocator has never
+ * had: a frame that outlives the first owner to let go of it. Until now every
+ * mapped frame had exactly one owner, so page_free_tree could free whatever it
+ * walked; with COW a parent and child point at the SAME frame, and whichever
+ * exits first must not pull it out from under the other.
+ *
+ * ZERO MEANS SOLE OWNER, not "no owners". That is deliberate: every frame in
+ * the system already exists and is singly owned, so the default-initialised
+ * array is already correct for all of them and no existing path has to learn
+ * about refcounts to stay right. Only sharing touches this.
+ *
+ * free_frame() therefore decrements while extra owners remain and returns 0 —
+ * "not reclaimed by me". That keeps the invariant every suite asserts,
+ * g_frame_free_depth == g_frames_freed - g_frames_reused, exactly true: the
+ * counters only ever move when a frame really goes on or off the list.
+ *
+ * The existing double-free shadow bit is what makes this safe to get wrong
+ * loudly rather than silently: a refcount bug that frees a still-shared frame
+ * halts the machine at the second free with the offending address, instead of
+ * handing live memory to a second owner. */
+static uint16_t g_frame_ref[FRAME_DBG_MAX];
+static volatile uint64_t g_frames_shared = 0;    /* share operations, lifetime */
+static volatile uint64_t g_frames_cow_copied = 0;/* COW faults that duplicated */
+
+static inline int64_t frame_ref_idx(uint64_t pa) {
+    pa &= ADDR_MASK;
+    if (pa < FRAME_POOL_BASE) return -1;
+    uint64_t i = (pa - FRAME_POOL_BASE) / 0x1000;
+    return i < FRAME_DBG_MAX ? (int64_t)i : -1;
+}
+
+/* Claim one more owner for `pa`. Returns 1 if the frame is refcountable (in
+ * the pool and inside the shadow window), 0 otherwise — a device MMIO alias or
+ * an out-of-window frame is not ours to count, and callers that map one are
+ * responsible for not freeing it either, which frame_is_device_mmio already
+ * guarantees on every teardown path. */
+static int frame_share(uint64_t pa) {
+    int64_t i = frame_ref_idx(pa);
+    if (i < 0 || !frame_in_pool(pa)) return 0;
+    frame_lock();
+    g_frame_ref[i]++;
+    frame_unlock();
+    __sync_fetch_and_add(&g_frames_shared, 1);
+    return 1;
+}
+
+/* How many owners besides the first. 0 = sole owner, so a COW fault on a frame
+ * reading 0 can simply take the page writable instead of copying it — the last
+ * process holding a COW page should not pay for a copy nobody else wants. */
+static uint16_t frame_refs(uint64_t pa) {
+    int64_t i = frame_ref_idx(pa);
+    if (i < 0) return 0;
+    return g_frame_ref[i];
+}
+
 /* Return one 4 KiB frame to the pool. Returns 1 if it was actually reclaimed,
  * 0 if the address was out of the managed window (and thus ignored) — the
  * caller uses that to count exactly how many frames came back. */
 static int free_frame(uint64_t pa) {
     pa &= ADDR_MASK;
     if (!frame_in_pool(pa)) return 0;
+    /* v0.63: a shared frame loses an owner, not its contents. Checked BEFORE
+     * anything touches the free list, so a still-shared frame never reaches
+     * the list at all and the double-free detector below stays meaningful. */
+    {
+        int64_t ri = frame_ref_idx(pa);
+        if (ri >= 0) {
+            frame_lock();
+            if (g_frame_ref[ri]) { g_frame_ref[ri]--; frame_unlock(); return 0; }
+            frame_unlock();
+        }
+    }
     frame_lock();
     if (pa == g_frame_freelist) {
         frame_unlock();
@@ -1061,6 +1137,68 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
     return (pt[i1] & PTE_PRESENT) ? pt[i1] : 0;
 }
 
+/* ===========================================================================
+ * v0.63: SOFTWARE PTE BITS — demand-zero and copy-on-write, with no VMA list
+ * ===========================================================================
+ * x86-64 ignores PTE bits 9-11 entirely, and when PRESENT is clear it ignores
+ * every other bit too. That is enough to record what a page IS without a
+ * parallel VMA structure: the page table becomes the map.
+ *
+ * This kernel has never had VMA objects, and adding them for two page kinds
+ * would mean a second description of the address space that has to be kept
+ * consistent with the first — the classic way for an unmap to free a frame the
+ * other structure still believes is live. The PTE is already authoritative;
+ * this keeps it that way.
+ *
+ *   PTE_ZFOD   PRESENT=0. "Anonymous mapping, not yet backed." The intended
+ *              permissions ride along in the same word, which is free precisely
+ *              because the hardware is not looking at a non-present entry.
+ *   PTE_COW    PRESENT=1, WRITE=0. "Writable, but the frame is shared — a
+ *              write must copy first."
+ *   PTE_SHM    PRESENT=1. "Shared-memory frame: never copy, never demand-zero."
+ *              Distinguishes a genuinely shared writable page from a COW one,
+ *              which otherwise look identical the moment COW clears WRITE.  */
+/* Counters for the lazy-paging paths. Declared here, next to the bits they
+ * describe, because both the fault handler and access_ok's kernel-side
+ * resolver bump them and the two live far apart in this file. */
+static volatile uint64_t g_zfod_faults = 0, g_cow_faults = 0;
+static volatile uint64_t g_mmap_calls = 0, g_munmap_calls = 0, g_mprotect_calls = 0;
+
+#define PTE_ZFOD (1ull << 9)
+#define PTE_COW  (1ull << 10)
+#define PTE_SHM  (1ull << 11)
+
+/* Locate the PTE SLOT (not its value) so a fault can rewrite it in place.
+ * Returns 0 if any level above it is absent — nothing to fix up. */
+static uint64_t *pte_slot(uint64_t pml4_phys, uint64_t vaddr) {
+    uint64_t i4 = (vaddr >> 39) & 0x1FF, i3 = (vaddr >> 30) & 0x1FF;
+    uint64_t i2 = (vaddr >> 21) & 0x1FF, i1 = (vaddr >> 12) & 0x1FF;
+    uint64_t *pml4 = (uint64_t *)(pml4_phys & ADDR_MASK);
+    if (!(pml4[i4] & PTE_PRESENT)) return 0;
+    uint64_t *pdpt = (uint64_t *)(pml4[i4] & ADDR_MASK);
+    if (!(pdpt[i3] & PTE_PRESENT) || (pdpt[i3] & PTE_HUGE)) return 0;
+    uint64_t *pd = (uint64_t *)(pdpt[i3] & ADDR_MASK);
+    if (!(pd[i2] & PTE_PRESENT) || (pd[i2] & PTE_HUGE)) return 0;
+    uint64_t *pt = (uint64_t *)(pd[i2] & ADDR_MASK);
+    return &pt[i1];
+}
+
+/* v0.63: install a non-present PTE that PROMISES a page. The permissions live
+ * in the same word: the hardware ignores every bit of a non-present entry, so
+ * the entry can carry its own future without a parallel structure to consult.
+ * Builds the intermediate tables by mapping a dummy present entry and then
+ * rewriting the leaf, which reuses map_page's table construction rather than
+ * duplicating a second, subtly different walker. */
+static int vm_reserve_zfod(uint64_t cr3, uint64_t va, uint64_t prot_flags) {
+    /* map_page returns 0 unconditionally — it is not a status — so the check
+     * that matters is whether the leaf slot actually materialised. */
+    map_page(cr3, va, 0, PTE_USER);
+    uint64_t *slot = pte_slot(cr3, va);
+    if (!slot) return 0;
+    *slot = PTE_ZFOD | PTE_USER | prot_flags;      /* PRESENT deliberately clear */
+    return 1;
+}
+
 /* ---- user-space address range + pointer validation ------------------------- */
 #define USER_VMIN 0x400000000000ull
 #define USER_VMAX 0x600000000000ull
@@ -1070,6 +1208,9 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
 #define WIN_USER_V  0x0000550000000000ull   /* v0.53: ring-3 WIMP window content thumbnail */
 #define THR_USER_V  0x0000560000000000ull   /* v0.55: per-POSIX-thread ring-3 stacks       */
 #define HEAP_USER_V 0x0000570000000000ull   /* v0.56: ring-3 heap (SYS_BRK grows it upward) */
+#define MMAP_USER_V 0x0000580000000000ull   /* v0.63: SYS_MMAP anonymous regions, bump upward */
+#define SHM_USER_V  0x0000590000000000ull   /* v0.63: SYS_SHM_MAP attachments                 */
+#define MMAP_MAX_BYTES (64u * 1024u * 1024u)  /* per-process mmap window ceiling             */
 #define HEAP_MAX_BYTES (4u * 1024u * 1024u) /* per-process heap ceiling: 4 MiB              */
 /* Everything at or above DMA_USER_V is a WINDOW the kernel grants explicitly
  * (device DMA, shared pixels, per-thread stacks); only the region below it is
@@ -1095,11 +1236,76 @@ static uint64_t walk_pte(uint64_t pml4_phys, uint64_t vaddr) {
 /* mapped USER-present (and USER-writable if need_write). Defends every syscall   */
 /* that touches a ring-3-supplied pointer. (Uniprocessor: the process's own page  */
 /* tables can't change mid-syscall, so this check is not subject to TOCTOU here.) */
+/* v0.63: resolve a lazy page ON BEHALF OF THE KERNEL.
+ *
+ * Demand-zero and copy-on-write are transparent to ring 3 because the CPU
+ * faults and vm_fault_handle fixes it up. The kernel gets no such courtesy: it
+ * writes to user memory through the process's own mapping while in ring 0, and
+ * CR0.WP is not set — so a ring-0 store to a read-only COW page does NOT fault.
+ * It succeeds, silently, straight into a frame another process is still using.
+ *
+ * That is the real hazard this function exists for, and it is worse than the
+ * one that made it visible. What surfaced first was the opposite failure:
+ * access_ok saw a COW page as not-writable and refused, so sig_deliver could
+ * not build a signal frame on a forked process's stack and killed it with
+ * "no stack" — every fork-heavy suite failed at once with exit 145
+ * (128 + SIGCHLD). The refusal was loud. The silent write would not have been.
+ *
+ * Both are fixed in the same place, because access_ok is the ONE gate every
+ * kernel path already passes through before touching user memory: resolve the
+ * page here, and by the time any caller has permission it also has a private,
+ * genuinely writable frame. */
+static int vm_touch(uint64_t cr3, uint64_t va, int need_write) {
+    uint64_t *slot = pte_slot(cr3, va & ~0xFFFull);
+    if (!slot) return 0;
+    uint64_t e = *slot;
+
+    if (!(e & PTE_PRESENT) && (e & PTE_ZFOD)) {      /* back a promised page */
+        uint64_t nf = alloc_frame();
+        if (!nf) return 0;
+        *slot = (nf & ADDR_MASK) | (e & (PTE_USER | PTE_WRITE | PTE_NX)) | PTE_PRESENT;
+        __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+        __sync_fetch_and_add(&g_zfod_faults, 1);
+        e = *slot;
+    }
+    if (!(e & PTE_PRESENT) || !(e & PTE_USER)) return 0;
+    if (!need_write) return 1;
+
+    if (e & PTE_COW) {                               /* take a private copy  */
+        uint64_t old = e & ADDR_MASK;
+        uint64_t keep = (e & (PTE_USER | PTE_NX)) | PTE_WRITE | PTE_PRESENT;
+        if (frame_refs(old) == 0) {
+            *slot = old | keep;
+        } else {
+            uint64_t nf = alloc_frame();
+            if (!nf) return 0;
+            const uint8_t *s = (const uint8_t *)old;
+            uint8_t *d = (uint8_t *)nf;
+            for (int b = 0; b < 0x1000; b++) d[b] = s[b];
+            *slot = (nf & ADDR_MASK) | keep;
+            free_frame(old);
+            __sync_fetch_and_add(&g_frames_cow_copied, 1);
+        }
+        __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+        __sync_fetch_and_add(&g_cow_faults, 1);
+        return 1;
+    }
+    return (*slot & PTE_WRITE) ? 1 : 0;
+}
+
 static int access_ok(uint64_t cr3, uint64_t ptr, uint64_t len, int need_write) {
     if (len == 0) return 1;
     if (ptr < USER_VMIN || ptr + len < ptr || ptr + len > USER_VMAX) return 0;
     for (uint64_t p = ptr & ~0xFFFull; p <= ((ptr + len - 1) & ~0xFFFull); p += 0x1000) {
         uint64_t pte = walk_pte(cr3, p);
+        /* Lazy page? Resolve it and re-read. A page that is merely PROMISED is
+         * as valid as one already backed — refusing it here would make mmap'd
+         * memory unusable as a syscall buffer until userland had touched it,
+         * which is not a property any caller could reasonably know about. */
+        if (!(pte & PTE_PRESENT) || (need_write && !(pte & PTE_WRITE))) {
+            if (!vm_touch(cr3, p, need_write)) return 0;
+            pte = walk_pte(cr3, p);
+        }
         if (!(pte & PTE_PRESENT) || !(pte & PTE_USER)) return 0;
         if (need_write && !(pte & PTE_WRITE)) return 0;
     }
@@ -1554,11 +1760,60 @@ struct kproc {
     uint64_t sigframe_sp;
     volatile uint64_t alarm_deadline;      /* g_ticks value at which SIGALRM fires (0 = off) */
     int      ppid_slot;           /* parent kproc slot, for SIGCHLD (-1 = none)     */
+    /* v0.62: PROCESS GROUP. Job control needs a name for "this pipeline" that
+     * outlives the individual processes in it and that the console can signal
+     * as a unit — which is exactly what a process group is, and why Ctrl+C
+     * reaching only the foreground job (and not the shell) is a property of the
+     * kernel rather than something a shell can fake. A thread inherits its
+     * leader's group: a thread is not separately signallable from a terminal. */
+    int      pgid;                /* 0 = unset (treated as this process's own pid)  */
     /* Thread group. Several uthreads may share ONE kproc (= one address space);
      * the address space may only be torn down when the LAST of them exits, so
      * every exit path decrements this and only the 0-transition tears down. */
     volatile int nthreads;
     uint64_t ustack_next;         /* bump allocator for per-thread ring-3 stacks    */
+    /* ===================== v0.61: THREAD GROUP ===========================
+     * A thread is its OWN kproc slot sharing the leader's address space —
+     * the clone(CLONE_VM) model. That is what makes a thread a first-class
+     * run-queue entity: rq_push_any/rq_steal/cpu_exec_proc/affinity/migration
+     * and the preemption capture path all key on a kproc INDEX, so a thread
+     * that IS one inherits every piece of SMP machinery for free instead of
+     * needing a second scheduler that has to be kept in step (see
+     * docs/THREADS-M61.md for why v0.55's BSP-only restriction existed).
+     *
+     * tg_leader is the slot owning everything SHARED: the address space, the
+     * fd table, signal dispositions, the heap, the group refcount. A leader
+     * points at itself, so `kprocs[p].tg_leader` is always safe to deref and
+     * no path needs an is-it-a-thread test just to find the owner.
+     *
+     * Each member keeps its OWN pid — that is its thread id, and it is what
+     * lets kproc_find_by_pid, the reap log and the run queues stay unmodified.
+     * SYS_GETPID reports the LEADER's pid (POSIX: one pid per thread group);
+     * SYS_GETTID reports the caller's own. */
+    int      tg_leader;           /* slot owning the shared state (self if leader) */
+    int      tg_tid;              /* 0-based tid within the group; -1 = the leader */
+    uint64_t tstack_base;         /* this thread's OWN ring-3 stack (0 = leader's) */
+    int      tstack_pages;        /* pages at tstack_base; 0 = caller-supplied     */
+    /* v0.61: LEADER-OWNED join table. A departing thread's kproc slot is
+     * recycled the moment it is torn down, so a joiner arriving afterwards has
+     * nothing left to read — the same problem v0.55's reap log solved for
+     * processes, and it needs the same answer: capture the status AT THE
+     * SOURCE. Keyed by tid rather than by slot precisely because the slot does
+     * not survive, which also makes the join key stable across recycling. */
+    uint64_t thr_exit[THR_MAX];   /* exit code of each departed thread            */
+    volatile uint32_t thr_done;   /* bit t = "tid t has exited; thr_exit[t] valid" */
+    /* ---- v0.61: blocking (futex / join). See the park protocol in
+     * docs/THREADS-M61.md §3.4. `wait_armed` is published by the WAITING core
+     * before it unwinds; `parked` is set only by cpu_exec_proc AFTER the uctx
+     * capture is complete, so anything that sees `parked` sees a runnable
+     * context. A wake landing in between sets `wake_pending` and the parking
+     * core requeues itself — neither order can lose the wakeup. */
+    volatile uint64_t wait_key;      /* futex: phys addr of the word. join: 1+slot */
+    volatile uint64_t wait_deadline; /* g_ticks at which the park times out        */
+    volatile int      wait_armed;    /* 1 = intends to park (context may be mid-capture) */
+    volatile int      parked;        /* 1 = context complete, in NO run queue       */
+    volatile int      wake_pending;  /* 1 = woken during the arming window          */
+    volatile uint64_t wait_rv;       /* what SYS_FUTEX_WAIT/JOIN returns on resume  */
     /* v0.55: argv/envp image handed to the ring-3 crt on the initial stack.    */
     int      argc;
     int      exit_authoritative;   /* v0.55: exit_code came from exit(), not pthread_exit() */
@@ -1567,6 +1822,14 @@ struct kproc {
      * needs to know about it — the pages are ordinary USER mappings, so
      * page_free_tree reclaims them at exit exactly like the stack. */
     uint64_t heap_brk;
+    /* v0.63: bump cursors for the two new windows. Bump-only, never a free
+     * list: munmap punches holes that are reusable by ADDRESS but this kernel
+     * does not attempt to re-pack them, because a 64 MiB window is far past
+     * anything the system allocates and a first-fit scan would be code with no
+     * consumer. Stated rather than left to be discovered. */
+    uint64_t mmap_next;
+    uint64_t shm_next;
+    uint32_t shm_attached;        /* bit i = attached to shared segment i  */
     /* v0.49: leaf spinlock serializing this ONE process's own VMA/page-table
      * mutations (map_page + smp_slot_phys bookkeeping) against itself. In
      * this kernel's one-thread-per-kproc execution model only the single
@@ -1626,9 +1889,21 @@ static void kproc_reset(struct kproc *p) {
      * one thread in the group, per-thread stacks start below the main stack. */
     for (int sg = 0; sg < NSIG; sg++) p->sig_handler[sg] = 0;
     p->sig_pending = 0; p->sig_mask = 0; p->sigframe_sp = 0;
-    p->alarm_deadline = 0; p->ppid_slot = -1;
+    p->alarm_deadline = 0; p->ppid_slot = -1; p->pgid = 0;
     p->nthreads = 1; p->ustack_next = 0; p->argc = 0; p->exit_authoritative = 0;
+    /* v0.61: a fresh slot is its OWN thread-group leader. kproc_spawn fixes up
+     * tg_leader to the real index right after this returns (kproc_reset takes a
+     * pointer, not an index, so it cannot know its own slot number). */
+    p->tg_leader = -1; p->tg_tid = -1;
+    p->tstack_base = 0; p->tstack_pages = 0;
+    for (int t = 0; t < THR_MAX; t++) p->thr_exit[t] = 0;
+    p->thr_done = 0;
+    p->wait_key = 0; p->wait_deadline = 0;
+    p->wait_armed = 0; p->parked = 0; p->wake_pending = 0; p->wait_rv = 0;
     p->heap_brk = HEAP_USER_V;
+    p->mmap_next = MMAP_USER_V;
+    p->shm_next = SHM_USER_V;
+    p->shm_attached = 0;
     p->finish_seq = 0;
     p->dispatches = 0;
     p->frames_freed = 0;
@@ -1664,7 +1939,12 @@ void dbg_syscall_exit(uint64_t saved_rip, uint64_t saved_rsp) {
  * in this kernel issues SYS_SPAWN from ring 3), so this closes a latent gap
  * rather than a live one: with per-CPU run queues now able to run genuinely
  * concurrent ring-3 workloads across every core, a second spawn source would
- * otherwise race the scan-then-claim of n_kproc/torn_down against this one. */
+ * otherwise race the scan-then-claim of n_kproc/torn_down against this one.
+ *
+ * v0.61: the gap stopped being latent. kproc_spawn_thread() claims slots from
+ * this same table on behalf of SYS_THREAD_CREATE, which any core may now issue
+ * from ring 3 — so this lock is load-bearing rather than precautionary, and
+ * the two claimants share it precisely so that they cannot claim one slot. */
 static volatile int g_kproc_lock = 0;
 static inline void kproc_lock(void)   { while (__sync_lock_test_and_set(&g_kproc_lock, 1)) __asm__ volatile("pause"); }
 static inline void kproc_unlock(void) { __sync_lock_release(&g_kproc_lock); }
@@ -1705,12 +1985,72 @@ static int kproc_spawn(const char *name, uint64_t caps) {
     kstrcpy_n(kprocs[i].name, name, sizeof kprocs[i].name);
     kprocs[i].caps = caps;
     kprocs[i].cr3  = create_address_space();
+    kprocs[i].tg_leader = i;              /* v0.61: leader of its own group */
+    kprocs[i].pgid = (int)pid;            /* v0.62: leads its own process group */
     kprocs[i].used = true;
     if (g_debug_kproc_lifetime)
         kprintf("[dbgkpr ] spawn: slot %d %s -> pid %u '%s' caps %X\n",
                 i, recycled ? "RECYCLED" : "fresh", pid, name, caps);
     kprintf("[kernel ] spawned pid %u '%s' caps %X — private PML4 @ phys %X\n",
             kprocs[i].pid, name, caps, kprocs[i].cr3);
+    return i;
+}
+
+/* v0.61: the thread-group leader of slot p, bounds-checked. Every shared
+ * resource — address space, fd table, signal dispositions, heap, the group
+ * refcount — is owned by this slot and by no other member. Returns p itself
+ * for anything that is not a thread, so callers never need a special case. */
+static inline int tg_of(int p) {
+    if (p < 0 || p >= n_kproc) return p;
+    int L = kprocs[p].tg_leader;
+    if (L < 0 || L >= n_kproc) return p;      /* pre-v0.61 slot, or corrupt */
+    return L;
+}
+
+/* v0.61: claim a kproc slot that SHARES an existing address space — a thread.
+ *
+ * This is kproc_spawn's sibling and deliberately not a flag on it: the one
+ * thing kproc_spawn does that must NOT happen here is create_address_space().
+ * A thread's cr3 is the LEADER's, copied in rather than looked up, because cr3
+ * is read on the hot dispatch path (cpu_exec_proc) and a leader indirection
+ * there would be a cost paid by every task to serve a minority.
+ *
+ * Everything the group shares is left pointing at the leader; everything the
+ * thread owns alone (its pid/tid, its ring-3 stack, its scheduling state) is
+ * its own. Caps, role and affinity are COPIED because they are policy the
+ * thread must not be able to escape by being a thread.
+ *
+ * Runs on ANY core: the slot claim is the same atomic critical section
+ * kproc_spawn uses, and nothing here touches BSP scheduler state. */
+static int kproc_spawn_thread(const char *name, int leader, int tid) {
+    if (leader < 0 || leader >= n_kproc || !kprocs[leader].used) return -1;
+    int i = -1;
+    kproc_lock();
+    for (int s = 0; s < n_kproc; s++)
+        if (kprocs[s].used && kprocs[s].torn_down) { i = s; kprocs[s].torn_down = 0; break; }
+    if (i < 0) {
+        if (n_kproc >= MAX_KPROC) { kproc_unlock(); return -1; }
+        i = n_kproc++;
+    }
+    kproc_unlock();
+    if (i == leader) return -1;                  /* cannot thread onto itself */
+    kproc_reset(&kprocs[i]);
+    uint64_t pid = g_next_pid++;
+    if (!g_next_pid) g_next_pid = 1;
+    kprocs[i].pid  = pid;                        /* its OWN pid == its tid    */
+    kstrcpy_n(kprocs[i].name, name, sizeof kprocs[i].name);
+    kprocs[i].caps      = kprocs[leader].caps;
+    kprocs[i].cr3       = kprocs[leader].cr3;    /* SHARED — never freed here */
+    kprocs[i].role      = kprocs[leader].role;
+    kprocs[i].affinity  = kprocs[leader].affinity;
+    kprocs[i].redir_in  = kprocs[leader].redir_in;
+    kprocs[i].redir_out = kprocs[leader].redir_out;
+    kprocs[i].ppid_slot = kprocs[leader].ppid_slot;
+    kprocs[i].pgid      = kprocs[leader].pgid;   /* v0.62: threads share the group */
+    kprocs[i].tg_leader = leader;
+    kprocs[i].tg_tid    = tid;
+    kprocs[i].nthreads  = 0;                     /* the LEADER holds the count */
+    kprocs[i].used      = true;
     return i;
 }
 
@@ -2186,9 +2526,15 @@ static void thread_release(int tid) {
     g_threads[tid].state = T_RUNNABLE;
 }
 
+static void futex_timeout_scan(void);      /* fwd: v0.61, defined with the futex */
+
 static void idle_fn(void *a) {
     (void)a;
-    for (;;) { __asm__ volatile("sti; hlt"); sched_yield(); }
+    /* v0.61: the BSP's counterpart to the AP idle scan. This thread runs only
+     * when nothing else can, which is precisely the condition a timed-out park
+     * has to be rescued from. Thread context, not interrupt context, so taking
+     * run-queue locks here is safe. */
+    for (;;) { __asm__ volatile("sti; hlt"); futex_timeout_scan(); sched_yield(); }
 }
 
 /* ===========================================================================
@@ -2257,6 +2603,51 @@ static inline void krelax(void) {
     if (cpu_idx() == 0 && g_sched_on) sched_yield();
     else __asm__ volatile("pause");
 }
+
+/* ===========================================================================
+ * v0.61: THE EXEC STAGING BUFFER LOCK
+ * ===========================================================================
+ * g_execbuf is ONE 256 KiB global buffer. Both exec paths — exec_from_cas and
+ * SYS_EXECVE_PATH — read a whole ELF image into it and then parse it out of it,
+ * and until now neither serialised that. On a uniprocessor it could not matter;
+ * with several cores in ring 3 it is a straightforward data race, and its
+ * signature is unmistakable in a boot log:
+ *
+ *   [kernel ] spawned pid 666 ...
+ *   [kernel ] spawned pid 667 ...
+ *   [elf    ] PT_LOAD ... filesz 0000000000001b50 ...      <- pid 666, /bin/emit
+ *   [elf    ] reject: segment file range out of bounds     <- 667 overwrote it
+ *   [elf    ] PT_LOAD ... filesz 0000000000001c63 ...      <- pid 667, /bin/wcx
+ *
+ * One core's image replaced the other's mid-parse, so the second segment header
+ * pointed past the end of what was now a different, shorter file. The exec was
+ * refused — correctly, given what the buffer contained — and the program simply
+ * never ran. In `a | b`, that empties the pipeline.
+ *
+ * FOUND BY: the v0.60 pipestrs pipeline assertion, which failed on some SMP and
+ * IOMMU runs and passed on others with a byte-identical ISO. It was recorded
+ * then as a timing-sensitive flake and NOT root caused. It is not a flake; it
+ * is this, and it has been present since v0.56 gave the system a second way to
+ * exec. Threads did not cause it and do not depend on it — but a milestone
+ * about running more things on more cores at once is the wrong one in which to
+ * leave a concurrency defect in the exec path unfixed.
+ *
+ * ORDERING: this is taken BEFORE any klock (the holder goes on to acquire
+ * vfs -> cas -> vblk inside vfs_read_file), and nothing that already holds a
+ * klock ever execs. It is deliberately not itself a klock: it is held across a
+ * blocking disk read, and the rank machinery is for the ordered chain beneath
+ * it, not for the buffer above it. The backoff is krelax(), so a contended
+ * acquire yields to the scheduler on the BSP rather than starving the very
+ * thread that has to finish and release. */
+static volatile int      g_execbuf_lock = 0;
+static volatile uint32_t g_execbuf_contended = 0;   /* proves the race was real */
+static inline void execbuf_acquire(void) {
+    if (__sync_lock_test_and_set(&g_execbuf_lock, 1)) {
+        __sync_fetch_and_add(&g_execbuf_contended, 1);
+        do { krelax(); } while (g_execbuf_lock || __sync_lock_test_and_set(&g_execbuf_lock, 1));
+    }
+}
+static inline void execbuf_release(void) { __sync_lock_release(&g_execbuf_lock); }
 
 /* Rank bookkeeping storage for the CURRENT context (see the pcb comment).    */
 static inline uint8_t *rank_ctx(uint8_t **sp) {
@@ -4308,6 +4699,8 @@ static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
 #define VOL_TMP  1
 #define VOL_DEV  2
 #define VOL_PIPE 3   /* v0.59: not a store at all — a live channel, see g_pipes */
+#define VOL_EPOLL 4  /* v0.64: an epoll instance; g_epoll[ofile.ep]            */
+#define VOL_EVFD  5  /* v0.64: an eventfd counter; g_evfd[ofile.efd]           */
 
 #define TMP_MAXFILES 4                 /* small, ephemeral, RAM-only scratch area */
 #define TMP_MAXBYTES 512
@@ -4398,7 +4791,13 @@ static int64_t dev_read_file(void *buf, uint32_t max) {
  * that every `switch (volume)` in the read/write paths has to account for it
  * explicitly rather than silently treating a pipe as a ROOT file.           */
 struct ofile { int used; int dirent; uint64_t off; uint64_t owner_mask; int volume;
-               int pipe; int pipe_w; };
+               int pipe; int pipe_w;
+               /* v0.64: an epoll instance and an eventfd are DESCRIPTORS, which
+                * is not decoration — it is what gives them fork inheritance,
+                * SYS_CLOSE, owner-mask refcounting and force-close-on-exit for
+                * free, from machinery that is already tested. A side table keyed
+                * by process would have had to reimplement all four. */
+               int ep; int efd; };
 static struct ofile g_ofiles[16];
 
 /* ===========================================================================
@@ -4448,6 +4847,175 @@ static void pipe_unref_locked(int pi, int is_w) {
         g_pipes[pi].used = 0;        /* last end closed: the buffer is garbage */
 }
 
+/* ===========================================================================
+ * v0.64: EVENTFD AND EPOLL — readiness, and how to wait for it
+ * ===========================================================================
+ * Everything that could block in this kernel has, until now, been polled: the
+ * shell polls the tty, vsh polls waitpid, a pipe reader yields and retries.
+ * That works and it is honest, but it means a process waiting on two things at
+ * once has to spin between them, and on a uniprocessor spinning is how you
+ * starve the very task that would make progress.
+ *
+ * epoll answers "which of these is ready", and eventfd is the thing you can
+ * make ready on purpose. Together they are what let a thread sleep on several
+ * sources and be woken by whichever fires.
+ *
+ * BOTH ARE DESCRIPTORS, deliberately. An epoll instance and an eventfd live in
+ * g_ofiles like a file or a pipe end, which is what gives them fork
+ * inheritance, SYS_CLOSE, owner-mask refcounting and force-close-on-exit
+ * without writing any of it again — all four already exist and are tested by
+ * pipestrs. A private table keyed by process would have had to reimplement
+ * every one of them, and would have been the fifth place in this kernel that
+ * knows how a process releases things when it dies.
+ *
+ * READINESS IS COMPUTED, NOT CACHED. ep_poll_fd() asks the source directly
+ * every time rather than maintaining a ready-list updated by hooks. With eight
+ * descriptors and four epoll instances the scan is trivial, and the property
+ * bought is worth more than the cycles: a cached ready-bit that disagrees with
+ * the source is a hang (missed event) or a spin (phantom event), and both are
+ * exactly the bugs that are hardest to reproduce. Nothing can drift from a
+ * value that is never stored. */
+#define MAX_EPOLL      4
+#define EPOLL_MAXWATCH 8
+#define MAX_EVENTFD    8
+
+/* Event masks — the Linux values, so the constants a reader already knows mean
+ * what they normally mean. */
+#define EPOLLIN   0x001u
+#define EPOLLOUT  0x004u
+#define EPOLLERR  0x008u
+#define EPOLLHUP  0x010u
+#define EPOLLET   0x80000000u
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+
+struct epwatch {
+    int      used;
+    int      fd;
+    uint32_t events;      /* what the caller asked to hear about        */
+    uint64_t data;        /* opaque cookie handed back verbatim         */
+    uint32_t seen;        /* edge-triggered: the mask last reported     */
+};
+struct kepoll {
+    int used;
+    struct epwatch w[EPOLL_MAXWATCH];
+};
+static struct kepoll g_epoll[MAX_EPOLL];
+
+struct keventfd {
+    int      used;
+    uint64_t counter;
+    int      semaphore;   /* EFD_SEMAPHORE: a read takes 1, not the lot */
+};
+static struct keventfd g_evfd[MAX_EVENTFD];
+
+static volatile uint64_t g_epoll_creates = 0, g_epoll_waits = 0, g_epoll_parks = 0;
+static volatile uint64_t g_evfd_creates = 0, g_evfd_writes = 0, g_evfd_reads = 0;
+
+/* An epoll instance's park key, in the same tagged space join keys use. */
+#define EPOLL_WAIT_KEY(epi) (0xE000000000000000ull | (uint64_t)(epi))
+static int futex_wake_key(uint64_t key, int n, uint64_t rv);   /* fwd: v0.61 */
+
+/* What is `fd` ready for RIGHT NOW? Caller holds g_ofile_lock.
+ *
+ * The pipe rules are the ones with content, and they are the same distinctions
+ * v0.59 had to get right for read(): data means readable, but so does EOF —
+ * a reader must be woken to *learn* there is nothing more coming, or a
+ * pipeline hangs at its last byte instead of finishing. */
+static uint32_t ep_poll_fd_locked(int fd) {
+    if (fd < 0 || fd >= 16 || !g_ofiles[fd].used) return EPOLLERR;
+    struct ofile *o = &g_ofiles[fd];
+    uint32_t r = 0;
+    if (o->volume == VOL_PIPE) {
+        int pi = o->pipe;
+        if (pi < 0 || pi >= MAX_PIPES || !g_pipes[pi].used) return EPOLLERR | EPOLLHUP;
+        if (o->pipe_w) {
+            if (g_pipes[pi].readers == 0) r |= EPOLLERR;      /* nobody will ever read */
+            else if (g_pipes[pi].count < PIPE_CAP) r |= EPOLLOUT;
+        } else {
+            if (g_pipes[pi].count > 0) r |= EPOLLIN;
+            if (g_pipes[pi].writers == 0) r |= EPOLLIN | EPOLLHUP;  /* EOF is readable */
+        }
+        return r;
+    }
+    if (o->volume == VOL_EVFD) {
+        int ei = o->efd;
+        if (ei < 0 || ei >= MAX_EVENTFD || !g_evfd[ei].used) return EPOLLERR;
+        if (g_evfd[ei].counter > 0) r |= EPOLLIN;
+        if (g_evfd[ei].counter < 0xFFFFFFFFFFFFFFFEull) r |= EPOLLOUT;
+        return r;
+    }
+    if (o->volume == VOL_EPOLL) {
+        /* Watching an epoll fd with epoll is legal in POSIX and pointless
+         * here; report it as never-ready rather than pretending to nest. */
+        return 0;
+    }
+    /* A stored file is always ready both ways — POSIX says so, and it is true:
+     * a read or write on one completes without waiting for anything. */
+    return EPOLLIN | EPOLLOUT;
+}
+
+/* Something happened on `fd`: wake any thread parked in epoll_wait on an
+ * instance watching it. Scanning every instance is cheap at MAX_EPOLL = 4, and
+ * it means a notifier does not have to maintain a reverse index that could go
+ * stale — the same reason readiness itself is computed rather than cached. */
+static void ep_notify_fd(int fd) {
+    for (int i = 0; i < MAX_EPOLL; i++) {
+        if (!g_epoll[i].used) continue;
+        for (int k = 0; k < EPOLL_MAXWATCH; k++) {
+            if (!g_epoll[i].w[k].used || g_epoll[i].w[k].fd != fd) continue;
+            futex_wake_key(EPOLL_WAIT_KEY(i), MAX_KPROC, (uint64_t)-11);
+            break;
+        }
+    }
+}
+
+/* v0.64: an eventfd behaves as a FILE holding one 64-bit counter, so it is
+ * read and written through the ordinary SYS_READ / SYS_WRITE_FILE paths rather
+ * than through calls of its own. That is the point of making it a descriptor:
+ * anything that already knows how to write to an fd can signal one.
+ *
+ * A read DRAINS the counter and returns what it held; in semaphore mode it
+ * takes exactly 1. Reading zero is EAGAIN rather than a short read, because
+ * "no events" is a state to wait on, not an end of file. */
+static int64_t evfd_read_fd(int fd, void *dst, uint32_t len) {
+    if (len < 8) return -22;                                  /* EINVAL */
+    klock_acquire(&g_ofile_lock);
+    int ei = (fd >= 0 && fd < 16 && g_ofiles[fd].used) ? g_ofiles[fd].efd : -1;
+    if (ei < 0 || ei >= MAX_EVENTFD || !g_evfd[ei].used) { klock_release(&g_ofile_lock); return -9; }
+    uint64_t v = g_evfd[ei].counter;
+    int64_t r;
+    if (!v) r = -11;                                          /* EAGAIN: nothing posted */
+    else {
+        if (g_evfd[ei].semaphore) { g_evfd[ei].counter -= 1; v = 1; }
+        else                        g_evfd[ei].counter = 0;
+        *(uint64_t *)dst = v;
+        r = 8;
+    }
+    klock_release(&g_ofile_lock);
+    if (r == 8) __sync_fetch_and_add(&g_evfd_reads, 1);
+    return r;
+}
+
+/* A write ADDS to the counter and wakes anything parked in epoll_wait on it.
+ * The wake happens after the lock is released: waking takes run-queue locks,
+ * and the ordering discipline puts those outside the descriptor lock. */
+static int64_t evfd_write_fd(int fd, const void *src, uint32_t len) {
+    if (len < 8) return -22;
+    klock_acquire(&g_ofile_lock);
+    int ei = (fd >= 0 && fd < 16 && g_ofiles[fd].used) ? g_ofiles[fd].efd : -1;
+    if (ei < 0 || ei >= MAX_EVENTFD || !g_evfd[ei].used) { klock_release(&g_ofile_lock); return -9; }
+    uint64_t add = *(const uint64_t *)src;
+    int64_t r;
+    if (add == 0xFFFFFFFFFFFFFFFFull) r = -22;                /* reserved, as Linux has it */
+    else if (g_evfd[ei].counter + add < g_evfd[ei].counter) r = -11;   /* would wrap: EAGAIN */
+    else { g_evfd[ei].counter += add; r = 8; }
+    klock_release(&g_ofile_lock);
+    if (r == 8) { __sync_fetch_and_add(&g_evfd_writes, 1); ep_notify_fd(fd); }
+    return r;
+}
+
 static int ofile_claim(int owner, int volume, int dirent) {
     klock_acquire(&g_ofile_lock);
     for (int fd = 0; fd < 16; fd++)
@@ -4457,6 +5025,7 @@ static int ofile_claim(int owner, int volume, int dirent) {
             g_ofiles[fd].owner_mask = 1ull << owner;
             g_ofiles[fd].volume = volume;
             g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
+            g_ofiles[fd].ep = -1;   g_ofiles[fd].efd = -1;
             klock_release(&g_ofile_lock);
             return fd;
         }
@@ -4489,7 +5058,22 @@ static int ofile_drop_locked(int fd, int slot) {
      * once the entry itself is gone. */
     if (kprocs[slot].redir_in  == fd) kprocs[slot].redir_in  = -1;
     if (kprocs[slot].redir_out == fd) kprocs[slot].redir_out = -1;
+    /* v0.64: an epoll instance and an eventfd belong to the DESCRIPTOR, not to
+     * any one owner, so they are released exactly when the entry itself goes —
+     * unlike a pipe end above, whose refcount is per owner because fork takes
+     * a reference per owner. Getting these two the same way round would either
+     * free an instance a forked sibling still holds, or never free it at all. */
     if (g_ofiles[fd].owner_mask) return 0;             /* other owners remain */
+    if (g_ofiles[fd].ep >= 0 && g_ofiles[fd].ep < MAX_EPOLL) {
+        g_epoll[g_ofiles[fd].ep].used = 0;
+        for (int k = 0; k < EPOLL_MAXWATCH; k++) g_epoll[g_ofiles[fd].ep].w[k].used = 0;
+        g_ofiles[fd].ep = -1;
+    }
+    if (g_ofiles[fd].efd >= 0 && g_ofiles[fd].efd < MAX_EVENTFD) {
+        g_evfd[g_ofiles[fd].efd].used = 0;
+        g_evfd[g_ofiles[fd].efd].counter = 0;
+        g_ofiles[fd].efd = -1;
+    }
     for (int s = 0; s < n_kproc; s++) {
         if (kprocs[s].redir_in  == fd) kprocs[s].redir_in  = -1;
         if (kprocs[s].redir_out == fd) kprocs[s].redir_out = -1;
@@ -4562,6 +5146,20 @@ static int64_t pipe_write_fd(int fd, const void *src, uint32_t len) {
         }
     }
     klock_release(&g_ofile_lock);
+    /* v0.64: bytes landed in the pipe, so anything parked in epoll_wait on the
+     * READ end is now runnable. Notified after the lock is released, because
+     * waking takes the run-queue locks and the ordering discipline puts those
+     * outside the descriptor lock, never inside it.
+     *
+     * The read end is a DIFFERENT descriptor from this one, so the notify has
+     * to name the pipe rather than the fd that was written — a reader watches
+     * its own end, and nobody is watching the writer's. */
+    if (r > 0) {
+        int pi = g_ofiles[fd].pipe;
+        for (int q = 0; q < 16; q++)
+            if (g_ofiles[q].used && g_ofiles[q].volume == VOL_PIPE &&
+                g_ofiles[q].pipe == pi && !g_ofiles[q].pipe_w) ep_notify_fd(q);
+    }
     return r;
 }
 
@@ -6328,7 +6926,16 @@ static volatile uint64_t g_sig_raised = 0, g_sig_delivered = 0, g_sig_returned =
 /* Post a signal to a process. Returns 0 on success, negative if the target is
  * gone. SIGKILL is never blockable and never handled in ring 3. */
 static int sig_raise(int slot, int signo) {
-    if (slot < 0 || slot >= n_kproc || !kprocs[slot].used || kprocs[slot].exited) return -1;
+    if (slot < 0 || slot >= n_kproc || !kprocs[slot].used) return -1;
+    /* v0.62: a signal is posted to the PROCESS, so it lands on the thread-group
+     * leader and any member may run the handler. POSIX splits this exactly
+     * here: DISPOSITIONS and PENDING are process-wide, MASKS and signal FRAMES
+     * are per-thread — a thread has its own stack, so its frame cannot be
+     * anywhere else. Raising on the caller's own slot instead would mean a
+     * signal sent to a process could be answered only by whichever thread
+     * happened to be named, which is not what kill(2) means. */
+    slot = tg_of(slot);
+    if (kprocs[slot].exited) return -1;
     if (signo <= 0 || signo >= NSIG) return -1;
     __sync_fetch_and_or(&kprocs[slot].sig_pending, 1u << signo);
     g_sig_raised++;
@@ -6340,7 +6947,12 @@ static int sig_raise(int slot, int signo) {
 
 /* Pick the lowest-numbered deliverable signal, or 0. Caller must hold nothing. */
 static int sig_next(int slot) {
-    uint32_t p = kprocs[slot].sig_pending & ~kprocs[slot].sig_mask;
+    /* v0.62: process-wide pending (the leader's) union anything posted directly
+     * to this thread, minus THIS thread's own mask — which is what makes
+     * per-thread blocking meaningful: one thread can block a signal while a
+     * sibling stays able to take it. */
+    int L = tg_of(slot);
+    uint32_t p = (kprocs[L].sig_pending | kprocs[slot].sig_pending) & ~kprocs[slot].sig_mask;
     if (!p) return 0;
     for (int sg = 1; sg < NSIG; sg++) if (p & (1u << sg)) return sg;
     return 0;
@@ -6354,7 +6966,13 @@ static int sig_next(int slot) {
  * action / ignore), and -1 if the process must die. */
 static int sig_deliver(int slot, int signo, struct uctx *regs) {
     struct kproc *k = &kprocs[slot];
-    uint64_t h = k->sig_handler[signo];
+    /* v0.62: the HANDLER is the process's (the leader's) — installing one in a
+     * thread must affect the whole program, as POSIX requires. The FRAME and
+     * the mask update below stay on `k`, this thread, because the frame is
+     * written to this thread's own stack. */
+    struct kproc *KL = &kprocs[tg_of(slot)];
+    uint64_t h = KL->sig_handler[signo];
+    __sync_fetch_and_and(&KL->sig_pending, ~(1u << signo));
     __sync_fetch_and_and(&k->sig_pending, ~(1u << signo));
 
     if (signo == SIGKILL || (h == 0 && (signo == SIGSEGV || signo == SIGINT || signo == SIGKILL)))
@@ -6405,6 +7023,52 @@ static int sig_return(int slot, struct uctx *regs) {
     return 1;
 }
 
+/* ===========================================================================
+ * v0.62: PROCESS GROUPS AND THE TERMINAL INTERRUPT
+ * ===========================================================================
+ * Ctrl+C must reach the job and NOT the shell. That is not something a shell
+ * can arrange for itself — whatever mechanism delivers the interrupt has to
+ * already know which processes are "the current job", and the shell is not one
+ * of them. A process group is that name, and the foreground group is which one
+ * the console is currently talking to.
+ *
+ * The shell's side of the bargain is two calls: put each job in its own group,
+ * and hand that group the terminal for as long as the job runs. Then it does
+ * not need a SIGINT handler at all — it is simply not in the group being
+ * signalled. That matters here beyond elegance: /bin/vsh is compiled by occ,
+ * which cannot produce a function pointer, so a shell that needed a handler to
+ * survive Ctrl+C could not be written in this system's own C.               */
+static volatile int g_fg_pgid = 0;        /* process group owning the console */
+static volatile uint32_t g_tty_intrs = 0; /* interrupts delivered to a group  */
+
+/* Raise `signo` on every live member of `pgid`. Returns how many got it.
+ * Threads are skipped: a thread inherits its leader's group, and delivering to
+ * both would post the same signal twice to one process. */
+static int sig_raise_pgrp(int pgid, int signo) {
+    int n = 0;
+    if (!pgid) return 0;
+    for (int i = 0; i < n_kproc; i++) {
+        if (!kprocs[i].used || kprocs[i].exited || kprocs[i].torn_down) continue;
+        if (kprocs[i].pgid != pgid) continue;
+        if (tg_of(i) != i) continue;                  /* leaders only */
+        if (sig_raise(i, signo) == 0) n++;
+    }
+    return n;
+}
+
+/* The interrupt character arrived on the console. One function, two callers:
+ * the tty input path when it sees 0x03, and `sigstrs`, which drives it
+ * directly — a headless boot has no one to press Ctrl+C, and a suite that
+ * tested a different code path from the real one would be testing nothing. */
+static int tty_intr(void) {
+    int n = sig_raise_pgrp(g_fg_pgid, SIGINT);
+    if (n) __sync_fetch_and_add(&g_tty_intrs, 1);
+    if (g_debug_posix)
+        kprintf("[dbgposix] tty INTR -> pgid %d, %d process(es) signalled\n",
+                (uint64_t)(int64_t)g_fg_pgid, (uint64_t)(int64_t)n);
+    return n;
+}
+
 /* Fire SIGALRM for any process whose deadline has passed. Called from the
  * scheduler boundary (never from the timer ISR itself, so no lock ordering
  * hazard against a process mid-teardown). */
@@ -6446,6 +7110,174 @@ static int posix_thread_leave(int p) {
     return left <= 0;
 }
 
+/* ===========================================================================
+ * v0.61: THE BLOCKING PRIMITIVE — futex park / wake
+ * ===========================================================================
+ * In the run-queue execution model "blocked" has a natural spelling: NOT in
+ * any run queue, and not running. A blocked task is simply absent, and waking
+ * it is an rq_push_any. That is the whole design; everything below exists to
+ * close the one window where it is not that simple.
+ *
+ * THE LOST-WAKEUP WINDOW. Between a task deciding to sleep and its ring-3
+ * context being safe for another core to resume, there is a gap — and here it
+ * is WIDER than in a conventional kernel, because the capture completes in
+ * cpu_exec_proc, after the syscall has already unwound through resume_kernel.
+ * A waker that requeues inside that gap hands a half-captured context to
+ * another core, which is a silent, data-dependent corruption.
+ *
+ * So the decision to park is made AFTER the unwind, by the core that owns the
+ * context, and arming is separated from parking:
+ *
+ *   WAIT  (syscall, waiting core): value check, publish wait_key + wait_armed,
+ *                                  then capture uctx and unwind RET_PREEMPTED
+ *   PARK  (cpu_exec_proc, same core, context now complete):
+ *                                  wake_pending ? requeue : parked = 1
+ *   WAKE  (any core):              parked ? requeue : wake_pending = 1
+ *
+ * `parked` is only ever set strictly after the capture completed, so anything
+ * observing `parked` observes a runnable context. A wake arriving during the
+ * arming window sets wake_pending instead and the parking core requeues
+ * itself. Neither interleaving loses the wakeup.
+ *
+ * EVERY PARK HAS A DEADLINE, and that is not a convenience. A lost wake with
+ * no timeout is an unrecoverable wedge, and this system is verified by a
+ * bounded boot suite that has to terminate. With one, a futex bug surfaces as
+ * a failing assertion instead of a hung machine.
+ *
+ * The lock is a raw leaf spinlock, NOT a klock, for the same reason
+ * g_frame_lock is: it is taken on APs (which have no per-CPU rank tracking)
+ * and it is never held across an allocation, a yield, or a run-queue push.  */
+static volatile int g_futex_lock = 0;
+static inline void futex_lock(void)   { while (__sync_lock_test_and_set(&g_futex_lock, 1)) __asm__ volatile("pause"); }
+static inline void futex_unlock(void) { __sync_lock_release(&g_futex_lock); }
+
+#define WAIT_RV_OK       0ull
+#define WAIT_RV_TIMEDOUT ((uint64_t)-62)      /* -ETIMEDOUT */
+/* Join keys live in a tagged space bit 63 can never collide with: this kernel's
+ * physical addresses come from a pool based at 16 MiB and are nowhere near the
+ * top of the 64-bit space, so a tagged key is unambiguous by construction. */
+#define FUTEX_JOIN_KEY(x) (0xF000000000000000ull | (uint64_t)(x))
+/* Keyed by (leader slot, tid) rather than by the thread's own kproc slot,
+ * because that slot is recycled the instant the thread is torn down — a joiner
+ * blocked on it would be waiting on an identity that now belongs to somebody
+ * else. Leader + tid is stable for as long as the group exists, which is
+ * exactly as long as a join can be outstanding. */
+#define JOIN_KEY_OF(L, t) FUTEX_JOIN_KEY((uint64_t)(L) * THR_MAX + (uint64_t)(t))
+
+static volatile uint32_t g_futex_waits = 0, g_futex_wakes = 0, g_futex_timeouts = 0;
+/* v0.61: what the THREAD paths actually did, audited from outside the process
+ * that ran them. A ring-3 driver can report its own success; it cannot report
+ * which cores its threads were dispatched on, or whether their stacks came
+ * back. Reset by the suite before each run. */
+static volatile uint32_t g_thr_ran_mask   = 0;   /* union of ran_on over departed threads */
+static volatile uint32_t g_thr_released   = 0;   /* thread slots released                 */
+static volatile uint32_t g_thr_stk_pages  = 0;   /* stack pages handed back to the allocator */
+static volatile uint32_t g_futex_lost_races = 0;   /* wakes that landed mid-arming */
+
+static int rq_push_any(int cpu, int proc);   /* fwd: the run queues            */
+static void sched_kick(int cpu);             /* fwd: IPI a core that just got work */
+static void thread_tlb_release(uint64_t va, uint32_t pages);  /* fwd: cross-core invalidate */
+
+/* Translate a ring-3 word address to its physical key. Threads share a cr3 so
+ * a virtual address would do — a physical one costs nothing more and means a
+ * futex placed in shared memory works BETWEEN processes, not only within one. */
+static uint64_t futex_key_of(uint64_t cr3, uint64_t uaddr) {
+    uint64_t pte = walk_pte(cr3, uaddr & ~0xFFFull);
+    if (!(pte & PTE_PRESENT)) return 0;
+    return (pte & ADDR_MASK) + (uaddr & 0xFFFull);
+}
+
+/* Requeue a task that was parked (or that never got to park). Called with the
+ * futex lock RELEASED — rq_push_any can walk every core's queue lock, and
+ * nesting that under a leaf spinlock would invert the ordering discipline. */
+static void futex_requeue(int p, uint64_t rv) {
+    kprocs[p].wait_rv = rv;
+    kprocs[p].uctx.rax = rv;                     /* what SYS_FUTEX_WAIT returns */
+    kprocs[p].wait_key = 0;
+    kprocs[p].wait_deadline = 0;
+    __sync_synchronize();
+    int dst = rq_push_any((int)cpu_idx(), p);
+    if (dst >= 0) sched_kick(dst);
+}
+
+/* WAKE: up to `n` waiters on `key`. Returns how many were made runnable.
+ * Collect under the lock, push outside it. */
+/* `rv` is what each woken waiter observes as its syscall's return value. A
+ * futex wake means "the value changed" and returns 0; a join wake means "the
+ * thread you were waiting on is gone, ask again" and returns -EAGAIN, because
+ * the waker cannot write the joiner's output pointer from another address
+ * space. One parameter instead of two near-identical wake functions. */
+static int futex_wake_key(uint64_t key, int n, uint64_t rv) {
+    int woken[MAX_KPROC], nw = 0, budget = n, armed = 0;
+    if (!key || n <= 0) return 0;
+    futex_lock();
+    for (int p = 0; p < n_kproc && budget > 0; p++) {
+        if (kprocs[p].wait_key != key) continue;
+        if (kprocs[p].parked) {
+            kprocs[p].parked = 0;
+            kprocs[p].wait_armed = 0;
+            woken[nw++] = p;
+            budget--;
+        } else if (kprocs[p].wait_armed && !kprocs[p].wake_pending) {
+            /* Arming, not yet parked: this waiter's OWN core will see the flag
+             * and requeue itself instead of parking, so it is not ours to push
+             * — but it IS woken, and it spends the quota. Counted separately,
+             * because a wake landing in this window is precisely the race the
+             * two-phase protocol exists for, and a suite should be able to
+             * prove it actually occurs rather than assume it. */
+            kprocs[p].wake_pending = 1;
+            kprocs[p].wait_rv = rv;          /* futex_park applies it */
+            __sync_fetch_and_add(&g_futex_lost_races, 1);
+            armed++;
+            budget--;
+        }
+    }
+    futex_unlock();
+    for (int i = 0; i < nw; i++) futex_requeue(woken[i], rv);
+    __sync_fetch_and_add(&g_futex_wakes, (uint32_t)(nw + armed));
+    return nw + armed;
+}
+
+/* PARK: called from cpu_exec_proc on the RET_PREEMPTED path, on the core that
+ * captured the context, with that capture COMPLETE. Returns 1 if the task is
+ * now parked (the caller must NOT enqueue it), 0 if it should be requeued
+ * normally — which happens when a wake landed during the arming window. */
+static int futex_park(int p) {
+    int park;
+    futex_lock();
+    if (kprocs[p].wake_pending) {
+        kprocs[p].wake_pending = 0;
+        kprocs[p].wait_armed = 0;
+        kprocs[p].wait_key = 0;
+        kprocs[p].wait_deadline = 0;
+        kprocs[p].uctx.rax = kprocs[p].wait_rv;   /* set by the waker */
+        park = 0;
+    } else {
+        kprocs[p].parked = 1;                    /* context is complete: safe  */
+        park = 1;
+    }
+    futex_unlock();
+    return park;
+}
+
+/* Timeout watchdog, driven from the timer tick. Invariant 4 of the design:
+ * no park is unbounded, so a lost wake costs a suite one failed assertion
+ * rather than the whole machine. */
+static void futex_timeout_scan(void) {
+    int woken[MAX_KPROC], nw = 0;
+    futex_lock();
+    for (int p = 0; p < n_kproc; p++) {
+        if (!kprocs[p].parked || !kprocs[p].wait_deadline) continue;
+        if (g_ticks < kprocs[p].wait_deadline) continue;
+        kprocs[p].parked = 0;
+        kprocs[p].wait_armed = 0;
+        woken[nw++] = p;
+    }
+    futex_unlock();
+    for (int i = 0; i < nw; i++) futex_requeue(woken[i], WAIT_RV_TIMEDOUT);
+    if (nw) __sync_fetch_and_add(&g_futex_timeouts, (uint32_t)nw);
+}
+
 /* v0.55: REAP LOG — a tiny wait-status table.
  * A kproc slot is recycled the instant it is marked torn_down, and fork() is a
  * prolific claimer of freed slots, so a process's exit status is only readable
@@ -6470,16 +7302,228 @@ static int posix_reap_lookup(uint32_t pid, uint64_t *code, uint64_t *frames) {
 /* Called by the LAST thread of a process, immediately before the slot becomes
  * recyclable: record the exit status, then tell the parent its child died —
  * exactly as POSIX requires. A parent that already exited gets nothing. */
-static void posix_proc_reaped(int p) {
+/* v0.61: the recording half on its own. A THREAD's slot recycles exactly like
+ * a process's, so its exit code needs capturing at the source for the same
+ * reason — but a thread ending is not a child dying, and raising SIGCHLD for
+ * one would be a lie the parent cannot distinguish from a real child exit. */
+static void posix_reap_record(int p) {
     if (p < 0 || p >= n_kproc) return;
     uint32_t i = __sync_fetch_and_add(&g_reap_n, 1) % REAP_LOG;
     g_reap[i].code   = kprocs[p].exit_code;
     g_reap[i].frames = kprocs[p].frames_freed;
     __sync_synchronize();
     g_reap[i].pid    = kprocs[p].pid;      /* published last: pid is the key */
+}
+
+static void posix_proc_reaped(int p) {
+    if (p < 0 || p >= n_kproc) return;
+    posix_reap_record(p);
     int par = kprocs[p].ppid_slot;
     if (par >= 0 && par < n_kproc && kprocs[par].used && !kprocs[par].exited)
         sig_raise(par, SIGCHLD);
+}
+
+/* ===========================================================================
+ * v0.61: A NON-FINAL THREAD LEAVING
+ * ===========================================================================
+ * The rule, stated once so every exit path can just call this:
+ *
+ *   A non-final thread reclaims exactly what is ITS OWN — its ring-3 stack and
+ *   its kproc slot. The final member of the group reclaims the address space
+ *   and every shared resource, against the LEADER's slot.
+ *
+ * The stack matters more than it looks. A process that spawns and joins in a
+ * loop would otherwise leak THR_STK_PAGES (16 KiB) per thread out of a shared
+ * address space that nobody frees until the whole group dies — and `leakcheck`
+ * would be right to fail it. page_free_tree cannot help: it only runs for the
+ * last member, which is precisely the case this is not.
+ *
+ * Note it frees the FRAMES, not just the mapping: unmap_page clears the PTE,
+ * and the frame under it is this thread's alone. */
+static void thread_stack_release(int p) {
+    if (p < 0 || p >= n_kproc) return;
+    uint64_t base = kprocs[p].tstack_base;
+    int pages = kprocs[p].tstack_pages;
+    if (!base || pages <= 0) return;
+    uint64_t cr3 = kprocs[p].cr3;
+    for (int i = 0; i < pages; i++) {
+        uint64_t va  = base + (uint64_t)i * 0x1000;
+        uint64_t pte = walk_pte(cr3, va);
+        unmap_page(cr3, va);
+        if (pte & PTE_PRESENT) { free_frame(pte & ADDR_MASK); __sync_fetch_and_add(&g_thr_stk_pages, 1); }
+    }
+    /* The mapping is gone on THIS core; any sibling still running in this
+     * address space on ANOTHER core must not keep a stale TLB entry for a
+     * stack whose frames are already back in the allocator. This is the first
+     * place in the kernel where one core unmaps a page another core may have
+     * cached for the SAME address space — before threads, an address space
+     * only ever had one core in it, which is why nothing needed this until now. */
+    thread_tlb_release(base, (uint32_t)pages);
+    kprocs[p].tstack_base = 0;
+    kprocs[p].tstack_pages = 0;
+}
+
+/* Release a non-final thread's slot. Records the exit code (the slot recycles,
+ * so it has to be captured at the source exactly as a process's is), wakes
+ * anything blocked in SYS_THREAD_JOIN on it, and marks the slot recyclable.
+ * Deliberately does NOT touch the address space, the fd table, IPC, DMA or
+ * surfaces: siblings are still executing out of all of them. */
+static void thread_slot_release(int p, uint64_t code) {
+    if (p < 0 || p >= n_kproc) return;
+    int L = kprocs[p].tg_leader, t = kprocs[p].tg_tid;
+    kprocs[p].exit_code = code;
+    kprocs[p].frames_freed = 0;              /* a thread frees no page tree */
+    thread_stack_release(p);
+    posix_reap_record(p);                    /* status readable after recycle */
+    __sync_synchronize();
+    kprocs[p].exited = 1;
+    /* Publish into the LEADER's join table BEFORE waking anyone, and before
+     * this slot becomes recyclable: a joiner that arrives late must still find
+     * the status, and one woken early must not read a half-written entry. */
+    if (L >= 0 && L < n_kproc && t >= 0 && t < THR_MAX) {
+        kprocs[L].thr_exit[t] = code;
+        __sync_synchronize();
+        __sync_fetch_and_or(&kprocs[L].thr_done, 1u << t);
+        futex_wake_key(JOIN_KEY_OF(L, t), MAX_KPROC, (uint64_t)-11);  /* joiners: re-call */
+    }
+    kprocs[p].pstate = 0;
+    kprocs[p].wait_key = 0; kprocs[p].wait_armed = 0; kprocs[p].parked = 0;
+    __sync_fetch_and_or(&g_thr_ran_mask, kprocs[p].ran_on);
+    __sync_fetch_and_add(&g_thr_released, 1);
+    kprocs[p].torn_down = 1;                 /* NOW the slot may be reused   */
+}
+
+/* ===========================================================================
+ * v0.63: SHARED MEMORY — a registry of frames, not of processes
+ * ===========================================================================
+ * v0.46 already gave this kernel shared memory, but it is IPC-COUPLED: an
+ * ipc_shmem is granted as part of a message, lives in a fixed 16-slot table
+ * sized to one page each, and is reachable only through SYS_IPC_*. That is the
+ * right shape for what it does and is not being replaced.
+ *
+ * This is the general form the v0.46 one deliberately was not: an object with
+ * its own lifetime, created by size, named by an integer any process may map,
+ * and mapped at a per-process address rather than a system-wide fixed one. Two
+ * processes that never exchange a message can share memory through it.
+ *
+ * The frames are refcounted like any other, so the segment outlives whichever
+ * mapper exits first and dies with the last — the same mechanism COW uses, not
+ * a second lifetime scheme bolted on beside it. */
+#define MAX_SHM      8
+#define SHM_MAX_PAGES 64                     /* 256 KiB per segment */
+struct shm_seg {
+    int      used;
+    uint32_t owner_pid;                      /* creator, for the audit log only */
+    uint32_t npages;
+    uint32_t mappers;                        /* processes currently attached    */
+    uint64_t frames[SHM_MAX_PAGES];
+};
+static struct shm_seg g_shm[MAX_SHM];
+static volatile int g_shm_lock = 0;
+static volatile uint64_t g_shm_creates = 0, g_shm_maps = 0;
+
+static inline void shm_lock(void)   { while (__sync_lock_test_and_set(&g_shm_lock, 1)) __asm__ volatile("pause"); }
+static inline void shm_unlock(void) { __sync_lock_release(&g_shm_lock); }
+
+/* Release every attachment `proc_idx` holds. Called from the process exit
+ * paths alongside the other teardowns: a segment whose mappers all die must
+ * not keep its frames, and a process that exits without detaching is the
+ * normal case rather than an error. */
+static void shm_teardown_kproc(int proc_idx) {
+    if (proc_idx < 0 || proc_idx >= n_kproc) return;
+    /* The mappings themselves are ordinary user PTEs, so page_free_tree has
+     * already dropped this process's reference to each frame by the time the
+     * slot is recycled. What is left is the segment's own bookkeeping: when the
+     * last mapper is gone the creation reference goes too, and the frames
+     * return to the pool. */
+    shm_lock();
+    for (int i = 0; i < MAX_SHM; i++) {
+        if (!g_shm[i].used) continue;
+        if (kprocs[proc_idx].shm_attached & (1u << i)) {
+            kprocs[proc_idx].shm_attached &= ~(1u << i);
+            if (g_shm[i].mappers) g_shm[i].mappers--;
+            if (!g_shm[i].mappers) {
+                for (uint32_t k = 0; k < g_shm[i].npages; k++) free_frame(g_shm[i].frames[k]);
+                g_shm[i].used = 0;
+                if (g_debug_posix)
+                    kprintf("[dbgvm  ] shm %d destroyed — last mapper gone\n", (uint64_t)(int64_t)i);
+            }
+        }
+    }
+    shm_unlock();
+}
+
+/* ===========================================================================
+ * v0.63: THE RING-3 PAGE FAULT ENGINE
+ * ===========================================================================
+ * Runs BEFORE the SIGSEGV path, because a demand-zero or copy-on-write fault
+ * is not a program error — it is the mapping being completed. Returns 1 if the
+ * fault was resolved, and the caller simply iretqs: the faulting instruction
+ * re-executes and now succeeds. Returns 0 for anything it does not own, which
+ * then falls through to catchable SIGSEGV and, failing that, termination.
+ *
+ * Error code bits: 0 = present (0 means not-present), 1 = write, 4 = instruction
+ * fetch. Only the two that change the decision are read.
+ *
+ * This runs in the FAULTING address space with interrupts as the trap left
+ * them, and touches only this process's own page tables plus the frame
+ * allocator — both of which are already safe from any core. */
+
+static int vm_fault_handle(struct isr_frame *f) {
+    if (f->vector != 14) return 0;
+    if ((f->cs & 3) != 3) return 0;                 /* ring-3 faults only */
+    uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    if (cr2 < USER_VMIN || cr2 >= USER_VMAX) return 0;
+    int slot = (int)current_proc_idx;
+    if (slot < 0 || slot >= n_kproc || !kprocs[slot].used || kprocs[slot].exited) return 0;
+    uint64_t cr3 = kprocs[slot].cr3;
+    uint64_t *pte = pte_slot(cr3, cr2 & ~0xFFFull);
+    if (!pte) return 0;                             /* nothing mapped this far */
+    uint64_t e = *pte;
+    int is_write = (f->error & 2) != 0;
+
+    /* ---- demand zero ------------------------------------------------------
+     * A page promised by mmap but never touched. The permissions were parked
+     * in the non-present entry at mmap time, so honouring them here needs no
+     * lookup — the entry IS the record. */
+    if (!(e & PTE_PRESENT) && (e & PTE_ZFOD)) {
+        uint64_t nf = alloc_frame();
+        if (!nf) return 0;                          /* out of memory: let it be a fault */
+        uint64_t keep = e & (PTE_USER | PTE_WRITE | PTE_NX);
+        *pte = (nf & ADDR_MASK) | keep | PTE_PRESENT;
+        __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
+        __sync_fetch_and_add(&g_zfod_faults, 1);
+        return 1;
+    }
+
+    /* ---- copy on write ----------------------------------------------------
+     * Only a WRITE to a present, non-writable, COW-marked page. A read of such
+     * a page never faults, which is the entire economy of the scheme.
+     *
+     * The refcount decides whether a copy is needed at all: if no other owner
+     * remains, the last holder simply takes the page writable. Without that
+     * check a parent whose children have all exited keeps paying copy costs
+     * forever on pages nobody else can see. */
+    if ((e & PTE_PRESENT) && (e & PTE_COW) && is_write) {
+        uint64_t old = e & ADDR_MASK;
+        uint64_t keep = (e & (PTE_USER | PTE_NX)) | PTE_WRITE | PTE_PRESENT;
+        if (frame_refs(old) == 0) {                 /* sole owner: no copy needed */
+            *pte = old | keep;
+        } else {
+            uint64_t nf = alloc_frame();
+            if (!nf) return 0;
+            const uint8_t *s = (const uint8_t *)old;
+            uint8_t *d = (uint8_t *)nf;
+            for (int b = 0; b < 0x1000; b++) d[b] = s[b];
+            *pte = (nf & ADDR_MASK) | keep;
+            free_frame(old);                        /* drops OUR reference only */
+            __sync_fetch_and_add(&g_frames_cow_copied, 1);
+        }
+        __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
+        __sync_fetch_and_add(&g_cow_faults, 1);
+        return 1;
+    }
+    return 0;                                        /* not ours: SIGSEGV path */
 }
 
 /* Ring-3 memory fault -> catchable SIGSEGV. Called from isr_dispatch while the
@@ -6641,15 +7685,18 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     /* v0.41: take the surface lock BEFORE cli — a contended acquire may yield, */
     /* which must not happen once this thread has begun dying under cli.        */
     struct pcb *t0 = curthr;
+    /* v0.61: the group refcount and every shared resource belong to the
+     * LEADER's slot, not to whichever member is leaving. */
+    const int L = tg_of((int)t0->proc);
     /* v0.55: a NON-final thread of a multi-threaded process must reclaim
      * nothing — its siblings are still executing in this very address space.
      * Reap the thread slot and reschedule; the last one out does the work.    */
-    if (!posix_thread_leave((int)t0->proc)) {
+    if (!posix_thread_leave(L)) {
         __asm__ volatile("cli");
         struct pcb *tn = curthr;
         kprintf("[uthread] tid %d pid %u '%s' thread exited (code %u) — %d sibling(s) live\n",
-                (uint64_t)tn->id, kprocs[tn->proc].pid, tn->name, code,
-                (uint64_t)(int64_t)kprocs[tn->proc].nthreads);
+                (uint64_t)tn->id, kprocs[L].pid, tn->name, code,
+                (uint64_t)(int64_t)kprocs[L].nthreads);
         tn->state = T_FREE;
         sched_switch_to(pick_next());        /* does not return                 */
         /* Reached only if sched_switch_to declined to switch (nextid == g_cur).
@@ -6659,30 +7706,31 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
         for (;;) __asm__ volatile("sti; hlt");
     }
     klock_acquire(&g_surf_lock);
-    surfaces_reclaim((int)t0->proc);
+    surfaces_reclaim(L);
     klock_release(&g_surf_lock);
     __asm__ volatile("cli");
     struct pcb *t = curthr;
     /* pthread_exit() must NOT overwrite a status that exit() already set. */
-    if (!kprocs[t->proc].exit_authoritative) kprocs[t->proc].exit_code = code;
-    kprocs[t->proc].exited = 1;
+    if (!kprocs[L].exit_authoritative) kprocs[L].exit_code = code;
+    kprocs[L].exited = 1;
     write_cr3(kernel_cr3);                   /* off this space before tearing it down */
     /* v0.42: this is the BSP's OWN thread giving up its OWN address space —   */
     /* cr3 just changed away from it above, so it is safe to dismantle now.    */
-    vfio_teardown_kproc((int)t->proc);       /* v0.47: release any IRQ-line ownership FIRST */
-    gpu_teardown_kproc((int)t->proc);        /* v0.50: release any GPU resource/scanout FIRST */
-    audio_teardown_kproc((int)t->proc);      /* v0.51: release any PCM stream ownership FIRST */
-    usb_teardown_kproc((int)t->proc);        /* v0.51: symmetry hook (no per-process USB state today) */
-    net_teardown_kproc((int)t->proc);        /* v0.52: release any sockets this process owns */
-    wimp_teardown_kproc((int)t->proc);       /* v0.53: destroy any windows this process owns */
-    ipc_teardown_kproc((int)t->proc);        /* v0.46: release IPC mailbox/shmem FIRST */
-    descriptor_teardown_kproc((int)t->proc); /* v0.45: force-close any leaked fd FIRST */
-    dma_teardown_kproc((int)t->proc);        /* v0.44: revoke DMA/IOMMU grants FIRST */
-    kprocs[t->proc].frames_freed = page_free_tree(kprocs[t->proc].cr3);
-    posix_proc_reaped((int)t->proc);    /* v0.55: record status + SIGCHLD FIRST — */
-    kprocs[t->proc].torn_down = 1;      /* v0.45: NOW the slot is safe to recycle */
+    vfio_teardown_kproc(L);       /* v0.47: release any IRQ-line ownership FIRST */
+    gpu_teardown_kproc(L);        /* v0.50: release any GPU resource/scanout FIRST */
+    audio_teardown_kproc(L);      /* v0.51: release any PCM stream ownership FIRST */
+    usb_teardown_kproc(L);        /* v0.51: symmetry hook (no per-process USB state today) */
+    net_teardown_kproc(L);        /* v0.52: release any sockets this process owns */
+    wimp_teardown_kproc(L);       /* v0.53: destroy any windows this process owns */
+    ipc_teardown_kproc(L);        /* v0.46: release IPC mailbox/shmem FIRST */
+    shm_teardown_kproc(L);        /* v0.63: drop shared-segment attachments */
+    descriptor_teardown_kproc(L); /* v0.45: force-close any leaked fd FIRST */
+    dma_teardown_kproc(L);        /* v0.44: revoke DMA/IOMMU grants FIRST */
+    kprocs[L].frames_freed = page_free_tree(kprocs[L].cr3);
+    posix_proc_reaped(L);    /* v0.55: record status + SIGCHLD FIRST — */
+    kprocs[L].torn_down = 1;      /* v0.45: NOW the slot is safe to recycle */
     kprintf("[uthread] tid %d pid %u '%s' exited (code %u) — thread reaped, %u frame(s) reclaimed\n",
-            (uint64_t)t->id, kprocs[t->proc].pid, t->name, code, kprocs[t->proc].frames_freed);
+            (uint64_t)t->id, kprocs[L].pid, t->name, code, kprocs[L].frames_freed);
     t->state = T_FREE;                       /* never scheduled again           */
     sched_switch_to(pick_next());            /* does not return                 */
     for (;;) __asm__ volatile("hlt");
@@ -6789,6 +7837,19 @@ static void usermode_init(void) {
  * exactly why every uniprocessor invariant proven since v0.17 (access_ok's
  * TOCTOU argument above all) still holds. Per-CPU run queues are a future
  * milestone with its own re-verification, not a side effect of this one.
+ *
+ * ^ THAT PARAGRAPH DESCRIBES v0.35 AND IS NO LONGER TRUE. It is kept because
+ * it states what this section's code was built to do; here is what overtook it:
+ *
+ *   v0.39  per-CPU run queues + cpu_exec_proc. Ring-3 PROCESSES run on every
+ *          core, with work stealing, IPI preemption and migration.
+ *   v0.61  ring-3 THREADS became run-queue entities too, so the last thing
+ *          that was still BSP-pinned no longer is (docs/THREADS-M61.md).
+ *
+ * What genuinely remains BSP-only is the `struct pcb` KERNEL thread scheduler
+ * (g_threads[], sched_switch_to, pick_next) — g_cur and that array are
+ * unsynchronised BSP-local state by design, and every reference to a "BSP-only
+ * scheduler" below means that one, not the run queues.
  * =========================================================================== */
 #define LAPIC_V    0x0000601000000000ull   /* LAPIC MMIO window (PCD-mapped)   */
 #define LAPIC_PHYS 0xFEE00000ull
@@ -6897,6 +7958,18 @@ static void lapic_ipi(uint32_t apic_id, uint8_t vec, int broadcast) {
     }
 }
 
+/* v0.61: "a task just landed in cpu `dst`'s queue — go look". A no-op on a
+ * uniprocessor and when the destination is the calling core (which will reach
+ * its own queue on its own), so a wake never sends an IPI that has nothing to
+ * tell anyone. Declared early for the futex code, which is defined well above
+ * the LAPIC driver but must not open-code its own send. */
+static void sched_kick(int cpu) {
+    if (cpu < 0 || cpu >= MAX_CPUS) return;
+    if (g_ncpu_online <= 1 || cpu == (int)cpu_idx()) return;
+    if (!g_cpu[cpu].online) return;
+    lapic_ipi(g_cpu[cpu].apic_id, IPI_PING, 0);
+}
+
 /* IPI handlers — run on WHICHEVER cpu the interrupt lands on.                */
 static void smp_ipi_dispatch(uint64_t vec) {
     struct cpu_local *me = &g_cpu[cpu_idx()];
@@ -6989,6 +8062,22 @@ static int tlb_shootdown_range(uint64_t va, uint32_t pages, uint32_t cpu_mask) {
  * the general range/mask primitive above. */
 static int tlb_shootdown(uint64_t va) {
     return tlb_shootdown_range(va, 1, 0xFFFFFFFFu);
+}
+
+/* v0.61: invalidate a departing thread's stack pages on every OTHER core.
+ *
+ * A single-threaded process never needed this: only one core was ever inside
+ * its address space, so unmapping locally was the whole job. A thread group
+ * puts several cores in ONE cr3 at once, and the frames under those pages go
+ * straight back to the allocator — a sibling holding a stale TLB entry would
+ * be writing into memory that now belongs to somebody else.
+ *
+ * A no-op on a uniprocessor (where the local unmap_page already sufficed) and
+ * harmless when the siblings are elsewhere: an invlpg for an address a core
+ * has no entry for costs a few cycles and nothing else. */
+static void thread_tlb_release(uint64_t va, uint32_t pages) {
+    if (g_ncpu_online <= 1 || !pages) return;
+    tlb_shootdown_range(va, pages, 0xFFFFFFFFu);
 }
 
 /* Fold this core's share of the parallel job. Claims units from the shared
@@ -7152,6 +8241,12 @@ static volatile uint32_t g_dlog_n = 0;
  * (requeues the context, honouring a migration directive).                  */
 static void cpu_exec_proc(int c, int p) {
     struct cpu_local *me = &g_cpu[c];
+    /* v0.61: the thread-group leader owns everything shared. Resolved once, up
+     * front, because the exit paths below need it after the task has already
+     * released its own slot — reading tg_leader out of a recycled slot would
+     * name whatever process claimed it next. For anything that is not a thread
+     * this is just p, so nothing about the ordinary path changes. */
+    const int L = tg_of(p);
     __asm__ volatile("cli");
     me->cur_proc = (uint64_t)p;                        /* per-CPU identity     */
     g_tss[c].rsp0 = (uint64_t)(g_int_stack[c] + sizeof g_int_stack[c]);
@@ -7203,6 +8298,20 @@ static void cpu_exec_proc(int c, int p) {
     __sync_fetch_and_sub(&g_inr3, 1);
     if (code == RET_PREEMPTED) {
         kprocs[p].pstate = 1;                          /* uctx captured by IPI 50 */
+        /* v0.61: THE PARK POINT. A task that armed a futex/join wait unwinds
+         * through this very path, and its ring-3 context is complete only NOW
+         * — which is exactly why the decision to park is made here, on the core
+         * that owns the context, and not back in the syscall that asked for it.
+         * futex_park returns 0 if a wake landed during the arming window, in
+         * which case we fall through and requeue normally. Returning 1 means
+         * the task is parked: it belongs to NO run queue until something wakes
+         * it or its deadline expires, so this executor simply drops it and goes
+         * back for the next task. */
+        if (kprocs[p].wait_armed && futex_park(p)) {
+            __sync_fetch_and_add(&g_futex_waits, 1);
+            __asm__ volatile("sti");
+            return;
+        }
         int dst = kprocs[p].migrate_to;
         kprocs[p].migrate_to = -1;
         if (dst < 0 || dst >= MAX_CPUS || !g_cpu[dst].online) dst = c;
@@ -7233,51 +8342,71 @@ static void cpu_exec_proc(int c, int p) {
         if (rq_push_any(dst, p) < 0) dst = c;
         __sync_synchronize();
         if (dst != c) lapic_ipi(g_cpu[dst].apic_id, IPI_PING, 0);  /* wake the new home */
-    } else if (!posix_thread_leave(p)) {
-        /* v0.55: a sibling thread of this process is still live in this address
-         * space — reclaim NOTHING. The last thread out runs the teardown.
+    } else if (!posix_thread_leave(L)) {
+        /* v0.55: a sibling thread of this group is still live in this address
+         * space — reclaim NOTHING SHARED. The last member out runs the teardown.
          *
-         * But DO record the status: this excursion ended through SYS_EXIT (or a
-         * fault), and in POSIX `exit()` is the whole PROCESS's status while
-         * `pthread_exit()` is only a thread's. Discarding it here let the last
-         * *thread*'s SYS_THREAD_EXIT(0) become the process's exit code — a
-         * genuinely wrong status, found live in the pthread suite. */
-        kprocs[p].exit_code = code;
-        kprocs[p].exit_authoritative = 1;
+         * v0.61 splits the two cases that used to be one, because since threads
+         * became run-queue entities they are no longer the same slot:
+         *
+         *   p == L  the LEADER exited while its threads run on. Record the
+         *           status and leave the slot alone: in POSIX `exit()` is the
+         *           whole GROUP's status while `pthread_exit()` is only a
+         *           thread's, and discarding it here once let the last thread's
+         *           SYS_THREAD_EXIT(0) become the process's exit code (found
+         *           live in the v0.55 pthread suite). The leader's slot cannot
+         *           recycle yet — tg_of() still has to resolve for the siblings.
+         *
+         *   p != L  a THREAD exited. It owns its ring-3 stack and its slot and
+         *           nothing else, so it releases exactly those and any joiner
+         *           waiting on it — see thread_slot_release. */
+        if (p == L) {
+            kprocs[p].exit_code = code;
+            kprocs[p].exit_authoritative = 1;
+            kprocs[p].exited = 1;
+        } else {
+            thread_slot_release(p, code);
+        }
         __sync_fetch_and_add(&me->rq_ran, 1);
         if (g_debug_posix)
-            kprintf("[dbgposix] pid %u exit()ed code %X with %d thread(s) still live\n",
-                    kprocs[p].pid, code, (uint64_t)(int64_t)kprocs[p].nthreads);
+            kprintf("[dbgposix] %s pid %u exited code %X — %d member(s) of pid %u still live\n",
+                    p == L ? "leader" : "thread", kprocs[p].pid, code,
+                    (uint64_t)(int64_t)kprocs[L].nthreads, kprocs[L].pid);
     } else {
-        kprocs[p].exit_code = code;
-        kprocs[p].finish_seq = __sync_add_and_fetch(&g_finish_seq, 1);
+        /* LAST member of the group. Everything shared is torn down against the
+         * LEADER's slot — never against whichever member happened to be last
+         * out, which since v0.61 is frequently not the leader at all. */
+        if (p != L) thread_slot_release(p, code);
+        if (!kprocs[L].exit_authoritative) kprocs[L].exit_code = code;
+        kprocs[L].finish_seq = __sync_add_and_fetch(&g_finish_seq, 1);
         __sync_synchronize();
-        kprocs[p].exited = 1;
+        kprocs[L].exited = 1;
         __sync_fetch_and_add(&me->rq_ran, 1);
         /* v0.41 audit fix: only the BSP's uthread reap path ever reclaimed     */
         /* surfaces — a task that exited on an AP leaked its slot and pixel     */
         /* pair permanently. Every executor now reclaims on exit.               */
         __asm__ volatile("sti");                       /* lock may spin: IF on   */
         klock_acquire(&g_surf_lock);
-        surfaces_reclaim(p);
+        surfaces_reclaim(L);
         klock_release(&g_surf_lock);
         /* v0.42: the address space just went dead on EVERY core (this executor */
         /* is the only one that was ever running it, and it just gave it up) —  */
         /* tear it all the way down. page_free_tree is not a klock: it is safe  */
         /* to call with interrupts on, exactly like the frame allocator it      */
         /* drives underneath.                                                   */
-        vfio_teardown_kproc(p);                /* v0.47: release any IRQ-line ownership FIRST */
-        gpu_teardown_kproc(p);                 /* v0.50: release any GPU resource/scanout FIRST */
-        audio_teardown_kproc(p);               /* v0.51: release any PCM stream ownership FIRST */
-        usb_teardown_kproc(p);                 /* v0.51: symmetry hook (no per-process USB state today) */
-        net_teardown_kproc(p);                 /* v0.52: release any sockets this process owns */
-        wimp_teardown_kproc(p);                /* v0.53: destroy any windows this process owns */
-        ipc_teardown_kproc(p);                 /* v0.46: release IPC mailbox/shmem FIRST */
-        descriptor_teardown_kproc(p);           /* v0.45: force-close any leaked fd FIRST */
-        dma_teardown_kproc(p);                 /* v0.44: revoke DMA/IOMMU grants FIRST */
-        kprocs[p].frames_freed = page_free_tree(kprocs[p].cr3);
-        posix_proc_reaped(p);              /* v0.55: record status + SIGCHLD FIRST —   */
-        kprocs[p].torn_down = 1;           /* v0.45: NOW the slot is safe to recycle   */
+        vfio_teardown_kproc(L);                /* v0.47: release any IRQ-line ownership FIRST */
+        gpu_teardown_kproc(L);                 /* v0.50: release any GPU resource/scanout FIRST */
+        audio_teardown_kproc(L);               /* v0.51: release any PCM stream ownership FIRST */
+        usb_teardown_kproc(L);                 /* v0.51: symmetry hook (no per-process USB state today) */
+        net_teardown_kproc(L);                 /* v0.52: release any sockets this process owns */
+        wimp_teardown_kproc(L);                /* v0.53: destroy any windows this process owns */
+        ipc_teardown_kproc(L);                 /* v0.46: release IPC mailbox/shmem FIRST */
+        shm_teardown_kproc(L);                 /* v0.63: drop shared-segment attachments */
+        descriptor_teardown_kproc(L);          /* v0.45: force-close any leaked fd FIRST */
+        dma_teardown_kproc(L);                 /* v0.44: revoke DMA/IOMMU grants FIRST */
+        kprocs[L].frames_freed = page_free_tree(kprocs[L].cr3);
+        posix_proc_reaped(L);              /* v0.55: record status + SIGCHLD FIRST —   */
+        kprocs[L].torn_down = 1;           /* v0.45: NOW the slot is safe to recycle   */
         __asm__ volatile("cli");
     }
     __asm__ volatile("sti");
@@ -7379,6 +8508,14 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
             g_cpu[idx].dbg_was_idle = 0;               /* leaving idle: reset the latch */
             cpu_exec_proc((int)idx, p);
         }
+        /* v0.61: this core found nothing to run. If a parked waiter's deadline
+         * has passed, requeueing it here is what turns a lost wakeup into a
+         * failed assertion instead of a wedged machine — and an idle core is
+         * exactly the right place to do it. Deliberately NOT on the timer tick:
+         * the scan requeues, requeueing takes run-queue locks, and a timer
+         * interrupt landing on a core that already holds its own rq_lock would
+         * deadlock against itself. */
+        if (!picked) futex_timeout_scan();
         if (!picked && g_debug_smp_sched && !g_cpu[idx].dbg_was_idle) {
             g_cpu[idx].dbg_was_idle = 1;                /* log the TRANSITION once, not */
             kprintf("[dbgsmp ] cpu%u idle (queue drained, nothing to steal)\n", (uint64_t)idx);
@@ -8343,6 +9480,9 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
     kprocs[ch].heap_brk  = kprocs[par].heap_brk;
     kprocs[ch].entry     = kprocs[par].entry;
     kprocs[ch].affinity  = kprocs[par].affinity;
+    kprocs[ch].pgid      = kprocs[par].pgid;     /* v0.62: fork stays in the job */
+    kprocs[ch].mmap_next = kprocs[par].mmap_next;  /* v0.63: inherited mmap regions */
+    kprocs[ch].shm_next  = SHM_USER_V;             /* shm attachments are NOT inherited */
     for (int sg = 0; sg < NSIG; sg++) kprocs[ch].sig_handler[sg] = kprocs[par].sig_handler[sg];
     kprocs[ch].sig_pending = 0;                         /* POSIX: pending set is NOT inherited */
     kprocs[ch].sig_mask    = 0;
@@ -8410,23 +9550,253 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
  * through the very same machinery as involuntary preemption. Returns normally
  * (falling through to the old sched_yield behaviour) for the BSP-thread case,
  * which has a real scheduler to yield to. */
+/* v0.61: the SYSCALL-entry register block -> a resumable ring-3 context.
+ *
+ * Factored out because three callers now need exactly this and a divergent
+ * copy would be a context restored as garbage: voluntary yield, futex wait and
+ * thread join all capture the same way. Two fields are not the plain copy they
+ * look like — SYSCALL leaves the return address in RCX and the caller's RFLAGS
+ * in R11, so those are where the resumed context has to find them, and reading
+ * sf->rcx/sf->r11 instead would restore the syscall's own clobber.
+ *
+ * `rax` is the value the interrupted code will observe as the syscall's return
+ * when it resumes, which for a blocking call is decided by whoever wakes it. */
+static void uctx_from_sysframe(struct uctx *u, struct sysframe *sf, uint64_t rax) {
+    u->r15 = sf->r15; u->r14 = sf->r14; u->r13 = sf->r13; u->r12 = sf->r12;
+    u->r11 = sf->rflags; u->r10 = sf->r10; u->r9 = sf->r9; u->r8 = sf->r8;
+    u->rbp = sf->rbp; u->rdi = sf->rdi; u->rsi = sf->rsi; u->rdx = sf->rdx;
+    u->rcx = sf->rip;  u->rbx = sf->rbx;
+    u->rax = rax;
+    u->rip = sf->rip;  u->rsp = sf->rsp; u->rflags = sf->rflags;
+}
+
 static void sys_yield_ring3(struct sysframe *sf) {
     if (!sf) return;
     if (cpu_idx() == 0 && curthr->uthread) return;       /* BSP thread: sched_yield handles it */
     int p = (int)current_proc_idx;
     if (p < 0 || p >= n_kproc || !kprocs[p].used || kprocs[p].exited) return;
     if ((sf->rip < USER_VMIN) || (sf->rip >= USER_VMAX)) return;  /* not a ring-3 caller */
-    struct uctx *u = &kprocs[p].uctx;
-    u->r15 = sf->r15; u->r14 = sf->r14; u->r13 = sf->r13; u->r12 = sf->r12;
-    u->r11 = sf->rflags; u->r10 = sf->r10; u->r9 = sf->r9; u->r8 = sf->r8;
-    u->rbp = sf->rbp; u->rdi = sf->rdi; u->rsi = sf->rsi; u->rdx = sf->rdx;
-    u->rcx = sf->rip;  u->rbx = sf->rbx;
-    u->rax = 0;                                          /* SYS_YIELD returns 0 */
-    u->rip = sf->rip;  u->rsp = sf->rsp; u->rflags = sf->rflags;
+    uctx_from_sysframe(&kprocs[p].uctx, sf, 0);          /* SYS_YIELD returns 0 */
     kprocs[p].pstate = 1;
     __sync_synchronize();
     write_cr3(kernel_cr3);
     resume_kernel(RET_PREEMPTED);                        /* cpu_exec_proc requeues us */
+}
+
+/* ===========================================================================
+ * v0.61: THE BLOCKING SYSCALLS — futex wait/wake and thread join
+ * ===========================================================================
+ * All three share one mechanism (see docs/THREADS-M61.md §3.4): a waiter
+ * captures its context, publishes an intent to park, and unwinds through
+ * RET_PREEMPTED; cpu_exec_proc then makes the actual park decision on the core
+ * that owns the context. What differs between them is only the KEY.
+ *
+ * A parked task is in no run queue and consumes no core. That is the point:
+ * before this, the only way for ring-3 code to wait was to spin or to yield in
+ * a loop, both of which burn a core to make no progress — and on a
+ * uniprocessor, a spin waiting for a sibling thread is a deadlock.           */
+
+/* Common tail: arm the park and leave. Never returns. The context is captured
+ * BEFORE arming, so by the time any other core can observe wait_armed the uctx
+ * is already complete; the park itself still happens later, in cpu_exec_proc,
+ * because until this core has finished unwinding the task is still RUNNING
+ * here and a second core resuming it would put one task on two cores. */
+static void __attribute__((noreturn))
+block_ring3(struct sysframe *sf, int p, uint64_t key, uint64_t timeout) {
+    uctx_from_sysframe(&kprocs[p].uctx, sf, WAIT_RV_OK);
+    futex_lock();
+    kprocs[p].wait_key      = key;
+    kprocs[p].wait_deadline = g_ticks + timeout;
+    kprocs[p].wake_pending  = 0;
+    kprocs[p].parked        = 0;
+    kprocs[p].wait_rv       = WAIT_RV_OK;
+    kprocs[p].wait_armed    = 1;
+    futex_unlock();
+    kprocs[p].pstate = 1;
+    __sync_synchronize();
+    write_cr3(kernel_cr3);
+    resume_kernel(RET_PREEMPTED);            /* cpu_exec_proc parks or requeues */
+    for (;;) __asm__ volatile("hlt");        /* unreachable                     */
+}
+
+/* Every park is bounded. A caller that passes 0 gets this rather than an
+ * unbounded sleep — see invariant 4: a lost wake must cost a failed assertion,
+ * not the machine. */
+#define FUTEX_DEFAULT_TICKS 20000ull
+
+/* Can this context park at all? A Model-A pcb uthread cannot: it belongs to the
+ * BSP thread scheduler, not to a run queue, so there is no RET_PREEMPTED path
+ * to unwind through. Those callers fall back to yield-and-recheck, which is
+ * correct and merely less efficient — stated plainly rather than left as a
+ * silent behavioural difference. */
+static inline int can_park(void) {
+    return !(cpu_idx() == 0 && curthr->uthread);
+}
+
+/* SYS_FUTEX_WAIT(uaddr, val, timeout_ticks)
+ *   0            woken by SYS_FUTEX_WAKE
+ *   -EAGAIN(-11) *uaddr != val — the caller lost the race and must re-check
+ *   -ETIMEDOUT   the deadline passed with no wake
+ * The compare-and-park is atomic against SYS_FUTEX_WAKE (both take the futex
+ * lock), which is the whole reason a futex needs kernel help at all: without
+ * it, a wake landing between "I read the value" and "I am asleep" is lost. */
+static uint64_t sys_futex_wait(struct sysframe *sf, uint64_t uaddr, uint64_t val,
+                               uint64_t timeout) {
+    int p = (int)current_proc_idx, L = tg_of(p);
+    if (!sf) return (uint64_t)-1;
+    if (L < 0 || L >= n_kproc || !kprocs[L].used) return (uint64_t)-1;
+    if (uaddr < USER_VMIN || uaddr >= USER_VMAX || (uaddr & 7)) return (uint64_t)-1;
+    if (!access_ok(kprocs[L].cr3, uaddr, 8, 1)) return (uint64_t)-14;
+    if (!timeout) timeout = FUTEX_DEFAULT_TICKS;
+    uint64_t key = futex_key_of(kprocs[L].cr3, uaddr);
+    if (!key) return (uint64_t)-14;
+
+    if (!can_park()) {
+        /* Model A: yield-and-recheck, bounded by the same deadline. */
+        uint64_t dl = g_ticks + timeout;
+        while (*(volatile uint64_t *)uaddr == val) {
+            if (g_ticks >= dl) return WAIT_RV_TIMEDOUT;
+            sched_yield();
+        }
+        return WAIT_RV_OK;
+    }
+    futex_lock();
+    if (*(volatile uint64_t *)uaddr != val) { futex_unlock(); return (uint64_t)-11; }
+    futex_unlock();
+    block_ring3(sf, p, key, timeout);         /* never returns */
+}
+
+/* SYS_EPOLL_WAIT(epfd, events, maxevents_and_timeout) -> ready count, or negative.
+ *
+ * The third argument packs maxevents in the low half and the timeout in
+ * milliseconds in the high half, for the same reason epoll_ctl packs its
+ * fourth: three argument registers, and a struct read on the hot path buys
+ * nothing. The userland wrapper presents the ordinary four-argument shape.
+ *
+ * Returns:
+ *   > 0          that many events were written to `events`
+ *   0            timeout was 0 and nothing was ready — a poll, not a wait
+ *   -EAGAIN(-11) we slept, something happened, CALL AGAIN. Same retry contract
+ *                as SYS_THREAD_JOIN and for the same reason: a woken task
+ *                resumes with only RAX, and the waker is in another address
+ *                space and cannot fill in the caller's array.
+ *   -ETIMEDOUT   the deadline passed with nothing ready.
+ *
+ * EDGE TRIGGERING is per watch, and `seen` is what makes it edge rather than
+ * level: a watch registered with EPOLLET reports a mask only when it DIFFERS
+ * from what it last reported. Clearing `seen` on EPOLL_CTL_MOD re-arms it,
+ * which is what a caller changing the mask expects.                        */
+struct uepoll_event { uint32_t events; uint32_t _pad; uint64_t data; };
+
+static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, uint64_t a2) {
+    int p = tg_of((int)current_proc_idx);
+    int epfd = (int)(int64_t)a0;
+    int maxev = (int)(a2 & 0xFFFFFFFFu);
+    int64_t tmo_ms = (int64_t)(int32_t)(a2 >> 32);
+    if (epfd < 0 || epfd >= 16 || maxev <= 0) return (uint64_t)-22;
+    if (maxev > EPOLL_MAXWATCH) maxev = EPOLL_MAXWATCH;
+    if (!access_ok(kprocs[p].cr3, a1, (uint64_t)maxev * sizeof(struct uepoll_event), 1))
+        return (uint64_t)-14;
+
+    klock_acquire(&g_ofile_lock);
+    if (!g_ofiles[epfd].used || g_ofiles[epfd].volume != VOL_EPOLL ||
+        !(g_ofiles[epfd].owner_mask & (1ull << p))) {
+        klock_release(&g_ofile_lock); return (uint64_t)-9;
+    }
+    int epi = g_ofiles[epfd].ep;
+    if (epi < 0 || epi >= MAX_EPOLL || !g_epoll[epi].used) {
+        klock_release(&g_ofile_lock); return (uint64_t)-9;
+    }
+    struct kepoll *E = &g_epoll[epi];
+    struct uepoll_event *out = (struct uepoll_event *)a1;
+    int n = 0;
+    for (int k = 0; k < EPOLL_MAXWATCH && n < maxev; k++) {
+        if (!E->w[k].used) continue;
+        /* EPOLLERR and EPOLLHUP are reported whether or not they were asked
+         * for — POSIX requires it, and a caller that only asked for EPOLLIN
+         * still has to learn that its peer is gone or it waits forever. */
+        uint32_t want = E->w[k].events | EPOLLERR | EPOLLHUP;
+        uint32_t got = ep_poll_fd_locked(E->w[k].fd) & want;
+        if (!got) { E->w[k].seen = 0; continue; }
+        if ((E->w[k].events & EPOLLET) && got == E->w[k].seen) continue;  /* no edge */
+        E->w[k].seen = got;
+        out[n].events = got; out[n]._pad = 0; out[n].data = E->w[k].data;
+        n++;
+    }
+    klock_release(&g_ofile_lock);
+    __sync_fetch_and_add(&g_epoll_waits, 1);
+    if (n > 0) return (uint64_t)(int64_t)n;
+    if (tmo_ms == 0) return 0;                       /* a poll: nothing ready */
+
+    /* Nothing ready and the caller is willing to wait. Park on this instance's
+     * key using the v0.61 protocol, so the thread leaves the run queue rather
+     * than spinning — which on a uniprocessor is the difference between
+     * waiting and preventing the event from ever happening. */
+    if (!sf || !can_park()) {
+        uint64_t dl = g_ticks + (tmo_ms < 0 ? FUTEX_DEFAULT_TICKS : (uint64_t)tmo_ms / 10 + 1);
+        while (g_ticks < dl) { sched_yield(); }
+        return WAIT_RV_TIMEDOUT;
+    }
+    __sync_fetch_and_add(&g_epoll_parks, 1);
+    /* PIT is 100 Hz, so a tick is 10 ms; a negative timeout means "wait", which
+     * here is still bounded by the kernel default — no park in this system is
+     * unbounded, for the reason set out with the futex. */
+    uint64_t ticks = (tmo_ms < 0) ? FUTEX_DEFAULT_TICKS : ((uint64_t)tmo_ms / 10 + 1);
+    block_ring3(sf, (int)current_proc_idx, EPOLL_WAIT_KEY(epi), ticks);  /* never returns */
+}
+
+/* SYS_FUTEX_WAKE(uaddr, n) -> how many waiters were released (0 is normal and
+ * not an error: waking an uncontended futex is the common case). */
+static uint64_t sys_futex_wake(uint64_t uaddr, uint64_t n) {
+    int p = (int)current_proc_idx, L = tg_of(p);
+    if (L < 0 || L >= n_kproc || !kprocs[L].used) return (uint64_t)-1;
+    if (uaddr < USER_VMIN || uaddr >= USER_VMAX || (uaddr & 7)) return (uint64_t)-1;
+    if (!access_ok(kprocs[L].cr3, uaddr, 8, 1)) return (uint64_t)-14;
+    uint64_t key = futex_key_of(kprocs[L].cr3, uaddr);
+    if (!key) return (uint64_t)-14;
+    if (!n) n = MAX_KPROC;
+    return (uint64_t)(int64_t)futex_wake_key(key, (int)n, WAIT_RV_OK);
+}
+
+/* SYS_THREAD_JOIN(tid, uint64_t *out_code)
+ *   0            the thread has exited; *out_code holds its status
+ *   -EAGAIN(-11) it had not exited, we slept, and something woke us — CALL AGAIN
+ *   -ESRCH(-3)   no such tid in this thread group
+ *   -ETIMEDOUT   the deadline passed
+ *
+ * The retry contract is deliberate and is the honest shape for this kernel. A
+ * woken task resumes at the instruction after its SYSCALL with only RAX to
+ * carry a result — the waker runs in a different address space and cannot
+ * write *out_code on the joiner's behalf. So the wake says "the state you were
+ * waiting on changed; look again", and the second call reads the status from
+ * the leader's join table and returns immediately. Userland wraps it in a
+ * two-line loop (see the pthread shim). */
+static uint64_t sys_thread_join(struct sysframe *sf, uint64_t tid, uint64_t out) {
+    int p = (int)current_proc_idx, L = tg_of(p);
+    if (L < 0 || L >= n_kproc || !kprocs[L].used) return (uint64_t)-1;
+    if (tid >= THR_MAX) return (uint64_t)-1;
+    if (tid >= kprocs[L].ustack_next) return (uint64_t)-3;   /* never created */
+    if (out) {
+        if (out < USER_VMIN || out >= USER_VMAX || (out & 7)) return (uint64_t)-1;
+        if (!access_ok(kprocs[L].cr3, out, 8, 1)) return (uint64_t)-14;
+    }
+    /* Already gone: answer from the leader's table. This is checked FIRST and
+     * again on every retry, so a thread that exits between two calls is never
+     * waited on forever. */
+    if (kprocs[L].thr_done & (1u << tid)) {
+        if (out) *(volatile uint64_t *)out = kprocs[L].thr_exit[tid];
+        return WAIT_RV_OK;
+    }
+    if (!sf || !can_park()) {
+        uint64_t dl = g_ticks + FUTEX_DEFAULT_TICKS;
+        while (!(kprocs[L].thr_done & (1u << tid))) {
+            if (g_ticks >= dl) return WAIT_RV_TIMEDOUT;
+            sched_yield();
+        }
+        if (out) *(volatile uint64_t *)out = kprocs[L].thr_exit[tid];
+        return WAIT_RV_OK;
+    }
+    block_ring3(sf, p, JOIN_KEY_OF(L, tid), FUTEX_DEFAULT_TICKS);   /* never returns */
 }
 
 /* SYS_SIGRETURN() — pop the frame sig_deliver pushed and resume the interrupted
@@ -8529,6 +9899,7 @@ static int64_t redirect_write_bytes(int fd, const void *data, uint32_t len) {
     int di = ofile_deref(fd, &vol);
     if (di < 0) return -9;                                  /* EBADF */
     if (vol == VOL_PIPE) return pipe_write_fd(fd, data, len);
+    if (vol == VOL_EVFD) return evfd_write_fd(fd, data, len);
     if (vol == VOL_DEV)  return -13;                        /* read-only volume */
     if (!len) return 0;
 
@@ -8666,6 +10037,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             if (vol == VOL_ROOT)      n = vfs_read_file(di, (void *)a1, len);
             else if (vol == VOL_TMP)  n = tmp_read_file(di, (void *)a1, len);
             else if (vol == VOL_PIPE) n = pipe_read_fd(fd, (void *)a1, len);   /* v0.59 */
+            else if (vol == VOL_EVFD) n = evfd_read_fd(fd, (void *)a1, len);   /* v0.64 */
             else /* VOL_DEV */        n = dev_read_file((void *)a1, len);
         }
         fs_witness_leave();
@@ -8684,6 +10056,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             if (vol == VOL_ROOT)      r = vfs_write_by_dirent(di, (const void *)a1, len);  /* COW */
             else if (vol == VOL_TMP)  r = tmp_write_file(di, (const void *)a1, len);
             else if (vol == VOL_PIPE) r = pipe_write_fd(fd, (const void *)a1, len);        /* v0.59 */
+            else if (vol == VOL_EVFD) r = evfd_write_fd(fd, (const void *)a1, len);        /* v0.64 */
             else /* VOL_DEV */        r = -13;              /* read-only volume: capability-style denial */
         }
         fs_witness_leave();
@@ -8749,7 +10122,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         return 0;                                          /* thread resumes here later  */
 
     case 16:                                               /* SYS_GETPID()        */
-        return kprocs[current_proc_idx].pid;
+        /* v0.61: the LEADER's pid. POSIX gives a thread group one pid, and
+         * since threads became their own kproc slots each carries a distinct
+         * one — that distinct value is its TID (SYS_GETTID), not its pid.
+         * Reporting the slot's own pid here would make getpid() answer
+         * differently depending on which thread asked. */
+        return kprocs[tg_of((int)current_proc_idx)].pid;
 
     case 14: {   /* SYS_SURFACE_POLL(slot, *out_event) -> 1 if an event was popped */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FRAMEBUFFER)) return (uint64_t)-13;
@@ -9617,17 +10995,22 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
          * caller's address space is still intact. */
         int di = vfs_find(path);
         if (di < 0) return (uint64_t)-2;                    /* ENOENT */
+        /* v0.61: serialise the shared staging buffer. Two cores exec'ing at
+         * once used to overwrite each other's image mid-parse — see the
+         * execbuf_acquire comment for the boot log that showed it. */
+        execbuf_acquire();
         int64_t nimg = vfs_read_file(di, g_execbuf, sizeof g_execbuf);
-        if (nimg <= 0) return (uint64_t)-5;                 /* EIO   */
+        if (nimg <= 0) { execbuf_release(); return (uint64_t)-5; }        /* EIO   */
 
         uint64_t newcr3 = create_address_space();
-        if (!newcr3) return (uint64_t)-12;
+        if (!newcr3) { execbuf_release(); return (uint64_t)-12; }
         uint64_t save = kprocs[p].cr3;
         kprocs[p].cr3 = newcr3;                             /* elf_load targets this */
         /* elf_load enforces W^X on the way in: a segment that is both writable
          * and executable is refused, so a compiler cannot emit an image that
          * escapes the policy the rest of the system obeys. */
         uint64_t entry = elf_load(p, (uint64_t)g_execbuf, (uint64_t)nimg);
+        execbuf_release();                       /* the image is in the new space now */
         if (!entry) { kprocs[p].cr3 = save; page_free_tree(newcr3); return (uint64_t)-8; }
         uint64_t sp = uargs_build(newcr3, argc, (const char (*)[UARG_LEN])kargv,
                                           envc, (const char (*)[UARG_LEN])kenvp);
@@ -9712,7 +11095,9 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     }
     case 49: {   /* SYS_SIGACTION(signo, handler) -> previous handler, or negative.
                   * handler: 0 = SIG_DFL, 1 = SIG_IGN, else a ring-3 entry point. */
-        int p = (int)current_proc_idx;
+        /* v0.62: dispositions are PROCESS-wide, so this writes the leader's
+         * table — a handler installed by any thread governs the program. */
+        int p = tg_of((int)current_proc_idx);
         int sg = (int)(int64_t)a0;
         if (sg <= 0 || sg >= NSIG) return (uint64_t)-1;
         if (sg == SIGKILL) return (uint64_t)-1;        /* never catchable, never ignorable */
@@ -9737,73 +11122,110 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (tgt != me && kprocs[tgt].ppid_slot != me) return (uint64_t)-13;  /* EPERM */
         return (uint64_t)(int64_t)sig_raise(tgt, sg);
     }
-    case 52: {   /* SYS_THREAD_CREATE(entry, arg) -> new thread's index in this process,
-                  * or negative. The new thread shares this process's ADDRESS SPACE (same
-                  * cr3, same globals, same heap) but gets its own ring-3 stack and its own
-                  * kernel stack — the definition of a POSIX thread. */
-        int p = (int)current_proc_idx;
+    case 52: {   /* SYS_THREAD_CREATE(entry, arg, stack) -> the new thread's tid within
+                  * this thread group (0-based), or negative on failure.
+                  *
+                  * v0.61: A THREAD IS NOW A RUN-QUEUE ENTITY — its own kproc slot
+                  * sharing the leader's address space (the clone(CLONE_VM) model).
+                  * The v0.55 implementation built a BSP *scheduler* thread instead,
+                  * which is why it had to refuse creation from an AP: the thread it
+                  * produced could only ever be dispatched by the BSP, so a process
+                  * running under cpu_exec_proc on an AP ended up with members in two
+                  * schedulers that knew nothing about each other. That asymmetry is
+                  * gone, and with it the restriction — see docs/THREADS-M61.md.
+                  *
+                  * `stack` is new and optional: 0 means "kernel, give me one".
+                  * The syscall ABI already had the third argument free. */
+        int me = (int)current_proc_idx;
+        int L  = tg_of(me);
+        if (L < 0 || L >= n_kproc || !kprocs[L].used) return (uint64_t)-1;
         if (a0 < USER_VMIN || a0 >= USER_VMAX) return (uint64_t)-1;
-        if (!access_ok(kprocs[p].cr3, a0, 1, 0)) return (uint64_t)-14;
-        /* A POSIX thread here IS a BSP scheduler thread (see the changelog's
-         * scope notes), so only the BSP may create one. This restriction is
-         * enforced rather than merely documented because of a REAL, reproducible
-         * SMP hang: when the creating process ran on an AP while its threads ran
-         * on the BSP, the process's main thread would occasionally never be
-         * dispatched again after its last thread exited, and the machine went
-         * idle with no core making progress. It reproduces only when the host is
-         * oversubscribed (two 4-vCPU TCG guests on 4 cores), and it was NOT root
-         * caused — so rather than ship a path that can wedge, the kernel refuses
-         * it and the suite pins thread-creating processes to cpu 0. Lifting this
-         * is the first task of the next milestone. */
-        if (cpu_idx() != 0) return (uint64_t)-11;      /* EAGAIN: create from the BSP */
-        int slot = kprocs[p].ustack_next;
-        if (slot >= THR_MAX) return (uint64_t)-11;     /* EAGAIN: per-process ceiling */
-        uint64_t base = THR_USER_V + (uint64_t)slot * THR_STK_STRIDE;
-        for (int i = 0; i < THR_STK_PAGES; i++) {
-            uint64_t f = alloc_frame();
-            if (!f) return (uint64_t)-12;
-            map_page(kprocs[p].cr3, base + (uint64_t)i * 0x1000, f, PTE_USER | PTE_WRITE | PTE_NX);
+        if (!access_ok(kprocs[L].cr3, a0, 1, 0)) return (uint64_t)-14;   /* entry must be mapped */
+        /* Claim a tid with an atomic bump on the LEADER. Deliberately never
+         * given back on failure: two cores may be creating at once, and a
+         * decrement would let a tid be handed out twice — far worse than
+         * burning one out of a ceiling that is a hard limit either way. */
+        int tid = (int)__sync_fetch_and_add(&kprocs[L].ustack_next, 1);
+        if (tid >= THR_MAX) return (uint64_t)-11;      /* EAGAIN: per-group ceiling */
+
+        uint64_t base = 0, top;
+        int      pages = 0;
+        if (a2) {
+            /* Caller-supplied stack. `a2` is the TOP (stacks grow down), and it
+             * must be writable in the group's address space — checked, because
+             * a bad pointer here would fault on the new thread's first push,
+             * in a context that has no way to attribute the mistake. Pages the
+             * caller allocated are the caller's to free: tstack_pages stays 0
+             * so the exit path does not reclaim memory it did not map. */
+            if (a2 < USER_VMIN || a2 >= USER_VMAX) return (uint64_t)-1;
+            if (!access_ok(kprocs[L].cr3, a2 - 64, 64, 1)) return (uint64_t)-14;
+            top = a2;
+        } else {
+            base  = THR_USER_V + (uint64_t)tid * THR_STK_STRIDE;
+            pages = THR_STK_PAGES;
+            for (int i = 0; i < THR_STK_PAGES; i++) {
+                uint64_t f = alloc_frame();
+                if (!f) return (uint64_t)-12;
+                map_page(kprocs[L].cr3, base + (uint64_t)i * 0x1000, f,
+                         PTE_USER | PTE_WRITE | PTE_NX);
+            }
+            top = base + (uint64_t)THR_STK_PAGES * 0x1000;
         }
-        /* Hand the thread its argument through its own stack: enter_user_thread
-         * sets only RIP and RSP, so [rsp] is the ABI we have. The ring-3
-         * trampoline pops it. 16-byte aligned entry, as SysV requires.        */
-        uint64_t top = base + (uint64_t)THR_STK_PAGES * 0x1000;
-        uint64_t sp  = (top - 16) & ~0xFull;
-        uint64_t pte = walk_pte(kprocs[p].cr3, sp & ~0xFFFull);
+        uint64_t sp  = (top - 16) & ~0xFull;           /* 16-byte aligned, as SysV wants */
+        uint64_t pte = walk_pte(kprocs[L].cr3, sp & ~0xFFFull);
         if (!(pte & PTE_PRESENT)) return (uint64_t)-14;
-        *(uint64_t *)((pte & ADDR_MASK) + (sp & 0xFFF)) = a1;   /* [rsp] = arg */
-        __sync_fetch_and_add(&kprocs[p].nthreads, 1);
-        /* struct pcb::name is a BORROWED pointer, not a copy — a stack-local
-         * buffer here would dangle the instant this syscall returned (found
-         * live: thread names came back as whatever last used that stack). */
-        static const char *const thr_names[THR_MAX] = {
-            "pthr0", "pthr1", "pthr2", "pthr3", "pthr4", "pthr5", "pthr6", "pthr7"
-        };
-        /* Commit the slot BEFORE the thread becomes runnable: uthread_create
-         * publishes a schedulable PCB, and that thread may itself call
-         * SYS_THREAD_CREATE before this syscall finishes. Everything the new
-         * thread needs (its stack, its [rsp] argument, nthreads) is already in
-         * place above. A thread-table exhaustion below therefore burns this slot
-         * rather than risking a double allocation — the userland shim's index
-         * check turns that into a loud -1, never a silently wrong control block. */
-        kprocs[p].ustack_next = slot + 1;
-        int tid = uthread_create(thr_names[slot], p, a0, sp);
-        if (tid < 0) { __sync_fetch_and_sub(&kprocs[p].nthreads, 1); return (uint64_t)-11; }
+        /* v0.55 handed the argument through [rsp] because enter_user_thread set
+         * nothing but RIP and RSP. Seeding a uctx lets us use RDI — the SysV
+         * first-argument register, which is what a C function actually reads.
+         * [rsp] is still written so the existing /bin/init pthread shim, which
+         * pops it, keeps working unchanged across this rearchitecture. */
+        *(uint64_t *)((pte & ADDR_MASK) + (sp & 0xFFF)) = a1;
+
+        char nm[8];
+        nm[0]='p'; nm[1]='t'; nm[2]='h'; nm[3]='r';
+        nm[4]=(char)('0' + (tid % 10)); nm[5]=0;
+        int t = kproc_spawn_thread(nm, L, tid);
+        if (t < 0) return (uint64_t)-11;               /* EAGAIN: kproc table full */
+        kprocs[t].tstack_base  = base;
+        kprocs[t].tstack_pages = pages;
+        kprocs[t].entry        = a0;
+        /* Seed the context and mark it resumable. THIS is what makes a brand-new
+         * thread and a preempted one enter ring 3 through exactly one path
+         * (enter_user_resume), so there is no second entry convention to get
+         * wrong — and it is why no assembly was needed for any of this. */
+        struct uctx *u = &kprocs[t].uctx;
+        u->rip = a0; u->rsp = sp; u->rdi = a1; u->rflags = 0x202;   /* IF set */
+        kprocs[t].pstate = 1;
+        __sync_fetch_and_add(&kprocs[L].nthreads, 1);
+        __sync_synchronize();                          /* complete before runnable */
+        int dst = rq_push_any((int)cpu_idx(), t);
+        if (dst < 0) {                                 /* every queue full */
+            __sync_fetch_and_sub(&kprocs[L].nthreads, 1);
+            thread_stack_release(t);
+            kprocs[t].torn_down = 1;
+            return (uint64_t)-11;
+        }
+        sched_kick(dst);
         g_threads_made++;
         if (g_debug_posix)
-            kprintf("[dbgposix] thread_create pid %u slot %d tid %d entry %X sp %X (%d live)\n",
-                    kprocs[p].pid, (uint64_t)slot, (uint64_t)tid, a0, sp,
-                    (uint64_t)(int64_t)kprocs[p].nthreads);
-        return (uint64_t)slot;
+            kprintf("[dbgposix] thread_create pid %u tid %d -> slot %d cpu %d entry %X sp %X (%d live)\n",
+                    kprocs[L].pid, (uint64_t)tid, (uint64_t)t, (uint64_t)dst, a0, sp,
+                    (uint64_t)(int64_t)kprocs[L].nthreads);
+        return (uint64_t)tid;
     }
     case 53:     /* SYS_THREAD_EXIT(code) — leave this THREAD; siblings and the address
                   * space survive unless this was the last one (posix_thread_leave). */
         if (cpu_idx() == 0 && curthr->uthread) uthread_exit(a0);
-        /* Not a BSP scheduler thread: this is a queued-task excursion, so
-         * unwind it the same way SYS_EXIT does. Legal, but worth noticing. */
+        /* v0.61: this is now the ORDINARY path, not the odd one. A thread is a
+         * run-queue entity, so leaving means unwinding to cpu_exec_proc exactly
+         * as SYS_EXIT does — and cpu_exec_proc is where the group refcount
+         * decides between "release this thread's slot" and "tear the address
+         * space down". The v0.55 comment here called this case unusual because
+         * back then a thread was a BSP pcb; that is no longer what threads are. */
         if (g_debug_posix)
-            kprintf("[dbgposix] SYS_THREAD_EXIT(%u) outside a uthread ctx (cpu%u pid %u)\n",
-                    a0, (uint64_t)cpu_idx(), kprocs[current_proc_idx].pid);
+            kprintf("[dbgposix] SYS_THREAD_EXIT(%u) cpu%u pid %u tid %d\n",
+                    a0, (uint64_t)cpu_idx(), kprocs[current_proc_idx].pid,
+                    (uint64_t)(int64_t)kprocs[current_proc_idx].tg_tid);
         write_cr3(kernel_cr3);
         resume_kernel(a0);
         return 0;                                      /* unreachable */
@@ -9929,6 +11351,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             int c = kbd_getc_nonblock();
             if (c < 0) c = serial_getc_nonblock();
             if (c < 0) break;
+            /* v0.62: 0x03 is the INTERRUPT CHARACTER, not input. It is consumed
+             * here rather than handed to the reader, and it signals the
+             * foreground process group — which is why it reaches the job and
+             * not the shell that is sitting in this very read. */
+            if (c == 0x03) { tty_intr(); continue; }
             dst[n++] = (char)c;
         }
         return n;
@@ -10009,6 +11436,385 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                     which ? "stdout" : "stdin", (uint64_t)(int64_t)fd);
         return 0;
     }
+
+    /* ---- v0.61: thread identity + synchronisation -------------------------
+     * 64 and 66 are normally intercepted by syscall_trap, which has the
+     * `sf` they need to park. Reaching them HERE means there is no user
+     * context — a kernel-side capability probe, or a pcb uthread that cannot
+     * park at all — so they run their bounded yield-and-recheck fallback
+     * instead of silently doing nothing. */
+    case 64:     /* SYS_FUTEX_WAIT(uaddr, val, timeout_ticks) */
+        return sys_futex_wait(0, a0, a1, a2);
+    case 65:     /* SYS_FUTEX_WAKE(uaddr, n) -> waiters released */
+        return sys_futex_wake(a0, a1);
+    case 66:     /* SYS_THREAD_JOIN(tid, uint64_t *out_code) */
+        return sys_thread_join(0, a0, a1);
+    case 78:     /* SYS_EPOLL_WAIT — normally intercepted by syscall_trap, which
+                  * has the `sf` needed to park. Reaching here means no user
+                  * context, so it runs the bounded yield fallback. */
+        return sys_epoll_wait(0, a0, a1, a2);
+    case 76: {   /* SYS_EPOLL_CREATE(flags) -> an epoll descriptor, or negative. */
+        int p = tg_of((int)current_proc_idx);
+        (void)a0;                                    /* no flags defined yet */
+        klock_acquire(&g_ofile_lock);
+        int epi = -1;
+        for (int i = 0; i < MAX_EPOLL; i++) if (!g_epoll[i].used) { epi = i; break; }
+        if (epi < 0) { klock_release(&g_ofile_lock); return (uint64_t)-11; }
+        int fd = -1;
+        for (int i = 0; i < 16; i++) if (!g_ofiles[i].used) { fd = i; break; }
+        if (fd < 0) { klock_release(&g_ofile_lock); return (uint64_t)-24; }   /* EMFILE */
+        g_epoll[epi].used = 1;
+        for (int k = 0; k < EPOLL_MAXWATCH; k++) g_epoll[epi].w[k].used = 0;
+        /* dirent carries the INSTANCE INDEX, exactly as a pipe end carries its
+         * pipe index. ofile_deref returns this field and every read/write path
+         * gates on `di >= 0`, so a descriptor with dirent -1 is unusable — it
+         * dereferences as EBADF no matter how well-formed the rest of it is. */
+        g_ofiles[fd].used = 1; g_ofiles[fd].dirent = epi; g_ofiles[fd].off = 0;
+        g_ofiles[fd].owner_mask = 1ull << p; g_ofiles[fd].volume = VOL_EPOLL;
+        g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
+        g_ofiles[fd].ep = epi; g_ofiles[fd].efd = -1;
+        klock_release(&g_ofile_lock);
+        __sync_fetch_and_add(&g_epoll_creates, 1);
+        if (g_debug_posix)
+            kprintf("[dbgep  ] epoll_create pid %u -> fd %d (instance %d)\n",
+                    kprocs[p].pid, (uint64_t)(int64_t)fd, (uint64_t)(int64_t)epi);
+        return (uint64_t)(int64_t)fd;
+    }
+    case 77: {   /* SYS_EPOLL_CTL(epfd, op, fd, events_and_data)
+                  *
+                  * The fourth argument is (events | data<<32) packed into one
+                  * word rather than a pointer to a struct. This syscall ABI has
+                  * three argument registers, and a struct pointer would have
+                  * meant a user-memory read on a path whose whole job is to be
+                  * cheap; the userland wrapper below presents the ordinary
+                  * struct epoll_event shape over it. */
+        int p = tg_of((int)current_proc_idx);
+        int epfd = (int)(int64_t)a0;
+        int op   = (int)((a1 >> 32) & 0xFFFF);
+        int fd   = (int)(int32_t)(a1 & 0xFFFFFFFFu);
+        uint32_t evmask = (uint32_t)(a2 & 0xFFFFFFFFu);
+        uint64_t cookie = a2 >> 32;
+        if (epfd < 0 || epfd >= 16 || fd < 0 || fd >= 16) return (uint64_t)-9;   /* EBADF */
+        klock_acquire(&g_ofile_lock);
+        if (!g_ofiles[epfd].used || g_ofiles[epfd].volume != VOL_EPOLL ||
+            !(g_ofiles[epfd].owner_mask & (1ull << p))) {
+            klock_release(&g_ofile_lock); return (uint64_t)-9;
+        }
+        int epi = g_ofiles[epfd].ep;
+        if (epi < 0 || epi >= MAX_EPOLL || !g_epoll[epi].used) {
+            klock_release(&g_ofile_lock); return (uint64_t)-9;
+        }
+        struct kepoll *E = &g_epoll[epi];
+        int slot = -1, freeslot = -1;
+        for (int k = 0; k < EPOLL_MAXWATCH; k++) {
+            if (E->w[k].used && E->w[k].fd == fd) { slot = k; break; }
+            if (!E->w[k].used && freeslot < 0) freeslot = k;
+        }
+        int64_t rc = 0;
+        if (op == EPOLL_CTL_ADD) {
+            if (slot >= 0) rc = -17;                        /* EEXIST */
+            else if (!g_ofiles[fd].used) rc = -9;
+            else if (freeslot < 0) rc = -28;                /* ENOSPC */
+            else {
+                E->w[freeslot].used = 1; E->w[freeslot].fd = fd;
+                E->w[freeslot].events = evmask; E->w[freeslot].data = cookie;
+                E->w[freeslot].seen = 0;
+            }
+        } else if (op == EPOLL_CTL_DEL) {
+            if (slot < 0) rc = -2;                          /* ENOENT */
+            else E->w[slot].used = 0;
+        } else if (op == EPOLL_CTL_MOD) {
+            if (slot < 0) rc = -2;
+            else { E->w[slot].events = evmask; E->w[slot].data = cookie;
+                   E->w[slot].seen = 0; }                   /* re-arm the edge  */
+        } else rc = -22;                                    /* EINVAL */
+        klock_release(&g_ofile_lock);
+        return (uint64_t)rc;
+    }
+    case 79: {   /* SYS_EVENTFD(initval, flags) -> an eventfd descriptor.
+                  * flags bit 0 = EFD_SEMAPHORE. */
+        int p = tg_of((int)current_proc_idx);
+        klock_acquire(&g_ofile_lock);
+        int ei = -1;
+        for (int i = 0; i < MAX_EVENTFD; i++) if (!g_evfd[i].used) { ei = i; break; }
+        if (ei < 0) { klock_release(&g_ofile_lock); return (uint64_t)-11; }
+        int fd = -1;
+        for (int i = 0; i < 16; i++) if (!g_ofiles[i].used) { fd = i; break; }
+        if (fd < 0) { klock_release(&g_ofile_lock); return (uint64_t)-24; }
+        g_evfd[ei].used = 1;
+        g_evfd[ei].counter = a0;
+        g_evfd[ei].semaphore = (a1 & 1) ? 1 : 0;
+        g_ofiles[fd].used = 1; g_ofiles[fd].dirent = ei; g_ofiles[fd].off = 0;
+        g_ofiles[fd].owner_mask = 1ull << p; g_ofiles[fd].volume = VOL_EVFD;
+        g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
+        g_ofiles[fd].ep = -1; g_ofiles[fd].efd = ei;
+        klock_release(&g_ofile_lock);
+        __sync_fetch_and_add(&g_evfd_creates, 1);
+        if (g_debug_posix)
+            kprintf("[dbgep  ] eventfd pid %u -> fd %d (counter %u%s)\n",
+                    kprocs[p].pid, (uint64_t)(int64_t)fd, a0,
+                    g_evfd[ei].semaphore ? ", semaphore" : "");
+        return (uint64_t)(int64_t)fd;
+    }
+    case 74: {   /* SYS_SHM_CREATE(size) -> shm id, or negative.
+                  * Frames are allocated and ZEROED up front, not on demand:
+                  * a shared segment's whole point is that another process can
+                  * already see it, so deferring the backing would mean two
+                  * processes faulting independently on the same page and
+                  * racing to install different frames for it. */
+        int p = tg_of((int)current_proc_idx);
+        if (!rust_cap_check(kprocs[p].caps, PCAP_IPC)) return (uint64_t)-13;
+        uint64_t pages = (a0 + 0xFFFull) / 0x1000;
+        if (!pages || pages > SHM_MAX_PAGES) return (uint64_t)-1;
+        shm_lock();
+        int id = -1;
+        for (int i = 0; i < MAX_SHM; i++) if (!g_shm[i].used) { id = i; break; }
+        if (id < 0) { shm_unlock(); return (uint64_t)-11; }        /* EAGAIN */
+        g_shm[id].npages = 0;
+        for (uint64_t k = 0; k < pages; k++) {
+            uint64_t f = alloc_frame();
+            if (!f) {                                              /* unwind cleanly */
+                for (uint32_t j = 0; j < g_shm[id].npages; j++) free_frame(g_shm[id].frames[j]);
+                shm_unlock();
+                return (uint64_t)-12;                              /* ENOMEM */
+            }
+            g_shm[id].frames[g_shm[id].npages++] = f;
+        }
+        g_shm[id].used = 1;
+        g_shm[id].owner_pid = kprocs[p].pid;
+        g_shm[id].mappers = 0;
+        shm_unlock();
+        __sync_fetch_and_add(&g_shm_creates, 1);
+        if (g_debug_posix)
+            kprintf("[dbgvm  ] shm %d created by pid %u: %u page(s)\n",
+                    (uint64_t)(int64_t)id, kprocs[p].pid, pages);
+        return (uint64_t)(int64_t)id;
+    }
+    case 75: {   /* SYS_SHM_MAP(id, writable) -> vaddr, or negative.
+                  * Installs THIS process's own view of the segment's frames.
+                  * Marked PTE_SHM so neither COW nor demand-zero ever touches
+                  * them: a shared page must not be copied on write — copying is
+                  * precisely the behaviour sharing exists to avoid. */
+        int p = tg_of((int)current_proc_idx);
+        if (!rust_cap_check(kprocs[p].caps, PCAP_IPC)) return (uint64_t)-13;
+        int id = (int)(int64_t)a0;
+        if (id < 0 || id >= MAX_SHM) return (uint64_t)-1;
+        shm_lock();
+        if (!g_shm[id].used) { shm_unlock(); return (uint64_t)-3; }        /* ESRCH */
+        uint32_t np = g_shm[id].npages;
+        uint64_t base = kprocs[p].shm_next;
+        if (base + (uint64_t)np * 0x1000 > SHM_USER_V + 0x1000000ull) {
+            shm_unlock(); return (uint64_t)-12;
+        }
+        uint64_t flags = PTE_USER | PTE_NX | PTE_SHM | (a1 ? PTE_WRITE : 0);
+        for (uint32_t k = 0; k < np; k++) {
+            /* Each mapper takes its own reference, so page_free_tree dropping
+             * this process's view at exit decrements rather than frees. */
+            frame_share(g_shm[id].frames[k]);
+            map_page(kprocs[p].cr3, base + (uint64_t)k * 0x1000, g_shm[id].frames[k], flags);
+        }
+        kprocs[p].shm_next = base + (uint64_t)np * 0x1000;
+        if (!(kprocs[p].shm_attached & (1u << id))) {
+            kprocs[p].shm_attached |= (1u << id);
+            g_shm[id].mappers++;
+        }
+        shm_unlock();
+        __sync_fetch_and_add(&g_shm_maps, 1);
+        if (g_debug_posix)
+            kprintf("[dbgvm  ] shm %d mapped by pid %u at %X (%u page(s), %s)\n",
+                    (uint64_t)(int64_t)id, kprocs[p].pid, base, np, a1 ? "rw" : "ro");
+        return base;
+    }
+    case 71: {   /* SYS_MMAP(length, prot, flags) -> base vaddr, or MAP_FAILED (-1).
+                  *   prot : 1 READ, 2 WRITE, 4 EXEC
+                  *   flags: 0x01 SHARED, 0x02 PRIVATE, 0x20 ANONYMOUS
+                  *
+                  * ANONYMOUS ONLY, and the kernel says so rather than accepting
+                  * a file descriptor it would ignore: there is no file-backed
+                  * paging here, and a mmap that silently returned zeroes for a
+                  * file would be worse than a refusal.
+                  *
+                  * Nothing is allocated. The range is RESERVED as non-present
+                  * PTEs carrying their own permissions, and the frames arrive
+                  * one fault at a time — which is what makes a large mapping
+                  * cheap and is the whole point of the call. */
+        int p = tg_of((int)current_proc_idx);
+        uint64_t len = (a0 + 0xFFFull) & ~0xFFFull;
+        uint64_t prot = a1, flags = a2;
+        if (!len || len > MMAP_MAX_BYTES) return (uint64_t)-1;
+        if (!(flags & 0x20)) return (uint64_t)-1;            /* anonymous only */
+        if (prot & ~0x7ull) return (uint64_t)-1;
+        /* W^X, enforced here exactly as elf_load enforces it on images: a
+         * mapping may be writable or executable, never both. A JIT would have
+         * to mprotect between the two, which is the discipline this system
+         * applies to every other executable page. */
+        if ((prot & 0x2) && (prot & 0x4)) return (uint64_t)-1;
+        uint64_t base = kprocs[p].mmap_next;
+        if (base + len > MMAP_USER_V + MMAP_MAX_BYTES) return (uint64_t)-1;
+        uint64_t pf = PTE_USER;
+        if (prot & 0x2) pf |= PTE_WRITE;
+        if (!(prot & 0x4)) pf |= PTE_NX;
+        if (flags & 0x01) pf |= PTE_SHM;   /* MAP_SHARED: never COW on fork */
+        for (uint64_t off = 0; off < len; off += 0x1000)
+            if (!vm_reserve_zfod(kprocs[p].cr3, base + off, pf)) return (uint64_t)-1;
+        kprocs[p].mmap_next = base + len;
+        __sync_fetch_and_add(&g_mmap_calls, 1);
+        if (g_debug_posix)
+            kprintf("[dbgvm  ] mmap pid %u %X bytes prot %x -> %X (reserved, not backed)\n",
+                    kprocs[p].pid, len, prot, base);
+        return base;
+    }
+    case 72: {   /* SYS_MUNMAP(addr, length) -> 0 ok, negative.
+                  * Frees whatever is actually backed, leaves untouched
+                  * reservations costing nothing, and shoots the range down on
+                  * every other core before the frames can be handed out again. */
+        int p = tg_of((int)current_proc_idx);
+        uint64_t va = a0 & ~0xFFFull;
+        uint64_t len = (a1 + 0xFFFull) & ~0xFFFull;
+        if (!len) return (uint64_t)-1;
+        if (va < MMAP_USER_V || va + len > MMAP_USER_V + MMAP_MAX_BYTES) return (uint64_t)-1;
+        uint64_t released = 0;
+        for (uint64_t off = 0; off < len; off += 0x1000) {
+            uint64_t *slot = pte_slot(kprocs[p].cr3, va + off);
+            if (!slot) continue;
+            uint64_t e = *slot;
+            *slot = 0;
+            if (e & PTE_PRESENT) released += (uint64_t)free_frame(e & ADDR_MASK);
+        }
+        /* The mapping is gone locally; a sibling core still holding a stale
+         * translation would be writing into memory the allocator has already
+         * handed to somebody else. */
+        thread_tlb_release(va, (uint32_t)(len / 0x1000));
+        for (uint64_t off = 0; off < len; off += 0x1000)
+            __asm__ volatile("invlpg (%0)" :: "r"(va + off) : "memory");
+        __sync_fetch_and_add(&g_munmap_calls, 1);
+        if (g_debug_posix)
+            kprintf("[dbgvm  ] munmap pid %u %X..%X — %u frame(s) returned\n",
+                    kprocs[p].pid, va, va + len, released);
+        return 0;
+    }
+    case 73: {   /* SYS_MPROTECT(addr, length, prot) -> 0 ok, negative.
+                  * Rewrites permissions on backed pages AND on reservations
+                  * that have not faulted yet — the promise has to change too,
+                  * or the first touch would install the old permissions. */
+        int p = tg_of((int)current_proc_idx);
+        uint64_t va = a0 & ~0xFFFull;
+        uint64_t len = (a1 + 0xFFFull) & ~0xFFFull;
+        uint64_t prot = a2;
+        if (!len || (prot & ~0x7ull)) return (uint64_t)-1;
+        if ((prot & 0x2) && (prot & 0x4)) return (uint64_t)-1;      /* W^X */
+        if (va < MMAP_USER_V || va + len > MMAP_USER_V + MMAP_MAX_BYTES) return (uint64_t)-1;
+        uint64_t pf = PTE_USER;
+        if (prot & 0x2) pf |= PTE_WRITE;
+        if (!(prot & 0x4)) pf |= PTE_NX;
+        for (uint64_t off = 0; off < len; off += 0x1000) {
+            uint64_t *slot = pte_slot(kprocs[p].cr3, va + off);
+            if (!slot || !*slot) continue;
+            uint64_t e = *slot;
+            if (e & PTE_PRESENT) {
+                /* A COW page losing write permission keeps its COW mark: the
+                 * frame is still shared, and a later mprotect back to writable
+                 * must still copy rather than scribble on a sibling. */
+                *slot = (e & (ADDR_MASK | PTE_COW | PTE_SHM)) | pf | PTE_PRESENT;
+                if (e & PTE_COW) *slot &= ~PTE_WRITE;
+            } else if (e & PTE_ZFOD) {
+                *slot = PTE_ZFOD | pf;
+            }
+            __asm__ volatile("invlpg (%0)" :: "r"(va + off) : "memory");
+        }
+        thread_tlb_release(va, (uint32_t)(len / 0x1000));
+        __sync_fetch_and_add(&g_mprotect_calls, 1);
+        return 0;
+    }
+    case 68: {   /* SYS_SETPGID(pid, pgid, foreground) -> 0 ok, negative.
+                  *   pid  0 = the caller.  pgid 0 = "use the target's own pid",
+                  *   which is how a job leader creates its group.
+                  *   foreground != 0 additionally hands that group the console.
+                  *
+                  * The third argument folds tcsetpgrp(3) in rather than spending
+                  * another syscall number on a one-line operation that is never
+                  * useful separately: a shell that creates a job group and does
+                  * not give it the terminal has created a background job, which
+                  * it expresses by simply not passing the flag. */
+        int me = (int)current_proc_idx, meL = tg_of(me);
+        int tgt = meL;
+        if (a0) {
+            tgt = -1;
+            for (int i = 0; i < n_kproc; i++)
+                if (kprocs[i].used && !kprocs[i].exited && kprocs[i].pid == (uint32_t)a0 &&
+                    tg_of(i) == i) { tgt = i; break; }
+            if (tgt < 0) return (uint64_t)-3;                 /* ESRCH */
+            /* Containment, as SYS_KILL has it: a process may place ITSELF or a
+             * CHILD in a group, never an unrelated process — otherwise any task
+             * could drag another into a group it then signals. */
+            if (tgt != meL && kprocs[tgt].ppid_slot != meL) return (uint64_t)-13;  /* EPERM */
+        }
+        int g = (int)(int64_t)a1;
+        if (g < 0) return (uint64_t)-1;
+        if (!g) g = (int)kprocs[tgt].pid;
+        kprocs[tgt].pgid = g;
+        /* Threads follow their leader: a group is a property of the process. */
+        for (int i = 0; i < n_kproc; i++)
+            if (kprocs[i].used && kprocs[i].tg_leader == tgt && i != tgt) kprocs[i].pgid = g;
+        if (a2) g_fg_pgid = g;
+        if (g_debug_posix)
+            kprintf("[dbgposix] setpgid pid %u -> pgid %d%s\n",
+                    kprocs[tgt].pid, (uint64_t)(int64_t)g, a2 ? " (foreground)" : "");
+        return 0;
+    }
+    case 69: {   /* SYS_KILLPG(pgid, signo) -> processes signalled, or negative.
+                  * pgid 0 means the caller's own group. */
+        int me = (int)current_proc_idx, meL = tg_of(me);
+        int sg = (int)(int64_t)a1;
+        int g  = (int)(int64_t)a0;
+        if (sg <= 0 || sg >= NSIG) return (uint64_t)-1;
+        if (!g) g = kprocs[meL].pgid;
+        if (!g) return (uint64_t)-3;                          /* ESRCH */
+        /* Same containment rule as SYS_KILL, applied per member: the caller's
+         * own group, or a group made up of its children. A shell satisfies the
+         * second clause for every job it started, and nothing else satisfies
+         * either — so this cannot be used to signal across the system. */
+        int n = 0;
+        for (int i = 0; i < n_kproc; i++) {
+            if (!kprocs[i].used || kprocs[i].exited || kprocs[i].torn_down) continue;
+            if (kprocs[i].pgid != g || tg_of(i) != i) continue;
+            if (i != meL && kprocs[i].ppid_slot != meL && kprocs[i].pgid != kprocs[meL].pgid)
+                continue;                                     /* not ours to signal */
+            if (sig_raise(i, sg) == 0) n++;
+        }
+        return (uint64_t)(int64_t)n;
+    }
+    case 70: {   /* SYS_SIGPROCMASK(how, mask) -> the PREVIOUS mask.
+                  *   how 0 = block (OR), 1 = unblock (AND NOT), 2 = set.
+                  *
+                  * PER-THREAD, deliberately: this is the half of the signal
+                  * state POSIX does not share across a thread group, and it is
+                  * what lets one thread take a signal while a sibling is inside
+                  * a critical section that must not be interrupted.
+                  * SIGKILL can never be blocked, so it is masked out of any
+                  * request rather than the call being refused — a program that
+                  * blocks "everything" should still be killable, not rejected. */
+        int me = (int)current_proc_idx;
+        uint32_t old = kprocs[me].sig_mask;
+        uint32_t m = (uint32_t)a1 & ~(1u << SIGKILL);
+        if (a0 == 0)      kprocs[me].sig_mask |= m;
+        else if (a0 == 1) kprocs[me].sig_mask &= ~m;
+        else if (a0 == 2) kprocs[me].sig_mask = m;
+        else return (uint64_t)-1;
+        if (g_debug_posix)
+            kprintf("[dbgposix] sigprocmask pid %u how %u mask %x -> %x\n",
+                    kprocs[me].pid, a0, m, (uint64_t)kprocs[me].sig_mask);
+        return old;
+    }
+    case 67:     /* SYS_GETTID() -> this THREAD's own id.
+                  * 0 for a process that never called SYS_THREAD_CREATE, so
+                  * single-threaded code sees a stable, meaningful value rather
+                  * than a sentinel it has to know about. */
+        {
+            int me = (int)current_proc_idx;
+            int t  = (me >= 0 && me < n_kproc) ? kprocs[me].tg_tid : -1;
+            return t < 0 ? 0 : (uint64_t)t;
+        }
     }
     return (uint64_t)-1;
 }
@@ -10031,6 +11837,15 @@ uint64_t syscall_trap(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
     uint64_t r;
     if (num == 47) r = sys_fork(sf, a0);
     else if (num == 51) { sys_sigreturn(sf); r = 0; }   /* never returns */
+    /* v0.61: the blocking pair. They live here rather than in syscall_dispatch
+     * because parking requires the COMPLETE interrupted context, and `sf` is
+     * the only place it exists — the same reason SYS_FORK and SYS_SIGRETURN
+     * are handled at this level. Both may never return. */
+    else if (num == 64) r = sys_futex_wait(sf, a0, a1, a2);
+    else if (num == 66) r = sys_thread_join(sf, a0, a1);
+    /* v0.64: epoll_wait parks like the other two, so it needs `sf` for the
+     * same reason — the complete interrupted context exists nowhere else. */
+    else if (num == 78) r = sys_epoll_wait(sf, a0, a1, a2);
     else if (num == 15) {
         /* Deliver pending signals BEFORE yielding. sys_yield_ring3 unwinds
          * through resume_kernel and never returns, so for a queued ring-3 task
@@ -10148,8 +11963,15 @@ static uint64_t uargs_default(uint64_t cr3, const char *name) {
 static inline int va_is_forkable(uint64_t va) {
     if (va < UPRIVATE_VMAX) return 1;
     if (va >= HEAP_USER_V && va < HEAP_USER_V + HEAP_MAX_BYTES) return 1;
+    /* v0.63: anonymous mmap regions are ordinary private memory and inherit
+     * across fork exactly as the heap does. SHM deliberately does NOT: a
+     * shared segment is attached by an explicit SYS_SHM_MAP, and silently
+     * duplicating the attachment would give a child a mapping it never asked
+     * for and whose reference nobody would think to drop. */
+    if (va >= MMAP_USER_V && va < MMAP_USER_V + MMAP_MAX_BYTES) return 1;
     return 0;
 }
+
 
 static int vm_clone_user(uint64_t src_cr3, uint64_t dst_cr3) {
     uint64_t *pml4 = (uint64_t *)src_cr3;
@@ -10169,14 +11991,46 @@ static int vm_clone_user(uint64_t src_cr3, uint64_t dst_cr3) {
                     if (pte & PTE_PCD) continue;         /* device/DMA alias: never clone */
                     uint64_t va = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
                     if (!va_is_forkable(va)) continue;
-                    uint64_t nf = alloc_frame();
-                    if (!nf) return -1;
-                    const uint8_t *s = (const uint8_t *)(pte & ADDR_MASK);
-                    uint8_t *d = (uint8_t *)nf;
-                    for (int b = 0; b < 0x1000; b++) d[b] = s[b];
-                    /* identical permissions: a read-only text page stays R+X in
-                     * the child, so the child obeys the same W^X policy.       */
-                    map_page(dst_cr3, va, nf, pte & (PTE_USER | PTE_WRITE | PTE_NX));
+                    uint64_t frame = pte & ADDR_MASK;
+                    /* v0.63: COPY-ON-WRITE. The frame is SHARED, not copied,
+                     * and both sides lose write permission so the first write
+                     * from either traps and duplicates just that page.
+                     *
+                     * A read-only page (text) needs no COW mark at all — it can
+                     * never be written, so it can be shared outright and stays
+                     * R+X in the child, preserving W^X exactly as before.
+                     *
+                     * The PARENT's entry is rewritten too, and that is the part
+                     * that is easy to get wrong: if only the child were made
+                     * read-only, the parent would keep writing through to a
+                     * frame the child can still see, and the child would
+                     * observe changes made after the fork. */
+                    if (!frame_share(frame)) continue;   /* not refcountable: skip */
+                    uint64_t perms = pte & (PTE_USER | PTE_NX);
+                    if (pte & PTE_SHM) {
+                        /* MAP_SHARED: the whole point is that writes stay
+                         * visible on both sides, so this must NOT become COW —
+                         * copying it would silently turn shared memory into two
+                         * private copies at the first write. */
+                        map_page(dst_cr3, va, frame, perms | (pte & PTE_WRITE) | PTE_SHM);
+                    } else if ((pte & PTE_WRITE) || (pte & PTE_COW)) {
+                        /* Writable, OR ALREADY COW FROM AN EARLIER FORK. That
+                         * second clause is not defensive tidiness — without it a
+                         * process that forks TWICE is broken: the first fork
+                         * leaves these pages read-only-plus-COW, so the second
+                         * fork sees no PTE_WRITE, mistakes them for read-only
+                         * text, and shares them with the COW mark STRIPPED. The
+                         * page is then permanently unwritable by anyone, and the
+                         * fault handler declines it because nothing left says it
+                         * may be copied. Found live: vsh forks once per pipeline
+                         * stage, so `a | b` killed its second stage while a
+                         * single-stage command worked perfectly. */
+                        pt[i1] = frame | perms | PTE_COW | PTE_PRESENT;   /* parent */
+                        map_page(dst_cr3, va, frame, perms | PTE_COW);    /* child  */
+                        __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+                    } else {
+                        map_page(dst_cr3, va, frame, perms);   /* genuinely read-only */
+                    }
                     copied++;
                 }
             }
@@ -10212,8 +12066,13 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         kprintf("\n[guard  ] STACK OVERFLOW: ring-3 pid %u hit guard page @ %X — task terminated\n",
                 kprocs[current_proc_idx].pid, cr2);
     } else {
-        kprintf("\n[fault  ] ring-3 pid %u fault (vec %u) cr2=%X rip=%X — task terminated\n",
-                kprocs[current_proc_idx].pid, f->vector, cr2, f->rip);
+        /* v0.63: the PTE is the single most useful datum at a ring-3 fault now
+         * that a page can be lazily backed — it distinguishes "never mapped"
+         * (0) from "promised but unbacked" (ZFOD) from "present but protected",
+         * three different bugs that otherwise look identical from outside. */
+        uint64_t fpte = walk_pte(kprocs[current_proc_idx].cr3, cr2 & ~0xFFFull);
+        kprintf("\n[fault  ] ring-3 pid %u fault (vec %u) cr2=%X rip=%X err=%x pte=%X — task terminated\n",
+                kprocs[current_proc_idx].pid, f->vector, cr2, f->rip, f->error, fpte);
     }
     if (cpu_idx() == 0 && curthr->uthread) {
         /* First-class BSP thread: reap it in place and reschedule. The kernel  */
@@ -10221,30 +12080,36 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         /* On an AP, curthr is BSP scheduler state and means nothing — a ring-3 */
         /* fault there unwinds through the AP's own per-CPU resume context.     */
         struct pcb *t = curthr;
+        /* v0.61: shared teardown always names the thread-group LEADER. A
+         * Model-A pcb uthread is always a leader today (uthread_spawn_elf
+         * goes through kproc_spawn), so this resolves to t->proc unchanged
+         * — but it is the leader that owns the address space, and writing
+         * that down is what keeps this path correct if it ever isn't. */
+        const int L = tg_of((int)t->proc);
         /* v0.55: POSIX says a fault kills the whole thread GROUP, not just the
          * faulting thread. We cannot yank a sibling out of ring 3 from here, so
          * post an unblockable SIGKILL to the process: every sibling self-exits
          * at its next syscall boundary (see the SIGKILL check in do_syscall).
          * The faulting thread itself only tears the address space down if it is
          * the last one standing. */
-        if (kprocs[t->proc].nthreads > 1) {
-            __sync_fetch_and_or(&kprocs[t->proc].sig_pending, 1u << SIGKILL);
-            kprocs[t->proc].exit_code = 0x8000 + f->vector;
-            posix_thread_leave((int)t->proc);
+        if (kprocs[L].nthreads > 1) {
+            __sync_fetch_and_or(&kprocs[L].sig_pending, 1u << SIGKILL);
+            kprocs[L].exit_code = 0x8000 + f->vector;
+            posix_thread_leave(L);
             kprintf("[uthread] faulting tid %d reaped; SIGKILL posted to %d sibling(s)\n",
-                    (uint64_t)t->id, (uint64_t)(int64_t)kprocs[t->proc].nthreads);
+                    (uint64_t)t->id, (uint64_t)(int64_t)kprocs[L].nthreads);
             t->state = T_FREE;
             sched_switch_to(pick_next());    /* does not return                 */
             for (;;) __asm__ volatile("hlt");
         }
-        posix_thread_leave((int)t->proc);     /* last thread: balance the count  */
+        posix_thread_leave(L);     /* last thread: balance the count  */
         /* Synchronous fault on the dying task's behalf — thread context in     */
         /* effect, so the rank-5 acquire is legal here (never from a real IRQ). */
         klock_acquire(&g_surf_lock);
-        surfaces_reclaim((int)t->proc);
+        surfaces_reclaim(L);
         klock_release(&g_surf_lock);
-        kprocs[t->proc].exit_code = 0x8000 + f->vector;
-        kprocs[t->proc].exited = 1;
+        kprocs[L].exit_code = 0x8000 + f->vector;
+        kprocs[L].exited = 1;
         /* v0.42: write_cr3(kernel_cr3) already ran above, before this branch — */
         /* the faulting space is off every core, so tear it down here too.      */
         /* v0.45: this is the ONE path that could previously leak a descriptor  */
@@ -10252,20 +12117,21 @@ static void handle_cpl3_fault(struct isr_frame *f) {
         /* never runs. descriptor_teardown_kproc force-closes it here instead.  */
         /* v0.46: same reasoning extends to an in-flight IPC shmem grant.       */
         /* v0.47: and to IRQ-line ownership, for the exact same reason.         */
-        vfio_teardown_kproc((int)t->proc);
-        gpu_teardown_kproc((int)t->proc);
-        audio_teardown_kproc((int)t->proc);
-        usb_teardown_kproc((int)t->proc);
-        net_teardown_kproc((int)t->proc);
-        wimp_teardown_kproc((int)t->proc);
-        ipc_teardown_kproc((int)t->proc);
-        descriptor_teardown_kproc((int)t->proc);
-        dma_teardown_kproc((int)t->proc);      /* v0.44: revoke DMA/IOMMU grants FIRST */
-        kprocs[t->proc].frames_freed = page_free_tree(kprocs[t->proc].cr3);
-        posix_proc_reaped((int)t->proc);    /* v0.55: record status + SIGCHLD FIRST — */
-        kprocs[t->proc].torn_down = 1;      /* v0.45: NOW the slot is safe to recycle */
+        vfio_teardown_kproc(L);
+        gpu_teardown_kproc(L);
+        audio_teardown_kproc(L);
+        usb_teardown_kproc(L);
+        net_teardown_kproc(L);
+        wimp_teardown_kproc(L);
+        ipc_teardown_kproc(L);
+        shm_teardown_kproc(L);      /* v0.63 */
+        descriptor_teardown_kproc(L);
+        dma_teardown_kproc(L);      /* v0.44: revoke DMA/IOMMU grants FIRST */
+        kprocs[L].frames_freed = page_free_tree(kprocs[L].cr3);
+        posix_proc_reaped(L);    /* v0.55: record status + SIGCHLD FIRST — */
+        kprocs[L].torn_down = 1;      /* v0.45: NOW the slot is safe to recycle */
         kprintf("[uthread] faulting tid %d terminated — siblings and kernel unaffected, %u frame(s) reclaimed\n",
-                (uint64_t)t->id, kprocs[t->proc].frames_freed);
+                (uint64_t)t->id, kprocs[L].frames_freed);
         t->state = T_FREE;
         sched_switch_to(pick_next());        /* does not return                 */
         for (;;) __asm__ volatile("hlt");
@@ -12162,10 +14028,15 @@ uint8_t g_execbuf[VFS_MAX_FILE_BYTES] __attribute__((aligned(16)));
 static int exec_from_cas(const char *name, int proc_idx) {
     int di = vfs_find(name);
     if (di < 0) { kprintf("[exec   ] '%s' not found in VFS\n", name); return -1; }
+    /* v0.61: the staging buffer is shared by every core — hold it from the
+     * read through the parse. elf_load copies each segment into the target
+     * process's own pages, so the buffer is free again the moment it returns. */
+    execbuf_acquire();
     int64_t n = vfs_read_file(di, g_execbuf, sizeof g_execbuf);
     kprintf("[exec   ] read %d ELF bytes from CAS (file_hash %X) — not a GRUB module\n",
             n, DENTS[di].file_hash);
     uint64_t entry = elf_load(proc_idx, (uint64_t)g_execbuf, (uint64_t)n);
+    execbuf_release();
     if (!entry) { kprintf("[exec   ] ELF load failed\n"); return -1; }
     enter_process(name, proc_idx, entry);
     return 0;
@@ -12320,6 +14191,29 @@ static const char SDK_UNISTD_H[] =
 "int fork(void);                  /* returns twice: 0 in the child           */\n"
 "int waitpid(int pid, int timeout);\n"
 "int yield(void);\n"
+"/* v0.62: process groups. A shell puts each pipeline in its own group and\n"
+" * gives that group the terminal for as long as it runs; the interrupt\n"
+" * character then reaches the job and leaves the shell alone. This is why\n"
+" * /bin/vsh survives Ctrl+C without installing a signal handler — which\n"
+" * matters, because occ cannot produce a function pointer to install. */\n"
+"int setpgid(int pid, int pgid, int fg);   /* pid 0 = self, pgid 0 = own pid  */\n"
+"int killpg(int pgid, int sig);\n"
+"int sigprocmask(int how, int mask);       /* 0 block, 1 unblock, 2 set       */\n"
+"/* v0.64: epoll and eventfd. epoll_wait fills `events` with PAIRS of words —\n"
+" * mask then cookie, 16 bytes per entry — and returns how many it wrote, or\n"
+" * -11 meaning \"you slept, ask again\", the same retry contract thread_join\n"
+" * has. An eventfd is read and written as an ordinary 8-byte descriptor. */\n"
+"#define EPOLLIN  1\n"
+"#define EPOLLOUT 4\n"
+"#define EPOLLERR 8\n"
+"#define EPOLLHUP 16\n"
+"#define EPOLL_CTL_ADD 1\n"
+"#define EPOLL_CTL_DEL 2\n"
+"#define EPOLL_CTL_MOD 3\n"
+"int epoll_create(int flags);\n"
+"int epoll_ctl(int epfd, int op, int fd, int events, int cookie);\n"
+"int epoll_wait(int epfd, int *events, int maxevents, int timeout_ms);\n"
+"int eventfd(int initval, int flags);\n"
 "int unlink(char *path);\n"
 "/* v0.58: execp() replaces this image with an ELF loaded BY PATH out of the\n"
 " * VFS. `argv` is a WORD array of pointers terminated by a 0 — which is what\n"
@@ -12375,17 +14269,28 @@ static const char SDK_PTHREAD_H[] =
 " * genuine kernel-scheduled threads sharing one address space, with refcounted\n"
 " * thread-group teardown, and /bin/init's pthread shim is built on them.\n"
 " *\n"
-" * TWO honest limits apply here:\n"
-" *   1. SYS_THREAD_CREATE is BSP-ONLY and the kernel ENFORCES that. A process\n"
-" *      running on an application processor cannot create threads; the call is\n"
-" *      refused rather than hanging, which is what it used to do.\n"
-" *   2. It takes a function POINTER, and occ cannot produce one. So this API\n"
-" *      is reachable from /bin/init and not from occ-compiled source.\n"
+" * v0.61 LIFTED THE BSP-ONLY RESTRICTION. A thread is now its own scheduling\n"
+" * entity — its own kernel task sharing the leader's address space — so it can\n"
+" * be created from any core and dispatched on any core, with work stealing,\n"
+" * affinity and preemption applying to it exactly as to a process.\n"
+" *\n"
+" * Threads can also BLOCK now: SYS_FUTEX_WAIT/WAKE park a thread in no run\n"
+" * queue at all rather than spinning, and SYS_THREAD_JOIN waits on the same\n"
+" * machinery. Every wait is bounded — 0 means the kernel default, never\n"
+" * forever.\n"
+" *\n"
+" * ONE honest limit remains:\n"
+" *   It takes a function POINTER, and occ cannot produce one. So this API\n"
+" *   is reachable from /bin/init and not from occ-compiled source.\n"
 " *\n"
 " * Declared here because it is part of the ABI a program targeting this system\n"
 " * needs to know about, not because occ can call it today. */\n"
-"#define SYS_THREAD_CREATE 52\n"
-"#define SYS_THREAD_EXIT   53\n"
+"#define SYS_THREAD_CREATE 52   /* (entry, arg, stack) -> tid; stack 0 = kernel's */\n"
+"#define SYS_THREAD_EXIT   53   /* (code) -> does not return                      */\n"
+"#define SYS_FUTEX_WAIT    64   /* (uaddr, val, ticks) 0 / -EAGAIN / -ETIMEDOUT   */\n"
+"#define SYS_FUTEX_WAKE    65   /* (uaddr, n) -> waiters released                 */\n"
+"#define SYS_THREAD_JOIN   66   /* (tid, u64 *code) 0 / -EAGAIN: call again       */\n"
+"#define SYS_GETTID        67   /* () -> this thread's id; 0 for the leader       */\n"
 "#endif\n";
 
 /* The runtime. This IS compiled — occ prepends it to every translation unit,
@@ -12507,6 +14412,25 @@ static const char SDK_LIBC_OC[] =
 "int waitpid(int pid, int timeout) { return __syscall(56, pid, timeout, 0); }\n"
 "int yield(void)   { return __syscall(15, 0, 0, 0); }\n"
 "int kill(int pid, int sig) { return __syscall(50, pid, sig, 0); }\n"
+"/* v0.62: JOB CONTROL. setpgid names a group of processes; the third argument\n"
+" * additionally hands that group the console, so the interrupt character\n"
+" * reaches the job and not the shell waiting on it. pid 0 = me, pgid 0 = my\n"
+" * own pid (which is how a job leader creates its group). */\n"
+"int setpgid(int pid, int pgid, int fg) { return __syscall(68, pid, pgid, fg); }\n"
+"int killpg(int pgid, int sig) { return __syscall(69, pgid, sig, 0); }\n"
+"int sigprocmask(int how, int mask) { return __syscall(70, how, mask, 0); }\n"
+"/* v0.64: event-driven I/O. The kernel ABI has three argument registers, so\n"
+" * epoll_ctl and epoll_wait PACK their extra arguments; these wrappers present\n"
+" * the ordinary shapes over that. An epoll_event here is two words: the mask\n"
+" * and an opaque cookie handed back verbatim. */\n"
+"int epoll_create(int flags) { return __syscall(76, flags, 0, 0); }\n"
+"int epoll_ctl(int epfd, int op, int fd, int events, int cookie) {\n"
+"  return __syscall(77, epfd, (op << 32) | (fd & 4294967295), (cookie << 32) | (events & 4294967295));\n"
+"}\n"
+"int epoll_wait(int epfd, int *events, int maxevents, int timeout_ms) {\n"
+"  return __syscall(78, epfd, events, (timeout_ms << 32) | (maxevents & 4294967295));\n"
+"}\n"
+"int eventfd(int initval, int flags) { return __syscall(79, initval, flags, 0); }\n"
 "int exit(int status) { __syscall(2, status, 0, 0); return 0; }\n"
 "/* v0.58: run another program, and read the console. These three are what turn\n"
 " * a compiled program from something that computes into something that can\n"
@@ -13635,6 +15559,13 @@ static int posix_drain(int *procs, int nproc, struct px_round *R, uint64_t watch
             sched_yield();
             continue;
         }
+        /* v0.61: the run queue is dry and the round has not finished — either a
+         * sibling core is still working, or someone is parked on a futex whose
+         * wake never came. The BSP sits in THIS loop rather than in idle_fn for
+         * the whole of a suite round, so without a scan here a timed-out park
+         * would never be rescued and the round would end on the watchdog with
+         * no explanation instead of on a specific failed assertion. */
+        futex_timeout_scan();
         if (++spins & 1) sched_yield();
         if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);
         /* Progress breadcrumb: in a serial log a silent stall is
@@ -14232,6 +16163,597 @@ static void cmd_lang_stress(void) {
     if (!g_lsfail)
         kputs("[langstrs] LANGUAGE AND TOOLCHAIN VERIFIED — sizeof, for-init, switch, unsigned, and a native make\n");
     else kputs("[langstrs] LANGUAGE DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.61: THREAD STRESS (threadstrs)
+ * ===========================================================================
+ * Role 43 runs four futex-synchronised workers, a thread on a caller-supplied
+ * stack, and one that genuinely sleeps until woken. The driver reports its own
+ * verdict; everything the driver CANNOT honestly claim about itself is audited
+ * here from outside: which cores its threads were dispatched on, whether their
+ * stacks came back to the allocator, whether the group refcount reconciled,
+ * and whether anything is still parked when the round is over.              */
+static int g_utpass = 0, g_utfail = 0;
+static void utcheck(const char *what, int ok) {
+    if (ok) { g_utpass++; kprintf("[threadstrs] PASS: %s\n", what); }
+    else    { g_utfail++; kprintf("[threadstrs] FAIL: %s\n", what); }
+}
+
+static void cmd_thread_stress(void) {
+    kputs("-- THREAD STRESS: ring-3 threads across cores, futex blocking, kernel join --\n");
+    g_utpass = g_utfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0  = g_rank_violations;
+    uint32_t waits0 = g_futex_waits, wakes0 = g_futex_wakes;
+    uint32_t tmo0   = g_futex_timeouts, races0 = g_futex_lost_races;
+    g_thr_ran_mask = 0; g_thr_released = 0; g_thr_stk_pages = 0;
+
+    int p = kproc_spawn("threadstr", PCAP_FILESYSTEM);
+    if (p < 0) { utcheck("kproc_spawn never fails", 0);
+        kprintf("[threadstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_utpass, (uint64_t)g_utfail);
+        return; }
+    kprocs[p].role = 43;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { utcheck("the driver's ELF loads", 0);
+        kprintf("[threadstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_utpass, (uint64_t)g_utfail);
+        return; }
+    kprocs[p].entry = e;
+    /* Deliberately NOT pinned to cpu 0. v0.55 had to pin thread-creating
+     * processes there because SYS_THREAD_CREATE was BSP-only; leaving the
+     * affinity mask unrestricted is what makes this suite a test of the
+     * restriction having actually been lifted rather than a re-run of the
+     * old one. */
+    uint32_t pid0 = kprocs[p].pid;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    /* Six threads, 600 mutex round trips, two deliberate futex timeouts and a
+     * 300-yield settle before the gate opens — under TCG that is slow, and the
+     * watchdog has to leave room for it without hiding a genuine stall. */
+    int finished = posix_drain(procs, 1, &R, 160000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[threadstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 960 ? "" :
+        R.code[0] == 961 ? "SYS_GETTID on the main thread did not answer 0" :
+        R.code[0] == 962 ? "a thread could not be created, or the kernel's tid disagreed with userland's index" :
+        R.code[0] == 963 ? "SYS_THREAD_JOIN failed or never completed" :
+        R.code[0] == 964 ? "a thread's exit code came back wrong" :
+        R.code[0] == 965 ? "THE COUNTER CAME OUT SHORT — the futex mutex is not mutually exclusive" :
+        R.code[0] == 966 ? "not every worker thread ran" :
+        R.code[0] == 967 ? "a thread on a CALLER-SUPPLIED stack could not be created" :
+        R.code[0] == 968 ? "the caller-supplied-stack thread returned the wrong value" :
+        R.code[0] == 969 ? "the gate thread could not be created" :
+        R.code[0] == 970 ? "the sleeping thread never observed the wake (or passed the gate early)" :
+        R.code[0] == 971 ? "a futex wait with NO waker did not time out — an unbounded park" :
+        R.code[0] == 972 ? "a futex wait on a mismatched value did not return EAGAIN" :
+        R.code[0] == 973 ? "getpid()/gettid() disagreed across the thread group" :
+                           "unknown";
+    if (R.code[0] != 960)
+        kprintf("[threadstrs] driver exit %u — %s\n", R.code[0], why);
+
+    utcheck("the driver created, synchronised and joined its threads (exit 960)",
+            finished && R.code[0] == 960);
+
+    /* ---- what the driver cannot claim about itself ------------------------ */
+    kprintf("[threadstrs] threads released %u, stack pages reclaimed %u, ran_on mask %x (cores online %d)\n",
+            g_thr_released, g_thr_stk_pages, (uint64_t)g_thr_ran_mask, (uint64_t)(int64_t)n);
+    utcheck("every thread released its own slot (6 created, 6 released)",
+            g_thr_released == 6);
+    /* 5 kernel-allocated stacks of THR_STK_PAGES; the sixth thread ran on a
+     * caller-supplied stack the kernel must NOT have freed. */
+    utcheck("each kernel-allocated thread stack came back, and the caller's did not",
+            g_thr_stk_pages == 5u * THR_STK_PAGES);
+
+    int cores_used = 0;
+    for (int c = 0; c < MAX_CPUS; c++) if (g_thr_ran_mask & (1u << c)) cores_used++;
+    if (n > 1) {
+        /* THE POINT OF THE MILESTONE. Before v0.61 a ring-3 thread was a BSP
+         * scheduler thread and could only ever be dispatched on cpu 0, so this
+         * mask was always exactly 1. */
+        utcheck("threads were dispatched on MORE THAN ONE core", cores_used >= 2);
+        utcheck("at least two cores were inside ring 3 simultaneously", g_inr3_max >= 2);
+    } else {
+        utcheck("on a uniprocessor every thread ran on cpu 0", g_thr_ran_mask == 1u);
+    }
+
+    kprintf("[threadstrs] futex: +%u parked, +%u woken, +%u timed out, +%u woken mid-arming\n",
+            g_futex_waits - waits0, g_futex_wakes - wakes0,
+            g_futex_timeouts - tmo0, g_futex_lost_races - races0);
+    /* A futex that never actually parks anybody would pass the mutex test by
+     * accident — the counter would still be right, just spun for. */
+    utcheck("threads genuinely PARKED rather than spinning", g_futex_waits > waits0);
+    utcheck("parked threads were woken by SYS_FUTEX_WAKE", g_futex_wakes > wakes0);
+    utcheck("the deliberate no-waker wait expired through the timeout watchdog",
+            g_futex_timeouts > tmo0);
+
+    /* ---- the group came apart cleanly ------------------------------------- */
+    int still_parked = 0, still_armed = 0, thr_slots_live = 0;
+    for (int s = 0; s < n_kproc; s++) {
+        if (kprocs[s].parked)     still_parked++;
+        if (kprocs[s].wait_armed) still_armed++;
+        if (kprocs[s].used && kprocs[s].tg_leader >= 0 && kprocs[s].tg_leader != s
+            && !kprocs[s].torn_down) thr_slots_live++;
+    }
+    utcheck("nothing is left parked on a futex when the round is over",
+            still_parked == 0 && still_armed == 0);
+    utcheck("no thread slot is left un-torn-down", thr_slots_live == 0);
+    utcheck("the thread group's refcount reconciled to zero",
+            kprocs[p].pid != pid0 || kprocs[p].nthreads <= 0);
+
+    int fds_leaked = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    utcheck("no descriptor leaked across the thread group", fds_leaked == 0);
+
+    /* v0.61: the exec staging buffer's contention count. Non-zero on SMP is the
+     * evidence that two cores really do try to exec at the same time — which is
+     * the race the v0.60 pipestrs "flake" turned out to be. Zero on a
+     * uniprocessor, by construction. */
+    kprintf("[threadstrs] exec staging buffer: %u contended acquisition(s)\n",
+            g_execbuf_contended);
+    kprintf("[threadstrs] +%u freed, +%u reused; global depth %u\n",
+            g_frames_freed - freed0, g_frames_reused - reused0, g_frame_free_depth);
+    utcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    utcheck("no lock-rank violation across the threading paths",
+            g_rank_violations == viol0);
+
+    kprintf("[threadstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_utpass, (uint64_t)g_utfail);
+    if (!g_utfail)
+        kputs("[threadstrs] RING-3 THREADS VERIFIED — scheduled on every core, blocking without spinning\n");
+    else kputs("[threadstrs] THREADING DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.62: PTHREADS_SMP — mutex contention and a condition variable
+ * =========================================================================== */
+static int g_pspass = 0, g_psfail = 0;
+static void pscheck(const char *what, int ok) {
+    if (ok) { g_pspass++; kprintf("[pthreads_smp] PASS: %s\n", what); }
+    else    { g_psfail++; kprintf("[pthreads_smp] FAIL: %s\n", what); }
+}
+
+static void cmd_pthreads_smp(void) {
+    kputs("-- PTHREADS SMP: mutex contention and a condition variable across cores --\n");
+    g_pspass = g_psfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations, waits0 = g_futex_waits, wakes0 = g_futex_wakes;
+    g_thr_ran_mask = 0; g_thr_released = 0; g_thr_stk_pages = 0;
+
+    int p = kproc_spawn("pthreadsmp", PCAP_FILESYSTEM);
+    if (p < 0) { pscheck("kproc_spawn never fails", 0);
+        kprintf("[pthreads_smp] RESULT: %d passed, %d failed\n", (uint64_t)g_pspass, (uint64_t)g_psfail);
+        return; }
+    kprocs[p].role = 44;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { pscheck("the driver's ELF loads", 0);
+        kprintf("[pthreads_smp] RESULT: %d passed, %d failed\n", (uint64_t)g_pspass, (uint64_t)g_psfail);
+        return; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 200000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[pthreads_smp] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 940 ? "" :
+        R.code[0] == 938 ? "pthread_cond_signal released the WRONG NUMBER of waiters" :
+        R.code[0] == 939 ? "pthread_self() disagreed with the thread's own index" :
+        R.code[0] == 941 ? "a fresh mutex was not acquirable exactly once" :
+        R.code[0] == 942 ? "pthread_create failed" :
+        R.code[0] == 943 ? "not every worker reached the condition variable" :
+        R.code[0] == 944 ? "a worker passed the predicate BEFORE it was ever set" :
+        R.code[0] == 945 ? "pthread_join failed or timed out" :
+        R.code[0] == 946 ? "a thread's return value came back wrong" :
+        R.code[0] == 947 ? "not every worker ran" :
+        R.code[0] == 948 ? "THE COUNTER CAME OUT SHORT — the mutex is not mutually exclusive" :
+        R.code[0] == 949 ? "a broadcast failed to release every sleeper" :
+                           "unknown";
+    if (R.code[0] != 940) kprintf("[pthreads_smp] driver exit %u — %s\n", R.code[0], why);
+
+    pscheck("mutex contention, condvar broadcast and joins all behaved (exit 940)",
+            finished && R.code[0] == 940);
+    kprintf("[pthreads_smp] threads released %u, stack pages %u, ran_on mask %x; futex +%u parked, +%u woken\n",
+            g_thr_released, g_thr_stk_pages, (uint64_t)g_thr_ran_mask,
+            g_futex_waits - waits0, g_futex_wakes - wakes0);
+    pscheck("every worker thread released its own slot and stack",
+            g_thr_released == 4 && g_thr_stk_pages == 4u * THR_STK_PAGES);
+    /* A condvar that never actually parked anyone would still let the tally
+     * come out right — the workers would simply spin until the predicate
+     * flipped. This is what separates the two. */
+    pscheck("threads PARKED on the mutex and the condvar rather than spinning",
+            g_futex_waits > waits0 && g_futex_wakes > wakes0);
+    int cores = 0;
+    for (int c = 0; c < MAX_CPUS; c++) if (g_thr_ran_mask & (1u << c)) cores++;
+    if (n > 1) pscheck("worker threads were dispatched on MORE THAN ONE core", cores >= 2);
+    else       pscheck("on a uniprocessor every worker ran on cpu 0", g_thr_ran_mask == 1u);
+    pscheck("free-frame count reconciles (no leak across the thread group)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    pscheck("no lock-rank violation across the pthread paths", g_rank_violations == viol0);
+    kprintf("[pthreads_smp] +%u freed, +%u reused; global depth %u\n",
+            g_frames_freed - freed0, g_frames_reused - reused0, g_frame_free_depth);
+    kprintf("[pthreads_smp] RESULT: %d passed, %d failed\n", (uint64_t)g_pspass, (uint64_t)g_psfail);
+    if (!g_psfail) kputs("[pthreads_smp] POSIX THREADS VERIFIED — exclusive under contention, and able to sleep\n");
+    else kputs("[pthreads_smp] PTHREAD DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.62: SIGSTRS — masks, dispositions, and process-group delivery
+ * =========================================================================== */
+static int g_sgpass = 0, g_sgfail = 0;
+static void sgcheck(const char *what, int ok) {
+    if (ok) { g_sgpass++; kprintf("[sigstrs] PASS: %s\n", what); }
+    else    { g_sgfail++; kprintf("[sigstrs] FAIL: %s\n", what); }
+}
+
+static void cmd_sig_stress(void) {
+    kputs("-- SIGSTRS: signal masks, dispositions, and process-group delivery --\n");
+    g_sgpass = g_sgfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t raised0 = g_sig_raised, delivered0 = g_sig_delivered, returned0 = g_sig_returned;
+
+    int p = kproc_spawn("sigstr", PCAP_FILESYSTEM);
+    if (p < 0) { sgcheck("kproc_spawn never fails", 0);
+        kprintf("[sigstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_sgpass, (uint64_t)g_sgfail);
+        return; }
+    kprocs[p].role = 45;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { sgcheck("the driver's ELF loads", 0);
+        kprintf("[sigstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_sgpass, (uint64_t)g_sgfail);
+        return; }
+    kprocs[p].entry = e;
+
+    /* ---- the terminal interrupt path, tested against the real function ----
+     * A headless boot has nobody to press Ctrl+C, so the console's own
+     * tty_intr() is called directly here. That is deliberately the SAME
+     * function the tty read path calls when it sees 0x03 — a suite that
+     * exercised a parallel code path would be testing something the machine
+     * does not do. Run BEFORE the driver starts, so it is deterministic; the
+     * pending bit is cleared afterwards so the driver is not killed by it. */
+    int saved_fg = g_fg_pgid;
+    g_fg_pgid = 0;
+    sgcheck("an interrupt with NO foreground group signals nobody", tty_intr() == 0);
+    g_fg_pgid = kprocs[p].pgid;
+    int hit = tty_intr();
+    int pend = (kprocs[p].sig_pending & (1u << SIGINT)) != 0;
+    sgcheck("the console interrupt reaches the foreground process group", hit == 1 && pend);
+    __sync_fetch_and_and(&kprocs[p].sig_pending, ~(1u << SIGINT));   /* let it live */
+    g_fg_pgid = saved_fg;
+    sgcheck("a process leads its own group by default",
+            kprocs[p].pgid == (int)kprocs[p].pid);
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 200000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[sigstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 950 ? "" :
+        R.code[0] == 951 ? "a raised signal never reached its handler" :
+        R.code[0] == 952 ? "the handler was called with the wrong signal number" :
+        R.code[0] == 953 ? "SIGRETURN did not restore the interrupted context" :
+        R.code[0] == 954 ? "A BLOCKED SIGNAL WAS DELIVERED ANYWAY" :
+        R.code[0] == 955 ? "a blocked signal was DROPPED instead of held until unblock" :
+        R.code[0] == 956 ? "SIGPROCMASK(SETMASK) did not replace the mask" :
+        R.code[0] == 957 ? "SIG_IGN did not discard the signal" :
+        R.code[0] == 958 ? "fork failed before the process-group round" :
+        R.code[0] == 959 ? "SYS_SETPGID refused a child of the caller" :
+        R.code[0] == 960 ? "SYS_KILLPG did not reach every member of the group" :
+        R.code[0] == 961 ? "a group member did not take the DEFAULT action for SIGINT" :
+                           "unknown";
+    if (R.code[0] != 950) kprintf("[sigstrs] driver exit %u — %s\n", R.code[0], why);
+
+    sgcheck("handlers, masks, SIG_IGN and group delivery all behaved (exit 950)",
+            finished && R.code[0] == 950);
+    kprintf("[sigstrs] signals: +%u raised, +%u delivered, +%u returned; %u tty interrupt(s)\n",
+            g_sig_raised - raised0, g_sig_delivered - delivered0,
+            g_sig_returned - returned0, g_tty_intrs);
+    /* Every delivery must be matched by a sigreturn, or a handler ran and the
+     * interrupted context was never put back — which is a silent corruption,
+     * not a crash, and would otherwise go unnoticed. */
+    sgcheck("every delivered signal was answered by a SIGRETURN",
+            (g_sig_delivered - delivered0) == (g_sig_returned - returned0));
+    sgcheck("signals were actually delivered (the suite is not vacuously passing)",
+            g_sig_delivered > delivered0);
+    sgcheck("no lock-rank violation across the signal paths", g_rank_violations == viol0);
+    kprintf("[sigstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_sgpass, (uint64_t)g_sgfail);
+    if (!g_sgfail) kputs("[sigstrs] SIGNALS VERIFIED — masks hold, groups deliver, contexts come back\n");
+    else kputs("[sigstrs] SIGNAL DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.63: MMAPSTRS — demand paging audited from the allocator's side
+ * =========================================================================== */
+static int g_mmpass = 0, g_mmfail = 0;
+static void mmcheck(const char *what, int ok) {
+    if (ok) { g_mmpass++; kprintf("[mmapstrs] PASS: %s\n", what); }
+    else    { g_mmfail++; kprintf("[mmapstrs] FAIL: %s\n", what); }
+}
+
+static void cmd_mmap_stress(void) {
+    kputs("-- MMAPSTRS: demand-zero paging, mprotect, and munmap --\n");
+    g_mmpass = g_mmfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t zf0 = g_zfod_faults, mm0 = g_mmap_calls, mu0 = g_munmap_calls, mp0 = g_mprotect_calls;
+    uint64_t inuse0 = g_next_frame / 0x1000 - g_frame_free_depth;
+
+    int p = kproc_spawn("mmapstr", PCAP_FILESYSTEM);
+    if (p < 0) { mmcheck("kproc_spawn never fails", 0); goto out; }
+    kprocs[p].role = 46;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { mmcheck("the driver's ELF loads", 0); goto out; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 200000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[mmapstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 980 ? "" :
+        R.code[0] == 981 ? "a 1 MiB anonymous mmap failed outright" :
+        R.code[0] == 982 ? "mmap returned an address that is not page aligned" :
+        R.code[0] == 983 ? "A DEMAND-ZERO PAGE CAME BACK NON-ZERO (stale frame contents)" :
+        R.code[0] == 984 ? "a written page did not read back" :
+        R.code[0] == 985 ? "mmap ACCEPTED a WRITE+EXEC mapping — W^X was not enforced" :
+        R.code[0] == 986 ? "a small mmap failed" :
+        R.code[0] == 987 ? "mprotect to read-only failed" :
+        R.code[0] == 988 ? "a read-only page stopped being readable" :
+        R.code[0] == 989 ? "A WRITE TO A READ-ONLY PAGE SUCCEEDED" :
+        R.code[0] == 990 ? "the write fault did not raise exactly one SIGSEGV" :
+        R.code[0] == 991 ? "mprotect back to writable failed" :
+        R.code[0] == 992 ? "the page did not become writable again" :
+        (R.code[0] == 993 || R.code[0] == 994) ? "munmap failed" :
+        R.code[0] == 995 ? "a >128 KiB malloc failed (the mmap path)" :
+        R.code[0] == 996 ? "an mmap-backed malloc block did not hold its data" :
+                           "unknown";
+    if (R.code[0] != 980) kprintf("[mmapstrs] driver exit %u — %s\n", R.code[0], why);
+
+    mmcheck("mapping, demand-zero, protection changes and release all behaved (exit 980)",
+            finished && R.code[0] == 980);
+    kprintf("[mmapstrs] mmap %u, munmap %u, mprotect %u; %u demand-zero fault(s)\n",
+            g_mmap_calls - mm0, g_munmap_calls - mu0, g_mprotect_calls - mp0,
+            g_zfod_faults - zf0);
+    /* THE POINT OF DEMAND PAGING. The driver maps 1 MiB (256 pages) and touches
+     * 8. If mapping allocated eagerly the fault count would be ~0 and the
+     * frame count would jump by 256; both numbers say otherwise. */
+    uint64_t zf = g_zfod_faults - zf0;
+    mmcheck("pages were backed ON FAULT, not at mmap time (some faults, far fewer than mapped)",
+            zf > 0 && zf < 64);
+    mmcheck("mmap/munmap/mprotect were all actually exercised",
+            g_mmap_calls > mm0 && g_munmap_calls > mu0 && g_mprotect_calls > mp0);
+    uint64_t inuse1 = g_next_frame / 0x1000 - g_frame_free_depth;
+    kprintf("[mmapstrs] frames in use %u -> %u (delta %d)\n",
+            inuse0, inuse1, (uint64_t)(int64_t)(inuse1 - inuse0));
+    mmcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    mmcheck("no lock-rank violation across the VM paths", g_rank_violations == viol0);
+    kprintf("[mmapstrs] +%u freed, +%u reused\n", g_frames_freed - freed0, g_frames_reused - reused0);
+out:
+    kprintf("[mmapstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_mmpass, (uint64_t)g_mmfail);
+    if (!g_mmfail) kputs("[mmapstrs] VIRTUAL MEMORY VERIFIED — mapped lazily, protected, and given back\n");
+    else kputs("[mmapstrs] VIRTUAL MEMORY DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.63: SHMSTRS — copy-on-write, and sharing that really is zero copy
+ * =========================================================================== */
+static int g_shpass = 0, g_shfail = 0;
+static void shcheck(const char *what, int ok) {
+    if (ok) { g_shpass++; kprintf("[shmstrs] PASS: %s\n", what); }
+    else    { g_shfail++; kprintf("[shmstrs] FAIL: %s\n", what); }
+}
+
+static void cmd_shm_stress(void) {
+    kputs("-- SHMSTRS: copy-on-write fork and zero-copy shared memory --\n");
+    g_shpass = g_shfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t sh0 = g_frames_shared, cw0 = g_frames_cow_copied, cf0 = g_cow_faults;
+    uint64_t cr0 = g_shm_creates, mp0 = g_shm_maps;
+
+    int p = kproc_spawn("shmstr", PCAP_FILESYSTEM | PCAP_IPC);
+    if (p < 0) { shcheck("kproc_spawn never fails", 0); goto out; }
+    kprocs[p].role = 47;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { shcheck("the driver's ELF loads", 0); goto out; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 2; for (int c = 0; c < 7; c++) R.cgot[c] = 0;
+    R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 200000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[shmstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 970 ? "" :
+        R.code[0] == 971 ? "fork failed before the COW round" :
+        R.code[0] == 972 ? "the COW child exited wrong (its own checks failed)" :
+        R.code[0] == 973 ? "THE CHILD'S WRITE LEAKED INTO THE PARENT — COW did not copy" :
+        R.code[0] == 974 ? "SYS_SHM_CREATE failed" :
+        R.code[0] == 975 ? "SYS_SHM_MAP failed in the creator" :
+        R.code[0] == 976 ? "a fresh shared segment was not zeroed" :
+        R.code[0] == 977 ? "fork failed before the sharing round" :
+        R.code[0] == 978 ? "the sharing child exited wrong (it could not see the segment)" :
+        R.code[0] == 979 ? "THE CHILD'S WRITE WAS NOT VISIBLE — the mapping is not shared" :
+                           "unknown";
+    if (R.code[0] != 970) kprintf("[shmstrs] driver exit %u — %s\n", R.code[0], why);
+
+    shcheck("COW fork and zero-copy sharing both behaved (exit 970)",
+            finished && R.code[0] == 970);
+    kprintf("[shmstrs] frames shared +%u, COW faults +%u (of which copied %u); shm created %u, mapped %u\n",
+            g_frames_shared - sh0, g_cow_faults - cf0, g_frames_cow_copied - cw0,
+            g_shm_creates - cr0, g_shm_maps - mp0);
+    /* fork must SHARE rather than copy — that is the change this milestone
+     * makes to fork, and a fork that still copied eagerly would show no shares. */
+    shcheck("fork SHARED its pages instead of copying them up front",
+            g_frames_shared > sh0);
+    shcheck("a write after fork actually triggered copy-on-write",
+            g_cow_faults > cf0 && g_frames_cow_copied > cw0);
+    shcheck("shared segments were created and mapped by more than one process",
+            g_shm_creates > cr0 && (g_shm_maps - mp0) >= 2);
+    /* Every segment must be gone: the last mapper's exit destroys it. A leaked
+     * segment would hold its frames for the rest of the boot. */
+    int live = 0;
+    for (int i = 0; i < MAX_SHM; i++) if (g_shm[i].used) live++;
+    shcheck("no shared segment outlived its last mapper", live == 0);
+    shcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
+            g_frame_free_depth == g_frames_freed - g_frames_reused);
+    shcheck("no lock-rank violation across the COW and shm paths", g_rank_violations == viol0);
+    kprintf("[shmstrs] +%u freed, +%u reused; global depth %u\n",
+            g_frames_freed - freed0, g_frames_reused - reused0, g_frame_free_depth);
+out:
+    kprintf("[shmstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_shpass, (uint64_t)g_shfail);
+    if (!g_shfail) kputs("[shmstrs] COW AND SHARED MEMORY VERIFIED — forks are cheap, sharing is real\n");
+    else kputs("[shmstrs] MEMORY SHARING DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.64: EPOLLSTRS — readiness reported, and the descriptors given back
+ * =========================================================================== */
+static int g_eppass = 0, g_epfail = 0;
+static void epcheck(const char *what, int ok) {
+    if (ok) { g_eppass++; kprintf("[epollstrs] PASS: %s\n", what); }
+    else    { g_epfail++; kprintf("[epollstrs] FAIL: %s\n", what); }
+}
+
+static void cmd_epoll_stress(void) {
+    kputs("-- EPOLLSTRS: event-driven readiness, eventfd counters, and EOF --\n");
+    g_eppass = g_epfail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t ec0 = g_epoll_creates, ew0 = g_epoll_waits;
+    uint64_t vc0 = g_evfd_creates, vw0 = g_evfd_writes, vr0 = g_evfd_reads;
+
+    int p = kproc_spawn("epollstr", PCAP_FILESYSTEM);
+    if (p < 0) { epcheck("kproc_spawn never fails", 0); goto out; }
+    kprocs[p].role = 48;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { epcheck("the driver's ELF loads", 0); goto out; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 160000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[epollstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 920 ? "" :
+        R.code[0] == 921 ? "eventfd creation failed" :
+        R.code[0] == 922 ? "reading an empty eventfd did not answer EAGAIN" :
+        (R.code[0] == 923 || R.code[0] == 924) ? "writing an eventfd failed" :
+        R.code[0] == 925 ? "reading a posted eventfd failed" :
+        R.code[0] == 926 ? "EVENTFD WRITES DID NOT ACCUMULATE (7 + 5 was not 12)" :
+        R.code[0] == 927 ? "the eventfd did not drain on read" :
+        R.code[0] == 928 ? "epoll_create failed" :
+        R.code[0] == 929 ? "EPOLL_CTL_ADD failed" :
+        R.code[0] == 930 ? "AN UNPOSTED EVENTFD WAS REPORTED READY" :
+        R.code[0] == 931 ? "posting the eventfd failed" :
+        R.code[0] == 932 ? "a posted eventfd was NOT reported ready" :
+        R.code[0] == 933 ? "the ready event did not carry EPOLLIN" :
+        R.code[0] == 934 ? "the caller's cookie came back altered" :
+        R.code[0] == 935 ? "EPOLL_CTL_DEL failed" :
+        R.code[0] == 936 ? "a DELETED watch still reported events" :
+        R.code[0] == 937 ? "SYS_PIPE failed" :
+        R.code[0] == 938 ? "EPOLL_CTL_ADD on a pipe failed" :
+        R.code[0] == 939 ? "AN EMPTY PIPE WAS REPORTED READABLE" :
+        R.code[0] == 940 ? "writing the pipe failed" :
+        R.code[0] == 941 ? "a written pipe was not reported readable" :
+        R.code[0] == 942 ? "draining the pipe failed" :
+        R.code[0] == 943 ? "END OF FILE WAS NOT REPORTED READABLE (a pipeline would hang)" :
+        R.code[0] == 944 ? "end of file did not carry EPOLLHUP" :
+                           "unknown";
+    if (R.code[0] != 920) kprintf("[epollstrs] driver exit %u — %s\n", R.code[0], why);
+
+    epcheck("readiness, cookies, deletion and end-of-file all behaved (exit 920)",
+            finished && R.code[0] == 920);
+    kprintf("[epollstrs] epoll: %u created, %u waits (%u parked); eventfd: %u created, %u writes, %u reads\n",
+            g_epoll_creates - ec0, g_epoll_waits - ew0, g_epoll_parks,
+            g_evfd_creates - vc0, g_evfd_writes - vw0, g_evfd_reads - vr0);
+    epcheck("the epoll and eventfd paths were actually exercised",
+            g_epoll_creates > ec0 && g_epoll_waits > ew0 && g_evfd_writes > vw0);
+
+    /* Both are descriptors, so the proof they were released is the one the
+     * descriptor layer already knows how to give: nothing left in the table. */
+    int fds_leaked = 0, ep_live = 0, ev_live = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    for (int i = 0; i < MAX_EPOLL; i++)   if (g_epoll[i].used) ep_live++;
+    for (int i = 0; i < MAX_EVENTFD; i++) if (g_evfd[i].used)  ev_live++;
+    epcheck("no descriptor leaked across the suite", fds_leaked == 0);
+    epcheck("every epoll instance and eventfd was reclaimed with its descriptor",
+            ep_live == 0 && ev_live == 0);
+    epcheck("no lock-rank violation across the epoll paths", g_rank_violations == viol0);
+out:
+    kprintf("[epollstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_eppass, (uint64_t)g_epfail);
+    if (!g_epfail) kputs("[epollstrs] EVENT-DRIVEN I/O VERIFIED — readiness is computed, not remembered\n");
+    else kputs("[epollstrs] EVENT I/O DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -16766,6 +19288,12 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "compilerstress")) cmd_compiler_stress();
     else if (!kstrcmp(argv[0], "pipestress")) cmd_pipe_stress();
     else if (!kstrcmp(argv[0], "langstress")) cmd_lang_stress();
+    else if (!kstrcmp(argv[0], "threadstress")) cmd_thread_stress();
+    else if (!kstrcmp(argv[0], "pthreadsmp")) cmd_pthreads_smp();
+    else if (!kstrcmp(argv[0], "sigstress")) cmd_sig_stress();
+    else if (!kstrcmp(argv[0], "mmapstress")) cmd_mmap_stress();
+    else if (!kstrcmp(argv[0], "shmstress")) cmd_shm_stress();
+    else if (!kstrcmp(argv[0], "epollstress")) cmd_epoll_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -16951,6 +19479,12 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_compiler_stress();  /* v0.57: language completeness + what the compiler must REFUSE      */
     cmd_pipe_stress();      /* v0.59: pipes, redirection, and a ring-3 shell this system built   */
     cmd_lang_stress();      /* v0.60: sizeof/for-init/switch/unsigned + omake driving occ natively */
+    cmd_thread_stress();    /* v0.61: ring-3 threads across cores, futex blocking, kernel join     */
+    cmd_pthreads_smp();     /* v0.62: pthread mutex contention + condition variable across cores   */
+    cmd_sig_stress();       /* v0.62: signal masks, dispositions, process-group delivery           */
+    cmd_mmap_stress();      /* v0.63: demand-zero paging, mprotect, munmap                         */
+    cmd_shm_stress();       /* v0.63: copy-on-write fork and zero-copy shared memory               */
+    cmd_epoll_stress();     /* v0.64: event-driven readiness, eventfd counters, EOF reporting      */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();

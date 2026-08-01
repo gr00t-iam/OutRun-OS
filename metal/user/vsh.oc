@@ -131,7 +131,16 @@ int vsh_wait(int pid) {
  * last write end is gone, and a stray inherited descriptor keeps a pipeline
  * waiting forever on a producer that has already finished.
  */
-int vsh_child(int a, int b, int rin, int wout, int extra) {
+int vsh_child(int a, int b, int rin, int wout, int extra, int job) {
+  /* v0.62: join the job's process group BEFORE anything else. The parent sets
+   * this too, and the duplication is deliberate: whichever of the two runs
+   * first wins, and neither ordering leaves a window in which this process is
+   * outside the group the terminal is about to signal. A stage that missed the
+   * group would survive a Ctrl+C that killed its siblings — a half-dead
+   * pipeline is worse than either outcome.
+   * job 0 means "the first stage": pgid 0 asks for our own pid, which is
+   * exactly the group the parent is about to name the job after. */
+  setpgid(0, job, 0);
   int i; int j; int fd; char *t; char *path;
   char pbuf[VSH_PATHSZ];
 
@@ -182,6 +191,7 @@ int vsh_child(int a, int b, int rin, int wout, int extra) {
 int vsh_pipeline(int n) {
   int i; int s; int nst; int pid; int rc;
   int prev_read; int cur_write; int next_read;
+  int job;                       /* v0.62: this pipeline's process group */
   int start[VSH_MAXSTAGE];
   int end[VSH_MAXSTAGE];
   int pids[VSH_MAXSTAGE];
@@ -209,6 +219,7 @@ int vsh_pipeline(int n) {
   }
 
   prev_read = 0 - 1;
+  job = 0;
   s = 0;
   while (s < nst) {
     cur_write = 0 - 1;
@@ -219,9 +230,13 @@ int vsh_pipeline(int n) {
       cur_write = fds[1];
     }
     pid = fork();
-    if (pid == 0) { vsh_child(start[s], end[s], prev_read, cur_write, next_read); }
+    if (pid == 0) { vsh_child(start[s], end[s], prev_read, cur_write, next_read, job); }
     if (pid < 0) { puts("vsh: fork failed\n"); return 0 - 1; }
     pids[s] = pid;
+    /* The FIRST stage names the job: its pid becomes the group every later
+     * stage joins, so the whole pipeline is one signallable unit. */
+    if (job == 0) { job = pid; }
+    setpgid(pid, job, 0);
     /* The PARENT drops its copies immediately. Holding either end open is the
      * classic way to hang a pipeline: the reader would never see end-of-file
      * because the shell itself still counts as a writer. */
@@ -232,12 +247,21 @@ int vsh_pipeline(int n) {
   }
   if (prev_read >= 0) { close(prev_read); }
 
+  /* Hand the job the console for as long as it runs. From here until the
+   * restore below, the interrupt character goes to the pipeline and not to
+   * this shell — which is the whole reason vsh needs no SIGINT handler. */
+  if (job) { setpgid(job, job, 1); }
+
   rc = 0;
   s = 0;
   while (s < nst) {
     rc = vsh_wait(pids[s]);
     s = s + 1;
   }
+  /* Take the terminal back. Unconditional, and NOT inside the loop above: if a
+   * stage were interrupted we would still have to reclaim it, and a shell that
+   * left the console owned by a dead group could never be interrupted again. */
+  setpgid(0, 0, 1);
   return rc;
 }
 
