@@ -2589,6 +2589,18 @@ static void tcp_stress_worker(void) {
     }
     if (!(evs[0].events & EPOLLHUP)) sysc(SYS_EXIT, 1624, 0, 0);
 
+    /* (7) THE WIRE. One non-blocking connect to an address that is NOT
+     * loopback, which forces tcp_output down the real encoder and onto the
+     * real NIC. Deliberately NOT gated on a reply: whether the SLIRP gateway
+     * answers is QEMU's business, and testing it would be testing QEMU. What
+     * is asserted, in the kernel half, is that a frame was genuinely built and
+     * transmitted — otherwise the encoder is verified only against itself. */
+    int ws = (int)(i64)sysc(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (ws >= 0) {
+        sysc(SYS_CONNECT, (u64)ws, 0x0A000202ull, 80);   /* 10.0.2.2:80, the gateway */
+        sysc(SYS_CLOSE, (u64)ws, 0, 0);
+    }
+
     sysc(SYS_CLOSE, (u64)sv, 0, 0);
     sysc(SYS_CLOSE, (u64)ls, 0, 0);
     sysc(SYS_CLOSE, (u64)ep, 0, 0);

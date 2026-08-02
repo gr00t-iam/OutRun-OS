@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.67.0-metal"
+#define KERNEL_VERSION "0.68.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -584,6 +584,10 @@ static void handle_cpl3_fault(struct isr_frame *f);      /* defined after proces
 static int  posix_try_fault_signal(struct isr_frame *f);  /* v0.55: catchable SIGSEGV (signal core) */
 static int  vm_fault_handle(struct isr_frame *f);        /* v0.63: demand-zero / copy-on-write     */
 static void tcp_timer_scan(void);                        /* v0.67: retransmit, driven from idle    */
+struct tseg;                                             /* v0.68: wire codec                      */
+static void net_rx_tcp(const uint8_t *f, uint32_t len);
+static int  tcp_wire_parse(const uint8_t *f, uint32_t len, struct tseg *out,
+                           uint32_t *saddr_out, uint32_t *daddr_out);
 static void canvas_inject_char(char c);                  /* v0.64: feed the kbd ring (suite use)   */
 static void sweep_tick(void);                            /* incremental PTE integrity audit */
 static void smp_ipi_dispatch(uint64_t vec);              /* v0.35: LAPIC IPI handlers      */
@@ -3680,7 +3684,12 @@ static void net_dispatch(int idx, const uint8_t *frame, uint32_t len) {
     if (eth == 0x0806) {                                  /* ARP               */
         g_vnet_rx_idx = idx; g_vnet_rx_len = len + 12; g_vnet_rx_pending = 1;
         if (g_net_waiter_tid >= 0) { thread_wake(g_net_waiter_tid); g_net_waiter_tid = -1; }
-    } else if (eth == 0x0800) {                           /* IPv4 -> UDP router */
+    } else if (eth == 0x0800) {
+        /* v0.68: TCP first — net_route only knows UDP, and a TCP segment
+         * handed to it is silently ignored rather than misrouted, which is
+         * how inbound connections used to disappear without a trace. */
+        const uint8_t *ip = frame + 14;
+        if (len >= 14 + 20 && ip[9] == 6) { net_rx_tcp(frame, len); return; }
         net_route(frame, len);
     }
 }
@@ -7143,6 +7152,7 @@ struct npend {
 #define TCP_MSS         512          /* one segment's payload ceiling */
 #define TCP_RTO_TICKS   6            /* ~60 ms at 100 Hz: a lossless link needs no more */
 #define TCP_MAX_RETRIES 8
+#define TCP_HDR_LEN     20           /* no options are emitted or honoured */
 
 enum {
     TCPS_CLOSED = 0, TCPS_LISTEN, TCPS_SYN_SENT, TCPS_SYN_RCVD, TCPS_ESTAB,
@@ -7356,8 +7366,12 @@ static volatile uint64_t g_tcp_conns = 0, g_tcp_resets = 0, g_tcp_drops = 0;
  * out. A lossless loopback link would otherwise leave the retransmit path as
  * code that has never once run. */
 static volatile int g_tcp_drop = 0;
+static volatile uint64_t g_tcp_wire_tx = 0, g_tcp_wire_rx = 0, g_tcp_wire_bad = 0;
 
 static void tcp_input(int si, struct tseg *g);   /* fwd */
+static uint32_t tcp_wire_build(uint8_t *f, uint32_t saddr, uint32_t daddr,
+                               const struct tseg *g, uint16_t window);   /* fwd: v0.68 */
+static void vnet_tx(const uint8_t *frame, uint32_t len);                 /* fwd: v0.68 */
 
 /* Find the socket that should receive a segment addressed to `dport` from
  * (saddr,sport): an established endpoint first, then a listener. Caller holds
@@ -7391,7 +7405,16 @@ static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len
     g.sport = s->lport; g.dport = s->rport;
     __sync_fetch_and_add(&g_tcp_segs_out, 1);
     if (g_tcp_drop > 0) { g_tcp_drop--; __sync_fetch_and_add(&g_tcp_drops, 1); return; }
-    if (s->raddr != NET_LOOPBACK) return;      /* wire TX is not implemented: see the changelog */
+    if (s->raddr != NET_LOOPBACK) {
+        /* v0.68: a real frame on the real NIC. */
+        static uint8_t wf[14 + 20 + TCP_HDR_LEN + TCP_MSS];
+        if (!g_vnet_ready) return;
+        uint32_t n = tcp_wire_build(wf, NET_GUEST_IP, s->raddr, &g, (uint16_t)(TCP_BUFSZ - s->rcount));
+        vnet_tx(wf, n);
+        g_net_tx_frames++;
+        __sync_fetch_and_add(&g_tcp_wire_tx, 1);
+        return;
+    }
     int peer = tcp_lookup_locked(s->rport, NET_LOOPBACK, s->lport);
     if (peer < 0) return;                      /* nobody listening: silently dropped */
     tcp_input(peer, &g);
@@ -7428,6 +7451,27 @@ static void tcp_ack_upto(struct nsock *s, uint32_t ack) {
     s->scount -= acked;
     s->snd_una = ack;
     if (!s->scount) s->rexmit_ticks = 0;       /* nothing outstanding */
+}
+
+/* v0.68: an inbound TCP frame, from the NIC bottom half.
+ *
+ * Runs OUTSIDE g_net_lock on entry and takes it here, because the bottom half
+ * is a normal kernel context and the lock ranking is only satisfied that way
+ * round. A frame that does not decode is counted and dropped: there is no
+ * useful reply to a segment whose checksum failed, since its addresses cannot
+ * be trusted either. */
+static void net_rx_tcp(const uint8_t *f, uint32_t len) {
+    struct tseg g;
+    uint32_t sa = 0, da = 0;
+    if (!tcp_wire_parse(f, len, &g, &sa, &da)) {
+        __sync_fetch_and_add(&g_tcp_wire_bad, 1);
+        return;
+    }
+    __sync_fetch_and_add(&g_tcp_wire_rx, 1);
+    klock_acquire(&g_net_lock);
+    int si = tcp_lookup_locked(g.dport, sa, g.sport);
+    if (si >= 0) tcp_input(si, &g);
+    klock_release(&g_net_lock);
 }
 
 /* THE STATE MACHINE. Caller holds g_net_lock. */
@@ -7685,6 +7729,106 @@ static void net_tx_udp(uint32_t daddr, uint16_t sport, uint16_t dport,
     vnet_tx(f, (uint32_t)(14 + iptot));
     g_net_tx_frames++;
 }
+
+/* ---- v0.68: TCP ON THE WIRE ----------------------------------------------
+ * v0.67 exchanged `struct tseg` between endpoints inside this kernel, which is
+ * a real state machine over a real link and is not a frame anything else could
+ * receive. This is the encoder and decoder that make the same segments legible
+ * to another machine.
+ *
+ * THE CHECKSUM IS MANDATORY, and that is the one place this cannot copy what
+ * net_tx_udp does. IPv4 UDP may leave its checksum zero to mean "not computed"
+ * and the existing datagram path does exactly that; TCP has no such escape —
+ * a zero checksum is simply a wrong checksum, and every receiver on earth will
+ * discard the segment. It covers a PSEUDO-HEADER (source and destination
+ * address, protocol, TCP length) as well as the segment, which is what ties a
+ * segment to the addresses it was sent between and stops a correctly-formed
+ * segment being accepted for the wrong connection. */
+static uint16_t tcp_cksum(uint32_t saddr, uint32_t daddr, const uint8_t *seg, uint32_t len) {
+    uint32_t sum = 0;
+    sum += (saddr >> 16) & 0xFFFF; sum += saddr & 0xFFFF;
+    sum += (daddr >> 16) & 0xFFFF; sum += daddr & 0xFFFF;
+    sum += 6;                                   /* protocol */
+    sum += len;                                 /* TCP length, header + payload */
+    for (uint32_t i = 0; i + 1 < len; i += 2) sum += (uint32_t)((seg[i] << 8) | seg[i + 1]);
+    if (len & 1) sum += (uint32_t)(seg[len - 1] << 8);
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)(~sum);
+}
+
+/* Build Ethernet + IPv4 + TCP into `f`. Returns the total frame length. */
+static uint32_t tcp_wire_build(uint8_t *f, uint32_t saddr, uint32_t daddr,
+                               const struct tseg *g, uint16_t window) {
+    uint16_t plen = g->len;
+    if (plen > TCP_MSS) plen = TCP_MSS;
+    for (int i = 0; i < 6; i++) f[i] = 0xFF;                  /* dst MAC broadcast */
+    for (int i = 0; i < 6; i++) f[6 + i] = g_vnet_mac[i];
+    f[12] = 0x08; f[13] = 0x00;                               /* ethertype IPv4    */
+    uint8_t *ip = f + 14;
+    uint16_t iptot = (uint16_t)(20 + TCP_HDR_LEN + plen);
+    for (int i = 0; i < 20; i++) ip[i] = 0;
+    ip[0] = 0x45; ip[2] = (uint8_t)(iptot >> 8); ip[3] = (uint8_t)iptot;
+    ip[8] = 64; ip[9] = 6;                                    /* TTL, proto TCP    */
+    ip[12] = (uint8_t)(saddr >> 24); ip[13] = (uint8_t)(saddr >> 16);
+    ip[14] = (uint8_t)(saddr >> 8);  ip[15] = (uint8_t)saddr;
+    ip[16] = (uint8_t)(daddr >> 24); ip[17] = (uint8_t)(daddr >> 16);
+    ip[18] = (uint8_t)(daddr >> 8);  ip[19] = (uint8_t)daddr;
+    uint16_t ick = net_cksum16(ip, 20); ip[10] = (uint8_t)(ick >> 8); ip[11] = (uint8_t)ick;
+
+    uint8_t *t = ip + 20;
+    for (int i = 0; i < TCP_HDR_LEN; i++) t[i] = 0;
+    t[0] = (uint8_t)(g->sport >> 8); t[1] = (uint8_t)g->sport;
+    t[2] = (uint8_t)(g->dport >> 8); t[3] = (uint8_t)g->dport;
+    t[4] = (uint8_t)(g->seq >> 24); t[5] = (uint8_t)(g->seq >> 16);
+    t[6] = (uint8_t)(g->seq >> 8);  t[7] = (uint8_t)g->seq;
+    t[8] = (uint8_t)(g->ack >> 24); t[9] = (uint8_t)(g->ack >> 16);
+    t[10] = (uint8_t)(g->ack >> 8); t[11] = (uint8_t)g->ack;
+    t[12] = 5 << 4;                                           /* data offset, no options */
+    t[13] = (uint8_t)g->flags;
+    t[14] = (uint8_t)(window >> 8); t[15] = (uint8_t)window;
+    for (uint16_t i = 0; i < plen; i++) t[TCP_HDR_LEN + i] = g->data[i];
+    uint16_t ck = tcp_cksum(saddr, daddr, t, (uint32_t)(TCP_HDR_LEN + plen));
+    t[16] = (uint8_t)(ck >> 8); t[17] = (uint8_t)ck;
+    return (uint32_t)(14 + iptot);
+}
+
+/* Decode a received frame into a segment. Returns 1 if it is a well-formed TCP
+ * segment for us, 0 otherwise — and a BAD CHECKSUM IS A ZERO, not a warning.
+ * Accepting a segment whose checksum does not verify is how corrupt data
+ * becomes application data with nothing in between to notice. */
+static int tcp_wire_parse(const uint8_t *f, uint32_t len, struct tseg *out,
+                          uint32_t *saddr_out, uint32_t *daddr_out) {
+    if (len < 14 + 20 + TCP_HDR_LEN) return 0;
+    if (f[12] != 0x08 || f[13] != 0x00) return 0;             /* not IPv4 */
+    const uint8_t *ip = f + 14;
+    if ((ip[0] >> 4) != 4) return 0;
+    uint32_t ihl = (uint32_t)(ip[0] & 0x0F) * 4;
+    if (ihl < 20 || ip[9] != 6) return 0;                     /* not TCP  */
+    uint16_t iptot = (uint16_t)((ip[2] << 8) | ip[3]);
+    if (iptot < ihl + TCP_HDR_LEN || 14u + iptot > len) return 0;
+    uint32_t sa = ((uint32_t)ip[12] << 24) | ((uint32_t)ip[13] << 16) |
+                  ((uint32_t)ip[14] << 8)  | ip[15];
+    uint32_t da = ((uint32_t)ip[16] << 24) | ((uint32_t)ip[17] << 16) |
+                  ((uint32_t)ip[18] << 8)  | ip[19];
+    const uint8_t *t = ip + ihl;
+    uint32_t tlen = (uint32_t)iptot - ihl;
+    uint32_t doff = (uint32_t)(t[12] >> 4) * 4;
+    if (doff < TCP_HDR_LEN || doff > tlen) return 0;
+    if (tcp_cksum(sa, da, t, tlen) != 0) return 0;            /* corrupt: discard */
+    out->sport = (uint16_t)((t[0] << 8) | t[1]);
+    out->dport = (uint16_t)((t[2] << 8) | t[3]);
+    out->seq = ((uint32_t)t[4] << 24) | ((uint32_t)t[5] << 16) |
+               ((uint32_t)t[6] << 8) | t[7];
+    out->ack = ((uint32_t)t[8] << 24) | ((uint32_t)t[9] << 16) |
+               ((uint32_t)t[10] << 8) | t[11];
+    out->flags = t[13];
+    out->len = (uint16_t)(tlen - doff);
+    out->data = t + doff;
+    if (saddr_out) *saddr_out = sa;
+    if (daddr_out) *daddr_out = da;
+    return 1;
+}
+
 
 /* Called from every kproc exit path (clean AND fault), alongside the other
  * teardown hooks. Releases every socket the dying process owns. Static RX
@@ -18626,7 +18770,7 @@ static void cmd_tcp_stress(void) {
     int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
     uint32_t viol0 = g_rank_violations;
     uint64_t so0 = g_tcp_segs_out, si0 = g_tcp_segs_in, rx0 = g_tcp_rexmits;
-    uint64_t cn0 = g_tcp_conns, dr0 = g_tcp_drops;
+    uint64_t cn0 = g_tcp_conns, dr0 = g_tcp_drops, wt0 = g_tcp_wire_tx;
     int socks0 = net_sock_count_used();
 
     /* THE RETRANSMIT TEST. A loopback link cannot lose anything, so the
@@ -18710,6 +18854,56 @@ static void cmd_tcp_stress(void) {
     klock_release(&g_ofile_lock);
     tccheck2("no descriptor leaked across the suite", fds_leaked == 0);
     tccheck2("no lock-rank violation across the TCP paths", g_rank_violations == viol0);
+
+    /* ---- v0.68: THE WIRE CODEC, verified without leaving the machine -------
+     * A round trip through the real encoder and the real decoder proves both
+     * halves against each other, deterministically. Gating this on a SLIRP
+     * reply would have tested QEMU's NAT; gating it on nothing would have left
+     * a checksum that is wrong in a way no loopback test can see — and a wrong
+     * TCP checksum is discarded by every receiver on earth, so the failure
+     * would appear only against real hardware. */
+    {
+        static uint8_t wf[14 + 20 + TCP_HDR_LEN + TCP_MSS];
+        static uint8_t pay[300];
+        for (int i = 0; i < 300; i++) pay[i] = (uint8_t)((i * 13 + 5) & 0xFF);
+        struct tseg tx, rx;
+        tx.seq = 0x11223344u; tx.ack = 0x55667788u;
+        tx.flags = TH_ACK | TH_SYN; tx.len = 300;
+        tx.sport = 0xBEEF; tx.dport = 0xCAFE; tx.data = pay;
+        uint32_t n = tcp_wire_build(wf, NET_GUEST_IP, 0x0A000202u, &tx, 4096);
+        tccheck2("the built frame is Ethernet + IPv4 + TCP of the right length",
+                 n == (uint32_t)(14 + 20 + TCP_HDR_LEN + 300) &&
+                 wf[12] == 0x08 && wf[13] == 0x00 && wf[14 + 9] == 6);
+        /* The IPv4 header checksum verifies over itself. */
+        tccheck2("the IPv4 header checksum verifies", net_cksum16(wf + 14, 20) == 0);
+        uint32_t sa = 0, da = 0;
+        int ok = tcp_wire_parse(wf, n, &rx, &sa, &da);
+        tccheck2("a frame this kernel built parses back, checksum and all", ok == 1);
+        tccheck2("every header field survived the round trip",
+                 ok && rx.seq == tx.seq && rx.ack == tx.ack &&
+                 rx.flags == tx.flags && rx.len == tx.len &&
+                 rx.sport == tx.sport && rx.dport == tx.dport &&
+                 sa == NET_GUEST_IP && da == 0x0A000202u);
+        int paysame = ok && rx.len == 300;
+        for (int i = 0; ok && i < 300; i++) if (rx.data[i] != pay[i]) { paysame = 0; break; }
+        tccheck2("the payload survived the round trip byte for byte", paysame);
+        /* CORRUPTION MUST BE REJECTED. One flipped bit anywhere in the segment
+         * has to fail the checksum — otherwise the checksum is decoration. */
+        wf[14 + 20 + TCP_HDR_LEN + 100] ^= 0x01;
+        tccheck2("a single flipped payload bit is REJECTED by the checksum",
+                 tcp_wire_parse(wf, n, &rx, &sa, &da) == 0);
+        wf[14 + 20 + TCP_HDR_LEN + 100] ^= 0x01;
+        tccheck2("and it parses again once the bit is restored",
+                 tcp_wire_parse(wf, n, &rx, &sa, &da) == 1);
+    }
+    kprintf("[tcpstrs] wire: %u frames out, %u in, %u rejected\n",
+            g_tcp_wire_tx, g_tcp_wire_rx, g_tcp_wire_bad);
+    /* The encoder is otherwise verified only against its own decoder. This is
+     * the assertion that a segment for a non-loopback peer genuinely reached
+     * the NIC. Whether anything answers is not asserted — that would be a test
+     * of QEMU's NAT, which is the trap v0.52 documented and avoided. */
+    tccheck2("a segment for a non-loopback peer was built and TRANSMITTED",
+             g_tcp_wire_tx > wt0);
 out:
     kprintf("[tcpstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_tcpass, (uint64_t)g_tcfail2);
     if (!g_tcfail2)
@@ -21485,10 +21679,18 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_epoll_stress();     /* v0.64: event-driven readiness, eventfd counters, EOF reporting      */
     cmd_netepoll_stress();  /* v0.65: non-blocking sockets multiplexed with epoll                  */
     cmd_mmapfile_stress();  /* v0.66: file-backed mappings, shared pages, writeback                */
-    cmd_tcp_stress();       /* v0.67: TCP handshake, byte stream, retransmission, FIN             */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
+    /* v0.68: tcpstrs runs AFTER capdma, deliberately. capdma proves a confined
+     * device is BLOCKED by the IOMMU when it attempts kernel DMA, and it needs
+     * a quiescent NIC transmit queue to produce that fault — which is exactly
+     * why netstrs has never sent a real frame, and says so in v0.52's
+     * changelog. v0.68 gave tcpstrs one genuine wire transmit, and that single
+     * SYN was enough to make capdma's confined-DMA assertion fail under VT-d
+     * while both BIOS configurations stayed clean. Ordering is the fix: the
+     * suite that needs silence goes first. */
+    cmd_tcp_stress();       /* v0.68: TCP handshake, byte stream, FIN, and the wire codec */
     mouse_init();
     fb_init();
     cmd_gfx();
