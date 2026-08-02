@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.63.0-metal"
+#define KERNEL_VERSION "0.65.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -583,6 +583,7 @@ static volatile int g_debug_posix = 0;          /* DEBUG_POSIX: fork/exec/signal
 static void handle_cpl3_fault(struct isr_frame *f);      /* defined after process globals */
 static int  posix_try_fault_signal(struct isr_frame *f);  /* v0.55: catchable SIGSEGV (signal core) */
 static int  vm_fault_handle(struct isr_frame *f);        /* v0.63: demand-zero / copy-on-write     */
+static void canvas_inject_char(char c);                  /* v0.64: feed the kbd ring (suite use)   */
 static void sweep_tick(void);                            /* incremental PTE integrity audit */
 static void smp_ipi_dispatch(uint64_t vec);              /* v0.35: LAPIC IPI handlers      */
 static void smp_preempt_ipi(struct isr_frame *f);        /* v0.39: vector 50 (may not return) */
@@ -1814,6 +1815,18 @@ struct kproc {
     volatile int      parked;        /* 1 = context complete, in NO run queue       */
     volatile int      wake_pending;  /* 1 = woken during the arming window          */
     volatile uint64_t wait_rv;       /* what SYS_FUTEX_WAIT/JOIN returns on resume  */
+    /* v0.64 Phase 2: SYS_EPOLL_WAIT is RESTARTED rather than returned from, so
+     * its deadline cannot live in the syscall's own frame — that frame is gone
+     * by the time the restart runs. Absolute (a g_ticks value), set on the
+     * first entry and cleared on every path that returns to the caller, so a
+     * wait woken five times still expires when the caller asked it to rather
+     * than five times later. 0 = not inside a restarted wait. */
+    volatile uint64_t ep_deadline;
+    /* v0.64 Phase 2: 1 = this park resumes by RE-EXECUTING its syscall, so RAX
+     * carries the call NUMBER and must survive the wake. A waker's return
+     * value is meaningless to a restarting syscall and writing it there
+     * destroys the only thing the resume needs. */
+    volatile int      wait_restart;
     /* v0.55: argv/envp image handed to the ring-3 crt on the initial stack.    */
     int      argc;
     int      exit_authoritative;   /* v0.55: exit_code came from exit(), not pthread_exit() */
@@ -1900,6 +1913,7 @@ static void kproc_reset(struct kproc *p) {
     p->thr_done = 0;
     p->wait_key = 0; p->wait_deadline = 0;
     p->wait_armed = 0; p->parked = 0; p->wake_pending = 0; p->wait_rv = 0;
+    p->ep_deadline = 0; p->wait_restart = 0;
     p->heap_brk = HEAP_USER_V;
     p->mmap_next = MMAP_USER_V;
     p->shm_next = SHM_USER_V;
@@ -2006,6 +2020,27 @@ static inline int tg_of(int p) {
     if (L < 0 || L >= n_kproc) return p;      /* pre-v0.61 slot, or corrupt */
     return L;
 }
+
+/* v0.64 Phase 2: the slot whose bit stands for "this PROCESS" in an
+ * `ofile.owner_mask` — the caller's thread-group leader.
+ *
+ * The mask is indexed by kproc slot, which was exactly right in v0.59 when a
+ * slot was a process. v0.61 made a thread its own slot and the fd paths were
+ * never told: they kept asking whether the CALLING slot held the descriptor,
+ * and a thread's bit is never set in anything, so every read, write and close
+ * a thread attempted answered EBADF. Nothing caught it, because no suite had
+ * yet had a thread touch a descriptor — pthreads_smp shares memory, not files.
+ * epollstrs is the first, and it found it: the poster thread's write to the
+ * eventfd was silently refused, so the waiter it was supposed to wake slept
+ * until its deadline.
+ *
+ * Resolving to the leader is what POSIX requires anyway — the descriptor table
+ * is a property of the process, not of the thread that happens to be running.
+ * Deliberately NOT used by descriptor TEARDOWN, which must stay per-slot: a
+ * thread that exits has to give back only its own claims, and giving back the
+ * leader's would close the whole process's files on the first thread to
+ * finish. */
+static inline int fd_owner(void) { return tg_of((int)current_proc_idx); }
 
 /* v0.61: claim a kproc slot that SHARES an existing address space — a thread.
  *
@@ -4701,6 +4736,16 @@ static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
 #define VOL_PIPE 3   /* v0.59: not a store at all — a live channel, see g_pipes */
 #define VOL_EPOLL 4  /* v0.64: an epoll instance; g_epoll[ofile.ep]            */
 #define VOL_EVFD  5  /* v0.64: an eventfd counter; g_evfd[ofile.efd]           */
+#define VOL_SOCK  6  /* v0.65: a datagram socket; g_sock[ofile.sock]            */
+
+/* v0.65: descriptor flags. O_NONBLOCK lives on the DESCRIPTOR, not on the
+ * socket, because POSIX puts it on the open file description — two descriptors
+ * for one object may disagree about blocking, and after fork they routinely do.
+ * The value is Linux's so that userland headers can be copied verbatim. */
+#define O_NONBLOCK    04000
+#define F_GETFL       3
+#define F_SETFL       4
+#define SOCK_NONBLOCK 0x800   /* OR into SYS_SOCKET's `type`, as Linux has it */
 
 #define TMP_MAXFILES 4                 /* small, ephemeral, RAM-only scratch area */
 #define TMP_MAXBYTES 512
@@ -4797,7 +4842,12 @@ struct ofile { int used; int dirent; uint64_t off; uint64_t owner_mask; int volu
                 * SYS_CLOSE, owner-mask refcounting and force-close-on-exit for
                 * free, from machinery that is already tested. A side table keyed
                 * by process would have had to reimplement all four. */
-               int ep; int efd; };
+               int ep; int efd;
+               /* v0.65: the socket this descriptor names, and the descriptor's
+                * own flags (O_NONBLOCK). `flags` is deliberately NOT on the
+                * socket: fork aliases a descriptor into a second slot and each
+                * alias carries its own blocking discipline. */
+               int sock; int flags; };
 static struct ofile g_ofiles[16];
 
 /* ===========================================================================
@@ -4886,6 +4936,11 @@ static void pipe_unref_locked(int pi, int is_w) {
 #define EPOLLERR  0x008u
 #define EPOLLHUP  0x010u
 #define EPOLLET   0x80000000u
+/* v0.64 Phase 2: the console has no descriptor — SYS_TTY_READ reads the
+ * keyboard ring directly, and inventing an fd for it would mean a new volume
+ * kind and an open path for something no program opens. So it is watchable by
+ * a reserved TARGET instead: EPOLL_CTL_ADD with this in place of an fd. */
+#define EPOLL_TTY_FD (-2)
 #define EPOLL_CTL_ADD 1
 #define EPOLL_CTL_DEL 2
 #define EPOLL_CTL_MOD 3
@@ -4916,6 +4971,8 @@ static volatile uint64_t g_evfd_creates = 0, g_evfd_writes = 0, g_evfd_reads = 0
 /* An epoll instance's park key, in the same tagged space join keys use. */
 #define EPOLL_WAIT_KEY(epi) (0xE000000000000000ull | (uint64_t)(epi))
 static int futex_wake_key(uint64_t key, int n, uint64_t rv);   /* fwd: v0.61 */
+static uint32_t net_sock_events(int si);                       /* fwd: v0.65 */
+static void net_sock_release(int si);                          /* fwd: v0.65 */
 
 /* What is `fd` ready for RIGHT NOW? Caller holds g_ofile_lock.
  *
@@ -4924,6 +4981,12 @@ static int futex_wake_key(uint64_t key, int n, uint64_t rv);   /* fwd: v0.61 */
  * a reader must be woken to *learn* there is nothing more coming, or a
  * pipeline hangs at its last byte instead of finishing. */
 static uint32_t ep_poll_fd_locked(int fd) {
+    if (fd == EPOLL_TTY_FD) {
+        /* Readable exactly when a keystroke is queued — the same condition
+         * SYS_TTY_READ consults, asked of the same ring. Nothing is cached, so
+         * this cannot disagree with what a subsequent read would find. */
+        return (kbd_w != kbd_r) ? EPOLLIN : 0;
+    }
     if (fd < 0 || fd >= 16 || !g_ofiles[fd].used) return EPOLLERR;
     struct ofile *o = &g_ofiles[fd];
     uint32_t r = 0;
@@ -4951,6 +5014,16 @@ static uint32_t ep_poll_fd_locked(int fd) {
          * here; report it as never-ready rather than pretending to nest. */
         return 0;
     }
+    if (o->volume == VOL_SOCK) {
+        /* v0.65: asks the socket layer, which takes g_net_lock (rank 9) while
+         * this caller holds g_ofile_lock (rank 1) — strictly upward, which is
+         * why the question is asked in this direction and the ANSWER is
+         * delivered in the other (see the notify in SYS_SEND). */
+        /* NSOCK is not in scope this early in the file; net_sock_events
+         * bounds-checks its own table, which is where that knowledge belongs. */
+        if (o->sock < 0) return EPOLLERR;
+        return net_sock_events(o->sock);
+    }
     /* A stored file is always ready both ways — POSIX says so, and it is true:
      * a read or write on one completes without waiting for anything. */
     return EPOLLIN | EPOLLOUT;
@@ -4961,14 +5034,25 @@ static uint32_t ep_poll_fd_locked(int fd) {
  * it means a notifier does not have to maintain a reverse index that could go
  * stale — the same reason readiness itself is computed rather than cached. */
 static void ep_notify_fd(int fd) {
+    /* v0.64 Phase 2: the watch lists are mutated by EPOLL_CTL_ADD/DEL under
+     * g_ofile_lock, and on SMP a notifier scanning them lock-free can read a
+     * half-installed entry — a watch whose `used` is set before its `fd` is,
+     * or one being removed underneath. Collect under the lock, wake outside
+     * it: waking takes run-queue locks, and the ordering discipline puts those
+     * strictly outside the descriptor lock, never nested inside it. */
+    int hit[MAX_EPOLL], nh = 0;
+    klock_acquire(&g_ofile_lock);
     for (int i = 0; i < MAX_EPOLL; i++) {
         if (!g_epoll[i].used) continue;
         for (int k = 0; k < EPOLL_MAXWATCH; k++) {
             if (!g_epoll[i].w[k].used || g_epoll[i].w[k].fd != fd) continue;
-            futex_wake_key(EPOLL_WAIT_KEY(i), MAX_KPROC, (uint64_t)-11);
+            hit[nh++] = i;
             break;
         }
     }
+    klock_release(&g_ofile_lock);
+    for (int i = 0; i < nh; i++)
+        futex_wake_key(EPOLL_WAIT_KEY(hit[i]), MAX_KPROC, (uint64_t)-11);
 }
 
 /* v0.64: an eventfd behaves as a FILE holding one 64-bit counter, so it is
@@ -5026,6 +5110,10 @@ static int ofile_claim(int owner, int volume, int dirent) {
             g_ofiles[fd].volume = volume;
             g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
             g_ofiles[fd].ep = -1;   g_ofiles[fd].efd = -1;
+            /* v0.65: -1, not 0 — g_ofiles is zero-initialised and socket 0 is
+             * a perfectly valid slot, so a defaulted 0 would make every fresh
+             * descriptor claim to be socket 0. */
+            g_ofiles[fd].sock = -1; g_ofiles[fd].flags = 0;
             klock_release(&g_ofile_lock);
             return fd;
         }
@@ -5064,6 +5152,22 @@ static int ofile_drop_locked(int fd, int slot) {
      * a reference per owner. Getting these two the same way round would either
      * free an instance a forked sibling still holds, or never free it at all. */
     if (g_ofiles[fd].owner_mask) return 0;             /* other owners remain */
+    /* v0.64 Phase 2: a closed descriptor must not stay watched. ep_poll_fd
+     * answers EPOLLERR for an unused slot, and EPOLLERR is reported whether or
+     * not it was asked for — so a watch left behind by a close fires on every
+     * subsequent wait, forever, for a descriptor that no longer exists. Linux
+     * removes the watch on close for exactly this reason. Found live: the
+     * suite closed a watched pipe end and the next wait returned two events
+     * where one was expected.
+     *
+     * Purged on the LAST drop, matching when the fd number itself becomes
+     * free to reissue — an fd still held by a forked sibling is still a real
+     * descriptor and its watch is still meaningful. */
+    for (int i = 0; i < MAX_EPOLL; i++) {
+        if (!g_epoll[i].used) continue;
+        for (int k = 0; k < EPOLL_MAXWATCH; k++)
+            if (g_epoll[i].w[k].used && g_epoll[i].w[k].fd == fd) g_epoll[i].w[k].used = 0;
+    }
     if (g_ofiles[fd].ep >= 0 && g_ofiles[fd].ep < MAX_EPOLL) {
         g_epoll[g_ofiles[fd].ep].used = 0;
         for (int k = 0; k < EPOLL_MAXWATCH; k++) g_epoll[g_ofiles[fd].ep].w[k].used = 0;
@@ -5074,12 +5178,48 @@ static int ofile_drop_locked(int fd, int slot) {
         g_evfd[g_ofiles[fd].efd].counter = 0;
         g_ofiles[fd].efd = -1;
     }
+    /* v0.65: a socket belongs to the DESCRIPTOR, like an epoll instance and
+     * unlike a pipe end — so it is released exactly when the entry itself
+     * goes, not per owner. This is what finally gives sockets SYS_CLOSE and
+     * force-close-on-exit; before it, the only way a socket was ever reclaimed
+     * was net_teardown_kproc at process death. */
+    if (g_ofiles[fd].sock >= 0) {
+        net_sock_release(g_ofiles[fd].sock);
+        g_ofiles[fd].sock = -1;
+    }
+    g_ofiles[fd].flags = 0;
     for (int s = 0; s < n_kproc; s++) {
         if (kprocs[s].redir_in  == fd) kprocs[s].redir_in  = -1;
         if (kprocs[s].redir_out == fd) kprocs[s].redir_out = -1;
     }
     g_ofiles[fd].used = 0; g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
     return 1;   /* the pipe reference was already given back above, per owner */
+}
+
+/* v0.64 Phase 2: which pipe READ ends are now at end-of-file? Caller holds
+ * g_ofile_lock and does the waking OUTSIDE it.
+ *
+ * Losing the last write end is what makes a read end EOF-readable, and it is
+ * the one readiness transition with no write behind it — nothing was produced,
+ * so nothing calls the write-side notify. A thread already parked in
+ * epoll_wait on that end would sit there until its deadline expired and then
+ * report a timeout for an event that had already happened. That is not a hang,
+ * because no park in this system is unbounded, but a bounded wait for
+ * something already true is still the wrong answer.
+ *
+ * Every close path shares this, so it is collected in one place rather than
+ * open-coded three times: SYS_CLOSE, the exit-time descriptor teardown (a
+ * pipeline stage that dies still closes its write end), and the IPC path that
+ * rejects a transferred descriptor. */
+static int ep_collect_eof_locked(int *out) {
+    int n = 0;
+    for (int q = 0; q < 16; q++) {
+        int pi = g_ofiles[q].pipe;
+        if (!g_ofiles[q].used || g_ofiles[q].volume != VOL_PIPE || g_ofiles[q].pipe_w) continue;
+        if (pi < 0 || pi >= MAX_PIPES || !g_pipes[pi].used) continue;
+        if (g_pipes[pi].writers == 0) out[n++] = q;
+    }
+    return n;
 }
 
 /* --- pipe transfer ---------------------------------------------------------
@@ -5097,7 +5237,7 @@ static int ofile_drop_locked(int fd, int slot) {
  * two apart either exits early on a slow producer or hangs forever on a
  * finished one, so pipestrs tests the boundary from both sides.              */
 static int64_t pipe_read_fd(int fd, void *dst, uint32_t len) {
-    int slot = (int)current_proc_idx;
+    int slot = fd_owner();
     klock_acquire(&g_ofile_lock);
     if (fd < 0 || fd >= 16 || !g_ofiles[fd].used ||
         !(g_ofiles[fd].owner_mask & (1ull << slot)) ||
@@ -5121,7 +5261,7 @@ static int64_t pipe_read_fd(int fd, void *dst, uint32_t len) {
     return r;
 }
 static int64_t pipe_write_fd(int fd, const void *src, uint32_t len) {
-    int slot = (int)current_proc_idx;
+    int slot = fd_owner();
     klock_acquire(&g_ofile_lock);
     if (fd < 0 || fd >= 16 || !g_ofiles[fd].used ||
         !(g_ofiles[fd].owner_mask & (1ull << slot)) ||
@@ -5145,21 +5285,31 @@ static int64_t pipe_write_fd(int fd, const void *src, uint32_t len) {
             r = (int64_t)n;
         }
     }
-    klock_release(&g_ofile_lock);
     /* v0.64: bytes landed in the pipe, so anything parked in epoll_wait on the
-     * READ end is now runnable. Notified after the lock is released, because
-     * waking takes the run-queue locks and the ordering discipline puts those
-     * outside the descriptor lock, never inside it.
+     * READ end is now runnable. The read end is a DIFFERENT descriptor from
+     * this one, so the notify has to name the pipe rather than the fd that was
+     * written — a reader watches its own end, and nobody is watching the
+     * writer's.
      *
-     * The read end is a DIFFERENT descriptor from this one, so the notify has
-     * to name the pipe rather than the fd that was written — a reader watches
-     * its own end, and nobody is watching the writer's. */
+     * Phase 2 (SMP): the read ends are IDENTIFIED under the lock and NOTIFIED
+     * outside it. Both halves are load-bearing and they pull in opposite
+     * directions. Scanning the descriptor table unlocked races a concurrent
+     * close, which can hand back an fd that has since been reissued as
+     * something else — and waking is not free of consequence, because the
+     * woken thread re-evaluates readiness and may return an event for a
+     * descriptor its owner never watched. Notifying while still holding the
+     * lock would be worse: the wake takes run-queue locks, and the ordering
+     * discipline puts those strictly outside the descriptor lock. Collecting
+     * first satisfies both. */
+    int rq[16], nr = 0;
     if (r > 0) {
         int pi = g_ofiles[fd].pipe;
         for (int q = 0; q < 16; q++)
             if (g_ofiles[q].used && g_ofiles[q].volume == VOL_PIPE &&
-                g_ofiles[q].pipe == pi && !g_ofiles[q].pipe_w) ep_notify_fd(q);
+                g_ofiles[q].pipe == pi && !g_ofiles[q].pipe_w) rq[nr++] = q;
     }
+    klock_release(&g_ofile_lock);
+    for (int i = 0; i < nr; i++) ep_notify_fd(rq[i]);
     return r;
 }
 
@@ -5234,8 +5384,8 @@ static int vfs_open_for(const char *name, int owner, int creat) {
     if (di < 0) return -1;
     return ofile_claim(owner, VOL_ROOT, di);
 }
-static int vfs_open(const char *name) { return vfs_open_for(name, (int)current_proc_idx, 0); }
-static int vfs_open_creat(const char *name) { return vfs_open_for(name, (int)current_proc_idx, 1); }
+static int vfs_open(const char *name) { return vfs_open_for(name, fd_owner(), 0); }
+static int vfs_open_creat(const char *name) { return vfs_open_for(name, fd_owner(), 1); }
 
 /* ===========================================================================
  * v0.48: SYS_VFS_UNLINK — zero the dirent, journal-commit the directory
@@ -5300,7 +5450,11 @@ static void descriptor_teardown_kproc(int proc_idx) {
     }
     for (int fd = 0; fd < 16; fd++)
         if (g_ofiles[fd].used && (g_ofiles[fd].owner_mask & bit)) after++;
+    /* A dying pipeline stage still closes its write end, and the next stage
+     * may be parked in epoll_wait waiting to learn exactly that. */
+    int eof[16], ne = ep_collect_eof_locked(eof);
     klock_release(&g_ofile_lock);
+    for (int i = 0; i < ne; i++) ep_notify_fd(eof[i]);
 
     if (g_debug_kproc_lifetime)
         kprintf("[dbgkpr ] pid %u slot %d: descriptors before=%d after=%d, DMA grants=%u\n",
@@ -6656,9 +6810,25 @@ static void audio_teardown_kproc(int proc_idx) {
 #define NET_LOOPBACK    0x7F000001u         /* 127.0.0.1, host byte order */
 #define NET_GUEST_IP    0x0A000210u         /* 10.0.2.16 (our SLIRP-side src) */
 
+/* v0.65: a listening socket's pending-peer queue. There is no TCP here, so a
+ * "connection" is a PEER: the first datagram from an (addr,port) this listener
+ * has not seen before is a session request, and accept() turns it into a
+ * socket of its own already connected to that peer, with that first datagram
+ * waiting in its RX ring. Nothing is invented — no handshake is synthesised
+ * and none is claimed. What this does give is the thing the milestone is
+ * about: a descriptor that becomes readable when a peer arrives, an accept
+ * that answers -EAGAIN when none has, and an epoll wait that is woken by the
+ * arrival rather than polling for it. */
+#define SOCK_BACKLOG 4
+struct npend {
+    uint32_t addr; uint16_t port;
+    uint16_t len;
+    uint8_t  data[SOCK_DGRAM_MAX];
+};
+
 struct nsock {
     int      used;
-    int      owner;                          /* kproc slot that owns this socket */
+    int      owner;                          /* thread-group LEADER slot that owns it */
     int      bound;
     uint16_t lport;                          /* bound local UDP port */
     int      connected;
@@ -6667,10 +6837,22 @@ struct nsock {
     uint16_t qlen[SOCK_QDEPTH];
     int      qhead, qtail, qcount;
     int      waiter_tid;                     /* thread parked in SYS_RECV, or -1 */
+    /* v0.65 */
+    int      fd;                             /* descriptor naming this socket, or -1 */
+    int      listening;                      /* 1 = accepts peer sessions          */
+    struct npend pend[SOCK_BACKLOG];         /* peers heard from, not yet accepted */
+    int      phead, ptail, pcount;
+    int      hup;                            /* peer session's listener went away  */
+    int      err;                            /* sticky error, reported as EPOLLERR */
 };
 static struct nsock g_sock[NSOCK];
 static struct klock g_net_lock = { 0, "net", 9, 0, 0 };
 static volatile uint64_t g_net_tx_frames = 0, g_net_loop_deliveries = 0;
+/* v0.65: the numbers the suite cannot see from ring 3. An EAGAIN count that
+ * never moves means the non-blocking path was never actually taken — the
+ * driver would pass every assertion it makes about itself and still be
+ * testing a blocking socket. */
+static volatile uint64_t g_net_accepts = 0, g_net_eagain = 0, g_net_sessions = 0;
 
 static int net_sock_count_used(void) {
     int n = 0;
@@ -6686,6 +6868,50 @@ static int net_find_bound(uint16_t port) {
     return -1;
 }
 
+
+/* v0.65: release a socket slot. Caller holds g_net_lock. Any peer session
+ * belonging to a listener that is going away is marked HUP rather than freed:
+ * the session is a descriptor its owner still holds, and yanking it would turn
+ * a readable end-of-conversation into a dangling fd. */
+static void net_sock_release_locked(int si) {
+    if (si < 0 || si >= NSOCK || !g_sock[si].used) return;
+    if (g_sock[si].listening)
+        for (int i = 0; i < NSOCK; i++)
+            if (g_sock[i].used && !g_sock[i].listening && g_sock[i].bound &&
+                g_sock[i].lport == g_sock[si].lport && i != si)
+                g_sock[i].hup = 1;
+    cmemset(&g_sock[si], 0, sizeof g_sock[si]);
+    g_sock[si].waiter_tid = -1;
+    g_sock[si].fd = -1;
+}
+
+/* Same, taking the lock itself — for callers that hold g_ofile_lock (rank 1)
+ * and are therefore free to climb to the net lock (rank 9), never the reverse. */
+static void net_sock_release(int si) {
+    klock_acquire(&g_net_lock);
+    net_sock_release_locked(si);
+    klock_release(&g_net_lock);
+}
+
+/* v0.65: descriptor -> socket, enforcing ownership the way every other fd path
+ * does. Ownership is the thread group's (fd_owner()), so a worker thread can
+ * serve a socket its leader opened — which is the entire shape of a threaded
+ * server and was impossible before v0.64's fd_owner() landed. Takes only the
+ * ofile lock (rank 1); the caller climbs to the net lock afterwards. */
+static int sock_of_fd(int fd, int *flags_out) {
+    if (flags_out) *flags_out = 0;
+    if (fd < 0 || fd >= 16) return -1;
+    int si = -1;
+    klock_acquire(&g_ofile_lock);
+    if (g_ofiles[fd].used && g_ofiles[fd].volume == VOL_SOCK &&
+        (g_ofiles[fd].owner_mask & (1ull << fd_owner()))) {
+        si = g_ofiles[fd].sock;
+        if (flags_out) *flags_out = g_ofiles[fd].flags;
+    }
+    klock_release(&g_ofile_lock);
+    return si;
+}
+
 /* Enqueue a datagram into a socket's RX ring and wake any parked receiver.
  * Caller holds g_net_lock. Drops silently if the ring is full (UDP semantics).*/
 static void net_sock_enqueue(int si, const uint8_t *data, uint16_t len) {
@@ -6698,6 +6924,98 @@ static void net_sock_enqueue(int si, const uint8_t *data, uint16_t len) {
     s->qcount++;
     g_net_loop_deliveries++;
     if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
+}
+
+/* v0.65: deliver a datagram addressed to local port `dport`, arriving from
+ * (saddr,sport). Caller holds g_net_lock. Returns the socket index the
+ * datagram landed in, or -1 if it was dropped — the caller needs that to know
+ * WHICH descriptor became readable, because the epoll notify has to happen
+ * after the net lock is released.
+ *
+ * The routing rule is what makes a listener behave like one: an established
+ * peer session takes precedence, then the listener's pending queue, then a
+ * plain bound socket. Checking the session first is not an optimisation — get
+ * that order wrong and the second packet of a conversation is mistaken for a
+ * new connection. */
+static int net_deliver_locked(uint16_t dport, uint32_t saddr, uint16_t sport,
+                              const uint8_t *data, uint16_t len) {
+    /* ROUTING ORDER, most specific first. After an accept, the listener AND
+     * its session child are both bound to `dport`, so "first socket bound to
+     * this port" is no longer a usable answer — net_find_bound would return
+     * whichever has the lower index and a second client's packets would land
+     * in the first client's socket. Resolve by peer identity first. */
+    int listener = -1, plain = -1;
+    for (int i = 0; i < NSOCK; i++) {
+        if (!g_sock[i].used || !g_sock[i].bound || g_sock[i].lport != dport) continue;
+        if (g_sock[i].listening) { if (listener < 0) listener = i; continue; }
+        if (g_sock[i].connected && g_sock[i].raddr == saddr && g_sock[i].rport == sport) {
+            /* An established session with exactly this peer. */
+            if (g_sock[i].qcount >= SOCK_QDEPTH) return -2;   /* full: EAGAIN */
+            net_sock_enqueue(i, data, len);
+            return i;
+        }
+        if (plain < 0) plain = i;
+    }
+    if (listener >= 0) {
+        /* A peer we have not heard from: a session request. The FIRST datagram
+         * is held with it rather than dropped, so accept() hands back a socket
+         * whose conversation starts where the peer started it. */
+        struct nsock *L = &g_sock[listener];
+        if (L->pcount >= SOCK_BACKLOG) return -2;             /* backlog full */
+        struct npend *pd = &L->pend[L->ptail];
+        pd->addr = saddr; pd->port = sport;
+        pd->len = len > SOCK_DGRAM_MAX ? SOCK_DGRAM_MAX : len;
+        cmemcpy(pd->data, data, pd->len);
+        L->ptail = (L->ptail + 1) % SOCK_BACKLOG;
+        L->pcount++;
+        g_net_loop_deliveries++; g_net_sessions++;
+        if (L->waiter_tid >= 0) { int w = L->waiter_tid; L->waiter_tid = -1; thread_wake(w); }
+        return listener;
+    }
+    if (plain >= 0) {
+        if (g_sock[plain].qcount >= SOCK_QDEPTH) return -2;   /* full: EAGAIN */
+        net_sock_enqueue(plain, data, len);
+        return plain;
+    }
+    return -1;                                                /* nothing bound here */
+}
+
+/* v0.65: what is this socket ready for, right now? Takes g_net_lock itself
+ * (rank 9, above the ofile lock its caller holds).
+ *
+ * Readiness is COMPUTED here for the same reason it is for pipes and
+ * eventfds: the answer is derived from the ring counters a following recv or
+ * accept would consult, so it cannot disagree with them. */
+static uint32_t net_sock_events(int si) {
+    if (si < 0 || si >= NSOCK) return EPOLLERR;
+    uint32_t r = 0;
+    klock_acquire(&g_net_lock);
+    struct nsock *s = &g_sock[si];
+    if (!s->used) { klock_release(&g_net_lock); return EPOLLERR; }
+    if (s->err) r |= EPOLLERR;
+    if (s->hup) r |= EPOLLHUP;                  /* the listener behind us is gone */
+    if (s->listening) {
+        /* A listener is READABLE when a peer is waiting to be accepted. That
+         * is the whole point: it lets one epoll_wait cover the accept loop and
+         * the established sessions together. It is never writable — there is
+         * nothing to send from a socket whose job is to hand out others. */
+        if (s->pcount > 0) r |= EPOLLIN;
+    } else {
+        if (s->qcount > 0) r |= EPOLLIN;
+        /* End of conversation is READABLE, exactly as end of file is on a
+         * pipe: a reader has to be woken to LEARN there is no more coming, or
+         * it waits for a peer that cannot answer. */
+        if (s->hup) r |= EPOLLIN;
+        /* Writable when the socket can actually send: it needs a destination.
+         * An unconnected socket reporting EPOLLOUT would invite a send that
+         * can only fail. There is no TX backpressure to expose beyond that —
+         * the virtio TX path takes the frame synchronously — so this says
+         * "your send will be accepted", which is true, rather than inventing a
+         * queue depth the hardware does not have. */
+        if (s->connected && !s->hup && !s->err) r |= EPOLLOUT;
+    }
+    klock_release(&g_net_lock);
+    return r;
 }
 
 /* 16-bit one's-complement checksum (IP header). */
@@ -6744,15 +7062,29 @@ static void net_tx_udp(uint32_t daddr, uint16_t sport, uint16_t dport,
  * teardown hooks. Releases every socket the dying process owns. Static RX
  * rings mean there are no frames to reclaim — just free the slots and clear
  * any waiter so a stale tid can never be woken. */
+/* v0.65: a SAFETY NET, no longer the reclaim path.
+ *
+ * Every socket now has a descriptor, and descriptor_teardown_kproc force-closes
+ * each fd the dying slot owns — which releases the socket through the same
+ * ofile_drop_locked every SYS_CLOSE goes through, honouring the owner mask.
+ * That matters because this hook runs BEFORE descriptor teardown: freeing by
+ * `owner` here would yank a socket out from under a forked sibling that still
+ * holds an inherited descriptor for it, which is exactly the bug the owner mask
+ * exists to prevent.
+ *
+ * So this now reclaims ONLY sockets no descriptor names (fd < 0) — the window
+ * between claiming a g_sock slot and claiming its ofile, which a fault in
+ * between could otherwise strand. Leaving the loop out entirely would leak
+ * those; leaving it as it was would corrupt the shared ones. */
 static void net_teardown_kproc(int proc_idx) {
+    int L = tg_of(proc_idx);
     klock_acquire(&g_net_lock);
     for (int i = 0; i < NSOCK; i++) {
-        if (g_sock[i].used && g_sock[i].owner == proc_idx) {
+        if (g_sock[i].used && g_sock[i].fd < 0 && g_sock[i].owner == L) {
             if (g_debug_net)
-                kprintf("[dbgnet ] pid %u slot %d: released socket (lport %u)\n",
+                kprintf("[dbgnet ] pid %u slot %d: released undescribed socket (lport %u)\n",
                         kprocs[proc_idx].pid, i, (uint64_t)g_sock[i].lport);
-            g_sock[i].used = 0; g_sock[i].bound = 0; g_sock[i].connected = 0;
-            g_sock[i].waiter_tid = -1; g_sock[i].qcount = 0;
+            net_sock_release_locked(i);
         }
     }
     klock_release(&g_net_lock);
@@ -7192,7 +7524,12 @@ static uint64_t futex_key_of(uint64_t cr3, uint64_t uaddr) {
  * nesting that under a leaf spinlock would invert the ordering discipline. */
 static void futex_requeue(int p, uint64_t rv) {
     kprocs[p].wait_rv = rv;
-    kprocs[p].uctx.rax = rv;                     /* what SYS_FUTEX_WAIT returns */
+    /* A restarting waiter re-runs its syscall and computes its own answer, so
+     * `rv` is not its return value — and RAX is holding the call number the
+     * re-execution needs. Overwriting it here dispatched syscall 0xFFFFFFF5
+     * instead of 78, which is how the epoll park came back as -1. */
+    if (!kprocs[p].wait_restart) kprocs[p].uctx.rax = rv;
+    kprocs[p].wait_restart = 0;
     kprocs[p].wait_key = 0;
     kprocs[p].wait_deadline = 0;
     __sync_synchronize();
@@ -7250,7 +7587,8 @@ static int futex_park(int p) {
         kprocs[p].wait_armed = 0;
         kprocs[p].wait_key = 0;
         kprocs[p].wait_deadline = 0;
-        kprocs[p].uctx.rax = kprocs[p].wait_rv;   /* set by the waker */
+        if (!kprocs[p].wait_restart) kprocs[p].uctx.rax = kprocs[p].wait_rv;
+        kprocs[p].wait_restart = 0;               /* same rule as futex_requeue */
         park = 0;
     } else {
         kprocs[p].parked = 1;                    /* context is complete: safe  */
@@ -9418,7 +9756,7 @@ static int ofile_deref(int fd, int *out_vol) {
     if (fd < 0 || fd >= 16) return -1;
     klock_acquire(&g_ofile_lock);
     int di = (g_ofiles[fd].used &&
-              (g_ofiles[fd].owner_mask & (1ull << (int)current_proc_idx)))
+              (g_ofiles[fd].owner_mask & (1ull << fd_owner())))
            ? g_ofiles[fd].dirent : -1;
     if (di >= 0 && out_vol) *out_vol = g_ofiles[fd].volume;
     klock_release(&g_ofile_lock);
@@ -9500,8 +9838,14 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
      * before forking, and the fork is what carries it into the new process. */
     klock_acquire(&g_ofile_lock);
     int inherited = 0;
+    /* v0.64 Phase 2: the descriptors to hand on are the PROCESS's, so the mask
+     * is read against the thread-group leader. `par` is the calling slot, which
+     * is the leader for an ordinary fork and is not when a thread forks — and
+     * in that case the parent's own bit is unset, so the child would inherit
+     * nothing at all. */
+    int par_fds = tg_of(par);
     for (int fd = 0; fd < 16; fd++) {
-        if (!g_ofiles[fd].used || !(g_ofiles[fd].owner_mask & (1ull << par))) continue;
+        if (!g_ofiles[fd].used || !(g_ofiles[fd].owner_mask & (1ull << par_fds))) continue;
         g_ofiles[fd].owner_mask |= (1ull << ch);
         if (g_ofiles[fd].pipe >= 0) pipe_ref_locked(g_ofiles[fd].pipe, g_ofiles[fd].pipe_w);
         inherited++;
@@ -9605,6 +9949,7 @@ static void __attribute__((noreturn))
 block_ring3(struct sysframe *sf, int p, uint64_t key, uint64_t timeout) {
     uctx_from_sysframe(&kprocs[p].uctx, sf, WAIT_RV_OK);
     futex_lock();
+    kprocs[p].wait_restart  = 0;      /* returns from the call, does not repeat it */
     kprocs[p].wait_key      = key;
     kprocs[p].wait_deadline = g_ticks + timeout;
     kprocs[p].wake_pending  = 0;
@@ -9616,6 +9961,65 @@ block_ring3(struct sysframe *sf, int p, uint64_t key, uint64_t timeout) {
     __sync_synchronize();
     write_cr3(kernel_cr3);
     resume_kernel(RET_PREEMPTED);            /* cpu_exec_proc parks or requeues */
+    for (;;) __asm__ volatile("hlt");        /* unreachable                     */
+}
+
+/* v0.64 Phase 2: park exactly as block_ring3 does, but arrange for the task to
+ * resume by RE-EXECUTING ITS SYSCALL instead of returning from it.
+ *
+ * WHY A SYSCALL WOULD WANT THIS. A woken task resumes with one register it did
+ * not have before — RAX — and nothing else. That is enough for futex_wait and
+ * thread_join, whose whole answer IS that value. It is not enough for
+ * epoll_wait, whose answer is a count plus an array that has to be filled in
+ * from the watch list, in the caller's address space, by the caller's own
+ * thread. The waker cannot do it: it is on another core, in another address
+ * space, holding locks ranked below the ones it would need.
+ *
+ * The alternative was to return -EAGAIN and make every caller loop. That is
+ * what Phase 1 documented, and it is why the suite failed here: the contract
+ * is invisible in the signature, so a caller that reads like POSIX behaves
+ * like POSIX right up until something is woken. Restarting keeps the honest
+ * signature and puts the obligation in the one place that can discharge it.
+ *
+ * RCX and R11 are architecturally clobbered by `syscall`, so no caller can be
+ * relying on them, and the argument registers are still in the frame — the
+ * instruction re-executes with exactly the operands it had. The deadline is
+ * the one thing that must NOT be recomputed, which is why it is absolute and
+ * lives in the kproc: see `ep_deadline`.
+ *
+ * `nr` is the syscall number to put back in RAX. The `syscall` instruction is
+ * two bytes and the saved RIP points just past it; that is verified rather
+ * than assumed, because rewinding onto something that is not a syscall would
+ * resume ring 3 in the middle of an instruction. If the check fails the task
+ * is not parked at all and the caller falls back — a slower answer, never a
+ * wrong one. Returns only on that failure. */
+static int block_ring3_restart(struct sysframe *sf, int p, uint64_t key,
+                               uint64_t timeout, uint64_t nr) {
+    if (sf->rip < USER_VMIN + 2 || sf->rip >= USER_VMAX) {
+        kprintf("[epoll  ] restart declined: rip %X is outside ring 3\n", sf->rip);
+        return 0;
+    }
+    const uint8_t *insn = (const uint8_t *)(sf->rip - 2);
+    if (insn[0] != 0x0F || insn[1] != 0x05) {            /* not `syscall`      */
+        kprintf("[epoll  ] restart declined: rip %X preceded by %x %x, not 0f 05\n",
+                sf->rip, (uint64_t)insn[0], (uint64_t)insn[1]);
+        return 0;
+    }
+    uctx_from_sysframe(&kprocs[p].uctx, sf, nr);         /* RAX = the call number */
+    kprocs[p].uctx.rip = sf->rip - 2;                    /* back onto the syscall */
+    futex_lock();
+    kprocs[p].wait_restart  = 1;      /* hands off RAX: it holds `nr` now */
+    kprocs[p].wait_key      = key;
+    kprocs[p].wait_deadline = g_ticks + timeout;
+    kprocs[p].wake_pending  = 0;
+    kprocs[p].parked        = 0;
+    kprocs[p].wait_rv       = WAIT_RV_OK;
+    kprocs[p].wait_armed    = 1;
+    futex_unlock();
+    kprocs[p].pstate = 1;
+    __sync_synchronize();
+    write_cr3(kernel_cr3);
+    resume_kernel(RET_PREEMPTED);
     for (;;) __asm__ volatile("hlt");        /* unreachable                     */
 }
 
@@ -9674,13 +10078,17 @@ static uint64_t sys_futex_wait(struct sysframe *sf, uint64_t uaddr, uint64_t val
  * nothing. The userland wrapper presents the ordinary four-argument shape.
  *
  * Returns:
- *   > 0          that many events were written to `events`
- *   0            timeout was 0 and nothing was ready — a poll, not a wait
- *   -EAGAIN(-11) we slept, something happened, CALL AGAIN. Same retry contract
- *                as SYS_THREAD_JOIN and for the same reason: a woken task
- *                resumes with only RAX, and the waker is in another address
- *                space and cannot fill in the caller's array.
- *   -ETIMEDOUT   the deadline passed with nothing ready.
+ *   > 0   that many events were written to `events`
+ *   0     nothing was ready: either the caller asked for a poll (timeout 0) or
+ *         the deadline passed. POSIX makes these the same answer, and they are
+ *         the same answer here.
+ *   < 0   a real error — EBADF, EINVAL, EFAULT.
+ *
+ * Never -EAGAIN. Phase 1 returned it to mean "we slept, something happened,
+ * call again", which put the retry on every caller and made the signature lie
+ * about the contract; the suite duly failed on it. A woken waiter now
+ * RE-EXECUTES this syscall (block_ring3_restart) and re-runs the scan below,
+ * so a caller sees only the answers above however many times it was woken.
  *
  * EDGE TRIGGERING is per watch, and `seen` is what makes it edge rather than
  * level: a watch registered with EPOLLET reports a mask only when it DIFFERS
@@ -9690,22 +10098,24 @@ struct uepoll_event { uint32_t events; uint32_t _pad; uint64_t data; };
 
 static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, uint64_t a2) {
     int p = tg_of((int)current_proc_idx);
+    int me = (int)current_proc_idx;
     int epfd = (int)(int64_t)a0;
     int maxev = (int)(a2 & 0xFFFFFFFFu);
     int64_t tmo_ms = (int64_t)(int32_t)(a2 >> 32);
-    if (epfd < 0 || epfd >= 16 || maxev <= 0) return (uint64_t)-22;
+    if (epfd < 0 || epfd >= 16 || maxev <= 0) { kprocs[me].ep_deadline = 0; return (uint64_t)-22; }
     if (maxev > EPOLL_MAXWATCH) maxev = EPOLL_MAXWATCH;
-    if (!access_ok(kprocs[p].cr3, a1, (uint64_t)maxev * sizeof(struct uepoll_event), 1))
-        return (uint64_t)-14;
+    if (!access_ok(kprocs[p].cr3, a1, (uint64_t)maxev * sizeof(struct uepoll_event), 1)) {
+        kprocs[me].ep_deadline = 0; return (uint64_t)-14;
+    }
 
     klock_acquire(&g_ofile_lock);
     if (!g_ofiles[epfd].used || g_ofiles[epfd].volume != VOL_EPOLL ||
         !(g_ofiles[epfd].owner_mask & (1ull << p))) {
-        klock_release(&g_ofile_lock); return (uint64_t)-9;
+        klock_release(&g_ofile_lock); kprocs[me].ep_deadline = 0; return (uint64_t)-9;
     }
     int epi = g_ofiles[epfd].ep;
     if (epi < 0 || epi >= MAX_EPOLL || !g_epoll[epi].used) {
-        klock_release(&g_ofile_lock); return (uint64_t)-9;
+        klock_release(&g_ofile_lock); kprocs[me].ep_deadline = 0; return (uint64_t)-9;
     }
     struct kepoll *E = &g_epoll[epi];
     struct uepoll_event *out = (struct uepoll_event *)a1;
@@ -9725,24 +10135,42 @@ static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, ui
     }
     klock_release(&g_ofile_lock);
     __sync_fetch_and_add(&g_epoll_waits, 1);
-    if (n > 0) return (uint64_t)(int64_t)n;
-    if (tmo_ms == 0) return 0;                       /* a poll: nothing ready */
+    if (n > 0) { kprocs[me].ep_deadline = 0; return (uint64_t)(int64_t)n; }
+    if (tmo_ms == 0) { kprocs[me].ep_deadline = 0; return 0; }  /* a poll: nothing ready */
+
+    /* PIT is 100 Hz, so a tick is 10 ms; a negative timeout means "wait", which
+     * here is still bounded by the kernel default — no park in this system is
+     * unbounded, for the reason set out with the futex.
+     *
+     * The deadline is established ONCE and survives the restarts, which is the
+     * whole reason it is kept in the kproc. Recomputing it here would give a
+     * waiter that is woken spuriously a fresh timeout every time, and a stream
+     * of wakes would then postpone the deadline indefinitely — the exact
+     * unbounded wait M61 invariant 4 exists to forbid, reintroduced through
+     * the back door of a restart. */
+    if (!kprocs[me].ep_deadline)
+        kprocs[me].ep_deadline = g_ticks +
+            ((tmo_ms < 0) ? FUTEX_DEFAULT_TICKS : ((uint64_t)tmo_ms / 10 + 1));
+    uint64_t dl = kprocs[me].ep_deadline;
+    if (g_ticks >= dl) { kprocs[me].ep_deadline = 0; return 0; }   /* expired: 0 events */
 
     /* Nothing ready and the caller is willing to wait. Park on this instance's
      * key using the v0.61 protocol, so the thread leaves the run queue rather
      * than spinning — which on a uniprocessor is the difference between
      * waiting and preventing the event from ever happening. */
     if (!sf || !can_park()) {
-        uint64_t dl = g_ticks + (tmo_ms < 0 ? FUTEX_DEFAULT_TICKS : (uint64_t)tmo_ms / 10 + 1);
         while (g_ticks < dl) { sched_yield(); }
-        return WAIT_RV_TIMEDOUT;
+        kprocs[me].ep_deadline = 0;
+        return 0;
     }
     __sync_fetch_and_add(&g_epoll_parks, 1);
-    /* PIT is 100 Hz, so a tick is 10 ms; a negative timeout means "wait", which
-     * here is still bounded by the kernel default — no park in this system is
-     * unbounded, for the reason set out with the futex. */
-    uint64_t ticks = (tmo_ms < 0) ? FUTEX_DEFAULT_TICKS : ((uint64_t)tmo_ms / 10 + 1);
-    block_ring3(sf, (int)current_proc_idx, EPOLL_WAIT_KEY(epi), ticks);  /* never returns */
+    block_ring3_restart(sf, me, EPOLL_WAIT_KEY(epi), dl - g_ticks, 78);
+    /* Only reached if the caller did not arrive through a `syscall` we can
+     * rewind onto; fall back to the bounded yield rather than parking with no
+     * way to re-run the scan. */
+    while (g_ticks < dl) { sched_yield(); }
+    kprocs[me].ep_deadline = 0;
+    return 0;
 }
 
 /* SYS_FUTEX_WAKE(uaddr, n) -> how many waiters were released (0 is normal and
@@ -10070,11 +10498,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     case 8: {                                              /* SYS_CLOSE(fd)              */
         int fd = (int)a0;
         if (fd >= 0 && fd < 16) {
+            int eof[16], ne = 0;
             fs_witness_enter();
             klock_acquire(&g_ofile_lock);
-            ofile_drop_locked(fd, (int)current_proc_idx);
+            ofile_drop_locked(fd, fd_owner());
+            ne = ep_collect_eof_locked(eof);   /* woken below, outside the lock */
             klock_release(&g_ofile_lock);
             fs_witness_leave();
+            for (int i = 0; i < ne; i++) ep_notify_fd(eof[i]);
         }
         return 0;
     }
@@ -10284,9 +10715,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             /* accept path instead of inventing a return-to-sender protocol.          */
             if (kmsg.msg_type == IPC_MSG_XFER_FD) {
                 int fd = (int)kmsg.xfer_handle;
+                int eof[16], ne;
                 klock_acquire(&g_ofile_lock);
-                ofile_drop_locked(fd, (int)current_proc_idx);
+                ofile_drop_locked(fd, fd_owner());
+                ne = ep_collect_eof_locked(eof);
                 klock_release(&g_ofile_lock);
+                for (int i = 0; i < ne; i++) ep_notify_fd(eof[i]);
             } else if (kmsg.msg_type == IPC_MSG_XFER_SHM) {
                 klock_acquire(&g_ipc_lock);
                 if (kmsg.xfer_handle >= 0 && kmsg.xfer_handle < MAX_IPC_SHMEM)
@@ -10656,102 +11090,160 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     }
 
     /* --- v0.52: ring-3 datagram sockets over virtio-net (require PCAP_NETWORK) --- */
-    case 35: {   /* SYS_SOCKET(domain, type, proto) -> socket fd (>=0), or negative */
+    case 35: {   /* SYS_SOCKET(domain, type, proto) -> DESCRIPTOR (>=0), or negative.
+                  * v0.65: the return is an ofile index, not a g_sock index. That
+                  * is the whole milestone in one line — until a socket had a
+                  * descriptor, epoll could not name it, close could not release
+                  * it and fork could not inherit it. `type` may carry
+                  * SOCK_NONBLOCK, as Linux allows, so a non-blocking socket
+                  * needs no second syscall to become one. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        if ((uint32_t)a0 != NET_AF_INET || (uint32_t)a1 != NET_SOCK_DGRAM) return (uint64_t)-1;
+        uint32_t type = (uint32_t)a1;
+        int nonblock = (type & SOCK_NONBLOCK) ? 1 : 0;
+        type &= ~(uint32_t)SOCK_NONBLOCK;
+        if ((uint32_t)a0 != NET_AF_INET || type != NET_SOCK_DGRAM) return (uint64_t)-1;
+        int owner = fd_owner();
         klock_acquire(&g_net_lock);
-        int fd = -1;
+        int si = -1;
         for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) {
             cmemset(&g_sock[i], 0, sizeof g_sock[i]);
-            g_sock[i].used = 1; g_sock[i].owner = (int)current_proc_idx; g_sock[i].waiter_tid = -1;
-            fd = i; break;
+            g_sock[i].used = 1; g_sock[i].owner = owner;
+            g_sock[i].waiter_tid = -1; g_sock[i].fd = -1;
+            si = i; break;
         }
         klock_release(&g_net_lock);
-        if (fd < 0) return (uint64_t)-1;                    /* socket table full */
-        if (g_debug_net) kprintf("[dbgnet ] pid %u: SOCKET -> fd %d\n", kprocs[current_proc_idx].pid, fd);
-        return (uint64_t)fd;
+        if (si < 0) return (uint64_t)-1;                    /* socket table full */
+        int fd = ofile_claim(owner, VOL_SOCK, si);
+        if (fd < 0) { net_sock_release(si); return (uint64_t)-24; }   /* EMFILE */
+        klock_acquire(&g_ofile_lock);
+        g_ofiles[fd].sock = si;
+        if (nonblock) g_ofiles[fd].flags |= O_NONBLOCK;
+        klock_release(&g_ofile_lock);
+        klock_acquire(&g_net_lock);
+        g_sock[si].fd = fd;
+        klock_release(&g_net_lock);
+        if (g_debug_net) kprintf("[dbgnet ] pid %u: SOCKET -> fd %d (socket %d)%s\n",
+                                 kprocs[current_proc_idx].pid, (uint64_t)(int64_t)fd,
+                                 (uint64_t)(int64_t)si, nonblock ? " NONBLOCK" : "");
+        return (uint64_t)(int64_t)fd;
     }
     case 36: {   /* SYS_BIND(fd, port) -> 0 ok, negative error */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        int fd = (int)(int64_t)a0; uint16_t port = (uint16_t)a1;
-        if (fd < 0 || fd >= NSOCK || port == 0) return (uint64_t)-1;
+        int si = sock_of_fd((int)(int64_t)a0, 0); uint16_t port = (uint16_t)a1;
+        if (si < 0 || port == 0) return (uint64_t)-9;                  /* EBADF/EINVAL */
         klock_acquire(&g_net_lock);
         int rc = -1;
-        if (g_sock[fd].used && g_sock[fd].owner == (int)current_proc_idx) {
-            int taken = net_find_bound(port);
-            if (taken < 0 || taken == fd) { g_sock[fd].lport = port; g_sock[fd].bound = 1; rc = 0; }
-        }
+        int taken = net_find_bound(port);
+        if (taken < 0 || taken == si) { g_sock[si].lport = port; g_sock[si].bound = 1; rc = 0; }
         klock_release(&g_net_lock);
-        if (g_debug_net) kprintf("[dbgnet ] pid %u: BIND fd %d port %u -> %d\n",
-                                 kprocs[current_proc_idx].pid, fd, (uint64_t)port, rc);
+        if (g_debug_net) kprintf("[dbgnet ] pid %u: BIND socket %d port %u -> %d\n",
+                                 kprocs[current_proc_idx].pid, (uint64_t)(int64_t)si,
+                                 (uint64_t)port, (uint64_t)(int64_t)rc);
         return rc == 0 ? (uint64_t)0 : (uint64_t)-1;
     }
-    case 37: {   /* SYS_CONNECT(fd, addr, port) -> 0 ok, negative */
+    case 37: {   /* SYS_CONNECT(fd, addr, port) -> 0 ok, negative.
+                  * A datagram connect records a default peer; it exchanges
+                  * nothing and so cannot block. It therefore NEVER returns
+                  * -EAGAIN, whatever O_NONBLOCK says — reporting "in progress"
+                  * for an operation that already completed would be a lie a
+                  * caller would then wait on. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        int fd = (int)(int64_t)a0; uint32_t addr = (uint32_t)a1; uint16_t port = (uint16_t)a2;
-        if (fd < 0 || fd >= NSOCK) return (uint64_t)-1;
+        int si = sock_of_fd((int)(int64_t)a0, 0);
+        uint32_t addr = (uint32_t)a1; uint16_t port = (uint16_t)a2;
+        if (si < 0) return (uint64_t)-9;
         klock_acquire(&g_net_lock);
         int rc = -1;
-        if (g_sock[fd].used && g_sock[fd].owner == (int)current_proc_idx) {
-            g_sock[fd].raddr = addr; g_sock[fd].rport = port; g_sock[fd].connected = 1; rc = 0;
-        }
+        if (g_sock[si].listening) rc = -22;                 /* EINVAL: a listener */
+        else { g_sock[si].raddr = addr; g_sock[si].rport = port;
+               g_sock[si].connected = 1; rc = 0; }
         klock_release(&g_net_lock);
-        if (g_debug_net) kprintf("[dbgnet ] pid %u: CONNECT fd %d -> %d\n",
-                                 kprocs[current_proc_idx].pid, fd, rc);
-        return rc == 0 ? (uint64_t)0 : (uint64_t)-1;
+        if (g_debug_net) kprintf("[dbgnet ] pid %u: CONNECT socket %d -> %d\n",
+                                 kprocs[current_proc_idx].pid, (uint64_t)(int64_t)si,
+                                 (uint64_t)(int64_t)rc);
+        return rc == 0 ? (uint64_t)0 : (uint64_t)(int64_t)rc;
     }
     case 38: {   /* SYS_SEND(fd, buf, len) -> bytes sent, or negative */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        int fd = (int)(int64_t)a0; uint64_t ubuf = a1; uint32_t len = (uint32_t)a2;
-        if (fd < 0 || fd >= NSOCK) return (uint64_t)-1;
+        int fl = 0;
+        int si = sock_of_fd((int)(int64_t)a0, &fl);
+        uint64_t ubuf = a1; uint32_t len = (uint32_t)a2;
+        if (si < 0) return (uint64_t)-9;
         if (len > SOCK_DGRAM_MAX) len = SOCK_DGRAM_MAX;
-        if (!access_ok(kprocs[current_proc_idx].cr3, ubuf, len, 0)) return (uint64_t)-1;
+        if (!access_ok(kprocs[tg_of((int)current_proc_idx)].cr3, ubuf, len, 0)) return (uint64_t)-14;
         uint8_t stage[SOCK_DGRAM_MAX];
         cmemcpy(stage, (const void *)ubuf, len);
         klock_acquire(&g_net_lock);
-        if (!(g_sock[fd].used && g_sock[fd].owner == (int)current_proc_idx && g_sock[fd].connected)) {
-            klock_release(&g_net_lock); return (uint64_t)-1;
+        if (!g_sock[si].used || !g_sock[si].connected || g_sock[si].listening) {
+            klock_release(&g_net_lock); return (uint64_t)-107;         /* ENOTCONN */
         }
-        uint32_t daddr = g_sock[fd].raddr; uint16_t dport = g_sock[fd].rport, sport = g_sock[fd].lport;
-        int delivered_loop = 0;
+        uint32_t daddr = g_sock[si].raddr;
+        uint16_t dport = g_sock[si].rport, sport = g_sock[si].lport;
+        int delivered_loop = 0, woke = -1;
+        int64_t rc = (int64_t)len;
         if (daddr == NET_LOOPBACK) {
-            int ti = net_find_bound(dport);
-            if (ti >= 0) { net_sock_enqueue(ti, stage, (uint16_t)len); delivered_loop = 1; }
+            /* v0.65: THE ONE PLACE THIS SYSTEM HAS REAL SEND BACKPRESSURE. The
+             * receiver's ring is four deep and net_sock_enqueue drops silently
+             * past that. A silent drop is legal for UDP and useless for a test
+             * of non-blocking semantics, so a full destination is reported:
+             * -EAGAIN, the caller's cue to wait for EPOLLOUT on the peer.
+             *
+             * It is reported whether or not O_NONBLOCK is set, because there is
+             * nothing to block ON — no transmit queue drains in the background
+             * here, and a blocking sender would be waiting for a receiver it is
+             * itself preventing from running on a uniprocessor. */
+            int d = net_deliver_locked(dport, NET_LOOPBACK, sport, stage, (uint16_t)len);
+            if (d == -2) { rc = -11; __sync_fetch_and_add(&g_net_eagain, 1); }  /* receiver full */
+            else if (d >= 0) { woke = d; delivered_loop = 1; }
+            /* d == -1: nothing bound locally, so it goes on the wire below. */
         }
+        int wake_fd = (woke >= 0) ? g_sock[woke].fd : -1;
         klock_release(&g_net_lock);
+        if (rc < 0) return (uint64_t)rc;
         if (!delivered_loop) net_tx_udp(daddr, sport, dport, stage, (uint16_t)len);  /* real wire */
-        if (g_debug_net) kprintf("[dbgnet ] pid %u: SEND fd %d %u bytes -> %s\n",
-                                 kprocs[current_proc_idx].pid, fd, (uint64_t)len,
-                                 delivered_loop ? "loopback" : "wire");
+        /* Notified AFTER the net lock is dropped: ep_notify_fd takes the ofile
+         * lock (rank 1) and waking takes run-queue locks, and both rank BELOW
+         * the net lock (9). Doing it inside would be a clean rank inversion. */
+        if (wake_fd >= 0) ep_notify_fd(wake_fd);
+        if (g_debug_net) kprintf("[dbgnet ] pid %u: SEND socket %d %u bytes -> %s\n",
+                                 kprocs[current_proc_idx].pid, (uint64_t)(int64_t)si,
+                                 (uint64_t)len, delivered_loop ? "loopback" : "wire");
         return (uint64_t)len;
     }
-    case 39: {   /* SYS_RECV(fd, buf, maxlen) -> bytes received (>=0), 0 if timed out empty, negative on error */
+    case 39: {   /* SYS_RECV(fd, buf, maxlen) -> bytes (>=0), or negative.
+                  * O_NONBLOCK: -EAGAIN the instant the ring is empty.
+                  * Blocking:   the v0.52 bounded poll, returning 0 on timeout —
+                  *             unchanged, because netstrs and every existing
+                  *             caller are written against it. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        int fd = (int)(int64_t)a0; uint64_t ubuf = a1; uint32_t maxlen = (uint32_t)a2;
-        if (fd < 0 || fd >= NSOCK) return (uint64_t)-1;
-        if (!access_ok(kprocs[current_proc_idx].cr3, ubuf, maxlen, 1)) return (uint64_t)-1;
-        /* Bounded poll (never blocks unbounded — same hang-proof discipline as
-         * gpu_fence_wait): loopback delivery is synchronous, so the common case
-         * returns immediately; a genuinely empty socket times out at ~2000
-         * ticks rather than ever deadlocking. Timer IRQs still fire during the
-         * pause, so the NIC softirq can deliver real inbound frames too. */
+        int fl = 0;
+        int si = sock_of_fd((int)(int64_t)a0, &fl);
+        uint64_t ubuf = a1; uint32_t maxlen = (uint32_t)a2;
+        if (si < 0) return (uint64_t)-9;
+        if (!access_ok(kprocs[tg_of((int)current_proc_idx)].cr3, ubuf, maxlen, 1)) return (uint64_t)-14;
         uint64_t t0 = g_ticks;
         for (;;) {
             klock_acquire(&g_net_lock);
-            if (!(g_sock[fd].used && g_sock[fd].owner == (int)current_proc_idx)) {
-                klock_release(&g_net_lock); return (uint64_t)-1;
-            }
-            if (g_sock[fd].qcount > 0) {
-                struct nsock *s = &g_sock[fd];
-                uint16_t dl = s->qlen[s->qhead]; if (dl > maxlen) dl = (uint16_t)maxlen;
-                cmemcpy((void *)ubuf, s->q[s->qhead], dl);
-                s->qhead = (s->qhead + 1) % SOCK_QDEPTH; s->qcount--;
+            if (!g_sock[si].used) { klock_release(&g_net_lock); return (uint64_t)-9; }
+            if (g_sock[si].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
+            if (g_sock[si].qcount > 0) {
+                struct nsock *sk = &g_sock[si];
+                uint16_t dl = sk->qlen[sk->qhead]; if (dl > maxlen) dl = (uint16_t)maxlen;
+                cmemcpy((void *)ubuf, sk->q[sk->qhead], dl);
+                sk->qhead = (sk->qhead + 1) % SOCK_QDEPTH; sk->qcount--;
                 klock_release(&g_net_lock);
-                if (g_debug_net) kprintf("[dbgnet ] pid %u: RECV fd %d -> %u bytes\n",
-                                         kprocs[current_proc_idx].pid, fd, (uint64_t)dl);
+                if (g_debug_net) kprintf("[dbgnet ] pid %u: RECV socket %d -> %u bytes\n",
+                                         kprocs[current_proc_idx].pid,
+                                         (uint64_t)(int64_t)si, (uint64_t)dl);
                 return (uint64_t)dl;
             }
+            /* Drained AND the peer is gone: 0 is end-of-conversation, the same
+             * answer a pipe read gives at end of file, and distinct from the
+             * -EAGAIN of a live-but-empty socket. */
+            int hup = g_sock[si].hup;
             klock_release(&g_net_lock);
+            if (hup) return (uint64_t)0;
+            if (fl & O_NONBLOCK) { __sync_fetch_and_add(&g_net_eagain, 1);
+                                   return (uint64_t)-11; }   /* EAGAIN */
             if (g_ticks - t0 >= 2000) return (uint64_t)0;    /* timed out empty */
             __asm__ volatile("pause");
         }
@@ -11399,7 +11891,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
          * SYS_STAT's two-word out-buffer set the same precedent. */
         if (!access_ok(kprocs[current_proc_idx].cr3, a0, 16, 1)) return (uint64_t)-14;
         int rfd = -1, wfd = -1;
-        int r = pipe_create_for((int)current_proc_idx, &rfd, &wfd);
+        int r = pipe_create_for(fd_owner(), &rfd, &wfd);
         if (r < 0) return (uint64_t)(int64_t)r;
         ((uint64_t *)a0)[0] = (uint64_t)rfd; ((uint64_t *)a0)[1] = (uint64_t)wfd;
         g_pipes_made++;
@@ -11494,7 +11986,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int fd   = (int)(int32_t)(a1 & 0xFFFFFFFFu);
         uint32_t evmask = (uint32_t)(a2 & 0xFFFFFFFFu);
         uint64_t cookie = a2 >> 32;
-        if (epfd < 0 || epfd >= 16 || fd < 0 || fd >= 16) return (uint64_t)-9;   /* EBADF */
+        if (epfd < 0 || epfd >= 16) return (uint64_t)-9;                        /* EBADF */
+        if (fd != EPOLL_TTY_FD && (fd < 0 || fd >= 16)) return (uint64_t)-9;
         klock_acquire(&g_ofile_lock);
         if (!g_ofiles[epfd].used || g_ofiles[epfd].volume != VOL_EPOLL ||
             !(g_ofiles[epfd].owner_mask & (1ull << p))) {
@@ -11513,7 +12006,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int64_t rc = 0;
         if (op == EPOLL_CTL_ADD) {
             if (slot >= 0) rc = -17;                        /* EEXIST */
-            else if (!g_ofiles[fd].used) rc = -9;
+            else if (fd != EPOLL_TTY_FD && !g_ofiles[fd].used) rc = -9;
             else if (freeslot < 0) rc = -28;                /* ENOSPC */
             else {
                 E->w[freeslot].used = 1; E->w[freeslot].fd = fd;
@@ -11530,6 +12023,108 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         } else rc = -22;                                    /* EINVAL */
         klock_release(&g_ofile_lock);
         return (uint64_t)rc;
+    }
+    case 80: {   /* v0.65: SYS_FCNTL(fd, cmd, arg) -> per POSIX.
+                  * F_GETFL returns the descriptor's flags; F_SETFL replaces the
+                  * settable ones (here: O_NONBLOCK). Deliberately on the
+                  * DESCRIPTOR and not the socket — after a fork both processes
+                  * name one socket through two descriptions, and POSIX lets
+                  * them disagree about blocking. Putting the flag on the socket
+                  * would make one process's fcntl silently retune the other's. */
+        int fd = (int)(int64_t)a0, cmd = (int)(int64_t)a1;
+        if (fd < 0 || fd >= 16) return (uint64_t)-9;
+        int64_t rc;
+        klock_acquire(&g_ofile_lock);
+        if (!g_ofiles[fd].used || !(g_ofiles[fd].owner_mask & (1ull << fd_owner()))) rc = -9;
+        else if (cmd == F_GETFL) rc = (int64_t)g_ofiles[fd].flags;
+        else if (cmd == F_SETFL) {
+            g_ofiles[fd].flags = (int)(a2 & O_NONBLOCK);   /* only settable bit */
+            rc = 0;
+        } else rc = -22;                                   /* EINVAL */
+        klock_release(&g_ofile_lock);
+        return (uint64_t)rc;
+    }
+    case 81: {   /* v0.65: SYS_LISTEN(fd, backlog) -> 0, or negative.
+                  * Marks a BOUND socket as one that hands out peer sessions.
+                  * `backlog` is accepted and clamped rather than honoured
+                  * exactly: the queue is a fixed SOCK_BACKLOG array, and
+                  * pretending to size it per socket would be a parameter with
+                  * no effect. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
+        int si = sock_of_fd((int)(int64_t)a0, 0);
+        if (si < 0) return (uint64_t)-9;
+        int64_t rc;
+        klock_acquire(&g_net_lock);
+        if (!g_sock[si].bound)         rc = -22;    /* EINVAL: nothing to listen on */
+        else if (g_sock[si].connected) rc = -22;    /* EINVAL: already a peer socket */
+        else { g_sock[si].listening = 1; rc = 0; }
+        klock_release(&g_net_lock);
+        if (g_debug_net) kprintf("[dbgnet ] pid %u: LISTEN socket %d -> %d\n",
+                                 kprocs[current_proc_idx].pid, (uint64_t)(int64_t)si,
+                                 (uint64_t)(int64_t)rc);
+        return (uint64_t)rc;
+    }
+    case 82: {   /* v0.65: SYS_ACCEPT(fd, peer_out, flags) -> a NEW descriptor,
+                  * or -EAGAIN when no peer is waiting.
+                  *
+                  * The accepted socket is bound to the SAME local port as its
+                  * listener and connected to the peer, and it carries the
+                  * datagram that announced that peer — so a server reads the
+                  * client's first message from the accepted socket, not from
+                  * the listener, exactly as a stream server would.
+                  *
+                  * `peer_out`, if non-NULL, receives two 32-bit words —
+                  * {addr, port} — rather than a packed one, so neither field is
+                  * truncated. `flags` may carry SOCK_NONBLOCK for the new
+                  * descriptor. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
+        int li = sock_of_fd((int)(int64_t)a0, 0);
+        if (li < 0) return (uint64_t)-9;
+        uint64_t upeer = a1;
+        int owner = fd_owner();
+        if (upeer && !access_ok(kprocs[owner].cr3, upeer, 8, 1)) return (uint64_t)-14;
+
+        /* Claim the child's socket slot BEFORE dequeuing the peer: if the table
+         * is full we must leave the request queued for a later accept, not
+         * consume and discard a client's first datagram. */
+        klock_acquire(&g_net_lock);
+        if (!g_sock[li].used || !g_sock[li].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
+        if (g_sock[li].pcount == 0) { klock_release(&g_net_lock);
+                                      __sync_fetch_and_add(&g_net_eagain, 1);
+                                      return (uint64_t)-11; }                    /* EAGAIN */
+        int ci = -1;
+        for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) {
+            cmemset(&g_sock[i], 0, sizeof g_sock[i]);
+            g_sock[i].used = 1; g_sock[i].waiter_tid = -1; g_sock[i].fd = -1;
+            ci = i; break;
+        }
+        if (ci < 0) { klock_release(&g_net_lock); return (uint64_t)-11; }   /* EAGAIN: retry */
+        struct nsock *L = &g_sock[li];
+        struct npend *pd = &L->pend[L->phead];
+        uint32_t paddr = pd->addr; uint16_t pport = pd->port;
+        g_sock[ci].owner = owner;
+        g_sock[ci].bound = 1;  g_sock[ci].lport = L->lport;
+        g_sock[ci].connected = 1; g_sock[ci].raddr = paddr; g_sock[ci].rport = pport;
+        net_sock_enqueue(ci, pd->data, pd->len);       /* the announcing datagram */
+        L->phead = (L->phead + 1) % SOCK_BACKLOG;
+        L->pcount--;
+        klock_release(&g_net_lock);
+
+        int nfd = ofile_claim(owner, VOL_SOCK, ci);
+        if (nfd < 0) { net_sock_release(ci); return (uint64_t)-24; }        /* EMFILE */
+        klock_acquire(&g_ofile_lock);
+        g_ofiles[nfd].sock = ci;
+        if ((uint32_t)a2 & SOCK_NONBLOCK) g_ofiles[nfd].flags |= O_NONBLOCK;
+        klock_release(&g_ofile_lock);
+        klock_acquire(&g_net_lock);
+        g_sock[ci].fd = nfd;
+        klock_release(&g_net_lock);
+        if (upeer) { ((uint32_t *)upeer)[0] = paddr; ((uint32_t *)upeer)[1] = (uint32_t)pport; }
+        __sync_fetch_and_add(&g_net_accepts, 1);
+        if (g_debug_net) kprintf("[dbgnet ] pid %u: ACCEPT listener %d -> fd %d (socket %d)\n",
+                                 kprocs[current_proc_idx].pid, (uint64_t)(int64_t)li,
+                                 (uint64_t)(int64_t)nfd, (uint64_t)(int64_t)ci);
+        return (uint64_t)(int64_t)nfd;
     }
     case 79: {   /* SYS_EVENTFD(initval, flags) -> an eventfd descriptor.
                   * flags bit 0 = EFD_SEMAPHORE. */
@@ -16682,6 +17277,7 @@ static void cmd_epoll_stress(void) {
     uint32_t viol0 = g_rank_violations;
     uint64_t ec0 = g_epoll_creates, ew0 = g_epoll_waits;
     uint64_t vc0 = g_evfd_creates, vw0 = g_evfd_writes, vr0 = g_evfd_reads;
+    uint64_t ep0 = g_epoll_parks, tmo0 = g_futex_timeouts;
 
     int p = kproc_spawn("epollstr", PCAP_FILESYSTEM);
     if (p < 0) { epcheck("kproc_spawn never fails", 0); goto out; }
@@ -16698,7 +17294,7 @@ static void cmd_epoll_stress(void) {
     rq_push_any(0, p);
     __sync_synchronize();
     if (n > 1) lapic_ipi(0, IPI_PING, 1);
-    int finished = posix_drain(procs, 1, &R, 160000);
+    int finished = posix_drain(procs, 1, &R, 220000);
     current_proc_idx = save;
     if (!finished) kprintf("[epollstrs] WATCHDOG: the driver did not finish\n");
 
@@ -16727,6 +17323,24 @@ static void cmd_epoll_stress(void) {
         R.code[0] == 942 ? "draining the pipe failed" :
         R.code[0] == 943 ? "END OF FILE WAS NOT REPORTED READABLE (a pipeline would hang)" :
         R.code[0] == 944 ? "end of file did not carry EPOLLHUP" :
+        R.code[0] == 945 ? "posting the eventfd for the edge round failed" :
+        R.code[0] == 946 ? "EPOLL_CTL_ADD with EPOLLET failed" :
+        R.code[0] == 947 ? "the edge-triggered arrival was not reported" :
+        R.code[0] == 948 ? "AN EDGE WAS REPORTED TWICE (it is behaving as level-triggered)" :
+        R.code[0] == 949 ? "EPOLL_CTL_MOD back to level-triggered failed" :
+        R.code[0] == 950 ? "level triggering did not re-report a still-ready fd" :
+        R.code[0] == 951 ? "draining the eventfd failed" :
+        R.code[0] == 952 ? "EPOLL_CTL_DEL failed after the edge round" :
+        R.code[0] == 953 ? "watching the console (EPOLL_TTY_FD) was refused" :
+        R.code[0] == 954 ? "AN IDLE CONSOLE WAS REPORTED READABLE" :
+        R.code[0] == 955 ? "removing the console watch failed" :
+        R.code[0] == 956 ? "re-adding the eventfd for the park round failed" :
+        R.code[0] == 957 ? "the poster thread could not be created" :
+        R.code[0] == 958 ? "THE PARKED WAITER WAS NEVER WOKEN by the other thread" :
+        R.code[0] == 959 ? "the woken event carried the wrong cookie" :
+        R.code[0] == 960 ? "joining the poster thread failed" :
+        R.code[0] == 961 ? "the poster thread returned the wrong value" :
+        R.code[0] == 962 ? "A WATCH SURVIVED ITS DESCRIPTOR being closed (stale EPOLLERR)" :
                            "unknown";
     if (R.code[0] != 920) kprintf("[epollstrs] driver exit %u — %s\n", R.code[0], why);
 
@@ -16737,6 +17351,29 @@ static void cmd_epoll_stress(void) {
             g_evfd_creates - vc0, g_evfd_writes - vw0, g_evfd_reads - vr0);
     epcheck("the epoll and eventfd paths were actually exercised",
             g_epoll_creates > ec0 && g_epoll_waits > ew0 && g_evfd_writes > vw0);
+    /* PHASE 2'S HEADLINE. A waiter that spun would satisfy every assertion the
+     * driver makes about itself and still be wrong; only the kernel can see
+     * that it left the run queue. Phase 1 reported 0 parks precisely because
+     * every check there resolved without blocking. */
+    epcheck("a waiter with nothing ready PARKED rather than spinning",
+            g_epoll_parks > ep0);
+    epcheck("the parked waiter was woken by another thread's write, not by its deadline",
+            g_futex_timeouts == tmo0);
+
+    /* The console round the driver cannot finish for itself: it proved an idle
+     * console is not readable, and this injects a keystroke through the very
+     * ring SYS_TTY_READ consumes and asks again. */
+    int tty_idle = (kbd_w != kbd_r) ? 0 : 1;
+    canvas_inject_char('x');
+    klock_acquire(&g_ofile_lock);
+    uint32_t tty_now = ep_poll_fd_locked(EPOLL_TTY_FD);
+    klock_release(&g_ofile_lock);
+    (void)kbd_getc_nonblock();                 /* consume it again */
+    klock_acquire(&g_ofile_lock);
+    uint32_t tty_after = ep_poll_fd_locked(EPOLL_TTY_FD);
+    klock_release(&g_ofile_lock);
+    epcheck("a queued keystroke makes the console readable, and draining it clears that",
+            tty_idle && (tty_now & EPOLLIN) && !(tty_after & EPOLLIN));
 
     /* Both are descriptors, so the proof they were released is the one the
      * descriptor layer already knows how to give: nothing left in the table. */
@@ -16754,6 +17391,145 @@ out:
     kprintf("[epollstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_eppass, (uint64_t)g_epfail);
     if (!g_epfail) kputs("[epollstrs] EVENT-DRIVEN I/O VERIFIED — readiness is computed, not remembered\n");
     else kputs("[epollstrs] EVENT I/O DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.65: NETEPOLLSTRS — non-blocking sockets multiplexed with epoll
+ * ===========================================================================
+ * The milestone in one suite: a socket is a descriptor, so epoll can name it;
+ * O_NONBLOCK means EAGAIN and not a stall; a listener becomes readable when a
+ * peer arrives; and a waiter with nothing ready SLEEPS until a datagram lands
+ * rather than spinning for one.
+ *
+ * The checks the driver cannot make for itself are the ones about mechanism
+ * rather than result — whether the EAGAIN path was taken at all, whether the
+ * waiter parked or span, and whether any socket outlived its descriptor. Those
+ * are only visible from ring 0, which is why this half exists. */
+static int g_nepass = 0, g_nefail = 0;
+static void necheck(const char *what, int ok) {
+    if (ok) { g_nepass++; kprintf("[netepollstrs] PASS: %s\n", what); }
+    else    { g_nefail++; kprintf("[netepollstrs] FAIL: %s\n", what); }
+}
+
+static void cmd_netepoll_stress(void) {
+    kputs("-- NETEPOLLSTRS: non-blocking sockets, sessions, and epoll over the network stack --\n");
+    g_nepass = g_nefail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t ea0 = g_net_eagain, ac0 = g_net_accepts, se0 = g_net_sessions;
+    uint64_t ep0 = g_epoll_parks, tmo0 = g_futex_timeouts, ew0 = g_epoll_waits;
+    int socks0 = net_sock_count_used();
+
+    int p = kproc_spawn("netepoll", PCAP_NETWORK);
+    if (p < 0) { necheck("kproc_spawn never fails", 0); goto out; }
+    kprocs[p].role = 49;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { necheck("the driver's ELF loads", 0); goto out; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 220000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[netepollstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 1400 ? "" :
+        R.code[0] == 1401 ? "creating a non-blocking socket failed" :
+        R.code[0] == 1402 ? "AN EMPTY NON-BLOCKING SOCKET DID NOT ANSWER EAGAIN" :
+        R.code[0] == 1403 ? "F_GETFL did not see the flag SOCK_NONBLOCK set at creation" :
+        (R.code[0] >= 1404 && R.code[0] <= 1407) ? "fcntl F_SETFL/F_GETFL did not round-trip O_NONBLOCK" :
+        R.code[0] == 1408 ? "binding the listener failed" :
+        R.code[0] == 1409 ? "SYS_LISTEN was refused on a bound socket" :
+        R.code[0] == 1410 ? "ACCEPT ON AN IDLE LISTENER DID NOT ANSWER EAGAIN" :
+        R.code[0] == 1411 ? "epoll_create failed" :
+        R.code[0] == 1412 ? "watching a socket with epoll was refused" :
+        R.code[0] == 1413 ? "AN IDLE LISTENER WAS REPORTED READABLE (a server would spin on EAGAIN)" :
+        R.code[0] == 1414 ? "creating the client socket failed" :
+        R.code[0] == 1415 ? "binding the client failed" :
+        R.code[0] == 1416 ? "connecting the client failed" :
+        R.code[0] == 1417 ? "the client's first send failed" :
+        R.code[0] == 1418 ? "A LISTENER WITH A WAITING PEER WAS NOT REPORTED READABLE" :
+        R.code[0] == 1419 ? "the listener's event did not carry EPOLLIN" :
+        R.code[0] == 1420 ? "the listener's cookie came back altered" :
+        R.code[0] == 1421 ? "ACCEPT FAILED with a peer waiting" :
+        R.code[0] == 1422 ? "accept returned the listener's own descriptor" :
+        (R.code[0] == 1423 || R.code[0] == 1424) ? "the accepted peer address/port was wrong" :
+        R.code[0] == 1425 ? "THE PEER'S FIRST DATAGRAM DID NOT ARRIVE WITH THE ACCEPTED SOCKET" :
+        R.code[0] == 1426 ? "the peer's first datagram came back corrupted" :
+        R.code[0] == 1427 ? "a second accept did not answer EAGAIN — the backlog did not drain" :
+        R.code[0] == 1428 ? "the listener still reported readable with an empty backlog" :
+        R.code[0] == 1429 ? "the session's echo send failed" :
+        R.code[0] == 1430 ? "THE ECHO NEVER REACHED THE CLIENT" :
+        R.code[0] == 1431 ? "the echoed payload came back corrupted" :
+        R.code[0] == 1432 ? "EPOLL_CTL_MOD on the listener failed" :
+        R.code[0] == 1433 ? "A LISTENER WAS REPORTED WRITABLE (it has nothing to send)" :
+        R.code[0] == 1434 ? "watching the client for EPOLLOUT was refused" :
+        R.code[0] == 1435 ? "a connected socket was NOT reported writable" :
+        (R.code[0] == 1436 || R.code[0] == 1437) ? "re-arming the client edge-triggered failed" :
+        R.code[0] == 1438 ? "a drained socket was reported readable" :
+        R.code[0] == 1439 ? "the edge-round send failed" :
+        R.code[0] == 1440 ? "an edge-triggered arrival was not reported" :
+        R.code[0] == 1441 ? "AN EDGE WAS REPORTED TWICE (it is behaving as level-triggered)" :
+        R.code[0] == 1442 ? "draining the edge-round datagram failed" :
+        R.code[0] == 1443 ? "a send that should have succeeded did not" :
+        R.code[0] == 1444 ? "SEND NEVER REFUSED A FULL RECEIVER (datagrams vanished silently)" :
+        (R.code[0] >= 1445 && R.code[0] <= 1447) ? "setting up the park round failed" :
+        R.code[0] == 1448 ? "THE PARKED WAITER WAS NEVER WOKEN by the posting thread" :
+        R.code[0] == 1449 ? "the woken event carried the wrong cookie" :
+        (R.code[0] == 1450 || R.code[0] == 1451) ? "joining the posting thread failed" :
+        R.code[0] == 1452 ? "SYS_CLOSE on a socket failed" :
+        R.code[0] == 1453 ? "A CLOSED SOCKET WAS STILL USABLE" :
+        R.code[0] == 1454 ? "closing the listener failed" :
+        R.code[0] == 1455 ? "a session did not report end-of-conversation after its listener closed" :
+                            "unknown";
+    if (R.code[0] != 1400) kprintf("[netepollstrs] driver exit %u — %s\n", R.code[0], why);
+
+    necheck("non-blocking sockets, sessions, echo and edges all behaved (exit 1400)",
+            finished && R.code[0] == 1400);
+    kprintf("[netepollstrs] sockets: %u sessions offered, %u accepted, %u EAGAIN; epoll: %u waits (%u parked)\n",
+            g_net_sessions - se0, g_net_accepts - ac0, g_net_eagain - ea0,
+            g_epoll_waits - ew0, g_epoll_parks - ep0);
+
+    /* A driver that never actually reached a would-block condition would pass
+     * every assertion above by never testing one. */
+    necheck("the non-blocking path was genuinely exercised (EAGAIN was returned)",
+            g_net_eagain > ea0);
+    necheck("a peer session was offered by a listener and accepted",
+            g_net_sessions > se0 && g_net_accepts > ac0);
+    /* THE HEADLINE, and the one thing ring 3 cannot see about itself: a waiter
+     * that spun would satisfy the driver's own checks and still be wrong. */
+    necheck("a waiter with no datagram ready PARKED rather than spinning",
+            g_epoll_parks > ep0);
+    necheck("the parked waiter was woken by an arriving datagram, not by its deadline",
+            g_futex_timeouts == tmo0);
+
+    /* A socket is a descriptor now, so the proof it was released is the one the
+     * descriptor layer already gives — and the socket table must agree with it.
+     * Those two numbers disagreeing is precisely the bug that a side table
+     * keyed by process would have made permanent. */
+    int fds_leaked = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    necheck("no descriptor leaked across the suite", fds_leaked == 0);
+    necheck("every socket was reclaimed with its descriptor",
+            net_sock_count_used() == socks0);
+    necheck("no lock-rank violation across the socket and epoll paths",
+            g_rank_violations == viol0);
+out:
+    kprintf("[netepollstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_nepass, (uint64_t)g_nefail);
+    if (!g_nefail)
+        kputs("[netepollstrs] ASYNC NETWORK I/O VERIFIED — sockets are descriptors, and waiting is sleeping\n");
+    else kputs("[netepollstrs] ASYNC NETWORK DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -19294,6 +20070,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "mmapstress")) cmd_mmap_stress();
     else if (!kstrcmp(argv[0], "shmstress")) cmd_shm_stress();
     else if (!kstrcmp(argv[0], "epollstress")) cmd_epoll_stress();
+    else if (!kstrcmp(argv[0], "netepollstress")) cmd_netepoll_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -19485,6 +20262,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_mmap_stress();      /* v0.63: demand-zero paging, mprotect, munmap                         */
     cmd_shm_stress();       /* v0.63: copy-on-write fork and zero-copy shared memory               */
     cmd_epoll_stress();     /* v0.64: event-driven readiness, eventfd counters, EOF reporting      */
+    cmd_netepoll_stress();  /* v0.65: non-blocking sockets multiplexed with epoll                  */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
