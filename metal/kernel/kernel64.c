@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.68.0-metal"
+#define KERNEL_VERSION "0.69.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -3679,9 +3679,116 @@ static void net_route(const uint8_t *frame, uint32_t len) {
 }
 
 /* Per-frame dispatch: ARP -> the ARP waiter; IPv4 -> the UDP router.          */
+/* ===========================================================================
+ * v0.69: ARP — learning who is actually at an address
+ * ===========================================================================
+ * v0.68 put real TCP frames on the wire and addressed every one of them to the
+ * BROADCAST MAC, inherited from net_tx_udp. SLIRP accepts that; a switch does
+ * not have to, and a real network is entitled to drop it. Worse, broadcasting
+ * every segment of every connection is precisely the behaviour switching exists
+ * to eliminate.
+ *
+ * The cache is eight entries and learns from ANY ARP frame that crosses it,
+ * request or reply. That is the standard behaviour and it is not laziness: a
+ * host that is asking for us is about to talk to us, so its mapping is the one
+ * we are most likely to need next, and learning it from the request saves the
+ * round trip we would otherwise make asking back. */
+#define NET_GUEST_IP    0x0A000210u    /* 10.0.2.16: our SLIRP-side address    */
+static volatile uint64_t g_net_tx_frames;   /* defined with the socket layer   */
+static void vnet_tx(const uint8_t *frame, uint32_t len);   /* fwd: v0.69 */
+#define ARP_CACHE_N 8
+struct arpent { int used; uint32_t ip; uint8_t mac[6]; uint64_t seen; };
+static struct arpent g_arp[ARP_CACHE_N];
+static volatile uint64_t g_arp_learned = 0, g_arp_requests = 0, g_arp_replies = 0;
+static volatile uint64_t g_arp_hits = 0, g_arp_misses = 0;
+
+static int arp_lookup(uint32_t ip, uint8_t *mac_out) {
+    for (int i = 0; i < ARP_CACHE_N; i++)
+        if (g_arp[i].used && g_arp[i].ip == ip) {
+            for (int k = 0; k < 6; k++) mac_out[k] = g_arp[i].mac[k];
+            __sync_fetch_and_add(&g_arp_hits, 1);
+            return 1;
+        }
+    __sync_fetch_and_add(&g_arp_misses, 1);
+    return 0;
+}
+
+/* Insert or refresh. A changed MAC for a known address REPLACES the old one —
+ * machines move, interfaces fail over, and a cache that refused to update
+ * would keep talking to somewhere nothing is listening. */
+static void arp_learn(uint32_t ip, const uint8_t *mac) {
+    if (!ip) return;
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < ARP_CACHE_N; i++) {
+        if (g_arp[i].used && g_arp[i].ip == ip) { slot = i; break; }
+        if (!g_arp[i].used && slot < 0) slot = i;
+        if (g_arp[i].used && g_arp[i].seen < g_arp[oldest].seen) oldest = i;
+    }
+    if (slot < 0) slot = oldest;                    /* full: evict least recent */
+    g_arp[slot].used = 1; g_arp[slot].ip = ip;
+    for (int k = 0; k < 6; k++) g_arp[slot].mac[k] = mac[k];
+    g_arp[slot].seen = g_ticks;
+    __sync_fetch_and_add(&g_arp_learned, 1);
+}
+
+/* Build an ARP frame. `op` is 1 request, 2 reply. Returns the frame length.
+ * Split out from sending so the suite can inspect what this kernel actually
+ * emits rather than trusting that it emitted something. */
+static uint32_t arp_build(uint8_t *f, uint16_t op, uint32_t tpa, const uint8_t *tha) {
+    for (int i = 0; i < 6; i++) f[i] = tha ? tha[i] : 0xFF;      /* dst MAC */
+    for (int i = 0; i < 6; i++) f[6 + i] = g_vnet_mac[i];
+    f[12] = 0x08; f[13] = 0x06;                                  /* ARP      */
+    uint8_t *a = f + 14;
+    a[0] = 0x00; a[1] = 0x01;                                    /* Ethernet */
+    a[2] = 0x08; a[3] = 0x00;                                    /* IPv4     */
+    a[4] = 6; a[5] = 4;
+    a[6] = (uint8_t)(op >> 8); a[7] = (uint8_t)op;
+    for (int i = 0; i < 6; i++) a[8 + i] = g_vnet_mac[i];        /* sender HA */
+    a[14] = (uint8_t)(NET_GUEST_IP >> 24); a[15] = (uint8_t)(NET_GUEST_IP >> 16);
+    a[16] = (uint8_t)(NET_GUEST_IP >> 8);  a[17] = (uint8_t)NET_GUEST_IP;
+    for (int i = 0; i < 6; i++) a[18 + i] = tha ? tha[i] : 0x00; /* target HA */
+    a[24] = (uint8_t)(tpa >> 24); a[25] = (uint8_t)(tpa >> 16);
+    a[26] = (uint8_t)(tpa >> 8);  a[27] = (uint8_t)tpa;
+    return 14 + 28;
+}
+
+static void arp_request(uint32_t ip) {
+    if (!g_vnet_ready) return;
+    uint8_t f[14 + 28];
+    uint32_t n = arp_build(f, 1, ip, 0);
+    vnet_tx(f, n);
+    g_net_tx_frames++;
+    __sync_fetch_and_add(&g_arp_requests, 1);
+}
+
+/* Handle an inbound ARP frame: learn the sender, and answer a request that is
+ * asking for us. Answering is what makes this host REACHABLE — without it a
+ * peer can never address a frame to us and every inbound connection dies
+ * before it starts. */
+static void arp_input(const uint8_t *f, uint32_t len) {
+    if (len < 14 + 28) return;
+    const uint8_t *a = f + 14;
+    if (a[0] != 0x00 || a[1] != 0x01 || a[2] != 0x08 || a[3] != 0x00) return;
+    if (a[4] != 6 || a[5] != 4) return;
+    uint16_t op = (uint16_t)((a[6] << 8) | a[7]);
+    uint32_t spa = ((uint32_t)a[14] << 24) | ((uint32_t)a[15] << 16) |
+                   ((uint32_t)a[16] << 8) | a[17];
+    uint32_t tpa = ((uint32_t)a[24] << 24) | ((uint32_t)a[25] << 16) |
+                   ((uint32_t)a[26] << 8) | a[27];
+    arp_learn(spa, a + 8);
+    if (op == 1 && tpa == NET_GUEST_IP && g_vnet_ready) {
+        uint8_t r[14 + 28];
+        uint32_t n = arp_build(r, 2, spa, a + 8);
+        vnet_tx(r, n);
+        g_net_tx_frames++;
+        __sync_fetch_and_add(&g_arp_replies, 1);
+    }
+}
+
 static void net_dispatch(int idx, const uint8_t *frame, uint32_t len) {
     uint16_t eth = (uint16_t)((frame[12] << 8) | frame[13]);
     if (eth == 0x0806) {                                  /* ARP               */
+        arp_input(frame, len);                            /* v0.69: learn + reply */
         g_vnet_rx_idx = idx; g_vnet_rx_len = len + 12; g_vnet_rx_pending = 1;
         if (g_net_waiter_tid >= 0) { thread_wake(g_net_waiter_tid); g_net_waiter_tid = -1; }
     } else if (eth == 0x0800) {
@@ -7105,7 +7212,6 @@ static void audio_teardown_kproc(int proc_idx) {
 #define SOCK_QDEPTH     4
 #define SOCK_DGRAM_MAX  512
 #define NET_LOOPBACK    0x7F000001u         /* 127.0.0.1, host byte order */
-#define NET_GUEST_IP    0x0A000210u         /* 10.0.2.16 (our SLIRP-side src) */
 
 /* v0.65: a listening socket's pending-peer queue. There is no TCP here, so a
  * "connection" is a PEER: the first datagram from an (addr,port) this listener
@@ -7209,7 +7315,8 @@ struct nsock {
 static struct nsock g_sock[NSOCK];
 static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len); /* fwd: v0.67 */
 static struct klock g_net_lock = { 0, "net", 9, 0, 0 };
-static volatile uint64_t g_net_tx_frames = 0, g_net_loop_deliveries = 0;
+static volatile uint64_t g_net_tx_frames = 0;
+static volatile uint64_t g_net_loop_deliveries = 0;
 /* v0.65: the numbers the suite cannot see from ring 3. An EAGAIN count that
  * never moves means the non-blocking path was never actually taken — the
  * driver would pass every assertion it makes about itself and still be
@@ -7371,7 +7478,6 @@ static volatile uint64_t g_tcp_wire_tx = 0, g_tcp_wire_rx = 0, g_tcp_wire_bad = 
 static void tcp_input(int si, struct tseg *g);   /* fwd */
 static uint32_t tcp_wire_build(uint8_t *f, uint32_t saddr, uint32_t daddr,
                                const struct tseg *g, uint16_t window);   /* fwd: v0.68 */
-static void vnet_tx(const uint8_t *frame, uint32_t len);                 /* fwd: v0.68 */
 
 /* Find the socket that should receive a segment addressed to `dport` from
  * (saddr,sport): an established endpoint first, then a listener. Caller holds
@@ -7761,7 +7867,13 @@ static uint32_t tcp_wire_build(uint8_t *f, uint32_t saddr, uint32_t daddr,
                                const struct tseg *g, uint16_t window) {
     uint16_t plen = g->len;
     if (plen > TCP_MSS) plen = TCP_MSS;
-    for (int i = 0; i < 6; i++) f[i] = 0xFF;                  /* dst MAC broadcast */
+    /* v0.69: the peer's real MAC when we know it. Broadcast is the fallback
+     * for a first segment to an unresolved address, and it fires an ARP
+     * request so the NEXT segment is addressed properly — dropping the segment
+     * instead would stall every new connection for a round trip. */
+    uint8_t dmac[6];
+    if (arp_lookup(daddr, dmac)) { for (int i = 0; i < 6; i++) f[i] = dmac[i]; }
+    else { for (int i = 0; i < 6; i++) f[i] = 0xFF; arp_request(daddr); }
     for (int i = 0; i < 6; i++) f[6 + i] = g_vnet_mac[i];
     f[12] = 0x08; f[13] = 0x00;                               /* ethertype IPv4    */
     uint8_t *ip = f + 14;
@@ -18896,6 +19008,75 @@ static void cmd_tcp_stress(void) {
         tccheck2("and it parses again once the bit is restored",
                  tcp_wire_parse(wf, n, &rx, &sa, &da) == 1);
     }
+    /* ---- v0.69: ARP, verified against synthetic frames ---------------------
+     * Every assertion here is driven by a frame this suite constructs and
+     * hands to the real handler, so none of it depends on SLIRP answering. */
+    {
+        static uint8_t af[64], wf2[14 + 20 + TCP_HDR_LEN + 8];
+        uint64_t rep0 = g_arp_replies;
+        uint32_t peer = 0x0A000209u;                     /* 10.0.2.9 */
+        uint8_t pmac[6] = { 0x52, 0x54, 0x00, 0x11, 0x22, 0x33 };
+
+        /* A request this kernel builds must be a well-formed ARP request. */
+        uint32_t n = arp_build(af, 1, peer, 0);
+        tccheck2("the ARP request is a well-formed Ethernet ARP frame",
+                 n == 42 && af[12] == 0x08 && af[13] == 0x06 &&
+                 af[14] == 0 && af[15] == 1 && af[20] == 0 && af[21] == 1 &&
+                 af[0] == 0xFF && af[38] == 0x0A && af[41] == 0x09);
+
+        /* A reply from that peer must be LEARNED. */
+        uint8_t rf[64];
+        for (int i = 0; i < 64; i++) rf[i] = 0;
+        for (int i = 0; i < 6; i++) rf[i] = g_vnet_mac[i];
+        for (int i = 0; i < 6; i++) rf[6 + i] = pmac[i];
+        rf[12] = 0x08; rf[13] = 0x06;
+        rf[14] = 0; rf[15] = 1; rf[16] = 0x08; rf[17] = 0x00;
+        rf[18] = 6; rf[19] = 4; rf[20] = 0; rf[21] = 2;         /* reply */
+        for (int i = 0; i < 6; i++) rf[22 + i] = pmac[i];
+        rf[28] = 0x0A; rf[29] = 0x00; rf[30] = 0x02; rf[31] = 0x09;
+        arp_input(rf, 42);
+        uint8_t got[6];
+        int known = arp_lookup(peer, got);
+        int same = known;
+        for (int i = 0; i < 6; i++) if (got[i] != pmac[i]) same = 0;
+        tccheck2("an ARP reply is learned into the cache, MAC intact", same);
+
+        /* And a TCP frame to that peer must now carry the LEARNED MAC rather
+         * than broadcast — which is the entire point of resolving it. */
+        struct tseg t2; uint8_t z = 0;
+        t2.seq = 1; t2.ack = 0; t2.flags = TH_SYN; t2.len = 0;
+        t2.sport = 1234; t2.dport = 80; t2.data = &z;
+        tcp_wire_build(wf2, NET_GUEST_IP, peer, &t2, 1024);
+        int addressed = 1;
+        for (int i = 0; i < 6; i++) if (wf2[i] != pmac[i]) addressed = 0;
+        tccheck2("a segment to a resolved peer is addressed to its MAC, not broadcast",
+                 addressed);
+
+        /* A request FOR US must be answered, or nothing can ever reach us. */
+        uint8_t qf[64];
+        for (int i = 0; i < 64; i++) qf[i] = 0;
+        for (int i = 0; i < 6; i++) qf[i] = 0xFF;
+        for (int i = 0; i < 6; i++) qf[6 + i] = pmac[i];
+        qf[12] = 0x08; qf[13] = 0x06;
+        qf[14] = 0; qf[15] = 1; qf[16] = 0x08; qf[17] = 0x00;
+        qf[18] = 6; qf[19] = 4; qf[20] = 0; qf[21] = 1;         /* request */
+        for (int i = 0; i < 6; i++) qf[22 + i] = pmac[i];
+        qf[28] = 0x0A; qf[29] = 0x00; qf[30] = 0x02; qf[31] = 0x09;
+        qf[38] = (uint8_t)(NET_GUEST_IP >> 24); qf[39] = (uint8_t)(NET_GUEST_IP >> 16);
+        qf[40] = (uint8_t)(NET_GUEST_IP >> 8);  qf[41] = (uint8_t)NET_GUEST_IP;
+        arp_input(qf, 42);
+        tccheck2("an ARP request for THIS host is answered", g_arp_replies > rep0);
+
+        /* A request for somebody else must NOT be answered. Replying to every
+         * request on the segment is how a host poisons a whole network. */
+        uint64_t rep1 = g_arp_replies;
+        qf[38] = 0x0A; qf[39] = 0x00; qf[40] = 0x02; qf[41] = 0x63;   /* 10.0.2.99 */
+        arp_input(qf, 42);
+        tccheck2("an ARP request for SOMEBODY ELSE is not answered",
+                 g_arp_replies == rep1);
+    }
+    kprintf("[tcpstrs] arp: %u learned, %u requests out, %u replies out, %u hits, %u misses\n",
+            g_arp_learned, g_arp_requests, g_arp_replies, g_arp_hits, g_arp_misses);
     kprintf("[tcpstrs] wire: %u frames out, %u in, %u rejected\n",
             g_tcp_wire_tx, g_tcp_wire_rx, g_tcp_wire_bad);
     /* The encoder is otherwise verified only against its own decoder. This is
