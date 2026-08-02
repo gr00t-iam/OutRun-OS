@@ -131,6 +131,18 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_FCNTL               80          /* v0.65 */
 #define SYS_LISTEN              81          /* v0.65 */
 #define SYS_ACCEPT              82          /* v0.65 */
+#define SYS_MMAP_FILE           83          /* v0.66 */
+#define SYS_MSYNC               84          /* v0.66 */
+
+/* v0.66: SYS_MMAP_FILE packs fd/prot/flags into a0 because the dispatch ABI
+ * has three argument registers and the offset needs one of its own. */
+static u64 ommap_file(int kfd, u64 len, int prot, int flags, u64 off) {
+    u64 a0 = ((u64)(kfd & 0xFF)) | ((u64)(prot & 0xFF) << 8) | ((u64)(flags & 0xFFFF) << 16);
+    return sysc(SYS_MMAP_FILE, a0, len, off);
+}
+static int omsync(u64 addr, u64 len, int flags) {
+    return (int)(i64)sysc(SYS_MSYNC, addr, len, (u64)flags);
+}
 
 /* v0.65: descriptor flags and socket types. Values mirror Linux so the SDK
  * headers can carry them verbatim. */
@@ -1488,6 +1500,12 @@ static i64 oread(int fd, char *buf, u64 n) {
     if (g_ofd[fd] == OFD_CONSOLE) return 0;              /* no ring-3 tty input yet */
     return (i64)sysc(SYS_READ, (u64)g_ofd[fd], (u64)buf, n);
 }
+/* The userland table maps its own indices onto kernel descriptors; mmap needs
+ * the kernel one, since the kernel has never heard of the userland table. */
+static int okfd(int fd) {
+    if (fd < 0 || fd >= OFD_MAX) return -1;
+    return g_ofd[fd];
+}
 static int oclose(int fd) {
     if (fd < 3 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;  /* std three are not closable */
     sysc(SYS_CLOSE, (u64)g_ofd[fd], 0, 0);
@@ -2463,6 +2481,122 @@ static void shm_stress_worker(void) {
     if (st != 110)            sysc(SYS_EXIT, 978, 0, 0);
     if (sp[1] != 0xBEEFBEEF)  sysc(SYS_EXIT, 979, 0, 0);      /* child's write unseen */
     sysc(SYS_EXIT, 970, 0, 0);
+}
+
+/* --- role 50: mmapfilestrs — memory that IS a file --------------------------
+ *
+ * The fixture 'm66dat' is created by the kernel half, deliberately: a suite
+ * that corrupts a shared file is exactly the hazard v0.65 spent a milestone
+ * chasing, so this one owns its own file and touches nothing else.
+ *
+ * Byte i of the file is (i*7+3)&0xFF, which is not constant within a page and
+ * not equal across pages — so a mapping that returned zeroes, or returned page
+ * 0 for every page, fails rather than accidentally passing. */
+#define M66_PAGES 4
+#define M66_LEN   (M66_PAGES * 4096)
+static u8 m66_expect(u64 i) { return (u8)((i * 7 + 3) & 0xFF); }
+
+static void mmapfile_stress_worker(void) {
+    int uf = oopen("m66dat");
+    if (uf < 0) sysc(SYS_EXIT, 1501, 0, 0);
+    int kf = okfd(uf);
+    if (kf < 0) sysc(SYS_EXIT, 1502, 0, 0);
+
+    /* (1) MAP_PRIVATE, read-only. The bytes must be the FILE's bytes — and the
+     * check reaches into page 3, which only demand paging at a nonzero offset
+     * can satisfy. */
+    u64 pa = ommap_file(kf, M66_LEN, PROT_READ, MAP_PRIVATE, 0);
+    if (pa == MAP_FAILED || (i64)pa < 0) sysc(SYS_EXIT, 1503, 0, 0);
+    volatile u8 *pp = (volatile u8 *)pa;
+    for (u64 i = 0; i < 64; i++)        if (pp[i] != m66_expect(i))        sysc(SYS_EXIT, 1504, 0, 0);
+    for (u64 i = 0; i < 64; i++)        if (pp[4096 + i] != m66_expect(4096 + i)) sysc(SYS_EXIT, 1505, 0, 0);
+    for (u64 i = 0; i < 64; i++)        if (pp[3 * 4096 + i] != m66_expect(3 * 4096 + i)) sysc(SYS_EXIT, 1506, 0, 0);
+
+    /* (2) A PRIVATE mapping is a copy: writing it must not reach the file. */
+    u64 pw = ommap_file(kf, M66_LEN, PROT_READ | PROT_WRITE, MAP_PRIVATE, 0);
+    if (pw == MAP_FAILED || (i64)pw < 0) sysc(SYS_EXIT, 1507, 0, 0);
+    volatile u8 *wp = (volatile u8 *)pw;
+    if (wp[0] != m66_expect(0)) sysc(SYS_EXIT, 1508, 0, 0);
+    wp[0] = 0xEE; wp[1] = 0xFF;
+    if (wp[0] != 0xEE)          sysc(SYS_EXIT, 1509, 0, 0);
+    if (omsync(pw, M66_LEN, 0) != 0) sysc(SYS_EXIT, 1510, 0, 0);   /* legal, and a no-op */
+    u8 chk[8];
+    if (oread(uf, (char *)chk, 8) != 8) sysc(SYS_EXIT, 1511, 0, 0);
+    if (chk[0] != m66_expect(0))        sysc(SYS_EXIT, 1512, 0, 0); /* PRIVATE leaked to the file */
+
+    /* (3) MAP_SHARED, writable: the write must reach the file, and only after
+     * it is asked to. */
+    u64 sa = ommap_file(kf, M66_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, 0);
+    if (sa == MAP_FAILED || (i64)sa < 0) sysc(SYS_EXIT, 1513, 0, 0);
+    volatile u8 *sp = (volatile u8 *)sa;
+    if (sp[0] != m66_expect(0)) sysc(SYS_EXIT, 1514, 0, 0);
+    sp[0] = 0xA1; sp[1] = 0xA2; sp[4096] = 0xB1;      /* two different pages */
+    if (sp[0] != 0xA1 || sp[4096] != 0xB1) sysc(SYS_EXIT, 1515, 0, 0);
+    if (omsync(sa, M66_LEN, 0) != 0) sysc(SYS_EXIT, 1516, 0, 0);
+
+    /* Re-read through the ORDINARY file path: writeback is only real if a
+     * reader that never mapped anything can see it. */
+    int uf2 = oopen("m66dat");
+    if (uf2 < 0) sysc(SYS_EXIT, 1517, 0, 0);
+    u8 rb[8];
+    if (oread(uf2, (char *)rb, 8) != 8) sysc(SYS_EXIT, 1518, 0, 0);
+    if (rb[0] != 0xA1 || rb[1] != 0xA2) sysc(SYS_EXIT, 1519, 0, 0);
+    oclose(uf2);
+
+    /* (4) CROSS-PROCESS SHARING. The child writes through its own mapping of
+     * the same file; the parent must see it through memory it mapped BEFORE
+     * the fork, with no syscall in between. That can only happen if both
+     * resolve to one frame — which is the entire content of MAP_SHARED and the
+     * thing a private-copy implementation fails. */
+    i64 r = ofork();
+    if (r == 0) {
+        /* The child maps the file ITSELF rather than reusing the inherited
+         * range. That is the real test: a second, independent mapping of the
+         * same file must resolve to the SAME frames, which only a page cache
+         * can arrange — an inherited mapping would agree even if every mapper
+         * got a private copy, because it agrees by descent rather than by
+         * sharing. */
+        u64 ca = ommap_file(kf, M66_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, 0);
+        if (ca == MAP_FAILED || (i64)ca < 0) sysc(SYS_EXIT, 62, 0, 0);
+        volatile u8 *cm = (volatile u8 *)ca;
+        if (cm[0] != 0xA1) sysc(SYS_EXIT, 61, 0, 0);   /* not the parent's page */
+        cm[2] = 0xC3;
+        sysc(SYS_EXIT, 60, 0, 0);
+    }
+    if (r < 0) sysc(SYS_EXIT, 1520, 0, 0);
+    if (owaitpid((u32)r, 400000) != 60) sysc(SYS_EXIT, 1521, 0, 0);
+    if (sp[2] != 0xC3)                  sysc(SYS_EXIT, 1522, 0, 0);  /* NOT shared */
+
+    /* (5) Unmapping a shared writable mapping flushes it — a process that
+     * forgets msync must not lose its writes. */
+    if ((i64)sysc(SYS_MUNMAP, sa, M66_LEN, 0) != 0) sysc(SYS_EXIT, 1523, 0, 0);
+    int uf3 = oopen("m66dat");
+    if (uf3 < 0) sysc(SYS_EXIT, 1524, 0, 0);
+    if (oread(uf3, (char *)rb, 8) != 8) sysc(SYS_EXIT, 1525, 0, 0);
+    if (rb[2] != 0xC3)                  sysc(SYS_EXIT, 1526, 0, 0);  /* child's write lost */
+    oclose(uf3);
+
+    /* (6) Refusals that must stay refusals. */
+    if ((i64)ommap_file(kf, M66_LEN, PROT_WRITE | PROT_EXEC, MAP_SHARED, 0) >= 0)
+        sysc(SYS_EXIT, 1527, 0, 0);                                  /* W^X */
+    if ((i64)ommap_file(kf, M66_LEN, PROT_READ, MAP_SHARED, 0x800) >= 0)
+        sysc(SYS_EXIT, 1528, 0, 0);                                  /* unaligned offset */
+    if ((i64)ommap_file(99, M66_LEN, PROT_READ, MAP_SHARED, 0) >= 0)
+        sysc(SYS_EXIT, 1529, 0, 0);                                  /* EBADF */
+
+    /* (7) The v0.66 catch-all patch, checked from ring 3: an epoll descriptor
+     * is not a byte stream and read() must say so rather than hand back
+     * device bytes. */
+    int ep = oepoll_create();
+    if (ep < 0) sysc(SYS_EXIT, 1530, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)ep, (u64)(void *)rb, 8) != -22) sysc(SYS_EXIT, 1531, 0, 0);
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)ep, (u64)(void *)rb, 8) != -22) sysc(SYS_EXIT, 1532, 0, 0);
+    sysc(SYS_CLOSE, (u64)ep, 0, 0);
+
+    sysc(SYS_MUNMAP, pa, M66_LEN, 0);
+    sysc(SYS_MUNMAP, pw, M66_LEN, 0);
+    oclose(uf);
+    sysc(SYS_EXIT, 1500, 0, 0);
 }
 
 /* --- role 49: netepollstrs — sockets as descriptors, and epoll over them ---
@@ -3867,6 +4001,7 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 41) { vsh_worker(); }                   /* v0.59 build /bin/vsh with occ and run a real script */
     if (role == 48) { epoll_stress_worker(); }         /* v0.64 epoll readiness, edges, eventfd, EOF        */
     if (role == 49) { netepoll_stress_worker(); }      /* v0.65 non-blocking sockets multiplexed with epoll */
+    if (role == 50) { mmapfile_stress_worker(); }      /* v0.66 file-backed mappings and writeback           */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
     if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
     if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */

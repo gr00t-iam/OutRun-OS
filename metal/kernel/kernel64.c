@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.65.0-metal"
+#define KERNEL_VERSION "0.66.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -1199,6 +1199,64 @@ static int vm_reserve_zfod(uint64_t cr3, uint64_t va, uint64_t prot_flags) {
     *slot = PTE_ZFOD | PTE_USER | prot_flags;      /* PRESENT deliberately clear */
     return 1;
 }
+
+/* ===========================================================================
+ * v0.66: FILE-BACKED MAPPINGS — the page cache and the range that names a file
+ * ===========================================================================
+ * v0.63 established that THE PAGE TABLE IS THE MAP: a page's nature rides in
+ * its own PTE, and there is no VMA list to keep in step. File-backed mapping
+ * is the one thing that principle cannot express, and it is worth saying why
+ * rather than quietly adding a second description of the address space.
+ *
+ * A fault on a file page has to answer "which file, and which offset". For a
+ * NON-present entry there is room — the hardware ignores every bit. For a
+ * PRESENT one there is not: bits 9-11 are already ZFOD/COW/SHM and 52-62 is
+ * eleven bits, nowhere near a file id plus a page index. And a shared mapping
+ * needs its pages found by (file, offset) from a SECOND process that has its
+ * own page tables entirely — a per-PTE encoding cannot be looked up that way
+ * even in principle.
+ *
+ * So this adds exactly two bounded tables and no more:
+ *
+ *   g_fmap[]   which user ranges name which file. Consulted only on a fault
+ *              that the PTE alone could not resolve, so the fast paths — ZFOD
+ *              and COW — never touch it.
+ *   g_pcache[] the page cache: (dirent, page index) -> frame. This is what
+ *              makes MAP_SHARED mean anything. Two processes mapping one file
+ *              must land on the SAME frame; give them private copies and they
+ *              agree only until the first write, which is the bug MAP_SHARED
+ *              exists to prevent.
+ *
+ * NEITHER TABLE IS AUTHORITATIVE ABOUT PERMISSIONS. The PTE still is. These
+ * answer "what is behind this page", never "may it be written" — so the
+ * v0.63 invariant that a page's rights are readable from its entry alone
+ * survives intact. */
+#define MAX_FMAP        8
+#define MAX_PCACHE      32
+#define FMAP_MAX_BYTES  (64u * 1024u)   /* ceiling on one file-backed mapping */
+#define M66_FIXTURE_LEN (4u * 4096u)    /* mmapfilestrs' own file: 4 pages     */
+
+struct fmap {
+    int      used;
+    int      owner;                 /* thread-group leader slot that mapped it */
+    uint64_t base, len;             /* user VA range                           */
+    int      dirent;                /* VFS dirent this range is backed by      */
+    uint64_t foff;                  /* file offset corresponding to `base`     */
+    int      shared;                /* MAP_SHARED: writes are visible + written back */
+    int      writable;
+};
+static struct fmap g_fmap[MAX_FMAP];
+
+struct pcpage {
+    int      used;
+    int      dirent;
+    uint32_t pgidx;                 /* page index within the file */
+    uint64_t frame;
+    int      dirty;                 /* written through a shared mapping */
+};
+static struct pcpage g_pcache[MAX_PCACHE];
+
+static volatile uint64_t g_file_faults = 0, g_pc_hits = 0, g_writebacks = 0;
 
 /* ---- user-space address range + pointer validation ------------------------- */
 #define USER_VMIN 0x400000000000ull
@@ -2629,6 +2687,12 @@ static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0 };
 static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0 };
 static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0 };
 static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0 };
+/* v0.66. Rank 12: ABOVE every lock this ever needs, because it is never held
+ * across one. Filling a page reads the VFS and flushing one writes it, and
+ * both happen with this released — collect under the lock, do the I/O outside
+ * it, re-check on the way back in. Holding it across g_vfs_lock (rank 2) would
+ * be a real inversion, not a bookkeeping nicety. */
+static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0 };
 static volatile uint32_t g_rank_violations = 0;
 
 /* Back off without monopolizing the core that must make our progress: the BSP
@@ -4099,8 +4163,20 @@ static uint64_t cas_scratch_base(uint64_t fallback) {
  * (/usr/include has seven headers alone, plus /usr/lib, /bin/occ and test
  * sources). Growing this changes VFS_DIR_BLOCKS and therefore the on-disk
  * layout — which is exactly why it is bundled with the version-4 format break
- * below rather than deferred into a second, separate break later. */
-#define VFS_MAXFILES   64
+ * below rather than deferred into a second, separate break later.
+ *
+ * v0.66: 64 -> 96. This has been out of headroom since v0.60 — `[vfs]
+ * directory full` appears mid-boot in every log — and v0.66 is where it stopped
+ * being a warning and started failing suites: adding ONE fixture file for
+ * mmapfilestrs pushed langstrs over the edge on SMP-4, which is not a bug in
+ * either suite but the tree running out of names.
+ *
+ * It needs no format break. VFS_DIR_BLOCKS is derived from this constant and
+ * RECORDED in the superblock (v0.48 made it dynamic for exactly this reason),
+ * and mount reads min(SB->dir_blocks, VFS_DIR_BLOCKS) — so a volume written by
+ * an older kernel still mounts, with its own smaller directory, and the version
+ * gate is untouched. The static directory image grows by 8 KiB. */
+#define VFS_MAXFILES   96
 /* v0.56: VFS_MAX_CHUNKS is now the count of DIRECT chunk hashes stored inline
  * in the dirent — the unchanged fast path for every small file. (Stage A added
  * this without touching the on-disk layout at all; Stage B then widened `name`
@@ -4690,6 +4766,217 @@ static int vfs_write_by_dirent(int di, const void *data, uint32_t len) {
     klock_release(&g_vfs_lock);
     return r;
 }
+static int64_t vfs_read_file(int idx, void *buf, uint32_t max);   /* fwd: v0.66 */
+static void thread_tlb_release(uint64_t va, uint32_t pages);      /* fwd: v0.66 */
+
+/* v0.66: read an arbitrary BYTE RANGE of a file. vfs_read_file only ever reads
+ * from the start, which is fine for a whole-file read and useless for demand
+ * paging, where the whole point is to fetch page N without touching pages
+ * 0..N-1. Walks the same chunk map, honours the same "stop rather than lie"
+ * rule on a missing chunk, and returns the byte count actually produced. */
+static int64_t vfs_read_range(int di, uint64_t off, void *out, uint32_t len) {
+    if (di < 0 || di >= VFS_MAXFILES || !out) return -1;
+    klock_acquire(&g_vfs_lock);
+    struct dirent *d = &DENTS[di];
+    if (!d->used) { klock_release(&g_vfs_lock); return -1; }
+    uint32_t flen = d->len;
+    if (off >= flen) { klock_release(&g_vfs_lock); return 0; }   /* wholly past EOF */
+    uint32_t want = len;
+    if (off + want > flen) want = (uint32_t)(flen - off);
+    uint8_t *dst = (uint8_t *)out;
+    uint32_t got = 0;
+    uint8_t tmp[512];
+    while (got < want) {
+        uint64_t abs = off + got;
+        uint64_t h = vfs_chunk_hash_at(d, (uint32_t)(abs / 512));
+        if (!h) break;                                  /* hole: stop, do not lie */
+        if (cas_get(h, tmp, 512) < 0) break;
+        uint32_t within = (uint32_t)(abs % 512);
+        uint32_t n = 512 - within;
+        if (n > want - got) n = want - got;
+        for (uint32_t i = 0; i < n; i++) dst[got + i] = tmp[within + i];
+        got += n;
+    }
+    klock_release(&g_vfs_lock);
+    return (int64_t)got;
+}
+
+/* ---- the page cache ------------------------------------------------------
+ * Keyed by (dirent, page index). One frame per file page, however many
+ * processes map it — which is the whole content of the promise MAP_SHARED
+ * makes. Caller must NOT hold g_vm_lock across the VFS reads below; each of
+ * these takes and drops it around the table work only. */
+static int pc_find_locked(int di, uint32_t pg) {
+    for (int i = 0; i < MAX_PCACHE; i++)
+        if (g_pcache[i].used && g_pcache[i].dirent == di && g_pcache[i].pgidx == pg)
+            return i;
+    return -1;
+}
+
+/* The frame backing (di, pg), shared. Returns 0 on failure. On success the
+ * CALLER holds one reference (frame_share'd) and the cache holds the other. */
+static uint64_t pc_get_shared(int di, uint32_t pg) {
+    klock_acquire(&g_vm_lock);
+    int i = pc_find_locked(di, pg);
+    if (i >= 0) {
+        uint64_t f = g_pcache[i].frame;
+        frame_share(f);
+        __sync_fetch_and_add(&g_pc_hits, 1);
+        klock_release(&g_vm_lock);
+        return f;
+    }
+    klock_release(&g_vm_lock);
+
+    /* Filled with the lock DROPPED: vfs_read_range takes g_vfs_lock (rank 2)
+     * and g_vm_lock is rank 12, so holding it across the read would be a rank
+     * inversion — and a real one, not a bookkeeping nicety, because the VFS is
+     * reachable from paths that already hold locks of their own. */
+    uint64_t nf = alloc_frame();
+    if (!nf) return 0;
+    for (int b = 0; b < 0x1000; b++) ((uint8_t *)nf)[b] = 0;   /* tail past EOF reads as zero */
+    vfs_read_range(di, (uint64_t)pg * 0x1000ull, (void *)nf, 0x1000);
+
+    klock_acquire(&g_vm_lock);
+    i = pc_find_locked(di, pg);
+    if (i >= 0) {                       /* another core populated it while we read */
+        uint64_t f = g_pcache[i].frame;
+        frame_share(f);
+        klock_release(&g_vm_lock);
+        free_frame(nf);                 /* ours was redundant; theirs is canonical */
+        return f;
+    }
+    int slot = -1;
+    for (int k = 0; k < MAX_PCACHE; k++) if (!g_pcache[k].used) { slot = k; break; }
+    if (slot < 0) { klock_release(&g_vm_lock); free_frame(nf); return 0; }
+    g_pcache[slot].used = 1; g_pcache[slot].dirent = di;
+    g_pcache[slot].pgidx = pg; g_pcache[slot].frame = nf; g_pcache[slot].dirty = 0;
+    frame_share(nf);                    /* one ref for the cache, one for the caller */
+    klock_release(&g_vm_lock);
+    return nf;
+}
+
+/* v0.66: the writeback staging buffer. A raw flag rather than a klock, on the
+ * v0.61 execbuf precedent: it guards a buffer, not an ordering, and giving it
+ * a rank would put it in a graph it has no edges in. */
+static volatile uint32_t g_wb_busy = 0;
+static uint8_t g_wb_buf[FMAP_MAX_BYTES];
+static void wb_acquire(void) { while (__sync_lock_test_and_set(&g_wb_busy, 1)) krelax(); }
+static void wb_release(void) { __sync_lock_release(&g_wb_busy); }
+
+/* Flush every dirty cached page of `di` back to the file. Returns the number
+ * of pages written, or negative on failure.
+ *
+ * The VFS is CONTENT-ADDRESSED: a file is a list of immutable chunk hashes and
+ * writing it means producing a new list and repointing the name. There is no
+ * such thing as writing one page in place. So a flush is unavoidably a
+ * read-modify-write of the whole file — read it, overlay the dirty pages,
+ * write it back once. That is not a shortcut; it is what the storage model
+ * makes possible, and it is why FMAP_MAX_BYTES exists to bound it. */
+static int pc_flush_file(int di) {
+    if (di < 0 || di >= VFS_MAXFILES) return -1;
+    int dirty[MAX_PCACHE], nd = 0;
+    klock_acquire(&g_vm_lock);
+    for (int i = 0; i < MAX_PCACHE; i++)
+        if (g_pcache[i].used && g_pcache[i].dirent == di && g_pcache[i].dirty)
+            dirty[nd++] = i;
+    klock_release(&g_vm_lock);
+    if (!nd) return 0;                                  /* nothing to write back */
+
+    wb_acquire();
+    int64_t flen = vfs_read_file(di, g_wb_buf, FMAP_MAX_BYTES);
+    if (flen < 0) { wb_release(); return -1; }
+    /* The file KEEPS ITS LENGTH. A mapping is rounded up to whole pages and the
+     * tail past EOF is zero — writing that back would silently grow every
+     * mapped file to a page multiple, which POSIX msync does not do and which
+     * would corrupt the very content the test then compares. */
+    uint32_t keep = (uint32_t)flen;
+    klock_acquire(&g_vm_lock);
+    for (int k = 0; k < nd; k++) {
+        int i = dirty[k];
+        if (!g_pcache[i].used || g_pcache[i].dirent != di) continue;
+        uint64_t off = (uint64_t)g_pcache[i].pgidx * 0x1000ull;
+        if (off >= keep) continue;
+        uint32_t n = 0x1000; if (off + n > keep) n = (uint32_t)(keep - off);
+        const uint8_t *src = (const uint8_t *)g_pcache[i].frame;
+        for (uint32_t b = 0; b < n; b++) g_wb_buf[off + b] = src[b];
+    }
+    klock_release(&g_vm_lock);
+    int rc = vfs_write_by_dirent(di, g_wb_buf, keep);
+    wb_release();
+    if (rc < 0) return -1;                              /* leave pages dirty: retry later */
+
+    klock_acquire(&g_vm_lock);
+    for (int k = 0; k < nd; k++)
+        if (g_pcache[dirty[k]].used && g_pcache[dirty[k]].dirent == di)
+            g_pcache[dirty[k]].dirty = 0;
+    klock_release(&g_vm_lock);
+    __sync_fetch_and_add(&g_writebacks, 1);
+    return nd;
+}
+
+/* v0.66: after a flush, RE-PROTECT the range so the next write faults again.
+ *
+ * Clearing the dirty flag without this loses writes, and the way it loses them
+ * is instructive: msync marks the pages clean but leaves them WRITABLE, so a
+ * subsequent store — in this process or in a child that inherited the entry —
+ * completes in hardware with no fault, no dirty mark, and no trace. The next
+ * flush then finds nothing to do and the data is gone at unmap. Cleaning and
+ * write-protecting have to happen together or the tracking is decorative.
+ *
+ * Only the caller's own address space is re-protected; a second process
+ * mapping the same file has its own tables and its own fmap entry, and will
+ * re-protect them on its own flush. There is no reverse map from frame to PTE
+ * in this kernel, and building one to cover a case nothing exercises would be
+ * machinery without a consumer. */
+static void fmap_writeprotect(int fi) {
+    klock_acquire(&g_vm_lock);
+    if (!g_fmap[fi].used) { klock_release(&g_vm_lock); return; }
+    int owner = g_fmap[fi].owner;
+    uint64_t base = g_fmap[fi].base, len = g_fmap[fi].len;
+    klock_release(&g_vm_lock);
+    if (owner < 0 || owner >= n_kproc || !kprocs[owner].used) return;
+    uint64_t cr3 = kprocs[owner].cr3;
+    for (uint64_t off = 0; off < len; off += 0x1000) {
+        uint64_t *slot = pte_slot(cr3, base + off);
+        if (!slot) continue;
+        uint64_t e = *slot;
+        if (!(e & PTE_PRESENT) || !(e & PTE_SHM) || !(e & PTE_WRITE)) continue;
+        *slot = e & ~PTE_WRITE;
+        __asm__ volatile("invlpg (%0)" :: "r"(base + off) : "memory");
+    }
+    thread_tlb_release(base, (uint32_t)(len / 0x1000));
+}
+
+/* Which file-backed range, if any, covers `va` for this thread group? */
+static int fmap_find(int owner, uint64_t va) {
+    int r = -1;
+    klock_acquire(&g_vm_lock);
+    for (int i = 0; i < MAX_FMAP; i++)
+        if (g_fmap[i].used && g_fmap[i].owner == owner &&
+            va >= g_fmap[i].base && va < g_fmap[i].base + g_fmap[i].len) { r = i; break; }
+    klock_release(&g_vm_lock);
+    return r;
+}
+
+/* Release every file mapping a dying thread group holds, flushing first: an
+ * exiting process that had written a shared mapping must not lose the writes
+ * merely because it never called msync. */
+static void vmfile_teardown_kproc(int proc_idx) {
+    int L = tg_of(proc_idx);
+    int flush[MAX_FMAP], nf = 0;
+    klock_acquire(&g_vm_lock);
+    for (int i = 0; i < MAX_FMAP; i++)
+        if (g_fmap[i].used && g_fmap[i].owner == L) {
+            if (g_fmap[i].shared && g_fmap[i].writable) flush[nf++] = g_fmap[i].dirent;
+            g_fmap[i].used = 0;
+        }
+    klock_release(&g_vm_lock);
+    for (int i = 0; i < nf; i++) pc_flush_file(flush[i]);
+    /* Cached pages themselves are NOT dropped here. They belong to the file,
+     * not to the process, and another mapper may still hold them; the frame
+     * refcount is what decides when the last reference goes. */
+}
+
 static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
     klock_acquire(&g_vfs_lock);                /* the chunk list must not be    */
     struct dirent *d = &DENTS[idx];            /* COW-swapped under our read    */
@@ -7825,13 +8112,78 @@ static int vm_fault_handle(struct isr_frame *f) {
      * in the non-present entry at mmap time, so honouring them here needs no
      * lookup — the entry IS the record. */
     if (!(e & PTE_PRESENT) && (e & PTE_ZFOD)) {
+        uint64_t keep = e & (PTE_USER | PTE_WRITE | PTE_NX);
+        /* v0.66: is this promise backed by a FILE rather than by zeroes? The
+         * side table is consulted only here, on a page that has never been
+         * touched — the ZFOD and COW fast paths above and below never reach
+         * it, so anonymous memory pays nothing for the existence of file
+         * mappings. */
+        int fi = fmap_find(tg_of(slot), cr2 & ~0xFFFull);
+        if (fi >= 0) {
+            klock_acquire(&g_vm_lock);
+            int    di     = g_fmap[fi].dirent;
+            int    shared = g_fmap[fi].shared;
+            int    wr     = g_fmap[fi].writable;
+            uint64_t pg   = (cr2 - g_fmap[fi].base + g_fmap[fi].foff) >> 12;
+            klock_release(&g_vm_lock);
+            uint64_t nf;
+            if (shared) {
+                /* One frame per file page, however many processes map it. */
+                nf = pc_get_shared(di, (uint32_t)pg);
+                if (!nf) return 0;
+                /* Installed READ-ONLY even when the mapping is writable. The
+                 * first write then faults, which is the ONLY moment this
+                 * kernel can observe that the page became dirty — x86 has a
+                 * hardware dirty bit, but it lives in the PTE of whichever
+                 * process wrote, and the page cache entry is shared between
+                 * processes that each have their own tables. Faulting once per
+                 * page per mapping is the price of knowing. PTE_SHM keeps COW
+                 * away from it for good. */
+                *pte = (nf & ADDR_MASK) | (keep & ~PTE_WRITE) | PTE_SHM | PTE_PRESENT;
+            } else {
+                /* MAP_PRIVATE: a copy of the file's bytes that belongs to this
+                 * process alone. Writes never reach the file, which is what
+                 * private means — and is why it needs no dirty tracking. */
+                nf = alloc_frame();
+                if (!nf) return 0;
+                for (int b = 0; b < 0x1000; b++) ((uint8_t *)nf)[b] = 0;
+                vfs_read_range(di, pg * 0x1000ull, (void *)nf, 0x1000);
+                *pte = (nf & ADDR_MASK) | keep | PTE_PRESENT;
+            }
+            (void)wr;
+            __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
+            __sync_fetch_and_add(&g_file_faults, 1);
+            return 1;
+        }
         uint64_t nf = alloc_frame();
         if (!nf) return 0;                          /* out of memory: let it be a fault */
-        uint64_t keep = e & (PTE_USER | PTE_WRITE | PTE_NX);
         *pte = (nf & ADDR_MASK) | keep | PTE_PRESENT;
         __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
         __sync_fetch_and_add(&g_zfod_faults, 1);
         return 1;
+    }
+
+    /* ---- first write to a shared file page: mark it dirty, then allow it ----
+     * A present, SHM-marked, non-writable page that is being written. COW is
+     * ruled out (PTE_SHM and PTE_COW are never both set), so this can only be
+     * the read-only install above asking to be told about the write. */
+    if ((e & PTE_PRESENT) && (e & PTE_SHM) && !(e & PTE_WRITE) && is_write) {
+        int fi = fmap_find(tg_of(slot), cr2 & ~0xFFFull);
+        if (fi >= 0) {
+            klock_acquire(&g_vm_lock);
+            int ok = g_fmap[fi].shared && g_fmap[fi].writable;
+            int di = g_fmap[fi].dirent;
+            uint64_t pg = (cr2 - g_fmap[fi].base + g_fmap[fi].foff) >> 12;
+            if (ok) {
+                int pi = pc_find_locked(di, (uint32_t)pg);
+                if (pi >= 0) g_pcache[pi].dirty = 1;
+            }
+            klock_release(&g_vm_lock);
+            if (!ok) return 0;                      /* read-only mapping: a real SIGSEGV */
+            *pte = e | PTE_WRITE;
+            __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
+            return 1;
+        }
     }
 
     /* ---- copy on write ----------------------------------------------------
@@ -8059,6 +8411,7 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     audio_teardown_kproc(L);      /* v0.51: release any PCM stream ownership FIRST */
     usb_teardown_kproc(L);        /* v0.51: symmetry hook (no per-process USB state today) */
     net_teardown_kproc(L);        /* v0.52: release any sockets this process owns */
+    vmfile_teardown_kproc(L);     /* v0.66: flush + drop file-backed mappings     */
     wimp_teardown_kproc(L);       /* v0.53: destroy any windows this process owns */
     ipc_teardown_kproc(L);        /* v0.46: release IPC mailbox/shmem FIRST */
     shm_teardown_kproc(L);        /* v0.63: drop shared-segment attachments */
@@ -8737,6 +9090,7 @@ static void cpu_exec_proc(int c, int p) {
         audio_teardown_kproc(L);               /* v0.51: release any PCM stream ownership FIRST */
         usb_teardown_kproc(L);                 /* v0.51: symmetry hook (no per-process USB state today) */
         net_teardown_kproc(L);                 /* v0.52: release any sockets this process owns */
+        vmfile_teardown_kproc(L);              /* v0.66: flush + drop file-backed mappings     */
         wimp_teardown_kproc(L);                /* v0.53: destroy any windows this process owns */
         ipc_teardown_kproc(L);                 /* v0.46: release IPC mailbox/shmem FIRST */
         shm_teardown_kproc(L);                 /* v0.63: drop shared-segment attachments */
@@ -9851,6 +10205,22 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
         inherited++;
     }
     klock_release(&g_ofile_lock);
+    /* v0.66: the child inherits the parent's FILE MAPPINGS as well as its page
+     * tables. Without this its already-faulted pages would be there (shared
+     * ones are exempt from COW, private ones copied) but any page the parent
+     * had NOT yet touched would fault in the child, find no range naming a
+     * file, and be filled with zeroes — a mapping that is file-backed at the
+     * start and anonymous from wherever the parent happened to stop reading. */
+    klock_acquire(&g_vm_lock);
+    for (int i = 0; i < MAX_FMAP; i++) {
+        if (!g_fmap[i].used || g_fmap[i].owner != par_fds) continue;
+        for (int k = 0; k < MAX_FMAP; k++) if (!g_fmap[k].used) {
+            g_fmap[k] = g_fmap[i];
+            g_fmap[k].owner = ch;
+            break;
+        }
+    }
+    klock_release(&g_vm_lock);
     kprocs[ch].redir_in  = kprocs[par].redir_in;
     kprocs[ch].redir_out = kprocs[par].redir_out;
 
@@ -10462,11 +10832,23 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int di = ofile_deref(fd, &vol);                     /* owner-checked      */
         int64_t n = -9;
         if (di >= 0) {
+            /* v0.66: dispatched EXHAUSTIVELY. This was a chain ending in
+             * a bare `else` labelled VOL_DEV, which is a catch-all wearing a
+             * label rather than a branch: an
+             * epoll instance or a socket — neither of which is a byte stream
+             * SYS_READ can serve — fell through it and was answered with
+             * device bytes. A read that returns plausible-looking data for the
+             * wrong object is worse than one that fails, because nothing
+             * downstream can tell. Every volume now names itself, and anything
+             * unrecognised is an error rather than the last branch. */
             if (vol == VOL_ROOT)      n = vfs_read_file(di, (void *)a1, len);
             else if (vol == VOL_TMP)  n = tmp_read_file(di, (void *)a1, len);
             else if (vol == VOL_PIPE) n = pipe_read_fd(fd, (void *)a1, len);   /* v0.59 */
             else if (vol == VOL_EVFD) n = evfd_read_fd(fd, (void *)a1, len);   /* v0.64 */
-            else /* VOL_DEV */        n = dev_read_file((void *)a1, len);
+            else if (vol == VOL_DEV)  n = dev_read_file((void *)a1, len);
+            else if (vol == VOL_SOCK) n = -22;   /* EINVAL: use SYS_RECV       */
+            else if (vol == VOL_EPOLL) n = -22;  /* EINVAL: use SYS_EPOLL_WAIT */
+            else                      n = -22;   /* unknown volume: never guess */
         }
         fs_witness_leave();
         return (uint64_t)n;
@@ -10481,11 +10863,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int di = ofile_deref(fd, &vol);
         int64_t r = -9;
         if (di >= 0) {
+            /* v0.66: exhaustive, for the reason set out in SYS_READ above. */
             if (vol == VOL_ROOT)      r = vfs_write_by_dirent(di, (const void *)a1, len);  /* COW */
             else if (vol == VOL_TMP)  r = tmp_write_file(di, (const void *)a1, len);
             else if (vol == VOL_PIPE) r = pipe_write_fd(fd, (const void *)a1, len);        /* v0.59 */
             else if (vol == VOL_EVFD) r = evfd_write_fd(fd, (const void *)a1, len);        /* v0.64 */
-            else /* VOL_DEV */        r = -13;              /* read-only volume: capability-style denial */
+            else if (vol == VOL_DEV)  r = -13;   /* read-only volume: capability-style denial */
+            else if (vol == VOL_SOCK) r = -22;   /* EINVAL: use SYS_SEND        */
+            else if (vol == VOL_EPOLL) r = -22;  /* EINVAL: an epoll set is not a stream */
+            else                      r = -22;
         }
         fs_witness_leave();
         /* v0.59: a pipe write is allowed to be SHORT (the buffer is finite), so
@@ -12259,6 +12645,92 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                     kprocs[p].pid, len, prot, base);
         return base;
     }
+    case 83: {   /* v0.66: SYS_MMAP_FILE(fd_prot_flags, length, offset) -> base, or -1.
+                  *
+                  *   a0 bits  0..7  fd
+                  *      bits  8..15 prot  (1 READ, 2 WRITE, 4 EXEC)
+                  *      bits 16..31 flags (0x01 SHARED, 0x02 PRIVATE)
+                  *   a1        length
+                  *   a2        file offset, page-aligned
+                  *
+                  * A separate call rather than more arguments on SYS_MMAP: the
+                  * dispatch ABI has three registers, anonymous mmap already
+                  * uses all three, and packing a descriptor into one of them
+                  * would have made the anonymous path pay for a feature it
+                  * does not have. v0.63's refusal to accept an ignored fd
+                  * stands — 71 is still anonymous-only and still says so. */
+        int p = tg_of((int)current_proc_idx);
+        int fd = (int)(a0 & 0xFF);
+        uint64_t prot = (a0 >> 8) & 0xFF, flags = (a0 >> 16) & 0xFFFF;
+        uint64_t len = (a1 + 0xFFFull) & ~0xFFFull;
+        uint64_t foff = a2;
+        if (!len || len > FMAP_MAX_BYTES) return (uint64_t)-1;
+        if (foff & 0xFFF) return (uint64_t)-22;              /* EINVAL: unaligned */
+        if (prot & ~0x7ull) return (uint64_t)-1;
+        if ((prot & 0x2) && (prot & 0x4)) return (uint64_t)-1;          /* W^X */
+        if ((flags & 0x03) == 0 || (flags & 0x03) == 0x03) return (uint64_t)-22;
+        int vol = VOL_ROOT;
+        int di = ofile_deref(fd, &vol);
+        if (di < 0) return (uint64_t)-9;                     /* EBADF */
+        if (vol != VOL_ROOT) return (uint64_t)-22;           /* only real files are mappable */
+        int shared = (flags & 0x01) ? 1 : 0;
+        int writable = (prot & 0x2) ? 1 : 0;
+
+        uint64_t base = kprocs[p].mmap_next;
+        if (base + len > MMAP_USER_V + MMAP_MAX_BYTES) return (uint64_t)-1;
+        int fi = -1;
+        klock_acquire(&g_vm_lock);
+        for (int i = 0; i < MAX_FMAP; i++) if (!g_fmap[i].used) { fi = i; break; }
+        if (fi >= 0) {
+            g_fmap[fi].used = 1; g_fmap[fi].owner = p;
+            g_fmap[fi].base = base; g_fmap[fi].len = len;
+            g_fmap[fi].dirent = di; g_fmap[fi].foff = foff;
+            g_fmap[fi].shared = shared; g_fmap[fi].writable = writable;
+        }
+        klock_release(&g_vm_lock);
+        if (fi < 0) return (uint64_t)-11;                    /* EAGAIN: table full */
+
+        uint64_t pf = PTE_USER;
+        if (prot & 0x2) pf |= PTE_WRITE;
+        if (!(prot & 0x4)) pf |= PTE_NX;
+        /* Reserved, not populated. The range is described by the entries and
+         * the frames arrive one fault at a time — a 64 KiB mapping of which the
+         * caller touches one page costs one page, exactly as the anonymous path
+         * promises, and the file is read a page at a time rather than whole. */
+        for (uint64_t off = 0; off < len; off += 0x1000)
+            if (!vm_reserve_zfod(kprocs[p].cr3, base + off, pf)) {
+                klock_acquire(&g_vm_lock); g_fmap[fi].used = 0; klock_release(&g_vm_lock);
+                return (uint64_t)-1;
+            }
+        kprocs[p].mmap_next = base + len;
+        __sync_fetch_and_add(&g_mmap_calls, 1);
+        if (g_debug_posix)
+            kprintf("[dbgvm  ] mmap_file pid %u fd %d dirent %d %X bytes %s -> %X\n",
+                    kprocs[p].pid, (uint64_t)(int64_t)fd, (uint64_t)(int64_t)di,
+                    len, shared ? "SHARED" : "PRIVATE", base);
+        return base;
+    }
+    case 84: {   /* v0.66: SYS_MSYNC(addr, length, flags) -> 0, or negative.
+                  * Writes back every dirty page of the file mapped at `addr`.
+                  * `flags` is accepted and ignored: MS_SYNC is the only
+                  * behaviour this can have, because the write goes straight
+                  * through vfs_write_by_dirent with no queue behind it, and
+                  * claiming to support MS_ASYNC would be a promise about
+                  * ordering that nothing here implements. */
+        int p = tg_of((int)current_proc_idx);
+        uint64_t va = a0 & ~0xFFFull;
+        (void)a1; (void)a2;
+        int fi = fmap_find(p, va);
+        if (fi < 0) return (uint64_t)-22;                    /* EINVAL: not a file mapping */
+        klock_acquire(&g_vm_lock);
+        int di = g_fmap[fi].dirent;
+        int wb = g_fmap[fi].shared && g_fmap[fi].writable;
+        klock_release(&g_vm_lock);
+        if (!wb) return 0;         /* private or read-only: nothing to write back */
+        if (pc_flush_file(di) < 0) return (uint64_t)-5;
+        fmap_writeprotect(fi);     /* clean and write-protected, together */
+        return 0;
+    }
     case 72: {   /* SYS_MUNMAP(addr, length) -> 0 ok, negative.
                   * Frees whatever is actually backed, leaves untouched
                   * reservations costing nothing, and shoots the range down on
@@ -12268,6 +12740,19 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         uint64_t len = (a1 + 0xFFFull) & ~0xFFFull;
         if (!len) return (uint64_t)-1;
         if (va < MMAP_USER_V || va + len > MMAP_USER_V + MMAP_MAX_BYTES) return (uint64_t)-1;
+        /* v0.66: unmapping a shared file mapping must not lose its writes.
+         * Flushed BEFORE the entries are torn down, because the flush reads the
+         * cached frames and dropping our references first could return the last
+         * one to the allocator. */
+        int fi = fmap_find(p, va);
+        if (fi >= 0) {
+            klock_acquire(&g_vm_lock);
+            int di = g_fmap[fi].dirent;
+            int wb = g_fmap[fi].shared && g_fmap[fi].writable;
+            g_fmap[fi].used = 0;
+            klock_release(&g_vm_lock);
+            if (wb) pc_flush_file(di);
+        }
         uint64_t released = 0;
         for (uint64_t off = 0; off < len; off += 0x1000) {
             uint64_t *slot = pte_slot(kprocs[p].cr3, va + off);
@@ -17533,6 +18018,130 @@ out:
     kputs("-- done --\n");
 }
 
+/* ===========================================================================
+ * v0.66: MMAPFILESTRS — memory that is a file, and a file that is memory
+ * ===========================================================================
+ * The suite owns its fixture. v0.65 lost most of a milestone to a verification
+ * suite that corrupted a file eleven other suites depended on, so this one
+ * creates 'm66dat' itself and touches nothing else.
+ *
+ * The pattern is (i*7+3)&0xFF: not constant within a page and not repeating
+ * across pages, so a mapping that returned zeroes, or returned page 0 for
+ * every page, produces a WRONG ANSWER rather than accidentally agreeing. */
+static int g_mfpass = 0, g_mffail = 0;
+static void mfcheck(const char *what, int ok) {
+    if (ok) { g_mfpass++; kprintf("[mmapfilestrs] PASS: %s\n", what); }
+    else    { g_mffail++; kprintf("[mmapfilestrs] FAIL: %s\n", what); }
+}
+
+static void cmd_mmapfile_stress(void) {
+    kputs("-- MMAPFILESTRS: file-backed mappings, shared pages, and writeback --\n");
+    g_mfpass = g_mffail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t ff0 = g_file_faults, wb0 = g_writebacks, pch0 = g_pc_hits;
+
+    /* Seeded before the battery ran — see the note at the call site. */
+    int fdi = vfs_find("m66dat");
+    mfcheck("the fixture file exists (seeded before the VFS directory filled)", fdi >= 0);
+    if (fdi < 0) goto out;
+
+    int p = kproc_spawn("mmapfile", PCAP_FILESYSTEM);
+    if (p < 0) { mfcheck("kproc_spawn never fails", 0); goto out; }
+    kprocs[p].role = 50;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { mfcheck("the driver's ELF loads", 0); goto out; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 250000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[mmapfilestrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 1500 ? "" :
+        R.code[0] == 1501 ? "the fixture file could not be opened from ring 3" :
+        R.code[0] == 1502 ? "the userland fd table did not yield a kernel descriptor" :
+        R.code[0] == 1503 ? "MAP_PRIVATE read-only mapping was refused" :
+        R.code[0] == 1504 ? "PAGE 0 OF THE MAPPING DID NOT CONTAIN THE FILE'S BYTES" :
+        R.code[0] == 1505 ? "page 1 was wrong — demand paging read the wrong offset" :
+        R.code[0] == 1506 ? "PAGE 3 WAS WRONG — every page returned page 0, or zeroes" :
+        R.code[0] == 1507 ? "MAP_PRIVATE writable mapping was refused" :
+        R.code[0] == 1508 ? "the private writable mapping did not start from file content" :
+        R.code[0] == 1509 ? "a write to a private mapping did not stick in memory" :
+        R.code[0] == 1510 ? "msync on a private mapping errored (it should be a no-op)" :
+        R.code[0] == 1511 ? "re-reading the file failed" :
+        R.code[0] == 1512 ? "A PRIVATE WRITE REACHED THE FILE — MAP_PRIVATE is not private" :
+        R.code[0] == 1513 ? "MAP_SHARED writable mapping was refused" :
+        R.code[0] == 1514 ? "the shared mapping did not start from file content" :
+        R.code[0] == 1515 ? "a write to a shared mapping did not stick in memory" :
+        R.code[0] == 1516 ? "msync failed" :
+        R.code[0] == 1517 ? "reopening the file failed" :
+        R.code[0] == 1518 ? "reading the file back failed" :
+        R.code[0] == 1519 ? "MSYNC DID NOT WRITE BACK — the file still holds the old bytes" :
+        R.code[0] == 1520 ? "fork failed" :
+        R.code[0] == 1521 ? "the child did not see the parent's shared mapping (exit 61) or died" :
+        R.code[0] == 1522 ? "THE CHILD'S WRITE WAS INVISIBLE TO THE PARENT — pages are not shared" :
+        R.code[0] == 1523 ? "munmap of the shared mapping failed" :
+        R.code[0] == 1524 ? "reopening after munmap failed" :
+        R.code[0] == 1525 ? "reading after munmap failed" :
+        R.code[0] == 1526 ? "UNMAP DID NOT FLUSH — writes were lost with the mapping" :
+        R.code[0] == 1527 ? "a WRITE+EXEC file mapping was ALLOWED (W^X breached)" :
+        R.code[0] == 1528 ? "an unaligned file offset was accepted" :
+        R.code[0] == 1529 ? "mapping a bogus descriptor was allowed" :
+        R.code[0] == 1530 ? "epoll_create failed" :
+        R.code[0] == 1531 ? "READ ON AN EPOLL DESCRIPTOR DID NOT FAIL (the v0.66 catch-all patch)" :
+        R.code[0] == 1532 ? "write on an epoll descriptor did not fail" :
+                            "unknown";
+    if (R.code[0] != 1500) kprintf("[mmapfilestrs] driver exit %u — %s\n", R.code[0], why);
+
+    mfcheck("file-backed mapping, privacy, sharing and writeback all behaved (exit 1500)",
+            finished && R.code[0] == 1500);
+    kprintf("[mmapfilestrs] %u file faults, %u page-cache hits, %u writebacks\n",
+            g_file_faults - ff0, g_pc_hits - pch0, g_writebacks - wb0);
+
+    /* Ring 3 cannot see whether the pages arrived FROM THE FILE or whether the
+     * cache was ever consulted — it only sees bytes. These are the mechanism. */
+    mfcheck("pages were demand-faulted from the file, not eagerly copied",
+            g_file_faults > ff0);
+    mfcheck("the page cache served a second mapper of the same page",
+            g_pc_hits > pch0);
+    mfcheck("dirty pages were written back", g_writebacks > wb0);
+
+    /* The file on disk must now hold exactly what the driver left, and nothing
+     * else about it may have moved. */
+    static uint8_t vb[64];
+    int64_t got = vfs_read_range(fdi, 0, vb, 8);
+    mfcheck("the file is still readable through the ordinary path after mapping", got == 8);
+    mfcheck("writeback left the driver's bytes, and only those",
+            got == 8 && vb[0] == 0xA1 && vb[1] == 0xA2 && vb[2] == 0xC3 &&
+            vb[3] == (uint8_t)((3 * 7 + 3) & 0xFF));
+    mfcheck("the file kept its length — a page-rounded mapping did not grow it",
+            fdi >= 0 && DENTS[fdi].len == M66_FIXTURE_LEN);
+
+    int fm_live = 0;
+    klock_acquire(&g_vm_lock);
+    for (int i = 0; i < MAX_FMAP; i++) if (g_fmap[i].used) fm_live++;
+    klock_release(&g_vm_lock);
+    mfcheck("every file mapping was released with its process", fm_live == 0);
+    mfcheck("no lock-rank violation across the mapping and writeback paths",
+            g_rank_violations == viol0);
+out:
+    kprintf("[mmapfilestrs] RESULT: %d passed, %d failed\n", (uint64_t)g_mfpass, (uint64_t)g_mffail);
+    if (!g_mffail)
+        kputs("[mmapfilestrs] FILE-BACKED VM VERIFIED — shared pages are one page, and writes reach the file\n");
+    else kputs("[mmapfilestrs] FILE-BACKED VM DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 static void cmd_selfhost_test(void) {
     kputs("-- TOOLCHAIN STRESS: author -> compile -> run, natively in ring 3 --\n");
     g_tcpass = g_tcfail = 0;
@@ -20092,6 +20701,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "shmstress")) cmd_shm_stress();
     else if (!kstrcmp(argv[0], "epollstress")) cmd_epoll_stress();
     else if (!kstrcmp(argv[0], "netepollstress")) cmd_netepoll_stress();
+    else if (!kstrcmp(argv[0], "mmapfilestress")) cmd_mmapfile_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -20255,6 +20865,19 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_smp();              /* v0.35: cross-core protocol verification            */
     cmd_parallel();         /* v0.36: work-stealing parallel job across cores     */
     cmd_audit();            /* v0.37: parallel page-table integrity audit         */
+    /* v0.66: mmapfilestrs' fixture is created HERE, before the battery, not
+     * inside the suite. The VFS directory is 64 entries and the toolchain
+     * suites spend the last of them mid-boot — by suite 41 there is no room
+     * left, which is a pre-existing headroom problem (v0.60 onward) and not
+     * something a new suite should discover for itself at the point of use.
+     * Creating it early also keeps the fixture out of every earlier suite's
+     * way: it is written once and only ever read or mapped afterwards. */
+    {
+        static uint8_t m66seed[M66_FIXTURE_LEN];
+        for (uint32_t i = 0; i < M66_FIXTURE_LEN; i++) m66seed[i] = (uint8_t)((i * 7 + 3) & 0xFF);
+        if (vfs_write_file("m66dat", m66seed, M66_FIXTURE_LEN) < 0)
+            kputs("[vfs    ] WARNING: could not seed 'm66dat' — mmapfilestrs will report it\n");
+    }
     cmd_mcsched();          /* v0.38: an AP autonomously runs a ring-3 thread      */
     cmd_mcq();              /* v0.39: per-CPU queues, stealing, concurrent ring 3  */
     cmd_mcpre();            /* v0.39: IPI preemption + cross-core context migration */
@@ -20284,6 +20907,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_shm_stress();       /* v0.63: copy-on-write fork and zero-copy shared memory               */
     cmd_epoll_stress();     /* v0.64: event-driven readiness, eventfd counters, EOF reporting      */
     cmd_netepoll_stress();  /* v0.65: non-blocking sockets multiplexed with epoll                  */
+    cmd_mmapfile_stress();  /* v0.66: file-backed mappings, shared pages, writeback                */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
