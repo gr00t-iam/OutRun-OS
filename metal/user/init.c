@@ -150,6 +150,7 @@ static int omsync(u64 addr, u64 len, int flags) {
 #define F_GETFL                 3
 #define F_SETFL                 4
 #define SOCK_DGRAM              2
+#define SOCK_STREAM             1
 #define SOCK_NONBLOCK           0x800
 #define AF_INET                 2
 #define IP_LOOPBACK             0x7F000001ull
@@ -2483,6 +2484,117 @@ static void shm_stress_worker(void) {
     sysc(SYS_EXIT, 970, 0, 0);
 }
 
+/* --- role 51: tcpstrs — a real stream, not a datagram in a stream's clothes --
+ *
+ * Everything is loopback and everything is deterministic. The assertions are
+ * written so that a stack which merely COPIED bytes between two sockets would
+ * fail them: byte-stream framing is checked across a payload larger than one
+ * segment, ordering is checked by content rather than by arrival, and
+ * end-of-stream is checked as a distinct answer from "nothing yet". */
+#define TCP_PORT_BASE 7000
+
+static void tcp_stress_worker(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    u16 sport = (u16)(TCP_PORT_BASE + (pid & 0x1FF));
+
+    /* (1) A listener. */
+    int ls = (int)(i64)sysc(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+    if (ls < 0) sysc(SYS_EXIT, 1601, 0, 0);
+    if ((i64)sysc(SYS_BIND, (u64)ls, (u64)sport, 0) != 0) sysc(SYS_EXIT, 1602, 0, 0);
+    if (olisten(ls, 4) != 0) sysc(SYS_EXIT, 1603, 0, 0);
+
+    /* An idle listener has nothing to accept and says so at once. */
+    u32 peer[2];
+    if (oaccept(ls, peer, 0) != -11) sysc(SYS_EXIT, 1604, 0, 0);
+
+    /* (2) THE HANDSHAKE. connect() on a stream is the one call that genuinely
+     * exchanges something before it can return. */
+    int cl = (int)(i64)sysc(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+    if (cl < 0) sysc(SYS_EXIT, 1605, 0, 0);
+    if ((i64)sysc(SYS_CONNECT, (u64)cl, IP_LOOPBACK, (u64)sport) != 0) sysc(SYS_EXIT, 1606, 0, 0);
+
+    /* The connection is ESTABLISHED before accept, not by it. */
+    int sv = oaccept(ls, peer, 0);
+    if (sv < 0) sysc(SYS_EXIT, 1607, 0, 0);
+    if (peer[0] != (u32)IP_LOOPBACK) sysc(SYS_EXIT, 1608, 0, 0);
+
+    /* (3) BYTE STREAM, not message boundaries. 1500 bytes is three segments at
+     * a 512-byte MSS, so a stack that preserved message framing — or that lost
+     * anything at a segment boundary — produces the wrong bytes here. */
+    static u8 big[1500], got[1500];
+    for (int i = 0; i < 1500; i++) big[i] = (u8)((i * 31 + 7) & 0xFF);
+    int sent = 0;
+    while (sent < 1500) {
+        i64 n = (i64)sysc(SYS_SEND, (u64)cl, (u64)(void *)(big + sent), (u64)(1500 - sent));
+        if (n == -11) { oyield(); continue; }        /* send buffer full: legal */
+        if (n <= 0) sysc(SYS_EXIT, 1609, 0, 0);
+        sent += (int)n;
+    }
+    int rcv = 0;
+    for (int guard = 0; guard < 20000 && rcv < 1500; guard++) {
+        i64 n = (i64)sysc(SYS_RECV, (u64)sv, (u64)(void *)(got + rcv), (u64)(1500 - rcv));
+        if (n == -11 || n == 0) { oyield(); continue; }
+        if (n < 0) sysc(SYS_EXIT, 1610, 0, 0);
+        rcv += (int)n;
+    }
+    if (rcv != 1500) sysc(SYS_EXIT, 1611, 0, 0);
+    for (int i = 0; i < 1500; i++) if (got[i] != big[i]) sysc(SYS_EXIT, 1612, 0, 0);
+
+    /* (4) BIDIRECTIONAL. The server answers on the same connection. */
+    u8 rep[16]; for (int i = 0; i < 16; i++) rep[i] = (u8)(0x40 + i);
+    if ((i64)sysc(SYS_SEND, (u64)sv, (u64)(void *)rep, 16) != 16) sysc(SYS_EXIT, 1613, 0, 0);
+    u8 cb[16]; int cr = 0;
+    for (int guard = 0; guard < 20000 && cr < 16; guard++) {
+        i64 n = (i64)sysc(SYS_RECV, (u64)cl, (u64)(void *)(cb + cr), (u64)(16 - cr));
+        if (n == -11 || n == 0) { oyield(); continue; }
+        if (n < 0) sysc(SYS_EXIT, 1614, 0, 0);
+        cr += (int)n;
+    }
+    if (cr != 16) sysc(SYS_EXIT, 1615, 0, 0);
+    for (int i = 0; i < 16; i++) if (cb[i] != rep[i]) sysc(SYS_EXIT, 1616, 0, 0);
+
+    /* (5) epoll over a stream: readable on data, writable when it can send. */
+    int ep = oepoll_create();
+    if (ep < 0) sysc(SYS_EXIT, 1617, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, sv, EPOLLIN | EPOLLOUT, 0x71) != 0) sysc(SYS_EXIT, 1618, 0, 0);
+    struct epoll_event evs[4];
+    int n2 = oepoll_wait(ep, evs, 4, 0);
+    if (n2 != 1 || !(evs[0].events & EPOLLOUT)) sysc(SYS_EXIT, 1619, 0, 0);  /* established = writable */
+    if (evs[0].events & EPOLLIN)                sysc(SYS_EXIT, 1620, 0, 0);  /* drained  = not readable */
+    if ((i64)sysc(SYS_SEND, (u64)cl, (u64)(void *)rep, 4) != 4) sysc(SYS_EXIT, 1621, 0, 0);
+    for (int guard = 0; guard < 20000; guard++) {
+        n2 = oepoll_wait(ep, evs, 4, 0);
+        if (n2 == 1 && (evs[0].events & EPOLLIN)) break;
+        oyield();
+    }
+    if (!(evs[0].events & EPOLLIN)) sysc(SYS_EXIT, 1622, 0, 0);
+    sysc(SYS_RECV, (u64)sv, (u64)(void *)cb, 4);
+
+    /* (6) ORDERLY CLOSE. Closing the client sends FIN; the server must read
+     * END OF STREAM — 0, distinct from EAGAIN — rather than waiting forever. */
+    sysc(SYS_CLOSE, (u64)cl, 0, 0);
+    int saw_eof = 0;
+    for (int guard = 0; guard < 20000; guard++) {
+        i64 n = (i64)sysc(SYS_RECV, (u64)sv, (u64)(void *)cb, 16);
+        if (n == 0) { saw_eof = 1; break; }
+        if (n == -11) { oyield(); continue; }
+        if (n < 0) break;
+    }
+    if (!saw_eof) sysc(SYS_EXIT, 1623, 0, 0);
+    /* And epoll must report the hang-up, not merely stop reporting readable. */
+    for (int guard = 0; guard < 2000; guard++) {
+        n2 = oepoll_wait(ep, evs, 4, 0);
+        if (n2 == 1 && (evs[0].events & EPOLLHUP)) break;
+        oyield();
+    }
+    if (!(evs[0].events & EPOLLHUP)) sysc(SYS_EXIT, 1624, 0, 0);
+
+    sysc(SYS_CLOSE, (u64)sv, 0, 0);
+    sysc(SYS_CLOSE, (u64)ls, 0, 0);
+    sysc(SYS_CLOSE, (u64)ep, 0, 0);
+    sysc(SYS_EXIT, 1600, 0, 0);
+}
+
 /* --- role 50: mmapfilestrs — memory that IS a file --------------------------
  *
  * The fixture 'm66dat' is created by the kernel half, deliberately: a suite
@@ -4002,6 +4114,7 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 48) { epoll_stress_worker(); }         /* v0.64 epoll readiness, edges, eventfd, EOF        */
     if (role == 49) { netepoll_stress_worker(); }      /* v0.65 non-blocking sockets multiplexed with epoll */
     if (role == 50) { mmapfile_stress_worker(); }      /* v0.66 file-backed mappings and writeback           */
+    if (role == 51) { tcp_stress_worker(); }           /* v0.67 TCP: handshake, byte stream, FIN             */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
     if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
     if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */

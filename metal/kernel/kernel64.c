@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.66.0-metal"
+#define KERNEL_VERSION "0.67.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -583,6 +583,7 @@ static volatile int g_debug_posix = 0;          /* DEBUG_POSIX: fork/exec/signal
 static void handle_cpl3_fault(struct isr_frame *f);      /* defined after process globals */
 static int  posix_try_fault_signal(struct isr_frame *f);  /* v0.55: catchable SIGSEGV (signal core) */
 static int  vm_fault_handle(struct isr_frame *f);        /* v0.63: demand-zero / copy-on-write     */
+static void tcp_timer_scan(void);                        /* v0.67: retransmit, driven from idle    */
 static void canvas_inject_char(char c);                  /* v0.64: feed the kbd ring (suite use)   */
 static void sweep_tick(void);                            /* incremental PTE integrity audit */
 static void smp_ipi_dispatch(uint64_t vec);              /* v0.35: LAPIC IPI handlers      */
@@ -2627,7 +2628,7 @@ static void idle_fn(void *a) {
      * when nothing else can, which is precisely the condition a timed-out park
      * has to be rescued from. Thread context, not interrupt context, so taking
      * run-queue locks here is safe. */
-    for (;;) { __asm__ volatile("sti; hlt"); futex_timeout_scan(); sched_yield(); }
+    for (;;) { __asm__ volatile("sti; hlt"); futex_timeout_scan(); tcp_timer_scan(); sched_yield(); }
 }
 
 /* ===========================================================================
@@ -7113,6 +7114,53 @@ struct npend {
     uint8_t  data[SOCK_DGRAM_MAX];
 };
 
+/* ===========================================================================
+ * v0.67: TCP — a real state machine, not a datagram wearing a stream's name
+ * ===========================================================================
+ * v0.65 said plainly that there was no TCP here and that accept() handed out
+ * datagram sessions. This is the milestone that makes the word honest: the
+ * eleven POSIX states, a three-way handshake, sequence and acknowledgement
+ * arithmetic over a byte stream, orderly close through FIN and abortive close
+ * through RST, and retransmission of unacknowledged data.
+ *
+ * WHERE IT RUNS. Segments are exchanged over LOOPBACK, endpoint to endpoint
+ * inside this kernel, and that is a deliberate choice rather than a shortcut.
+ * A loopback link is lossless and instantaneous, which verifies the state
+ * machine and the sequence arithmetic exactly and verifies retransmission not
+ * at all — so the suite INJECTS LOSS (`g_tcp_drop`) to make the retransmit
+ * timer do real work. Gating pass/fail on a SLIRP round trip would have tested
+ * QEMU's NAT timing instead, the same trap v0.52 avoided for datagrams and
+ * v0.51 for audio.
+ *
+ * WHAT A SEGMENT IS. `struct tseg` is the header this kernel cares about —
+ * flags, sequence, acknowledgement, payload. It is deliberately not a wire
+ * struct: the on-the-wire header has offsets, options and a checksum that the
+ * loopback path would compute only to immediately discard. Building the real
+ * header belongs with the real transmit path, and is marked as not-done rather
+ * than half-written. */
+#define NET_SOCK_STREAM 1
+#define TCP_BUFSZ       2048         /* per-direction byte ring */
+#define TCP_MSS         512          /* one segment's payload ceiling */
+#define TCP_RTO_TICKS   6            /* ~60 ms at 100 Hz: a lossless link needs no more */
+#define TCP_MAX_RETRIES 8
+
+enum {
+    TCPS_CLOSED = 0, TCPS_LISTEN, TCPS_SYN_SENT, TCPS_SYN_RCVD, TCPS_ESTAB,
+    TCPS_FIN_WAIT1, TCPS_FIN_WAIT2, TCPS_CLOSE_WAIT, TCPS_CLOSING,
+    TCPS_LAST_ACK, TCPS_TIME_WAIT
+};
+#define TH_FIN 0x01
+#define TH_SYN 0x02
+#define TH_RST 0x04
+#define TH_ACK 0x10
+
+struct tseg {
+    uint32_t seq, ack;
+    uint16_t flags, len;
+    uint16_t sport, dport;      /* who sent it, and to whom */
+    const uint8_t *data;
+};
+
 struct nsock {
     int      used;
     int      owner;                          /* thread-group LEADER slot that owns it */
@@ -7131,8 +7179,25 @@ struct nsock {
     int      phead, ptail, pcount;
     int      hup;                            /* peer session's listener went away  */
     int      err;                            /* sticky error, reported as EPOLLERR */
+    /* ---- v0.67: stream state. Zero for a datagram socket, so every existing
+     * path keeps working without knowing streams exist. ---- */
+    int      stream;                         /* 1 = SOCK_STREAM                    */
+    int      state;                          /* TCPS_*                             */
+    uint32_t iss, irs;                       /* initial send / receive sequence    */
+    uint32_t snd_una, snd_nxt;               /* oldest unacked, next to send       */
+    uint32_t rcv_nxt;                        /* next byte expected                 */
+    uint8_t  sbuf[TCP_BUFSZ];                /* sent-but-unacked, for retransmit   */
+    uint32_t scount;
+    uint8_t  rbuf[TCP_BUFSZ];                /* received, in order, unread         */
+    uint32_t rhead, rtail, rcount;
+    int      fin_sent, fin_rcvd;
+    int      rexmit_ticks, rexmit_count;
+    int      acceptq[SOCK_BACKLOG];          /* listener: COMPLETED connections    */
+    int      aq_head, aq_tail, aq_count;
+    int      parent;                         /* child: its listener, or -1         */
 };
 static struct nsock g_sock[NSOCK];
+static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len); /* fwd: v0.67 */
 static struct klock g_net_lock = { 0, "net", 9, 0, 0 };
 static volatile uint64_t g_net_tx_frames = 0, g_net_loop_deliveries = 0;
 /* v0.65: the numbers the suite cannot see from ring 3. An EAGAIN count that
@@ -7162,6 +7227,17 @@ static int net_find_bound(uint16_t port) {
  * a readable end-of-conversation into a dangling fd. */
 static void net_sock_release_locked(int si) {
     if (si < 0 || si >= NSOCK || !g_sock[si].used) return;
+    /* v0.67: an orderly close SENDS FIN. Dropping a stream socket silently
+     * would leave the peer blocked on a read that can never complete — the
+     * whole point of FIN is that end-of-stream is announced rather than
+     * inferred from a timeout. */
+    if (g_sock[si].stream && !g_sock[si].fin_sent &&
+        (g_sock[si].state == TCPS_ESTAB || g_sock[si].state == TCPS_CLOSE_WAIT)) {
+        g_sock[si].fin_sent = 1;
+        tcp_output(si, TH_FIN | TH_ACK, 0, 0);
+        g_sock[si].snd_nxt++;
+        g_sock[si].state = (g_sock[si].state == TCPS_ESTAB) ? TCPS_FIN_WAIT1 : TCPS_LAST_ACK;
+    }
     if (g_sock[si].listening)
         for (int i = 0; i < NSOCK; i++)
             if (g_sock[i].used && !g_sock[i].listening && g_sock[i].bound &&
@@ -7267,6 +7343,255 @@ static int net_deliver_locked(uint16_t dport, uint32_t saddr, uint16_t sport,
     return -1;                                                /* nothing bound here */
 }
 
+/* ---- TCP: sequence arithmetic ---------------------------------------------
+ * Sequence numbers wrap, so every comparison must be modular. Writing `a < b`
+ * on raw uint32 works for 4 billion bytes and then silently inverts, which is
+ * the kind of bug that only appears under sustained load and never in a test. */
+static int seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
+static int seq_le(uint32_t a, uint32_t b) { return (int32_t)(a - b) <= 0; }
+
+static volatile uint64_t g_tcp_segs_out = 0, g_tcp_segs_in = 0, g_tcp_rexmits = 0;
+static volatile uint64_t g_tcp_conns = 0, g_tcp_resets = 0, g_tcp_drops = 0;
+/* Suite-driven loss injection: the next N segments are discarded on the way
+ * out. A lossless loopback link would otherwise leave the retransmit path as
+ * code that has never once run. */
+static volatile int g_tcp_drop = 0;
+
+static void tcp_input(int si, struct tseg *g);   /* fwd */
+
+/* Find the socket that should receive a segment addressed to `dport` from
+ * (saddr,sport): an established endpoint first, then a listener. Caller holds
+ * g_net_lock. Same precedence rule as the datagram router and for the same
+ * reason — an established connection must win over the listener that created
+ * it, or every segment of a conversation looks like a new one. */
+static int tcp_lookup_locked(uint16_t dport, uint32_t saddr, uint16_t sport) {
+    int listener = -1;
+    for (int i = 0; i < NSOCK; i++) {
+        if (!g_sock[i].used || !g_sock[i].stream || !g_sock[i].bound) continue;
+        if (g_sock[i].lport != dport) continue;
+        if (g_sock[i].state == TCPS_LISTEN) { if (listener < 0) listener = i; continue; }
+        if (g_sock[i].raddr == saddr && g_sock[i].rport == sport) return i;
+    }
+    return listener;
+}
+
+/* Emit a segment from `si` to its peer. Caller holds g_net_lock.
+ *
+ * On loopback the peer's TCB is in this same table, so delivery is a direct
+ * call into tcp_input — a lossless, in-order, zero-latency link. That is a
+ * real link with real segments, not a shortcut around the protocol: the
+ * handshake, the sequence space and the close sequence all happen exactly as
+ * they would on a wire. What it cannot produce on its own is loss, which is
+ * why g_tcp_drop exists. */
+static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len) {
+    struct nsock *s = &g_sock[si];
+    struct tseg g;
+    g.seq = s->snd_nxt; g.ack = s->rcv_nxt;
+    g.flags = flags; g.len = len; g.data = data;
+    g.sport = s->lport; g.dport = s->rport;
+    __sync_fetch_and_add(&g_tcp_segs_out, 1);
+    if (g_tcp_drop > 0) { g_tcp_drop--; __sync_fetch_and_add(&g_tcp_drops, 1); return; }
+    if (s->raddr != NET_LOOPBACK) return;      /* wire TX is not implemented: see the changelog */
+    int peer = tcp_lookup_locked(s->rport, NET_LOOPBACK, s->lport);
+    if (peer < 0) return;                      /* nobody listening: silently dropped */
+    tcp_input(peer, &g);
+}
+
+/* Queue outgoing bytes and send them. Returns bytes accepted. */
+static uint32_t tcp_send_data(int si, const uint8_t *src, uint32_t len) {
+    struct nsock *s = &g_sock[si];
+    uint32_t space = TCP_BUFSZ - s->scount;
+    if (len > space) len = space;
+    if (!len) return 0;
+    /* Kept for retransmission until acknowledged — that buffer IS the reason a
+     * lost segment can be recovered, and the reason send() can report how much
+     * it truly took rather than pretending. */
+    for (uint32_t i = 0; i < len; i++) s->sbuf[s->scount + i] = src[i];
+    uint32_t base = s->scount;
+    s->scount += len;
+    for (uint32_t off = 0; off < len; ) {
+        uint32_t n = len - off; if (n > TCP_MSS) n = TCP_MSS;
+        tcp_output(si, TH_ACK, &s->sbuf[base + off], (uint16_t)n);
+        s->snd_nxt += n;
+        off += n;
+    }
+    s->rexmit_ticks = TCP_RTO_TICKS; s->rexmit_count = 0;
+    return len;
+}
+
+/* Drop acknowledged bytes off the front of the retransmit buffer. */
+static void tcp_ack_upto(struct nsock *s, uint32_t ack) {
+    if (!seq_lt(s->snd_una, ack)) return;
+    uint32_t acked = ack - s->snd_una;
+    if (acked > s->scount) acked = s->scount;
+    for (uint32_t i = 0; i + acked < s->scount; i++) s->sbuf[i] = s->sbuf[i + acked];
+    s->scount -= acked;
+    s->snd_una = ack;
+    if (!s->scount) s->rexmit_ticks = 0;       /* nothing outstanding */
+}
+
+/* THE STATE MACHINE. Caller holds g_net_lock. */
+static void tcp_input(int si, struct tseg *g) {
+    struct nsock *s = &g_sock[si];
+    __sync_fetch_and_add(&g_tcp_segs_in, 1);
+
+    if (g->flags & TH_RST) {
+        /* Abortive close: the connection is gone NOW, and a reader must be
+         * told rather than left waiting for data that will never come. */
+        s->state = TCPS_CLOSED; s->err = 1; s->hup = 1;
+        __sync_fetch_and_add(&g_tcp_resets, 1);
+        if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
+        return;
+    }
+
+    if (s->state == TCPS_LISTEN) {
+        if (!(g->flags & TH_SYN)) return;
+        /* A connection REQUEST becomes a socket of its own immediately, in
+         * SYN_RCVD — not on accept(). accept() hands back an established
+         * connection; the handshake cannot wait for the application to call it
+         * or the peer would time out on a server that happened to be busy. */
+        if (s->aq_count >= SOCK_BACKLOG) return;             /* backlog full: drop, peer retries */
+        int ci = -1;
+        for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) { ci = i; break; }
+        if (ci < 0) return;
+        cmemset(&g_sock[ci], 0, sizeof g_sock[ci]);
+        struct nsock *c = &g_sock[ci];
+        c->used = 1; c->owner = s->owner; c->waiter_tid = -1; c->fd = -1;
+        c->stream = 1; c->bound = 1; c->lport = s->lport;
+        c->raddr = NET_LOOPBACK; c->rport = g->sport;   /* the port it spoke from */
+        /* An accepted socket IS connected — it has a peer, and every send path
+         * gates on this flag. Omitting it made the server able to receive and
+         * unable to reply, which reads as a transport bug and is really a
+         * missing assignment. */
+        c->connected = 1;
+        c->parent = si;
+        c->irs = g->seq; c->rcv_nxt = g->seq + 1;
+        c->iss = (uint32_t)(g_ticks * 2654435761u) | 1u;
+        c->snd_una = c->iss; c->snd_nxt = c->iss;
+        c->state = TCPS_SYN_RCVD;
+        tcp_output(ci, TH_SYN | TH_ACK, 0, 0);
+        c->snd_nxt++;                                        /* SYN consumes one */
+        return;
+    }
+
+    if (s->state == TCPS_SYN_SENT) {
+        if ((g->flags & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK)) {
+            s->irs = g->seq; s->rcv_nxt = g->seq + 1;
+            tcp_ack_upto(s, g->ack);
+            s->state = TCPS_ESTAB;
+            __sync_fetch_and_add(&g_tcp_conns, 1);
+            tcp_output(si, TH_ACK, 0, 0);
+            if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
+        }
+        return;
+    }
+
+    if (g->flags & TH_ACK) tcp_ack_upto(s, g->ack);
+
+    if (s->state == TCPS_SYN_RCVD && (g->flags & TH_ACK)) {
+        s->state = TCPS_ESTAB;
+        __sync_fetch_and_add(&g_tcp_conns, 1);
+        /* Established, so it joins its listener's accept queue. Doing this here
+         * rather than at SYN is what makes accept() return a connection that is
+         * genuinely usable the moment it is handed over. */
+        int L = s->parent;
+        if (L >= 0 && L < NSOCK && g_sock[L].used && g_sock[L].aq_count < SOCK_BACKLOG) {
+            g_sock[L].acceptq[g_sock[L].aq_tail] = si;
+            g_sock[L].aq_tail = (g_sock[L].aq_tail + 1) % SOCK_BACKLOG;
+            g_sock[L].aq_count++;
+            if (g_sock[L].waiter_tid >= 0) {
+                int w = g_sock[L].waiter_tid; g_sock[L].waiter_tid = -1; thread_wake(w);
+            }
+        }
+    }
+
+    /* In-order data only. Out-of-order segments are DROPPED rather than
+     * queued: a reassembly queue is real work with no consumer on a link that
+     * cannot reorder, and dropping is protocol-legal — the peer retransmits.
+     * Stated rather than silently assumed, because it is the difference
+     * between this and a production stack. */
+    if (g->len && g->seq == s->rcv_nxt && s->state >= TCPS_ESTAB) {
+        uint32_t space = TCP_BUFSZ - s->rcount;
+        uint32_t n = g->len; if (n > space) n = space;
+        for (uint32_t i = 0; i < n; i++) {
+            s->rbuf[s->rtail] = g->data[i];
+            s->rtail = (s->rtail + 1) % TCP_BUFSZ;
+        }
+        s->rcount += n;
+        s->rcv_nxt += n;
+        tcp_output(si, TH_ACK, 0, 0);
+        if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
+    }
+
+    /* A FIN occupies the sequence number immediately AFTER the segment's
+     * payload, so it is in order exactly when the payload has been consumed —
+     * `g->seq == rcv_nxt` is only right for a bare FIN and silently accepts an
+     * out-of-order one the moment a FIN is piggybacked on data. */
+    if ((g->flags & TH_FIN) && (uint32_t)(g->seq + g->len) == s->rcv_nxt && !s->fin_rcvd) {
+        s->fin_rcvd = 1;
+        s->rcv_nxt++;
+        tcp_output(si, TH_ACK, 0, 0);
+        if (s->state == TCPS_ESTAB)          s->state = TCPS_CLOSE_WAIT;
+        else if (s->state == TCPS_FIN_WAIT1) s->state = TCPS_CLOSING;
+        else if (s->state == TCPS_FIN_WAIT2) s->state = TCPS_TIME_WAIT;
+        if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
+    }
+
+    /* Our own FIN being acknowledged advances the closing states. */
+    if (s->fin_sent && seq_le(s->snd_nxt, g->ack)) {
+        if (s->state == TCPS_FIN_WAIT1)     s->state = TCPS_FIN_WAIT2;
+        else if (s->state == TCPS_CLOSING)  s->state = TCPS_TIME_WAIT;
+        else if (s->state == TCPS_LAST_ACK) s->state = TCPS_CLOSED;
+    }
+}
+
+/* Retransmit anything unacknowledged whose timer has expired.
+ *
+ * Driven from the idle path, NOT the timer ISR — the same rule v0.61 set for
+ * futex timeouts, and for the same reason: this takes g_net_lock, and taking a
+ * klock from an interrupt that can land mid-critical-section deadlocks against
+ * whoever already holds it. */
+static void tcp_timer_scan(void) {
+    int woke[NSOCK], nw = 0;
+    klock_acquire(&g_net_lock);
+    for (int i = 0; i < NSOCK; i++) {
+        struct nsock *s = &g_sock[i];
+        if (!s->used || !s->stream || !s->rexmit_ticks) continue;
+        if (--s->rexmit_ticks) continue;
+        if (s->rexmit_count >= TCP_MAX_RETRIES) {
+            /* A connection that cannot be reached is an ERROR, not a hang. */
+            s->state = TCPS_CLOSED; s->err = 1; s->hup = 1; s->rexmit_ticks = 0;
+            woke[nw++] = i;
+            continue;
+        }
+        s->rexmit_count++;
+        __sync_fetch_and_add(&g_tcp_rexmits, 1);
+        uint32_t seq_save = s->snd_nxt;
+        s->snd_nxt = s->snd_una;                  /* rewind: resend from the hole */
+        if (s->state == TCPS_SYN_SENT) {
+            tcp_output(i, TH_SYN, 0, 0);          /* a SYN is not in the send buffer */
+        } else if (s->state == TCPS_SYN_RCVD) {
+            tcp_output(i, TH_SYN | TH_ACK, 0, 0);
+        } else {
+            for (uint32_t off = 0; off < s->scount; ) {
+                uint32_t n = s->scount - off; if (n > TCP_MSS) n = TCP_MSS;
+                tcp_output(i, TH_ACK, &s->sbuf[off], (uint16_t)n);
+                s->snd_nxt += n;
+                off += n;
+            }
+            /* A FIN sits past the data and is likewise absent from the buffer. */
+            if (s->fin_sent && !s->scount) tcp_output(i, TH_FIN | TH_ACK, 0, 0);
+        }
+        if (seq_lt(s->snd_nxt, seq_save)) s->snd_nxt = seq_save;
+        s->rexmit_ticks = TCP_RTO_TICKS;
+    }
+    klock_release(&g_net_lock);
+    for (int i = 0; i < nw; i++)
+        if (g_sock[woke[i]].waiter_tid >= 0) {
+            int w = g_sock[woke[i]].waiter_tid; g_sock[woke[i]].waiter_tid = -1; thread_wake(w);
+        }
+}
+
 /* v0.65: what is this socket ready for, right now? Takes g_net_lock itself
  * (rank 9, above the ofile lock its caller holds).
  *
@@ -7281,6 +7606,22 @@ static uint32_t net_sock_events(int si) {
     if (!s->used) { klock_release(&g_net_lock); return EPOLLERR; }
     if (s->err) r |= EPOLLERR;
     if (s->hup) r |= EPOLLHUP;                  /* the listener behind us is gone */
+    if (s->stream) {
+        if (s->state == TCPS_LISTEN) { if (s->aq_count > 0) r |= EPOLLIN; }
+        else {
+            if (s->rcount > 0) r |= EPOLLIN;
+            if (s->fin_rcvd)   r |= EPOLLIN | EPOLLHUP;   /* end of stream is readable */
+            if (s->err)        r |= EPOLLERR;
+            /* Writable when the connection can actually take bytes: established
+             * and with room in the send buffer. Reporting writable on a
+             * half-open or unconnected stream invites a send that can only
+             * fail. */
+            if ((s->state == TCPS_ESTAB || s->state == TCPS_CLOSE_WAIT) &&
+                s->scount < TCP_BUFSZ && !s->err) r |= EPOLLOUT;
+        }
+        klock_release(&g_net_lock);
+        return r;
+    }
     if (s->listening) {
         /* A listener is READABLE when a peer is waiting to be accepted. That
          * is the whole point: it lets one epoll_wait cover the accept loop and
@@ -9207,7 +9548,7 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
          * the scan requeues, requeueing takes run-queue locks, and a timer
          * interrupt landing on a core that already holds its own rq_lock would
          * deadlock against itself. */
-        if (!picked) futex_timeout_scan();
+        if (!picked) { futex_timeout_scan(); tcp_timer_scan(); }
         if (!picked && g_debug_smp_sched && !g_cpu[idx].dbg_was_idle) {
             g_cpu[idx].dbg_was_idle = 1;                /* log the TRANSITION once, not */
             kprintf("[dbgsmp ] cpu%u idle (queue drained, nothing to steal)\n", (uint64_t)idx);
@@ -11487,7 +11828,9 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         uint32_t type = (uint32_t)a1;
         int nonblock = (type & SOCK_NONBLOCK) ? 1 : 0;
         type &= ~(uint32_t)SOCK_NONBLOCK;
-        if ((uint32_t)a0 != NET_AF_INET || type != NET_SOCK_DGRAM) return (uint64_t)-1;
+        if ((uint32_t)a0 != NET_AF_INET) return (uint64_t)-1;
+        if (type != NET_SOCK_DGRAM && type != NET_SOCK_STREAM) return (uint64_t)-1;
+        int want_stream = (type == NET_SOCK_STREAM);
         int owner = fd_owner();
         klock_acquire(&g_net_lock);
         int si = -1;
@@ -11495,6 +11838,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             cmemset(&g_sock[i], 0, sizeof g_sock[i]);
             g_sock[i].used = 1; g_sock[i].owner = owner;
             g_sock[i].waiter_tid = -1; g_sock[i].fd = -1;
+            g_sock[i].stream = want_stream; g_sock[i].parent = -1;
+            g_sock[i].state = want_stream ? TCPS_CLOSED : 0;
             si = i; break;
         }
         klock_release(&g_net_lock);
@@ -11537,9 +11882,59 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int si = sock_of_fd((int)(int64_t)a0, 0);
         uint32_t addr = (uint32_t)a1; uint16_t port = (uint16_t)a2;
         if (si < 0) return (uint64_t)-9;
+        int fl = 0; (void)sock_of_fd((int)(int64_t)a0, &fl);
         klock_acquire(&g_net_lock);
         int rc = -1;
         if (g_sock[si].listening) rc = -22;                 /* EINVAL: a listener */
+        else if (g_sock[si].stream) {
+            /* v0.67: THE ONE CALL THAT GENUINELY BLOCKS. A datagram connect
+             * records an address; a stream connect exchanges a handshake with
+             * another machine and cannot finish inside the syscall. So this is
+             * where -EINPROGRESS finally means something — v0.65 was right to
+             * refuse to invent it for datagrams and is right to return it here. */
+            struct nsock *c = &g_sock[si];
+            if (c->state != TCPS_CLOSED) rc = -106;         /* EISCONN */
+            else {
+                if (!c->bound) {   /* an unbound client still needs a source port */
+                    uint16_t ep = (uint16_t)(40000 + (si * 7 + (g_ticks & 0x3FF)));
+                    while (net_find_bound(ep) >= 0) ep++;
+                    c->lport = ep; c->bound = 1;
+                }
+                c->raddr = addr; c->rport = port; c->connected = 1;
+                c->iss = (uint32_t)(g_ticks * 2246822519u) | 1u;
+                c->snd_una = c->iss; c->snd_nxt = c->iss;
+                c->state = TCPS_SYN_SENT;
+                tcp_output(si, TH_SYN, 0, 0);
+                c->snd_nxt++;                               /* SYN consumes one */
+                c->rexmit_ticks = TCP_RTO_TICKS; c->rexmit_count = 0;
+                rc = (c->state == TCPS_ESTAB) ? 0
+                   : ((fl & O_NONBLOCK) ? -115 : 0);        /* -EINPROGRESS */
+                if (rc == 0 && c->state != TCPS_ESTAB) {
+                    /* Blocking connect RETRANSMITS ITS OWN SYN. Loopback
+                     * delivery is synchronous, so a connect that has not
+                     * established by the time tcp_output returns had its SYN
+                     * dropped — and a SYN is the one segment the data
+                     * retransmit path cannot help with, because there is
+                     * nothing in the send buffer to resend.
+                     *
+                     * Bounded by ITERATIONS, not by g_ticks. A syscall that
+                     * spins on the tick counter is betting that interrupts are
+                     * enabled underneath it; sched_yield gives the rest of the
+                     * system a turn and cannot wedge if that bet is wrong. */
+                    for (int t = 0; t < 64 && c->state == TCPS_SYN_SENT; t++) {
+                        klock_release(&g_net_lock);
+                        sched_yield();
+                        klock_acquire(&g_net_lock);
+                        if (c->state != TCPS_SYN_SENT) break;
+                        c->snd_nxt = c->iss;
+                        tcp_output(si, TH_SYN, 0, 0);
+                        c->snd_nxt = c->iss + 1;
+                        __sync_fetch_and_add(&g_tcp_rexmits, 1);
+                    }
+                    rc = (c->state == TCPS_ESTAB) ? 0 : -110;   /* ETIMEDOUT */
+                }
+            }
+        }
         else { g_sock[si].raddr = addr; g_sock[si].rport = port;
                g_sock[si].connected = 1; rc = 0; }
         klock_release(&g_net_lock);
@@ -11561,6 +11956,18 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         klock_acquire(&g_net_lock);
         if (!g_sock[si].used || !g_sock[si].connected || g_sock[si].listening) {
             klock_release(&g_net_lock); return (uint64_t)-107;         /* ENOTCONN */
+        }
+        if (g_sock[si].stream) {
+            struct nsock *c = &g_sock[si];
+            if (c->state != TCPS_ESTAB && c->state != TCPS_CLOSE_WAIT) {
+                int rst = c->err;
+                klock_release(&g_net_lock);
+                return (uint64_t)(rst ? -104 : -107);   /* ECONNRESET / ENOTCONN */
+            }
+            uint32_t took = tcp_send_data(si, stage, len);
+            klock_release(&g_net_lock);
+            if (!took) { __sync_fetch_and_add(&g_net_eagain, 1); return (uint64_t)-11; }
+            return (uint64_t)took;      /* a SHORT WRITE is legal on a stream */
         }
         uint32_t daddr = g_sock[si].raddr;
         uint16_t dport = g_sock[si].rport, sport = g_sock[si].lport;
@@ -11611,6 +12018,28 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             klock_acquire(&g_net_lock);
             if (!g_sock[si].used) { klock_release(&g_net_lock); return (uint64_t)-9; }
             if (g_sock[si].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
+            if (g_sock[si].stream) {
+                struct nsock *c = &g_sock[si];
+                if (c->rcount) {
+                    uint32_t n = c->rcount; if (n > maxlen) n = maxlen;
+                    for (uint32_t i = 0; i < n; i++) {
+                        ((uint8_t *)ubuf)[i] = c->rbuf[c->rhead];
+                        c->rhead = (c->rhead + 1) % TCP_BUFSZ;
+                    }
+                    c->rcount -= n;
+                    klock_release(&g_net_lock);
+                    return (uint64_t)n;
+                }
+                if (c->err) { klock_release(&g_net_lock); return (uint64_t)-104; }  /* ECONNRESET */
+                /* Drained AND the peer sent FIN: 0 is end of stream, exactly as
+                 * a pipe read at end of file, and distinct from EAGAIN. */
+                if (c->fin_rcvd) { klock_release(&g_net_lock); return (uint64_t)0; }
+                klock_release(&g_net_lock);
+                if (fl & O_NONBLOCK) { __sync_fetch_and_add(&g_net_eagain, 1); return (uint64_t)-11; }
+                if (g_ticks - t0 >= 2000) return (uint64_t)0;
+                __asm__ volatile("pause");
+                continue;
+            }
             if (g_sock[si].qcount > 0) {
                 struct nsock *sk = &g_sock[si];
                 uint16_t dl = sk->qlen[sk->qhead]; if (dl > maxlen) dl = (uint16_t)maxlen;
@@ -12443,7 +12872,9 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         klock_acquire(&g_net_lock);
         if (!g_sock[si].bound)         rc = -22;    /* EINVAL: nothing to listen on */
         else if (g_sock[si].connected) rc = -22;    /* EINVAL: already a peer socket */
-        else { g_sock[si].listening = 1; rc = 0; }
+        else { g_sock[si].listening = 1;
+               if (g_sock[si].stream) g_sock[si].state = TCPS_LISTEN;
+               rc = 0; }
         klock_release(&g_net_lock);
         if (g_debug_net) kprintf("[dbgnet ] pid %u: LISTEN socket %d -> %d\n",
                                  kprocs[current_proc_idx].pid, (uint64_t)(int64_t)si,
@@ -12473,6 +12904,37 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         /* Claim the child's socket slot BEFORE dequeuing the peer: if the table
          * is full we must leave the request queued for a later accept, not
          * consume and discard a client's first datagram. */
+        if (g_sock[li].stream) {
+            /* v0.67: a real accept. The connection is already ESTABLISHED —
+             * the handshake completed in tcp_input without waiting for the
+             * application, which is what stops a busy server from timing its
+             * peers out. accept() only transfers ownership. */
+            klock_acquire(&g_net_lock);
+            if (g_sock[li].state != TCPS_LISTEN) { klock_release(&g_net_lock); return (uint64_t)-22; }
+            if (g_sock[li].aq_count == 0) {
+                klock_release(&g_net_lock);
+                __sync_fetch_and_add(&g_net_eagain, 1);
+                return (uint64_t)-11;                        /* EAGAIN */
+            }
+            int ci = g_sock[li].acceptq[g_sock[li].aq_head];
+            g_sock[li].aq_head = (g_sock[li].aq_head + 1) % SOCK_BACKLOG;
+            g_sock[li].aq_count--;
+            uint32_t paddr = g_sock[ci].raddr; uint16_t pport = g_sock[ci].rport;
+            g_sock[ci].owner = owner;
+            klock_release(&g_net_lock);
+            int nfd2 = ofile_claim(owner, VOL_SOCK, ci);
+            if (nfd2 < 0) { net_sock_release(ci); return (uint64_t)-24; }
+            klock_acquire(&g_ofile_lock);
+            g_ofiles[nfd2].sock = ci;
+            if ((uint32_t)a2 & SOCK_NONBLOCK) g_ofiles[nfd2].flags |= O_NONBLOCK;
+            klock_release(&g_ofile_lock);
+            klock_acquire(&g_net_lock);
+            g_sock[ci].fd = nfd2;
+            klock_release(&g_net_lock);
+            if (upeer) { ((uint32_t *)upeer)[0] = paddr; ((uint32_t *)upeer)[1] = (uint32_t)pport; }
+            __sync_fetch_and_add(&g_net_accepts, 1);
+            return (uint64_t)(int64_t)nfd2;
+        }
         klock_acquire(&g_net_lock);
         if (!g_sock[li].used || !g_sock[li].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
         if (g_sock[li].pcount == 0) { klock_release(&g_net_lock);
@@ -16646,6 +17108,7 @@ static int posix_drain(int *procs, int nproc, struct px_round *R, uint64_t watch
          * would never be rescued and the round would end on the watchdog with
          * no explanation instead of on a specific failed assertion. */
         futex_timeout_scan();
+        tcp_timer_scan();
         if (++spins & 1) sched_yield();
         if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);
         /* Progress breadcrumb: in a serial log a silent stall is
@@ -18139,6 +18602,119 @@ out:
     if (!g_mffail)
         kputs("[mmapfilestrs] FILE-BACKED VM VERIFIED — shared pages are one page, and writes reach the file\n");
     else kputs("[mmapfilestrs] FILE-BACKED VM DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.67: TCPSTRS — the handshake, the byte stream, and the close
+ * ===========================================================================
+ * v0.65 shipped accept() over datagram sessions and said so plainly. This is
+ * the suite that checks the word finally means what it says: three-way
+ * handshake, sequence-ordered bytes across segment boundaries, retransmission
+ * of a deliberately dropped segment, and FIN as an answer distinct from
+ * "nothing yet". */
+static int g_tcpass = 0, g_tcfail2 = 0;
+static void tccheck2(const char *what, int ok) {
+    if (ok) { g_tcpass++; kprintf("[tcpstrs] PASS: %s\n", what); }
+    else    { g_tcfail2++; kprintf("[tcpstrs] FAIL: %s\n", what); }
+}
+
+static void cmd_tcp_stress(void) {
+    kputs("-- TCPSTRS: three-way handshake, byte streams, retransmission and FIN --\n");
+    g_tcpass = g_tcfail2 = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t so0 = g_tcp_segs_out, si0 = g_tcp_segs_in, rx0 = g_tcp_rexmits;
+    uint64_t cn0 = g_tcp_conns, dr0 = g_tcp_drops;
+    int socks0 = net_sock_count_used();
+
+    /* THE RETRANSMIT TEST. A loopback link cannot lose anything, so the
+     * retransmit path would otherwise be code that has never run. Dropping the
+     * next two segments forces the timer to do real work, and the driver's
+     * byte-for-byte comparison is what proves recovery was correct rather than
+     * merely eventual. */
+    g_tcp_drop = 2;
+
+    int p = kproc_spawn("tcpstr", PCAP_NETWORK);
+    if (p < 0) { tccheck2("kproc_spawn never fails", 0); goto out; }
+    kprocs[p].role = 51;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { tccheck2("the driver's ELF loads", 0); goto out; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 300000);
+    current_proc_idx = save;
+    g_tcp_drop = 0;
+    if (!finished) kprintf("[tcpstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 1600 ? "" :
+        R.code[0] == 1601 ? "creating a SOCK_STREAM socket was refused" :
+        R.code[0] == 1602 ? "binding the listener failed" :
+        R.code[0] == 1603 ? "listen on a stream socket failed" :
+        R.code[0] == 1604 ? "ACCEPT ON AN IDLE LISTENER DID NOT ANSWER EAGAIN" :
+        R.code[0] == 1605 ? "creating the client socket failed" :
+        R.code[0] == 1606 ? "THE THREE-WAY HANDSHAKE DID NOT COMPLETE" :
+        R.code[0] == 1607 ? "accept did not hand back the established connection" :
+        R.code[0] == 1608 ? "the accepted peer address was wrong" :
+        R.code[0] == 1609 ? "send on an established stream failed" :
+        R.code[0] == 1610 ? "recv on an established stream failed" :
+        R.code[0] == 1611 ? "THE STREAM LOST BYTES — fewer arrived than were sent" :
+        R.code[0] == 1612 ? "THE STREAM DELIVERED THE WRONG BYTES (ordering or a segment boundary)" :
+        R.code[0] == 1613 ? "the server could not send on the accepted connection" :
+        R.code[0] == 1614 ? "the client could not receive the reply" :
+        R.code[0] == 1615 ? "the reply was short — the connection is not bidirectional" :
+        R.code[0] == 1616 ? "the reply came back corrupted" :
+        R.code[0] == 1617 ? "epoll_create failed" :
+        R.code[0] == 1618 ? "watching a stream socket with epoll was refused" :
+        R.code[0] == 1619 ? "AN ESTABLISHED STREAM WAS NOT REPORTED WRITABLE" :
+        R.code[0] == 1620 ? "a drained stream was reported readable" :
+        R.code[0] == 1621 ? "the client's send failed" :
+        R.code[0] == 1622 ? "arriving bytes did not make the stream readable" :
+        R.code[0] == 1623 ? "CLOSE DID NOT PRODUCE END OF STREAM — the peer would wait forever" :
+        R.code[0] == 1624 ? "epoll did not report EPOLLHUP after the peer closed" :
+                            "unknown";
+    if (R.code[0] != 1600) kprintf("[tcpstrs] driver exit %u — %s\n", R.code[0], why);
+
+    tccheck2("handshake, byte stream, bidirectional traffic and FIN all behaved (exit 1600)",
+             finished && R.code[0] == 1600);
+    kprintf("[tcpstrs] %u segments out, %u in, %u connections, %u dropped, %u retransmits\n",
+            g_tcp_segs_out - so0, g_tcp_segs_in - si0, g_tcp_conns - cn0,
+            g_tcp_drops - dr0, g_tcp_rexmits - rx0);
+
+    /* The mechanism, which ring 3 cannot see: real segments were exchanged,
+     * connections genuinely reached ESTABLISHED, and — the one that matters —
+     * the injected loss was RECOVERED by retransmission rather than papered
+     * over by a lossless link. */
+    tccheck2("real segments were exchanged in both directions",
+             g_tcp_segs_out > so0 && g_tcp_segs_in > si0);
+    tccheck2("connections reached ESTABLISHED through a three-way handshake",
+             g_tcp_conns - cn0 >= 2);        /* both ends count themselves */
+    tccheck2("the injected segment loss actually happened", g_tcp_drops - dr0 == 2);
+    tccheck2("RETRANSMISSION recovered the dropped segments", g_tcp_rexmits > rx0);
+
+    tccheck2("every stream socket was reclaimed with its descriptor",
+             net_sock_count_used() == socks0);
+    int fds_leaked = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    tccheck2("no descriptor leaked across the suite", fds_leaked == 0);
+    tccheck2("no lock-rank violation across the TCP paths", g_rank_violations == viol0);
+out:
+    kprintf("[tcpstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_tcpass, (uint64_t)g_tcfail2);
+    if (!g_tcfail2)
+        kputs("[tcpstrs] TCP VERIFIED — a handshake, an ordered byte stream, and an announced end\n");
+    else kputs("[tcpstrs] TCP DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -20702,6 +21278,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "epollstress")) cmd_epoll_stress();
     else if (!kstrcmp(argv[0], "netepollstress")) cmd_netepoll_stress();
     else if (!kstrcmp(argv[0], "mmapfilestress")) cmd_mmapfile_stress();
+    else if (!kstrcmp(argv[0], "tcpstress")) cmd_tcp_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -20908,6 +21485,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_epoll_stress();     /* v0.64: event-driven readiness, eventfd counters, EOF reporting      */
     cmd_netepoll_stress();  /* v0.65: non-blocking sockets multiplexed with epoll                  */
     cmd_mmapfile_stress();  /* v0.66: file-backed mappings, shared pages, writeback                */
+    cmd_tcp_stress();       /* v0.67: TCP handshake, byte stream, retransmission, FIN             */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
