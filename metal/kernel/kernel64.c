@@ -19333,6 +19333,27 @@ static void cmd_fuzz(void) {
                (int64_t)syscall_dispatch(6, (uint64_t)fd, (uint64_t)&g_rng, 100) == -14);
         fcheck("SYS_READ into valid user buffer succeeds",
                (int64_t)syscall_dispatch(6, (uint64_t)fd, vpage, 100) >= 0);
+        /* v0.65: CLOSE IT BEFORE FUZZING. The descriptor above exists to prove
+         * the targeted pointer checks; leaving it open hands the randomized
+         * loop below a live, WRITABLE handle on a file the rest of the boot
+         * depends on. `motd` opens as descriptor 0, the argument pool contains
+         * 0, and syscall 7 is SYS_WRITE_FILE — so the fuzzer eventually issues
+         * write(fd=0, ..., len=0) and truncates motd to nothing. posixstrs then
+         * reads it and gets no bytes.
+         *
+         * That is exactly what it looked like: an intermittent, ~1-in-3
+         * uniprocessor failure of posixstrs round 'std fd table' (exit 964),
+         * with the descriptor itself perfectly valid — dirent 18, 'motd',
+         * len=0, nchunks=0. The fuzzer is seeded from RDTSC, which is why it
+         * moved around and why it looked like a v0.65 regression: adding a
+         * suite changed the boot's timing, and so the dice.
+         *
+         * The fuzzer's job is to prove the syscall BOUNDARY holds, not to
+         * survive corrupting shared fixtures, so it gives the handle back and
+         * every later fd argument lands on a descriptor it does not own —
+         * EBADF, which is the answer being tested for anyway. It also stops
+         * the fuzz process leaking a descriptor past its own teardown. */
+        syscall_dispatch(8, (uint64_t)fd, 0, 0);              /* SYS_CLOSE */
     }
 
     /* --- randomized fuzzing: every syscall x adversarial argument pool --- */
