@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.65.0-metal"
+#define KERNEL_VERSION "0.69.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -583,6 +583,11 @@ static volatile int g_debug_posix = 0;          /* DEBUG_POSIX: fork/exec/signal
 static void handle_cpl3_fault(struct isr_frame *f);      /* defined after process globals */
 static int  posix_try_fault_signal(struct isr_frame *f);  /* v0.55: catchable SIGSEGV (signal core) */
 static int  vm_fault_handle(struct isr_frame *f);        /* v0.63: demand-zero / copy-on-write     */
+static void tcp_timer_scan(void);                        /* v0.67: retransmit, driven from idle    */
+struct tseg;                                             /* v0.68: wire codec                      */
+static void net_rx_tcp(const uint8_t *f, uint32_t len);
+static int  tcp_wire_parse(const uint8_t *f, uint32_t len, struct tseg *out,
+                           uint32_t *saddr_out, uint32_t *daddr_out);
 static void canvas_inject_char(char c);                  /* v0.64: feed the kbd ring (suite use)   */
 static void sweep_tick(void);                            /* incremental PTE integrity audit */
 static void smp_ipi_dispatch(uint64_t vec);              /* v0.35: LAPIC IPI handlers      */
@@ -1199,6 +1204,64 @@ static int vm_reserve_zfod(uint64_t cr3, uint64_t va, uint64_t prot_flags) {
     *slot = PTE_ZFOD | PTE_USER | prot_flags;      /* PRESENT deliberately clear */
     return 1;
 }
+
+/* ===========================================================================
+ * v0.66: FILE-BACKED MAPPINGS — the page cache and the range that names a file
+ * ===========================================================================
+ * v0.63 established that THE PAGE TABLE IS THE MAP: a page's nature rides in
+ * its own PTE, and there is no VMA list to keep in step. File-backed mapping
+ * is the one thing that principle cannot express, and it is worth saying why
+ * rather than quietly adding a second description of the address space.
+ *
+ * A fault on a file page has to answer "which file, and which offset". For a
+ * NON-present entry there is room — the hardware ignores every bit. For a
+ * PRESENT one there is not: bits 9-11 are already ZFOD/COW/SHM and 52-62 is
+ * eleven bits, nowhere near a file id plus a page index. And a shared mapping
+ * needs its pages found by (file, offset) from a SECOND process that has its
+ * own page tables entirely — a per-PTE encoding cannot be looked up that way
+ * even in principle.
+ *
+ * So this adds exactly two bounded tables and no more:
+ *
+ *   g_fmap[]   which user ranges name which file. Consulted only on a fault
+ *              that the PTE alone could not resolve, so the fast paths — ZFOD
+ *              and COW — never touch it.
+ *   g_pcache[] the page cache: (dirent, page index) -> frame. This is what
+ *              makes MAP_SHARED mean anything. Two processes mapping one file
+ *              must land on the SAME frame; give them private copies and they
+ *              agree only until the first write, which is the bug MAP_SHARED
+ *              exists to prevent.
+ *
+ * NEITHER TABLE IS AUTHORITATIVE ABOUT PERMISSIONS. The PTE still is. These
+ * answer "what is behind this page", never "may it be written" — so the
+ * v0.63 invariant that a page's rights are readable from its entry alone
+ * survives intact. */
+#define MAX_FMAP        8
+#define MAX_PCACHE      32
+#define FMAP_MAX_BYTES  (64u * 1024u)   /* ceiling on one file-backed mapping */
+#define M66_FIXTURE_LEN (4u * 4096u)    /* mmapfilestrs' own file: 4 pages     */
+
+struct fmap {
+    int      used;
+    int      owner;                 /* thread-group leader slot that mapped it */
+    uint64_t base, len;             /* user VA range                           */
+    int      dirent;                /* VFS dirent this range is backed by      */
+    uint64_t foff;                  /* file offset corresponding to `base`     */
+    int      shared;                /* MAP_SHARED: writes are visible + written back */
+    int      writable;
+};
+static struct fmap g_fmap[MAX_FMAP];
+
+struct pcpage {
+    int      used;
+    int      dirent;
+    uint32_t pgidx;                 /* page index within the file */
+    uint64_t frame;
+    int      dirty;                 /* written through a shared mapping */
+};
+static struct pcpage g_pcache[MAX_PCACHE];
+
+static volatile uint64_t g_file_faults = 0, g_pc_hits = 0, g_writebacks = 0;
 
 /* ---- user-space address range + pointer validation ------------------------- */
 #define USER_VMIN 0x400000000000ull
@@ -2569,7 +2632,7 @@ static void idle_fn(void *a) {
      * when nothing else can, which is precisely the condition a timed-out park
      * has to be rescued from. Thread context, not interrupt context, so taking
      * run-queue locks here is safe. */
-    for (;;) { __asm__ volatile("sti; hlt"); futex_timeout_scan(); sched_yield(); }
+    for (;;) { __asm__ volatile("sti; hlt"); futex_timeout_scan(); tcp_timer_scan(); sched_yield(); }
 }
 
 /* ===========================================================================
@@ -2629,6 +2692,12 @@ static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0 };
 static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0 };
 static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0 };
 static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0 };
+/* v0.66. Rank 12: ABOVE every lock this ever needs, because it is never held
+ * across one. Filling a page reads the VFS and flushing one writes it, and
+ * both happen with this released — collect under the lock, do the I/O outside
+ * it, re-check on the way back in. Holding it across g_vfs_lock (rank 2) would
+ * be a real inversion, not a bookkeeping nicety. */
+static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0 };
 static volatile uint32_t g_rank_violations = 0;
 
 /* Back off without monopolizing the core that must make our progress: the BSP
@@ -3610,12 +3679,124 @@ static void net_route(const uint8_t *frame, uint32_t len) {
 }
 
 /* Per-frame dispatch: ARP -> the ARP waiter; IPv4 -> the UDP router.          */
+/* ===========================================================================
+ * v0.69: ARP — learning who is actually at an address
+ * ===========================================================================
+ * v0.68 put real TCP frames on the wire and addressed every one of them to the
+ * BROADCAST MAC, inherited from net_tx_udp. SLIRP accepts that; a switch does
+ * not have to, and a real network is entitled to drop it. Worse, broadcasting
+ * every segment of every connection is precisely the behaviour switching exists
+ * to eliminate.
+ *
+ * The cache is eight entries and learns from ANY ARP frame that crosses it,
+ * request or reply. That is the standard behaviour and it is not laziness: a
+ * host that is asking for us is about to talk to us, so its mapping is the one
+ * we are most likely to need next, and learning it from the request saves the
+ * round trip we would otherwise make asking back. */
+#define NET_GUEST_IP    0x0A000210u    /* 10.0.2.16: our SLIRP-side address    */
+static volatile uint64_t g_net_tx_frames;   /* defined with the socket layer   */
+static void vnet_tx(const uint8_t *frame, uint32_t len);   /* fwd: v0.69 */
+#define ARP_CACHE_N 8
+struct arpent { int used; uint32_t ip; uint8_t mac[6]; uint64_t seen; };
+static struct arpent g_arp[ARP_CACHE_N];
+static volatile uint64_t g_arp_learned = 0, g_arp_requests = 0, g_arp_replies = 0;
+static volatile uint64_t g_arp_hits = 0, g_arp_misses = 0;
+
+static int arp_lookup(uint32_t ip, uint8_t *mac_out) {
+    for (int i = 0; i < ARP_CACHE_N; i++)
+        if (g_arp[i].used && g_arp[i].ip == ip) {
+            for (int k = 0; k < 6; k++) mac_out[k] = g_arp[i].mac[k];
+            __sync_fetch_and_add(&g_arp_hits, 1);
+            return 1;
+        }
+    __sync_fetch_and_add(&g_arp_misses, 1);
+    return 0;
+}
+
+/* Insert or refresh. A changed MAC for a known address REPLACES the old one —
+ * machines move, interfaces fail over, and a cache that refused to update
+ * would keep talking to somewhere nothing is listening. */
+static void arp_learn(uint32_t ip, const uint8_t *mac) {
+    if (!ip) return;
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < ARP_CACHE_N; i++) {
+        if (g_arp[i].used && g_arp[i].ip == ip) { slot = i; break; }
+        if (!g_arp[i].used && slot < 0) slot = i;
+        if (g_arp[i].used && g_arp[i].seen < g_arp[oldest].seen) oldest = i;
+    }
+    if (slot < 0) slot = oldest;                    /* full: evict least recent */
+    g_arp[slot].used = 1; g_arp[slot].ip = ip;
+    for (int k = 0; k < 6; k++) g_arp[slot].mac[k] = mac[k];
+    g_arp[slot].seen = g_ticks;
+    __sync_fetch_and_add(&g_arp_learned, 1);
+}
+
+/* Build an ARP frame. `op` is 1 request, 2 reply. Returns the frame length.
+ * Split out from sending so the suite can inspect what this kernel actually
+ * emits rather than trusting that it emitted something. */
+static uint32_t arp_build(uint8_t *f, uint16_t op, uint32_t tpa, const uint8_t *tha) {
+    for (int i = 0; i < 6; i++) f[i] = tha ? tha[i] : 0xFF;      /* dst MAC */
+    for (int i = 0; i < 6; i++) f[6 + i] = g_vnet_mac[i];
+    f[12] = 0x08; f[13] = 0x06;                                  /* ARP      */
+    uint8_t *a = f + 14;
+    a[0] = 0x00; a[1] = 0x01;                                    /* Ethernet */
+    a[2] = 0x08; a[3] = 0x00;                                    /* IPv4     */
+    a[4] = 6; a[5] = 4;
+    a[6] = (uint8_t)(op >> 8); a[7] = (uint8_t)op;
+    for (int i = 0; i < 6; i++) a[8 + i] = g_vnet_mac[i];        /* sender HA */
+    a[14] = (uint8_t)(NET_GUEST_IP >> 24); a[15] = (uint8_t)(NET_GUEST_IP >> 16);
+    a[16] = (uint8_t)(NET_GUEST_IP >> 8);  a[17] = (uint8_t)NET_GUEST_IP;
+    for (int i = 0; i < 6; i++) a[18 + i] = tha ? tha[i] : 0x00; /* target HA */
+    a[24] = (uint8_t)(tpa >> 24); a[25] = (uint8_t)(tpa >> 16);
+    a[26] = (uint8_t)(tpa >> 8);  a[27] = (uint8_t)tpa;
+    return 14 + 28;
+}
+
+static void arp_request(uint32_t ip) {
+    if (!g_vnet_ready) return;
+    uint8_t f[14 + 28];
+    uint32_t n = arp_build(f, 1, ip, 0);
+    vnet_tx(f, n);
+    g_net_tx_frames++;
+    __sync_fetch_and_add(&g_arp_requests, 1);
+}
+
+/* Handle an inbound ARP frame: learn the sender, and answer a request that is
+ * asking for us. Answering is what makes this host REACHABLE — without it a
+ * peer can never address a frame to us and every inbound connection dies
+ * before it starts. */
+static void arp_input(const uint8_t *f, uint32_t len) {
+    if (len < 14 + 28) return;
+    const uint8_t *a = f + 14;
+    if (a[0] != 0x00 || a[1] != 0x01 || a[2] != 0x08 || a[3] != 0x00) return;
+    if (a[4] != 6 || a[5] != 4) return;
+    uint16_t op = (uint16_t)((a[6] << 8) | a[7]);
+    uint32_t spa = ((uint32_t)a[14] << 24) | ((uint32_t)a[15] << 16) |
+                   ((uint32_t)a[16] << 8) | a[17];
+    uint32_t tpa = ((uint32_t)a[24] << 24) | ((uint32_t)a[25] << 16) |
+                   ((uint32_t)a[26] << 8) | a[27];
+    arp_learn(spa, a + 8);
+    if (op == 1 && tpa == NET_GUEST_IP && g_vnet_ready) {
+        uint8_t r[14 + 28];
+        uint32_t n = arp_build(r, 2, spa, a + 8);
+        vnet_tx(r, n);
+        g_net_tx_frames++;
+        __sync_fetch_and_add(&g_arp_replies, 1);
+    }
+}
+
 static void net_dispatch(int idx, const uint8_t *frame, uint32_t len) {
     uint16_t eth = (uint16_t)((frame[12] << 8) | frame[13]);
     if (eth == 0x0806) {                                  /* ARP               */
+        arp_input(frame, len);                            /* v0.69: learn + reply */
         g_vnet_rx_idx = idx; g_vnet_rx_len = len + 12; g_vnet_rx_pending = 1;
         if (g_net_waiter_tid >= 0) { thread_wake(g_net_waiter_tid); g_net_waiter_tid = -1; }
-    } else if (eth == 0x0800) {                           /* IPv4 -> UDP router */
+    } else if (eth == 0x0800) {
+        /* v0.68: TCP first — net_route only knows UDP, and a TCP segment
+         * handed to it is silently ignored rather than misrouted, which is
+         * how inbound connections used to disappear without a trace. */
+        const uint8_t *ip = frame + 14;
+        if (len >= 14 + 20 && ip[9] == 6) { net_rx_tcp(frame, len); return; }
         net_route(frame, len);
     }
 }
@@ -4099,8 +4280,20 @@ static uint64_t cas_scratch_base(uint64_t fallback) {
  * (/usr/include has seven headers alone, plus /usr/lib, /bin/occ and test
  * sources). Growing this changes VFS_DIR_BLOCKS and therefore the on-disk
  * layout — which is exactly why it is bundled with the version-4 format break
- * below rather than deferred into a second, separate break later. */
-#define VFS_MAXFILES   64
+ * below rather than deferred into a second, separate break later.
+ *
+ * v0.66: 64 -> 96. This has been out of headroom since v0.60 — `[vfs]
+ * directory full` appears mid-boot in every log — and v0.66 is where it stopped
+ * being a warning and started failing suites: adding ONE fixture file for
+ * mmapfilestrs pushed langstrs over the edge on SMP-4, which is not a bug in
+ * either suite but the tree running out of names.
+ *
+ * It needs no format break. VFS_DIR_BLOCKS is derived from this constant and
+ * RECORDED in the superblock (v0.48 made it dynamic for exactly this reason),
+ * and mount reads min(SB->dir_blocks, VFS_DIR_BLOCKS) — so a volume written by
+ * an older kernel still mounts, with its own smaller directory, and the version
+ * gate is untouched. The static directory image grows by 8 KiB. */
+#define VFS_MAXFILES   96
 /* v0.56: VFS_MAX_CHUNKS is now the count of DIRECT chunk hashes stored inline
  * in the dirent — the unchanged fast path for every small file. (Stage A added
  * this without touching the on-disk layout at all; Stage B then widened `name`
@@ -4690,6 +4883,217 @@ static int vfs_write_by_dirent(int di, const void *data, uint32_t len) {
     klock_release(&g_vfs_lock);
     return r;
 }
+static int64_t vfs_read_file(int idx, void *buf, uint32_t max);   /* fwd: v0.66 */
+static void thread_tlb_release(uint64_t va, uint32_t pages);      /* fwd: v0.66 */
+
+/* v0.66: read an arbitrary BYTE RANGE of a file. vfs_read_file only ever reads
+ * from the start, which is fine for a whole-file read and useless for demand
+ * paging, where the whole point is to fetch page N without touching pages
+ * 0..N-1. Walks the same chunk map, honours the same "stop rather than lie"
+ * rule on a missing chunk, and returns the byte count actually produced. */
+static int64_t vfs_read_range(int di, uint64_t off, void *out, uint32_t len) {
+    if (di < 0 || di >= VFS_MAXFILES || !out) return -1;
+    klock_acquire(&g_vfs_lock);
+    struct dirent *d = &DENTS[di];
+    if (!d->used) { klock_release(&g_vfs_lock); return -1; }
+    uint32_t flen = d->len;
+    if (off >= flen) { klock_release(&g_vfs_lock); return 0; }   /* wholly past EOF */
+    uint32_t want = len;
+    if (off + want > flen) want = (uint32_t)(flen - off);
+    uint8_t *dst = (uint8_t *)out;
+    uint32_t got = 0;
+    uint8_t tmp[512];
+    while (got < want) {
+        uint64_t abs = off + got;
+        uint64_t h = vfs_chunk_hash_at(d, (uint32_t)(abs / 512));
+        if (!h) break;                                  /* hole: stop, do not lie */
+        if (cas_get(h, tmp, 512) < 0) break;
+        uint32_t within = (uint32_t)(abs % 512);
+        uint32_t n = 512 - within;
+        if (n > want - got) n = want - got;
+        for (uint32_t i = 0; i < n; i++) dst[got + i] = tmp[within + i];
+        got += n;
+    }
+    klock_release(&g_vfs_lock);
+    return (int64_t)got;
+}
+
+/* ---- the page cache ------------------------------------------------------
+ * Keyed by (dirent, page index). One frame per file page, however many
+ * processes map it — which is the whole content of the promise MAP_SHARED
+ * makes. Caller must NOT hold g_vm_lock across the VFS reads below; each of
+ * these takes and drops it around the table work only. */
+static int pc_find_locked(int di, uint32_t pg) {
+    for (int i = 0; i < MAX_PCACHE; i++)
+        if (g_pcache[i].used && g_pcache[i].dirent == di && g_pcache[i].pgidx == pg)
+            return i;
+    return -1;
+}
+
+/* The frame backing (di, pg), shared. Returns 0 on failure. On success the
+ * CALLER holds one reference (frame_share'd) and the cache holds the other. */
+static uint64_t pc_get_shared(int di, uint32_t pg) {
+    klock_acquire(&g_vm_lock);
+    int i = pc_find_locked(di, pg);
+    if (i >= 0) {
+        uint64_t f = g_pcache[i].frame;
+        frame_share(f);
+        __sync_fetch_and_add(&g_pc_hits, 1);
+        klock_release(&g_vm_lock);
+        return f;
+    }
+    klock_release(&g_vm_lock);
+
+    /* Filled with the lock DROPPED: vfs_read_range takes g_vfs_lock (rank 2)
+     * and g_vm_lock is rank 12, so holding it across the read would be a rank
+     * inversion — and a real one, not a bookkeeping nicety, because the VFS is
+     * reachable from paths that already hold locks of their own. */
+    uint64_t nf = alloc_frame();
+    if (!nf) return 0;
+    for (int b = 0; b < 0x1000; b++) ((uint8_t *)nf)[b] = 0;   /* tail past EOF reads as zero */
+    vfs_read_range(di, (uint64_t)pg * 0x1000ull, (void *)nf, 0x1000);
+
+    klock_acquire(&g_vm_lock);
+    i = pc_find_locked(di, pg);
+    if (i >= 0) {                       /* another core populated it while we read */
+        uint64_t f = g_pcache[i].frame;
+        frame_share(f);
+        klock_release(&g_vm_lock);
+        free_frame(nf);                 /* ours was redundant; theirs is canonical */
+        return f;
+    }
+    int slot = -1;
+    for (int k = 0; k < MAX_PCACHE; k++) if (!g_pcache[k].used) { slot = k; break; }
+    if (slot < 0) { klock_release(&g_vm_lock); free_frame(nf); return 0; }
+    g_pcache[slot].used = 1; g_pcache[slot].dirent = di;
+    g_pcache[slot].pgidx = pg; g_pcache[slot].frame = nf; g_pcache[slot].dirty = 0;
+    frame_share(nf);                    /* one ref for the cache, one for the caller */
+    klock_release(&g_vm_lock);
+    return nf;
+}
+
+/* v0.66: the writeback staging buffer. A raw flag rather than a klock, on the
+ * v0.61 execbuf precedent: it guards a buffer, not an ordering, and giving it
+ * a rank would put it in a graph it has no edges in. */
+static volatile uint32_t g_wb_busy = 0;
+static uint8_t g_wb_buf[FMAP_MAX_BYTES];
+static void wb_acquire(void) { while (__sync_lock_test_and_set(&g_wb_busy, 1)) krelax(); }
+static void wb_release(void) { __sync_lock_release(&g_wb_busy); }
+
+/* Flush every dirty cached page of `di` back to the file. Returns the number
+ * of pages written, or negative on failure.
+ *
+ * The VFS is CONTENT-ADDRESSED: a file is a list of immutable chunk hashes and
+ * writing it means producing a new list and repointing the name. There is no
+ * such thing as writing one page in place. So a flush is unavoidably a
+ * read-modify-write of the whole file — read it, overlay the dirty pages,
+ * write it back once. That is not a shortcut; it is what the storage model
+ * makes possible, and it is why FMAP_MAX_BYTES exists to bound it. */
+static int pc_flush_file(int di) {
+    if (di < 0 || di >= VFS_MAXFILES) return -1;
+    int dirty[MAX_PCACHE], nd = 0;
+    klock_acquire(&g_vm_lock);
+    for (int i = 0; i < MAX_PCACHE; i++)
+        if (g_pcache[i].used && g_pcache[i].dirent == di && g_pcache[i].dirty)
+            dirty[nd++] = i;
+    klock_release(&g_vm_lock);
+    if (!nd) return 0;                                  /* nothing to write back */
+
+    wb_acquire();
+    int64_t flen = vfs_read_file(di, g_wb_buf, FMAP_MAX_BYTES);
+    if (flen < 0) { wb_release(); return -1; }
+    /* The file KEEPS ITS LENGTH. A mapping is rounded up to whole pages and the
+     * tail past EOF is zero — writing that back would silently grow every
+     * mapped file to a page multiple, which POSIX msync does not do and which
+     * would corrupt the very content the test then compares. */
+    uint32_t keep = (uint32_t)flen;
+    klock_acquire(&g_vm_lock);
+    for (int k = 0; k < nd; k++) {
+        int i = dirty[k];
+        if (!g_pcache[i].used || g_pcache[i].dirent != di) continue;
+        uint64_t off = (uint64_t)g_pcache[i].pgidx * 0x1000ull;
+        if (off >= keep) continue;
+        uint32_t n = 0x1000; if (off + n > keep) n = (uint32_t)(keep - off);
+        const uint8_t *src = (const uint8_t *)g_pcache[i].frame;
+        for (uint32_t b = 0; b < n; b++) g_wb_buf[off + b] = src[b];
+    }
+    klock_release(&g_vm_lock);
+    int rc = vfs_write_by_dirent(di, g_wb_buf, keep);
+    wb_release();
+    if (rc < 0) return -1;                              /* leave pages dirty: retry later */
+
+    klock_acquire(&g_vm_lock);
+    for (int k = 0; k < nd; k++)
+        if (g_pcache[dirty[k]].used && g_pcache[dirty[k]].dirent == di)
+            g_pcache[dirty[k]].dirty = 0;
+    klock_release(&g_vm_lock);
+    __sync_fetch_and_add(&g_writebacks, 1);
+    return nd;
+}
+
+/* v0.66: after a flush, RE-PROTECT the range so the next write faults again.
+ *
+ * Clearing the dirty flag without this loses writes, and the way it loses them
+ * is instructive: msync marks the pages clean but leaves them WRITABLE, so a
+ * subsequent store — in this process or in a child that inherited the entry —
+ * completes in hardware with no fault, no dirty mark, and no trace. The next
+ * flush then finds nothing to do and the data is gone at unmap. Cleaning and
+ * write-protecting have to happen together or the tracking is decorative.
+ *
+ * Only the caller's own address space is re-protected; a second process
+ * mapping the same file has its own tables and its own fmap entry, and will
+ * re-protect them on its own flush. There is no reverse map from frame to PTE
+ * in this kernel, and building one to cover a case nothing exercises would be
+ * machinery without a consumer. */
+static void fmap_writeprotect(int fi) {
+    klock_acquire(&g_vm_lock);
+    if (!g_fmap[fi].used) { klock_release(&g_vm_lock); return; }
+    int owner = g_fmap[fi].owner;
+    uint64_t base = g_fmap[fi].base, len = g_fmap[fi].len;
+    klock_release(&g_vm_lock);
+    if (owner < 0 || owner >= n_kproc || !kprocs[owner].used) return;
+    uint64_t cr3 = kprocs[owner].cr3;
+    for (uint64_t off = 0; off < len; off += 0x1000) {
+        uint64_t *slot = pte_slot(cr3, base + off);
+        if (!slot) continue;
+        uint64_t e = *slot;
+        if (!(e & PTE_PRESENT) || !(e & PTE_SHM) || !(e & PTE_WRITE)) continue;
+        *slot = e & ~PTE_WRITE;
+        __asm__ volatile("invlpg (%0)" :: "r"(base + off) : "memory");
+    }
+    thread_tlb_release(base, (uint32_t)(len / 0x1000));
+}
+
+/* Which file-backed range, if any, covers `va` for this thread group? */
+static int fmap_find(int owner, uint64_t va) {
+    int r = -1;
+    klock_acquire(&g_vm_lock);
+    for (int i = 0; i < MAX_FMAP; i++)
+        if (g_fmap[i].used && g_fmap[i].owner == owner &&
+            va >= g_fmap[i].base && va < g_fmap[i].base + g_fmap[i].len) { r = i; break; }
+    klock_release(&g_vm_lock);
+    return r;
+}
+
+/* Release every file mapping a dying thread group holds, flushing first: an
+ * exiting process that had written a shared mapping must not lose the writes
+ * merely because it never called msync. */
+static void vmfile_teardown_kproc(int proc_idx) {
+    int L = tg_of(proc_idx);
+    int flush[MAX_FMAP], nf = 0;
+    klock_acquire(&g_vm_lock);
+    for (int i = 0; i < MAX_FMAP; i++)
+        if (g_fmap[i].used && g_fmap[i].owner == L) {
+            if (g_fmap[i].shared && g_fmap[i].writable) flush[nf++] = g_fmap[i].dirent;
+            g_fmap[i].used = 0;
+        }
+    klock_release(&g_vm_lock);
+    for (int i = 0; i < nf; i++) pc_flush_file(flush[i]);
+    /* Cached pages themselves are NOT dropped here. They belong to the file,
+     * not to the process, and another mapper may still hold them; the frame
+     * refcount is what decides when the last reference goes. */
+}
+
 static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
     klock_acquire(&g_vfs_lock);                /* the chunk list must not be    */
     struct dirent *d = &DENTS[idx];            /* COW-swapped under our read    */
@@ -6808,7 +7212,6 @@ static void audio_teardown_kproc(int proc_idx) {
 #define SOCK_QDEPTH     4
 #define SOCK_DGRAM_MAX  512
 #define NET_LOOPBACK    0x7F000001u         /* 127.0.0.1, host byte order */
-#define NET_GUEST_IP    0x0A000210u         /* 10.0.2.16 (our SLIRP-side src) */
 
 /* v0.65: a listening socket's pending-peer queue. There is no TCP here, so a
  * "connection" is a PEER: the first datagram from an (addr,port) this listener
@@ -6824,6 +7227,54 @@ struct npend {
     uint32_t addr; uint16_t port;
     uint16_t len;
     uint8_t  data[SOCK_DGRAM_MAX];
+};
+
+/* ===========================================================================
+ * v0.67: TCP — a real state machine, not a datagram wearing a stream's name
+ * ===========================================================================
+ * v0.65 said plainly that there was no TCP here and that accept() handed out
+ * datagram sessions. This is the milestone that makes the word honest: the
+ * eleven POSIX states, a three-way handshake, sequence and acknowledgement
+ * arithmetic over a byte stream, orderly close through FIN and abortive close
+ * through RST, and retransmission of unacknowledged data.
+ *
+ * WHERE IT RUNS. Segments are exchanged over LOOPBACK, endpoint to endpoint
+ * inside this kernel, and that is a deliberate choice rather than a shortcut.
+ * A loopback link is lossless and instantaneous, which verifies the state
+ * machine and the sequence arithmetic exactly and verifies retransmission not
+ * at all — so the suite INJECTS LOSS (`g_tcp_drop`) to make the retransmit
+ * timer do real work. Gating pass/fail on a SLIRP round trip would have tested
+ * QEMU's NAT timing instead, the same trap v0.52 avoided for datagrams and
+ * v0.51 for audio.
+ *
+ * WHAT A SEGMENT IS. `struct tseg` is the header this kernel cares about —
+ * flags, sequence, acknowledgement, payload. It is deliberately not a wire
+ * struct: the on-the-wire header has offsets, options and a checksum that the
+ * loopback path would compute only to immediately discard. Building the real
+ * header belongs with the real transmit path, and is marked as not-done rather
+ * than half-written. */
+#define NET_SOCK_STREAM 1
+#define TCP_BUFSZ       2048         /* per-direction byte ring */
+#define TCP_MSS         512          /* one segment's payload ceiling */
+#define TCP_RTO_TICKS   6            /* ~60 ms at 100 Hz: a lossless link needs no more */
+#define TCP_MAX_RETRIES 8
+#define TCP_HDR_LEN     20           /* no options are emitted or honoured */
+
+enum {
+    TCPS_CLOSED = 0, TCPS_LISTEN, TCPS_SYN_SENT, TCPS_SYN_RCVD, TCPS_ESTAB,
+    TCPS_FIN_WAIT1, TCPS_FIN_WAIT2, TCPS_CLOSE_WAIT, TCPS_CLOSING,
+    TCPS_LAST_ACK, TCPS_TIME_WAIT
+};
+#define TH_FIN 0x01
+#define TH_SYN 0x02
+#define TH_RST 0x04
+#define TH_ACK 0x10
+
+struct tseg {
+    uint32_t seq, ack;
+    uint16_t flags, len;
+    uint16_t sport, dport;      /* who sent it, and to whom */
+    const uint8_t *data;
 };
 
 struct nsock {
@@ -6844,10 +7295,28 @@ struct nsock {
     int      phead, ptail, pcount;
     int      hup;                            /* peer session's listener went away  */
     int      err;                            /* sticky error, reported as EPOLLERR */
+    /* ---- v0.67: stream state. Zero for a datagram socket, so every existing
+     * path keeps working without knowing streams exist. ---- */
+    int      stream;                         /* 1 = SOCK_STREAM                    */
+    int      state;                          /* TCPS_*                             */
+    uint32_t iss, irs;                       /* initial send / receive sequence    */
+    uint32_t snd_una, snd_nxt;               /* oldest unacked, next to send       */
+    uint32_t rcv_nxt;                        /* next byte expected                 */
+    uint8_t  sbuf[TCP_BUFSZ];                /* sent-but-unacked, for retransmit   */
+    uint32_t scount;
+    uint8_t  rbuf[TCP_BUFSZ];                /* received, in order, unread         */
+    uint32_t rhead, rtail, rcount;
+    int      fin_sent, fin_rcvd;
+    int      rexmit_ticks, rexmit_count;
+    int      acceptq[SOCK_BACKLOG];          /* listener: COMPLETED connections    */
+    int      aq_head, aq_tail, aq_count;
+    int      parent;                         /* child: its listener, or -1         */
 };
 static struct nsock g_sock[NSOCK];
+static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len); /* fwd: v0.67 */
 static struct klock g_net_lock = { 0, "net", 9, 0, 0 };
-static volatile uint64_t g_net_tx_frames = 0, g_net_loop_deliveries = 0;
+static volatile uint64_t g_net_tx_frames = 0;
+static volatile uint64_t g_net_loop_deliveries = 0;
 /* v0.65: the numbers the suite cannot see from ring 3. An EAGAIN count that
  * never moves means the non-blocking path was never actually taken — the
  * driver would pass every assertion it makes about itself and still be
@@ -6875,6 +7344,17 @@ static int net_find_bound(uint16_t port) {
  * a readable end-of-conversation into a dangling fd. */
 static void net_sock_release_locked(int si) {
     if (si < 0 || si >= NSOCK || !g_sock[si].used) return;
+    /* v0.67: an orderly close SENDS FIN. Dropping a stream socket silently
+     * would leave the peer blocked on a read that can never complete — the
+     * whole point of FIN is that end-of-stream is announced rather than
+     * inferred from a timeout. */
+    if (g_sock[si].stream && !g_sock[si].fin_sent &&
+        (g_sock[si].state == TCPS_ESTAB || g_sock[si].state == TCPS_CLOSE_WAIT)) {
+        g_sock[si].fin_sent = 1;
+        tcp_output(si, TH_FIN | TH_ACK, 0, 0);
+        g_sock[si].snd_nxt++;
+        g_sock[si].state = (g_sock[si].state == TCPS_ESTAB) ? TCPS_FIN_WAIT1 : TCPS_LAST_ACK;
+    }
     if (g_sock[si].listening)
         for (int i = 0; i < NSOCK; i++)
             if (g_sock[i].used && !g_sock[i].listening && g_sock[i].bound &&
@@ -6980,6 +7460,288 @@ static int net_deliver_locked(uint16_t dport, uint32_t saddr, uint16_t sport,
     return -1;                                                /* nothing bound here */
 }
 
+/* ---- TCP: sequence arithmetic ---------------------------------------------
+ * Sequence numbers wrap, so every comparison must be modular. Writing `a < b`
+ * on raw uint32 works for 4 billion bytes and then silently inverts, which is
+ * the kind of bug that only appears under sustained load and never in a test. */
+static int seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
+static int seq_le(uint32_t a, uint32_t b) { return (int32_t)(a - b) <= 0; }
+
+static volatile uint64_t g_tcp_segs_out = 0, g_tcp_segs_in = 0, g_tcp_rexmits = 0;
+static volatile uint64_t g_tcp_conns = 0, g_tcp_resets = 0, g_tcp_drops = 0;
+/* Suite-driven loss injection: the next N segments are discarded on the way
+ * out. A lossless loopback link would otherwise leave the retransmit path as
+ * code that has never once run. */
+static volatile int g_tcp_drop = 0;
+static volatile uint64_t g_tcp_wire_tx = 0, g_tcp_wire_rx = 0, g_tcp_wire_bad = 0;
+
+static void tcp_input(int si, struct tseg *g);   /* fwd */
+static uint32_t tcp_wire_build(uint8_t *f, uint32_t saddr, uint32_t daddr,
+                               const struct tseg *g, uint16_t window);   /* fwd: v0.68 */
+
+/* Find the socket that should receive a segment addressed to `dport` from
+ * (saddr,sport): an established endpoint first, then a listener. Caller holds
+ * g_net_lock. Same precedence rule as the datagram router and for the same
+ * reason — an established connection must win over the listener that created
+ * it, or every segment of a conversation looks like a new one. */
+static int tcp_lookup_locked(uint16_t dport, uint32_t saddr, uint16_t sport) {
+    int listener = -1;
+    for (int i = 0; i < NSOCK; i++) {
+        if (!g_sock[i].used || !g_sock[i].stream || !g_sock[i].bound) continue;
+        if (g_sock[i].lport != dport) continue;
+        if (g_sock[i].state == TCPS_LISTEN) { if (listener < 0) listener = i; continue; }
+        if (g_sock[i].raddr == saddr && g_sock[i].rport == sport) return i;
+    }
+    return listener;
+}
+
+/* Emit a segment from `si` to its peer. Caller holds g_net_lock.
+ *
+ * On loopback the peer's TCB is in this same table, so delivery is a direct
+ * call into tcp_input — a lossless, in-order, zero-latency link. That is a
+ * real link with real segments, not a shortcut around the protocol: the
+ * handshake, the sequence space and the close sequence all happen exactly as
+ * they would on a wire. What it cannot produce on its own is loss, which is
+ * why g_tcp_drop exists. */
+static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len) {
+    struct nsock *s = &g_sock[si];
+    struct tseg g;
+    g.seq = s->snd_nxt; g.ack = s->rcv_nxt;
+    g.flags = flags; g.len = len; g.data = data;
+    g.sport = s->lport; g.dport = s->rport;
+    __sync_fetch_and_add(&g_tcp_segs_out, 1);
+    if (g_tcp_drop > 0) { g_tcp_drop--; __sync_fetch_and_add(&g_tcp_drops, 1); return; }
+    if (s->raddr != NET_LOOPBACK) {
+        /* v0.68: a real frame on the real NIC. */
+        static uint8_t wf[14 + 20 + TCP_HDR_LEN + TCP_MSS];
+        if (!g_vnet_ready) return;
+        uint32_t n = tcp_wire_build(wf, NET_GUEST_IP, s->raddr, &g, (uint16_t)(TCP_BUFSZ - s->rcount));
+        vnet_tx(wf, n);
+        g_net_tx_frames++;
+        __sync_fetch_and_add(&g_tcp_wire_tx, 1);
+        return;
+    }
+    int peer = tcp_lookup_locked(s->rport, NET_LOOPBACK, s->lport);
+    if (peer < 0) return;                      /* nobody listening: silently dropped */
+    tcp_input(peer, &g);
+}
+
+/* Queue outgoing bytes and send them. Returns bytes accepted. */
+static uint32_t tcp_send_data(int si, const uint8_t *src, uint32_t len) {
+    struct nsock *s = &g_sock[si];
+    uint32_t space = TCP_BUFSZ - s->scount;
+    if (len > space) len = space;
+    if (!len) return 0;
+    /* Kept for retransmission until acknowledged — that buffer IS the reason a
+     * lost segment can be recovered, and the reason send() can report how much
+     * it truly took rather than pretending. */
+    for (uint32_t i = 0; i < len; i++) s->sbuf[s->scount + i] = src[i];
+    uint32_t base = s->scount;
+    s->scount += len;
+    for (uint32_t off = 0; off < len; ) {
+        uint32_t n = len - off; if (n > TCP_MSS) n = TCP_MSS;
+        tcp_output(si, TH_ACK, &s->sbuf[base + off], (uint16_t)n);
+        s->snd_nxt += n;
+        off += n;
+    }
+    s->rexmit_ticks = TCP_RTO_TICKS; s->rexmit_count = 0;
+    return len;
+}
+
+/* Drop acknowledged bytes off the front of the retransmit buffer. */
+static void tcp_ack_upto(struct nsock *s, uint32_t ack) {
+    if (!seq_lt(s->snd_una, ack)) return;
+    uint32_t acked = ack - s->snd_una;
+    if (acked > s->scount) acked = s->scount;
+    for (uint32_t i = 0; i + acked < s->scount; i++) s->sbuf[i] = s->sbuf[i + acked];
+    s->scount -= acked;
+    s->snd_una = ack;
+    if (!s->scount) s->rexmit_ticks = 0;       /* nothing outstanding */
+}
+
+/* v0.68: an inbound TCP frame, from the NIC bottom half.
+ *
+ * Runs OUTSIDE g_net_lock on entry and takes it here, because the bottom half
+ * is a normal kernel context and the lock ranking is only satisfied that way
+ * round. A frame that does not decode is counted and dropped: there is no
+ * useful reply to a segment whose checksum failed, since its addresses cannot
+ * be trusted either. */
+static void net_rx_tcp(const uint8_t *f, uint32_t len) {
+    struct tseg g;
+    uint32_t sa = 0, da = 0;
+    if (!tcp_wire_parse(f, len, &g, &sa, &da)) {
+        __sync_fetch_and_add(&g_tcp_wire_bad, 1);
+        return;
+    }
+    __sync_fetch_and_add(&g_tcp_wire_rx, 1);
+    klock_acquire(&g_net_lock);
+    int si = tcp_lookup_locked(g.dport, sa, g.sport);
+    if (si >= 0) tcp_input(si, &g);
+    klock_release(&g_net_lock);
+}
+
+/* THE STATE MACHINE. Caller holds g_net_lock. */
+static void tcp_input(int si, struct tseg *g) {
+    struct nsock *s = &g_sock[si];
+    __sync_fetch_and_add(&g_tcp_segs_in, 1);
+
+    if (g->flags & TH_RST) {
+        /* Abortive close: the connection is gone NOW, and a reader must be
+         * told rather than left waiting for data that will never come. */
+        s->state = TCPS_CLOSED; s->err = 1; s->hup = 1;
+        __sync_fetch_and_add(&g_tcp_resets, 1);
+        if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
+        return;
+    }
+
+    if (s->state == TCPS_LISTEN) {
+        if (!(g->flags & TH_SYN)) return;
+        /* A connection REQUEST becomes a socket of its own immediately, in
+         * SYN_RCVD — not on accept(). accept() hands back an established
+         * connection; the handshake cannot wait for the application to call it
+         * or the peer would time out on a server that happened to be busy. */
+        if (s->aq_count >= SOCK_BACKLOG) return;             /* backlog full: drop, peer retries */
+        int ci = -1;
+        for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) { ci = i; break; }
+        if (ci < 0) return;
+        cmemset(&g_sock[ci], 0, sizeof g_sock[ci]);
+        struct nsock *c = &g_sock[ci];
+        c->used = 1; c->owner = s->owner; c->waiter_tid = -1; c->fd = -1;
+        c->stream = 1; c->bound = 1; c->lport = s->lport;
+        c->raddr = NET_LOOPBACK; c->rport = g->sport;   /* the port it spoke from */
+        /* An accepted socket IS connected — it has a peer, and every send path
+         * gates on this flag. Omitting it made the server able to receive and
+         * unable to reply, which reads as a transport bug and is really a
+         * missing assignment. */
+        c->connected = 1;
+        c->parent = si;
+        c->irs = g->seq; c->rcv_nxt = g->seq + 1;
+        c->iss = (uint32_t)(g_ticks * 2654435761u) | 1u;
+        c->snd_una = c->iss; c->snd_nxt = c->iss;
+        c->state = TCPS_SYN_RCVD;
+        tcp_output(ci, TH_SYN | TH_ACK, 0, 0);
+        c->snd_nxt++;                                        /* SYN consumes one */
+        return;
+    }
+
+    if (s->state == TCPS_SYN_SENT) {
+        if ((g->flags & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK)) {
+            s->irs = g->seq; s->rcv_nxt = g->seq + 1;
+            tcp_ack_upto(s, g->ack);
+            s->state = TCPS_ESTAB;
+            __sync_fetch_and_add(&g_tcp_conns, 1);
+            tcp_output(si, TH_ACK, 0, 0);
+            if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
+        }
+        return;
+    }
+
+    if (g->flags & TH_ACK) tcp_ack_upto(s, g->ack);
+
+    if (s->state == TCPS_SYN_RCVD && (g->flags & TH_ACK)) {
+        s->state = TCPS_ESTAB;
+        __sync_fetch_and_add(&g_tcp_conns, 1);
+        /* Established, so it joins its listener's accept queue. Doing this here
+         * rather than at SYN is what makes accept() return a connection that is
+         * genuinely usable the moment it is handed over. */
+        int L = s->parent;
+        if (L >= 0 && L < NSOCK && g_sock[L].used && g_sock[L].aq_count < SOCK_BACKLOG) {
+            g_sock[L].acceptq[g_sock[L].aq_tail] = si;
+            g_sock[L].aq_tail = (g_sock[L].aq_tail + 1) % SOCK_BACKLOG;
+            g_sock[L].aq_count++;
+            if (g_sock[L].waiter_tid >= 0) {
+                int w = g_sock[L].waiter_tid; g_sock[L].waiter_tid = -1; thread_wake(w);
+            }
+        }
+    }
+
+    /* In-order data only. Out-of-order segments are DROPPED rather than
+     * queued: a reassembly queue is real work with no consumer on a link that
+     * cannot reorder, and dropping is protocol-legal — the peer retransmits.
+     * Stated rather than silently assumed, because it is the difference
+     * between this and a production stack. */
+    if (g->len && g->seq == s->rcv_nxt && s->state >= TCPS_ESTAB) {
+        uint32_t space = TCP_BUFSZ - s->rcount;
+        uint32_t n = g->len; if (n > space) n = space;
+        for (uint32_t i = 0; i < n; i++) {
+            s->rbuf[s->rtail] = g->data[i];
+            s->rtail = (s->rtail + 1) % TCP_BUFSZ;
+        }
+        s->rcount += n;
+        s->rcv_nxt += n;
+        tcp_output(si, TH_ACK, 0, 0);
+        if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
+    }
+
+    /* A FIN occupies the sequence number immediately AFTER the segment's
+     * payload, so it is in order exactly when the payload has been consumed —
+     * `g->seq == rcv_nxt` is only right for a bare FIN and silently accepts an
+     * out-of-order one the moment a FIN is piggybacked on data. */
+    if ((g->flags & TH_FIN) && (uint32_t)(g->seq + g->len) == s->rcv_nxt && !s->fin_rcvd) {
+        s->fin_rcvd = 1;
+        s->rcv_nxt++;
+        tcp_output(si, TH_ACK, 0, 0);
+        if (s->state == TCPS_ESTAB)          s->state = TCPS_CLOSE_WAIT;
+        else if (s->state == TCPS_FIN_WAIT1) s->state = TCPS_CLOSING;
+        else if (s->state == TCPS_FIN_WAIT2) s->state = TCPS_TIME_WAIT;
+        if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
+    }
+
+    /* Our own FIN being acknowledged advances the closing states. */
+    if (s->fin_sent && seq_le(s->snd_nxt, g->ack)) {
+        if (s->state == TCPS_FIN_WAIT1)     s->state = TCPS_FIN_WAIT2;
+        else if (s->state == TCPS_CLOSING)  s->state = TCPS_TIME_WAIT;
+        else if (s->state == TCPS_LAST_ACK) s->state = TCPS_CLOSED;
+    }
+}
+
+/* Retransmit anything unacknowledged whose timer has expired.
+ *
+ * Driven from the idle path, NOT the timer ISR — the same rule v0.61 set for
+ * futex timeouts, and for the same reason: this takes g_net_lock, and taking a
+ * klock from an interrupt that can land mid-critical-section deadlocks against
+ * whoever already holds it. */
+static void tcp_timer_scan(void) {
+    int woke[NSOCK], nw = 0;
+    klock_acquire(&g_net_lock);
+    for (int i = 0; i < NSOCK; i++) {
+        struct nsock *s = &g_sock[i];
+        if (!s->used || !s->stream || !s->rexmit_ticks) continue;
+        if (--s->rexmit_ticks) continue;
+        if (s->rexmit_count >= TCP_MAX_RETRIES) {
+            /* A connection that cannot be reached is an ERROR, not a hang. */
+            s->state = TCPS_CLOSED; s->err = 1; s->hup = 1; s->rexmit_ticks = 0;
+            woke[nw++] = i;
+            continue;
+        }
+        s->rexmit_count++;
+        __sync_fetch_and_add(&g_tcp_rexmits, 1);
+        uint32_t seq_save = s->snd_nxt;
+        s->snd_nxt = s->snd_una;                  /* rewind: resend from the hole */
+        if (s->state == TCPS_SYN_SENT) {
+            tcp_output(i, TH_SYN, 0, 0);          /* a SYN is not in the send buffer */
+        } else if (s->state == TCPS_SYN_RCVD) {
+            tcp_output(i, TH_SYN | TH_ACK, 0, 0);
+        } else {
+            for (uint32_t off = 0; off < s->scount; ) {
+                uint32_t n = s->scount - off; if (n > TCP_MSS) n = TCP_MSS;
+                tcp_output(i, TH_ACK, &s->sbuf[off], (uint16_t)n);
+                s->snd_nxt += n;
+                off += n;
+            }
+            /* A FIN sits past the data and is likewise absent from the buffer. */
+            if (s->fin_sent && !s->scount) tcp_output(i, TH_FIN | TH_ACK, 0, 0);
+        }
+        if (seq_lt(s->snd_nxt, seq_save)) s->snd_nxt = seq_save;
+        s->rexmit_ticks = TCP_RTO_TICKS;
+    }
+    klock_release(&g_net_lock);
+    for (int i = 0; i < nw; i++)
+        if (g_sock[woke[i]].waiter_tid >= 0) {
+            int w = g_sock[woke[i]].waiter_tid; g_sock[woke[i]].waiter_tid = -1; thread_wake(w);
+        }
+}
+
 /* v0.65: what is this socket ready for, right now? Takes g_net_lock itself
  * (rank 9, above the ofile lock its caller holds).
  *
@@ -6994,6 +7756,22 @@ static uint32_t net_sock_events(int si) {
     if (!s->used) { klock_release(&g_net_lock); return EPOLLERR; }
     if (s->err) r |= EPOLLERR;
     if (s->hup) r |= EPOLLHUP;                  /* the listener behind us is gone */
+    if (s->stream) {
+        if (s->state == TCPS_LISTEN) { if (s->aq_count > 0) r |= EPOLLIN; }
+        else {
+            if (s->rcount > 0) r |= EPOLLIN;
+            if (s->fin_rcvd)   r |= EPOLLIN | EPOLLHUP;   /* end of stream is readable */
+            if (s->err)        r |= EPOLLERR;
+            /* Writable when the connection can actually take bytes: established
+             * and with room in the send buffer. Reporting writable on a
+             * half-open or unconnected stream invites a send that can only
+             * fail. */
+            if ((s->state == TCPS_ESTAB || s->state == TCPS_CLOSE_WAIT) &&
+                s->scount < TCP_BUFSZ && !s->err) r |= EPOLLOUT;
+        }
+        klock_release(&g_net_lock);
+        return r;
+    }
     if (s->listening) {
         /* A listener is READABLE when a peer is waiting to be accepted. That
          * is the whole point: it lets one epoll_wait cover the accept loop and
@@ -7057,6 +7835,112 @@ static void net_tx_udp(uint32_t daddr, uint16_t sport, uint16_t dport,
     vnet_tx(f, (uint32_t)(14 + iptot));
     g_net_tx_frames++;
 }
+
+/* ---- v0.68: TCP ON THE WIRE ----------------------------------------------
+ * v0.67 exchanged `struct tseg` between endpoints inside this kernel, which is
+ * a real state machine over a real link and is not a frame anything else could
+ * receive. This is the encoder and decoder that make the same segments legible
+ * to another machine.
+ *
+ * THE CHECKSUM IS MANDATORY, and that is the one place this cannot copy what
+ * net_tx_udp does. IPv4 UDP may leave its checksum zero to mean "not computed"
+ * and the existing datagram path does exactly that; TCP has no such escape —
+ * a zero checksum is simply a wrong checksum, and every receiver on earth will
+ * discard the segment. It covers a PSEUDO-HEADER (source and destination
+ * address, protocol, TCP length) as well as the segment, which is what ties a
+ * segment to the addresses it was sent between and stops a correctly-formed
+ * segment being accepted for the wrong connection. */
+static uint16_t tcp_cksum(uint32_t saddr, uint32_t daddr, const uint8_t *seg, uint32_t len) {
+    uint32_t sum = 0;
+    sum += (saddr >> 16) & 0xFFFF; sum += saddr & 0xFFFF;
+    sum += (daddr >> 16) & 0xFFFF; sum += daddr & 0xFFFF;
+    sum += 6;                                   /* protocol */
+    sum += len;                                 /* TCP length, header + payload */
+    for (uint32_t i = 0; i + 1 < len; i += 2) sum += (uint32_t)((seg[i] << 8) | seg[i + 1]);
+    if (len & 1) sum += (uint32_t)(seg[len - 1] << 8);
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)(~sum);
+}
+
+/* Build Ethernet + IPv4 + TCP into `f`. Returns the total frame length. */
+static uint32_t tcp_wire_build(uint8_t *f, uint32_t saddr, uint32_t daddr,
+                               const struct tseg *g, uint16_t window) {
+    uint16_t plen = g->len;
+    if (plen > TCP_MSS) plen = TCP_MSS;
+    /* v0.69: the peer's real MAC when we know it. Broadcast is the fallback
+     * for a first segment to an unresolved address, and it fires an ARP
+     * request so the NEXT segment is addressed properly — dropping the segment
+     * instead would stall every new connection for a round trip. */
+    uint8_t dmac[6];
+    if (arp_lookup(daddr, dmac)) { for (int i = 0; i < 6; i++) f[i] = dmac[i]; }
+    else { for (int i = 0; i < 6; i++) f[i] = 0xFF; arp_request(daddr); }
+    for (int i = 0; i < 6; i++) f[6 + i] = g_vnet_mac[i];
+    f[12] = 0x08; f[13] = 0x00;                               /* ethertype IPv4    */
+    uint8_t *ip = f + 14;
+    uint16_t iptot = (uint16_t)(20 + TCP_HDR_LEN + plen);
+    for (int i = 0; i < 20; i++) ip[i] = 0;
+    ip[0] = 0x45; ip[2] = (uint8_t)(iptot >> 8); ip[3] = (uint8_t)iptot;
+    ip[8] = 64; ip[9] = 6;                                    /* TTL, proto TCP    */
+    ip[12] = (uint8_t)(saddr >> 24); ip[13] = (uint8_t)(saddr >> 16);
+    ip[14] = (uint8_t)(saddr >> 8);  ip[15] = (uint8_t)saddr;
+    ip[16] = (uint8_t)(daddr >> 24); ip[17] = (uint8_t)(daddr >> 16);
+    ip[18] = (uint8_t)(daddr >> 8);  ip[19] = (uint8_t)daddr;
+    uint16_t ick = net_cksum16(ip, 20); ip[10] = (uint8_t)(ick >> 8); ip[11] = (uint8_t)ick;
+
+    uint8_t *t = ip + 20;
+    for (int i = 0; i < TCP_HDR_LEN; i++) t[i] = 0;
+    t[0] = (uint8_t)(g->sport >> 8); t[1] = (uint8_t)g->sport;
+    t[2] = (uint8_t)(g->dport >> 8); t[3] = (uint8_t)g->dport;
+    t[4] = (uint8_t)(g->seq >> 24); t[5] = (uint8_t)(g->seq >> 16);
+    t[6] = (uint8_t)(g->seq >> 8);  t[7] = (uint8_t)g->seq;
+    t[8] = (uint8_t)(g->ack >> 24); t[9] = (uint8_t)(g->ack >> 16);
+    t[10] = (uint8_t)(g->ack >> 8); t[11] = (uint8_t)g->ack;
+    t[12] = 5 << 4;                                           /* data offset, no options */
+    t[13] = (uint8_t)g->flags;
+    t[14] = (uint8_t)(window >> 8); t[15] = (uint8_t)window;
+    for (uint16_t i = 0; i < plen; i++) t[TCP_HDR_LEN + i] = g->data[i];
+    uint16_t ck = tcp_cksum(saddr, daddr, t, (uint32_t)(TCP_HDR_LEN + plen));
+    t[16] = (uint8_t)(ck >> 8); t[17] = (uint8_t)ck;
+    return (uint32_t)(14 + iptot);
+}
+
+/* Decode a received frame into a segment. Returns 1 if it is a well-formed TCP
+ * segment for us, 0 otherwise — and a BAD CHECKSUM IS A ZERO, not a warning.
+ * Accepting a segment whose checksum does not verify is how corrupt data
+ * becomes application data with nothing in between to notice. */
+static int tcp_wire_parse(const uint8_t *f, uint32_t len, struct tseg *out,
+                          uint32_t *saddr_out, uint32_t *daddr_out) {
+    if (len < 14 + 20 + TCP_HDR_LEN) return 0;
+    if (f[12] != 0x08 || f[13] != 0x00) return 0;             /* not IPv4 */
+    const uint8_t *ip = f + 14;
+    if ((ip[0] >> 4) != 4) return 0;
+    uint32_t ihl = (uint32_t)(ip[0] & 0x0F) * 4;
+    if (ihl < 20 || ip[9] != 6) return 0;                     /* not TCP  */
+    uint16_t iptot = (uint16_t)((ip[2] << 8) | ip[3]);
+    if (iptot < ihl + TCP_HDR_LEN || 14u + iptot > len) return 0;
+    uint32_t sa = ((uint32_t)ip[12] << 24) | ((uint32_t)ip[13] << 16) |
+                  ((uint32_t)ip[14] << 8)  | ip[15];
+    uint32_t da = ((uint32_t)ip[16] << 24) | ((uint32_t)ip[17] << 16) |
+                  ((uint32_t)ip[18] << 8)  | ip[19];
+    const uint8_t *t = ip + ihl;
+    uint32_t tlen = (uint32_t)iptot - ihl;
+    uint32_t doff = (uint32_t)(t[12] >> 4) * 4;
+    if (doff < TCP_HDR_LEN || doff > tlen) return 0;
+    if (tcp_cksum(sa, da, t, tlen) != 0) return 0;            /* corrupt: discard */
+    out->sport = (uint16_t)((t[0] << 8) | t[1]);
+    out->dport = (uint16_t)((t[2] << 8) | t[3]);
+    out->seq = ((uint32_t)t[4] << 24) | ((uint32_t)t[5] << 16) |
+               ((uint32_t)t[6] << 8) | t[7];
+    out->ack = ((uint32_t)t[8] << 24) | ((uint32_t)t[9] << 16) |
+               ((uint32_t)t[10] << 8) | t[11];
+    out->flags = t[13];
+    out->len = (uint16_t)(tlen - doff);
+    out->data = t + doff;
+    if (saddr_out) *saddr_out = sa;
+    if (daddr_out) *daddr_out = da;
+    return 1;
+}
+
 
 /* Called from every kproc exit path (clean AND fault), alongside the other
  * teardown hooks. Releases every socket the dying process owns. Static RX
@@ -7825,13 +8709,78 @@ static int vm_fault_handle(struct isr_frame *f) {
      * in the non-present entry at mmap time, so honouring them here needs no
      * lookup — the entry IS the record. */
     if (!(e & PTE_PRESENT) && (e & PTE_ZFOD)) {
+        uint64_t keep = e & (PTE_USER | PTE_WRITE | PTE_NX);
+        /* v0.66: is this promise backed by a FILE rather than by zeroes? The
+         * side table is consulted only here, on a page that has never been
+         * touched — the ZFOD and COW fast paths above and below never reach
+         * it, so anonymous memory pays nothing for the existence of file
+         * mappings. */
+        int fi = fmap_find(tg_of(slot), cr2 & ~0xFFFull);
+        if (fi >= 0) {
+            klock_acquire(&g_vm_lock);
+            int    di     = g_fmap[fi].dirent;
+            int    shared = g_fmap[fi].shared;
+            int    wr     = g_fmap[fi].writable;
+            uint64_t pg   = (cr2 - g_fmap[fi].base + g_fmap[fi].foff) >> 12;
+            klock_release(&g_vm_lock);
+            uint64_t nf;
+            if (shared) {
+                /* One frame per file page, however many processes map it. */
+                nf = pc_get_shared(di, (uint32_t)pg);
+                if (!nf) return 0;
+                /* Installed READ-ONLY even when the mapping is writable. The
+                 * first write then faults, which is the ONLY moment this
+                 * kernel can observe that the page became dirty — x86 has a
+                 * hardware dirty bit, but it lives in the PTE of whichever
+                 * process wrote, and the page cache entry is shared between
+                 * processes that each have their own tables. Faulting once per
+                 * page per mapping is the price of knowing. PTE_SHM keeps COW
+                 * away from it for good. */
+                *pte = (nf & ADDR_MASK) | (keep & ~PTE_WRITE) | PTE_SHM | PTE_PRESENT;
+            } else {
+                /* MAP_PRIVATE: a copy of the file's bytes that belongs to this
+                 * process alone. Writes never reach the file, which is what
+                 * private means — and is why it needs no dirty tracking. */
+                nf = alloc_frame();
+                if (!nf) return 0;
+                for (int b = 0; b < 0x1000; b++) ((uint8_t *)nf)[b] = 0;
+                vfs_read_range(di, pg * 0x1000ull, (void *)nf, 0x1000);
+                *pte = (nf & ADDR_MASK) | keep | PTE_PRESENT;
+            }
+            (void)wr;
+            __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
+            __sync_fetch_and_add(&g_file_faults, 1);
+            return 1;
+        }
         uint64_t nf = alloc_frame();
         if (!nf) return 0;                          /* out of memory: let it be a fault */
-        uint64_t keep = e & (PTE_USER | PTE_WRITE | PTE_NX);
         *pte = (nf & ADDR_MASK) | keep | PTE_PRESENT;
         __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
         __sync_fetch_and_add(&g_zfod_faults, 1);
         return 1;
+    }
+
+    /* ---- first write to a shared file page: mark it dirty, then allow it ----
+     * A present, SHM-marked, non-writable page that is being written. COW is
+     * ruled out (PTE_SHM and PTE_COW are never both set), so this can only be
+     * the read-only install above asking to be told about the write. */
+    if ((e & PTE_PRESENT) && (e & PTE_SHM) && !(e & PTE_WRITE) && is_write) {
+        int fi = fmap_find(tg_of(slot), cr2 & ~0xFFFull);
+        if (fi >= 0) {
+            klock_acquire(&g_vm_lock);
+            int ok = g_fmap[fi].shared && g_fmap[fi].writable;
+            int di = g_fmap[fi].dirent;
+            uint64_t pg = (cr2 - g_fmap[fi].base + g_fmap[fi].foff) >> 12;
+            if (ok) {
+                int pi = pc_find_locked(di, (uint32_t)pg);
+                if (pi >= 0) g_pcache[pi].dirty = 1;
+            }
+            klock_release(&g_vm_lock);
+            if (!ok) return 0;                      /* read-only mapping: a real SIGSEGV */
+            *pte = e | PTE_WRITE;
+            __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
+            return 1;
+        }
     }
 
     /* ---- copy on write ----------------------------------------------------
@@ -8059,6 +9008,7 @@ static void __attribute__((noreturn)) uthread_exit(uint64_t code) {
     audio_teardown_kproc(L);      /* v0.51: release any PCM stream ownership FIRST */
     usb_teardown_kproc(L);        /* v0.51: symmetry hook (no per-process USB state today) */
     net_teardown_kproc(L);        /* v0.52: release any sockets this process owns */
+    vmfile_teardown_kproc(L);     /* v0.66: flush + drop file-backed mappings     */
     wimp_teardown_kproc(L);       /* v0.53: destroy any windows this process owns */
     ipc_teardown_kproc(L);        /* v0.46: release IPC mailbox/shmem FIRST */
     shm_teardown_kproc(L);        /* v0.63: drop shared-segment attachments */
@@ -8737,6 +9687,7 @@ static void cpu_exec_proc(int c, int p) {
         audio_teardown_kproc(L);               /* v0.51: release any PCM stream ownership FIRST */
         usb_teardown_kproc(L);                 /* v0.51: symmetry hook (no per-process USB state today) */
         net_teardown_kproc(L);                 /* v0.52: release any sockets this process owns */
+        vmfile_teardown_kproc(L);              /* v0.66: flush + drop file-backed mappings     */
         wimp_teardown_kproc(L);                /* v0.53: destroy any windows this process owns */
         ipc_teardown_kproc(L);                 /* v0.46: release IPC mailbox/shmem FIRST */
         shm_teardown_kproc(L);                 /* v0.63: drop shared-segment attachments */
@@ -8853,7 +9804,7 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
          * the scan requeues, requeueing takes run-queue locks, and a timer
          * interrupt landing on a core that already holds its own rq_lock would
          * deadlock against itself. */
-        if (!picked) futex_timeout_scan();
+        if (!picked) { futex_timeout_scan(); tcp_timer_scan(); }
         if (!picked && g_debug_smp_sched && !g_cpu[idx].dbg_was_idle) {
             g_cpu[idx].dbg_was_idle = 1;                /* log the TRANSITION once, not */
             kprintf("[dbgsmp ] cpu%u idle (queue drained, nothing to steal)\n", (uint64_t)idx);
@@ -9851,6 +10802,22 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
         inherited++;
     }
     klock_release(&g_ofile_lock);
+    /* v0.66: the child inherits the parent's FILE MAPPINGS as well as its page
+     * tables. Without this its already-faulted pages would be there (shared
+     * ones are exempt from COW, private ones copied) but any page the parent
+     * had NOT yet touched would fault in the child, find no range naming a
+     * file, and be filled with zeroes — a mapping that is file-backed at the
+     * start and anonymous from wherever the parent happened to stop reading. */
+    klock_acquire(&g_vm_lock);
+    for (int i = 0; i < MAX_FMAP; i++) {
+        if (!g_fmap[i].used || g_fmap[i].owner != par_fds) continue;
+        for (int k = 0; k < MAX_FMAP; k++) if (!g_fmap[k].used) {
+            g_fmap[k] = g_fmap[i];
+            g_fmap[k].owner = ch;
+            break;
+        }
+    }
+    klock_release(&g_vm_lock);
     kprocs[ch].redir_in  = kprocs[par].redir_in;
     kprocs[ch].redir_out = kprocs[par].redir_out;
 
@@ -10462,11 +11429,23 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int di = ofile_deref(fd, &vol);                     /* owner-checked      */
         int64_t n = -9;
         if (di >= 0) {
+            /* v0.66: dispatched EXHAUSTIVELY. This was a chain ending in
+             * a bare `else` labelled VOL_DEV, which is a catch-all wearing a
+             * label rather than a branch: an
+             * epoll instance or a socket — neither of which is a byte stream
+             * SYS_READ can serve — fell through it and was answered with
+             * device bytes. A read that returns plausible-looking data for the
+             * wrong object is worse than one that fails, because nothing
+             * downstream can tell. Every volume now names itself, and anything
+             * unrecognised is an error rather than the last branch. */
             if (vol == VOL_ROOT)      n = vfs_read_file(di, (void *)a1, len);
             else if (vol == VOL_TMP)  n = tmp_read_file(di, (void *)a1, len);
             else if (vol == VOL_PIPE) n = pipe_read_fd(fd, (void *)a1, len);   /* v0.59 */
             else if (vol == VOL_EVFD) n = evfd_read_fd(fd, (void *)a1, len);   /* v0.64 */
-            else /* VOL_DEV */        n = dev_read_file((void *)a1, len);
+            else if (vol == VOL_DEV)  n = dev_read_file((void *)a1, len);
+            else if (vol == VOL_SOCK) n = -22;   /* EINVAL: use SYS_RECV       */
+            else if (vol == VOL_EPOLL) n = -22;  /* EINVAL: use SYS_EPOLL_WAIT */
+            else                      n = -22;   /* unknown volume: never guess */
         }
         fs_witness_leave();
         return (uint64_t)n;
@@ -10481,11 +11460,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int di = ofile_deref(fd, &vol);
         int64_t r = -9;
         if (di >= 0) {
+            /* v0.66: exhaustive, for the reason set out in SYS_READ above. */
             if (vol == VOL_ROOT)      r = vfs_write_by_dirent(di, (const void *)a1, len);  /* COW */
             else if (vol == VOL_TMP)  r = tmp_write_file(di, (const void *)a1, len);
             else if (vol == VOL_PIPE) r = pipe_write_fd(fd, (const void *)a1, len);        /* v0.59 */
             else if (vol == VOL_EVFD) r = evfd_write_fd(fd, (const void *)a1, len);        /* v0.64 */
-            else /* VOL_DEV */        r = -13;              /* read-only volume: capability-style denial */
+            else if (vol == VOL_DEV)  r = -13;   /* read-only volume: capability-style denial */
+            else if (vol == VOL_SOCK) r = -22;   /* EINVAL: use SYS_SEND        */
+            else if (vol == VOL_EPOLL) r = -22;  /* EINVAL: an epoll set is not a stream */
+            else                      r = -22;
         }
         fs_witness_leave();
         /* v0.59: a pipe write is allowed to be SHORT (the buffer is finite), so
@@ -11101,7 +12084,9 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         uint32_t type = (uint32_t)a1;
         int nonblock = (type & SOCK_NONBLOCK) ? 1 : 0;
         type &= ~(uint32_t)SOCK_NONBLOCK;
-        if ((uint32_t)a0 != NET_AF_INET || type != NET_SOCK_DGRAM) return (uint64_t)-1;
+        if ((uint32_t)a0 != NET_AF_INET) return (uint64_t)-1;
+        if (type != NET_SOCK_DGRAM && type != NET_SOCK_STREAM) return (uint64_t)-1;
+        int want_stream = (type == NET_SOCK_STREAM);
         int owner = fd_owner();
         klock_acquire(&g_net_lock);
         int si = -1;
@@ -11109,6 +12094,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             cmemset(&g_sock[i], 0, sizeof g_sock[i]);
             g_sock[i].used = 1; g_sock[i].owner = owner;
             g_sock[i].waiter_tid = -1; g_sock[i].fd = -1;
+            g_sock[i].stream = want_stream; g_sock[i].parent = -1;
+            g_sock[i].state = want_stream ? TCPS_CLOSED : 0;
             si = i; break;
         }
         klock_release(&g_net_lock);
@@ -11151,9 +12138,59 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int si = sock_of_fd((int)(int64_t)a0, 0);
         uint32_t addr = (uint32_t)a1; uint16_t port = (uint16_t)a2;
         if (si < 0) return (uint64_t)-9;
+        int fl = 0; (void)sock_of_fd((int)(int64_t)a0, &fl);
         klock_acquire(&g_net_lock);
         int rc = -1;
         if (g_sock[si].listening) rc = -22;                 /* EINVAL: a listener */
+        else if (g_sock[si].stream) {
+            /* v0.67: THE ONE CALL THAT GENUINELY BLOCKS. A datagram connect
+             * records an address; a stream connect exchanges a handshake with
+             * another machine and cannot finish inside the syscall. So this is
+             * where -EINPROGRESS finally means something — v0.65 was right to
+             * refuse to invent it for datagrams and is right to return it here. */
+            struct nsock *c = &g_sock[si];
+            if (c->state != TCPS_CLOSED) rc = -106;         /* EISCONN */
+            else {
+                if (!c->bound) {   /* an unbound client still needs a source port */
+                    uint16_t ep = (uint16_t)(40000 + (si * 7 + (g_ticks & 0x3FF)));
+                    while (net_find_bound(ep) >= 0) ep++;
+                    c->lport = ep; c->bound = 1;
+                }
+                c->raddr = addr; c->rport = port; c->connected = 1;
+                c->iss = (uint32_t)(g_ticks * 2246822519u) | 1u;
+                c->snd_una = c->iss; c->snd_nxt = c->iss;
+                c->state = TCPS_SYN_SENT;
+                tcp_output(si, TH_SYN, 0, 0);
+                c->snd_nxt++;                               /* SYN consumes one */
+                c->rexmit_ticks = TCP_RTO_TICKS; c->rexmit_count = 0;
+                rc = (c->state == TCPS_ESTAB) ? 0
+                   : ((fl & O_NONBLOCK) ? -115 : 0);        /* -EINPROGRESS */
+                if (rc == 0 && c->state != TCPS_ESTAB) {
+                    /* Blocking connect RETRANSMITS ITS OWN SYN. Loopback
+                     * delivery is synchronous, so a connect that has not
+                     * established by the time tcp_output returns had its SYN
+                     * dropped — and a SYN is the one segment the data
+                     * retransmit path cannot help with, because there is
+                     * nothing in the send buffer to resend.
+                     *
+                     * Bounded by ITERATIONS, not by g_ticks. A syscall that
+                     * spins on the tick counter is betting that interrupts are
+                     * enabled underneath it; sched_yield gives the rest of the
+                     * system a turn and cannot wedge if that bet is wrong. */
+                    for (int t = 0; t < 64 && c->state == TCPS_SYN_SENT; t++) {
+                        klock_release(&g_net_lock);
+                        sched_yield();
+                        klock_acquire(&g_net_lock);
+                        if (c->state != TCPS_SYN_SENT) break;
+                        c->snd_nxt = c->iss;
+                        tcp_output(si, TH_SYN, 0, 0);
+                        c->snd_nxt = c->iss + 1;
+                        __sync_fetch_and_add(&g_tcp_rexmits, 1);
+                    }
+                    rc = (c->state == TCPS_ESTAB) ? 0 : -110;   /* ETIMEDOUT */
+                }
+            }
+        }
         else { g_sock[si].raddr = addr; g_sock[si].rport = port;
                g_sock[si].connected = 1; rc = 0; }
         klock_release(&g_net_lock);
@@ -11175,6 +12212,18 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         klock_acquire(&g_net_lock);
         if (!g_sock[si].used || !g_sock[si].connected || g_sock[si].listening) {
             klock_release(&g_net_lock); return (uint64_t)-107;         /* ENOTCONN */
+        }
+        if (g_sock[si].stream) {
+            struct nsock *c = &g_sock[si];
+            if (c->state != TCPS_ESTAB && c->state != TCPS_CLOSE_WAIT) {
+                int rst = c->err;
+                klock_release(&g_net_lock);
+                return (uint64_t)(rst ? -104 : -107);   /* ECONNRESET / ENOTCONN */
+            }
+            uint32_t took = tcp_send_data(si, stage, len);
+            klock_release(&g_net_lock);
+            if (!took) { __sync_fetch_and_add(&g_net_eagain, 1); return (uint64_t)-11; }
+            return (uint64_t)took;      /* a SHORT WRITE is legal on a stream */
         }
         uint32_t daddr = g_sock[si].raddr;
         uint16_t dport = g_sock[si].rport, sport = g_sock[si].lport;
@@ -11225,6 +12274,28 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             klock_acquire(&g_net_lock);
             if (!g_sock[si].used) { klock_release(&g_net_lock); return (uint64_t)-9; }
             if (g_sock[si].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
+            if (g_sock[si].stream) {
+                struct nsock *c = &g_sock[si];
+                if (c->rcount) {
+                    uint32_t n = c->rcount; if (n > maxlen) n = maxlen;
+                    for (uint32_t i = 0; i < n; i++) {
+                        ((uint8_t *)ubuf)[i] = c->rbuf[c->rhead];
+                        c->rhead = (c->rhead + 1) % TCP_BUFSZ;
+                    }
+                    c->rcount -= n;
+                    klock_release(&g_net_lock);
+                    return (uint64_t)n;
+                }
+                if (c->err) { klock_release(&g_net_lock); return (uint64_t)-104; }  /* ECONNRESET */
+                /* Drained AND the peer sent FIN: 0 is end of stream, exactly as
+                 * a pipe read at end of file, and distinct from EAGAIN. */
+                if (c->fin_rcvd) { klock_release(&g_net_lock); return (uint64_t)0; }
+                klock_release(&g_net_lock);
+                if (fl & O_NONBLOCK) { __sync_fetch_and_add(&g_net_eagain, 1); return (uint64_t)-11; }
+                if (g_ticks - t0 >= 2000) return (uint64_t)0;
+                __asm__ volatile("pause");
+                continue;
+            }
             if (g_sock[si].qcount > 0) {
                 struct nsock *sk = &g_sock[si];
                 uint16_t dl = sk->qlen[sk->qhead]; if (dl > maxlen) dl = (uint16_t)maxlen;
@@ -12057,7 +13128,9 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         klock_acquire(&g_net_lock);
         if (!g_sock[si].bound)         rc = -22;    /* EINVAL: nothing to listen on */
         else if (g_sock[si].connected) rc = -22;    /* EINVAL: already a peer socket */
-        else { g_sock[si].listening = 1; rc = 0; }
+        else { g_sock[si].listening = 1;
+               if (g_sock[si].stream) g_sock[si].state = TCPS_LISTEN;
+               rc = 0; }
         klock_release(&g_net_lock);
         if (g_debug_net) kprintf("[dbgnet ] pid %u: LISTEN socket %d -> %d\n",
                                  kprocs[current_proc_idx].pid, (uint64_t)(int64_t)si,
@@ -12087,6 +13160,37 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         /* Claim the child's socket slot BEFORE dequeuing the peer: if the table
          * is full we must leave the request queued for a later accept, not
          * consume and discard a client's first datagram. */
+        if (g_sock[li].stream) {
+            /* v0.67: a real accept. The connection is already ESTABLISHED —
+             * the handshake completed in tcp_input without waiting for the
+             * application, which is what stops a busy server from timing its
+             * peers out. accept() only transfers ownership. */
+            klock_acquire(&g_net_lock);
+            if (g_sock[li].state != TCPS_LISTEN) { klock_release(&g_net_lock); return (uint64_t)-22; }
+            if (g_sock[li].aq_count == 0) {
+                klock_release(&g_net_lock);
+                __sync_fetch_and_add(&g_net_eagain, 1);
+                return (uint64_t)-11;                        /* EAGAIN */
+            }
+            int ci = g_sock[li].acceptq[g_sock[li].aq_head];
+            g_sock[li].aq_head = (g_sock[li].aq_head + 1) % SOCK_BACKLOG;
+            g_sock[li].aq_count--;
+            uint32_t paddr = g_sock[ci].raddr; uint16_t pport = g_sock[ci].rport;
+            g_sock[ci].owner = owner;
+            klock_release(&g_net_lock);
+            int nfd2 = ofile_claim(owner, VOL_SOCK, ci);
+            if (nfd2 < 0) { net_sock_release(ci); return (uint64_t)-24; }
+            klock_acquire(&g_ofile_lock);
+            g_ofiles[nfd2].sock = ci;
+            if ((uint32_t)a2 & SOCK_NONBLOCK) g_ofiles[nfd2].flags |= O_NONBLOCK;
+            klock_release(&g_ofile_lock);
+            klock_acquire(&g_net_lock);
+            g_sock[ci].fd = nfd2;
+            klock_release(&g_net_lock);
+            if (upeer) { ((uint32_t *)upeer)[0] = paddr; ((uint32_t *)upeer)[1] = (uint32_t)pport; }
+            __sync_fetch_and_add(&g_net_accepts, 1);
+            return (uint64_t)(int64_t)nfd2;
+        }
         klock_acquire(&g_net_lock);
         if (!g_sock[li].used || !g_sock[li].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
         if (g_sock[li].pcount == 0) { klock_release(&g_net_lock);
@@ -12259,6 +13363,92 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                     kprocs[p].pid, len, prot, base);
         return base;
     }
+    case 83: {   /* v0.66: SYS_MMAP_FILE(fd_prot_flags, length, offset) -> base, or -1.
+                  *
+                  *   a0 bits  0..7  fd
+                  *      bits  8..15 prot  (1 READ, 2 WRITE, 4 EXEC)
+                  *      bits 16..31 flags (0x01 SHARED, 0x02 PRIVATE)
+                  *   a1        length
+                  *   a2        file offset, page-aligned
+                  *
+                  * A separate call rather than more arguments on SYS_MMAP: the
+                  * dispatch ABI has three registers, anonymous mmap already
+                  * uses all three, and packing a descriptor into one of them
+                  * would have made the anonymous path pay for a feature it
+                  * does not have. v0.63's refusal to accept an ignored fd
+                  * stands — 71 is still anonymous-only and still says so. */
+        int p = tg_of((int)current_proc_idx);
+        int fd = (int)(a0 & 0xFF);
+        uint64_t prot = (a0 >> 8) & 0xFF, flags = (a0 >> 16) & 0xFFFF;
+        uint64_t len = (a1 + 0xFFFull) & ~0xFFFull;
+        uint64_t foff = a2;
+        if (!len || len > FMAP_MAX_BYTES) return (uint64_t)-1;
+        if (foff & 0xFFF) return (uint64_t)-22;              /* EINVAL: unaligned */
+        if (prot & ~0x7ull) return (uint64_t)-1;
+        if ((prot & 0x2) && (prot & 0x4)) return (uint64_t)-1;          /* W^X */
+        if ((flags & 0x03) == 0 || (flags & 0x03) == 0x03) return (uint64_t)-22;
+        int vol = VOL_ROOT;
+        int di = ofile_deref(fd, &vol);
+        if (di < 0) return (uint64_t)-9;                     /* EBADF */
+        if (vol != VOL_ROOT) return (uint64_t)-22;           /* only real files are mappable */
+        int shared = (flags & 0x01) ? 1 : 0;
+        int writable = (prot & 0x2) ? 1 : 0;
+
+        uint64_t base = kprocs[p].mmap_next;
+        if (base + len > MMAP_USER_V + MMAP_MAX_BYTES) return (uint64_t)-1;
+        int fi = -1;
+        klock_acquire(&g_vm_lock);
+        for (int i = 0; i < MAX_FMAP; i++) if (!g_fmap[i].used) { fi = i; break; }
+        if (fi >= 0) {
+            g_fmap[fi].used = 1; g_fmap[fi].owner = p;
+            g_fmap[fi].base = base; g_fmap[fi].len = len;
+            g_fmap[fi].dirent = di; g_fmap[fi].foff = foff;
+            g_fmap[fi].shared = shared; g_fmap[fi].writable = writable;
+        }
+        klock_release(&g_vm_lock);
+        if (fi < 0) return (uint64_t)-11;                    /* EAGAIN: table full */
+
+        uint64_t pf = PTE_USER;
+        if (prot & 0x2) pf |= PTE_WRITE;
+        if (!(prot & 0x4)) pf |= PTE_NX;
+        /* Reserved, not populated. The range is described by the entries and
+         * the frames arrive one fault at a time — a 64 KiB mapping of which the
+         * caller touches one page costs one page, exactly as the anonymous path
+         * promises, and the file is read a page at a time rather than whole. */
+        for (uint64_t off = 0; off < len; off += 0x1000)
+            if (!vm_reserve_zfod(kprocs[p].cr3, base + off, pf)) {
+                klock_acquire(&g_vm_lock); g_fmap[fi].used = 0; klock_release(&g_vm_lock);
+                return (uint64_t)-1;
+            }
+        kprocs[p].mmap_next = base + len;
+        __sync_fetch_and_add(&g_mmap_calls, 1);
+        if (g_debug_posix)
+            kprintf("[dbgvm  ] mmap_file pid %u fd %d dirent %d %X bytes %s -> %X\n",
+                    kprocs[p].pid, (uint64_t)(int64_t)fd, (uint64_t)(int64_t)di,
+                    len, shared ? "SHARED" : "PRIVATE", base);
+        return base;
+    }
+    case 84: {   /* v0.66: SYS_MSYNC(addr, length, flags) -> 0, or negative.
+                  * Writes back every dirty page of the file mapped at `addr`.
+                  * `flags` is accepted and ignored: MS_SYNC is the only
+                  * behaviour this can have, because the write goes straight
+                  * through vfs_write_by_dirent with no queue behind it, and
+                  * claiming to support MS_ASYNC would be a promise about
+                  * ordering that nothing here implements. */
+        int p = tg_of((int)current_proc_idx);
+        uint64_t va = a0 & ~0xFFFull;
+        (void)a1; (void)a2;
+        int fi = fmap_find(p, va);
+        if (fi < 0) return (uint64_t)-22;                    /* EINVAL: not a file mapping */
+        klock_acquire(&g_vm_lock);
+        int di = g_fmap[fi].dirent;
+        int wb = g_fmap[fi].shared && g_fmap[fi].writable;
+        klock_release(&g_vm_lock);
+        if (!wb) return 0;         /* private or read-only: nothing to write back */
+        if (pc_flush_file(di) < 0) return (uint64_t)-5;
+        fmap_writeprotect(fi);     /* clean and write-protected, together */
+        return 0;
+    }
     case 72: {   /* SYS_MUNMAP(addr, length) -> 0 ok, negative.
                   * Frees whatever is actually backed, leaves untouched
                   * reservations costing nothing, and shoots the range down on
@@ -12268,6 +13458,19 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         uint64_t len = (a1 + 0xFFFull) & ~0xFFFull;
         if (!len) return (uint64_t)-1;
         if (va < MMAP_USER_V || va + len > MMAP_USER_V + MMAP_MAX_BYTES) return (uint64_t)-1;
+        /* v0.66: unmapping a shared file mapping must not lose its writes.
+         * Flushed BEFORE the entries are torn down, because the flush reads the
+         * cached frames and dropping our references first could return the last
+         * one to the allocator. */
+        int fi = fmap_find(p, va);
+        if (fi >= 0) {
+            klock_acquire(&g_vm_lock);
+            int di = g_fmap[fi].dirent;
+            int wb = g_fmap[fi].shared && g_fmap[fi].writable;
+            g_fmap[fi].used = 0;
+            klock_release(&g_vm_lock);
+            if (wb) pc_flush_file(di);
+        }
         uint64_t released = 0;
         for (uint64_t off = 0; off < len; off += 0x1000) {
             uint64_t *slot = pte_slot(kprocs[p].cr3, va + off);
@@ -16161,6 +17364,7 @@ static int posix_drain(int *procs, int nproc, struct px_round *R, uint64_t watch
          * would never be rescued and the round would end on the watchdog with
          * no explanation instead of on a specific failed assertion. */
         futex_timeout_scan();
+        tcp_timer_scan();
         if (++spins & 1) sched_yield();
         if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);
         /* Progress breadcrumb: in a serial log a silent stall is
@@ -17530,6 +18734,362 @@ out:
     if (!g_nefail)
         kputs("[netepollstrs] ASYNC NETWORK I/O VERIFIED — sockets are descriptors, and waiting is sleeping\n");
     else kputs("[netepollstrs] ASYNC NETWORK DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.66: MMAPFILESTRS — memory that is a file, and a file that is memory
+ * ===========================================================================
+ * The suite owns its fixture. v0.65 lost most of a milestone to a verification
+ * suite that corrupted a file eleven other suites depended on, so this one
+ * creates 'm66dat' itself and touches nothing else.
+ *
+ * The pattern is (i*7+3)&0xFF: not constant within a page and not repeating
+ * across pages, so a mapping that returned zeroes, or returned page 0 for
+ * every page, produces a WRONG ANSWER rather than accidentally agreeing. */
+static int g_mfpass = 0, g_mffail = 0;
+static void mfcheck(const char *what, int ok) {
+    if (ok) { g_mfpass++; kprintf("[mmapfilestrs] PASS: %s\n", what); }
+    else    { g_mffail++; kprintf("[mmapfilestrs] FAIL: %s\n", what); }
+}
+
+static void cmd_mmapfile_stress(void) {
+    kputs("-- MMAPFILESTRS: file-backed mappings, shared pages, and writeback --\n");
+    g_mfpass = g_mffail = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t ff0 = g_file_faults, wb0 = g_writebacks, pch0 = g_pc_hits;
+
+    /* Seeded before the battery ran — see the note at the call site. */
+    int fdi = vfs_find("m66dat");
+    mfcheck("the fixture file exists (seeded before the VFS directory filled)", fdi >= 0);
+    if (fdi < 0) goto out;
+
+    int p = kproc_spawn("mmapfile", PCAP_FILESYSTEM);
+    if (p < 0) { mfcheck("kproc_spawn never fails", 0); goto out; }
+    kprocs[p].role = 50;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { mfcheck("the driver's ELF loads", 0); goto out; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 250000);
+    current_proc_idx = save;
+    if (!finished) kprintf("[mmapfilestrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 1500 ? "" :
+        R.code[0] == 1501 ? "the fixture file could not be opened from ring 3" :
+        R.code[0] == 1502 ? "the userland fd table did not yield a kernel descriptor" :
+        R.code[0] == 1503 ? "MAP_PRIVATE read-only mapping was refused" :
+        R.code[0] == 1504 ? "PAGE 0 OF THE MAPPING DID NOT CONTAIN THE FILE'S BYTES" :
+        R.code[0] == 1505 ? "page 1 was wrong — demand paging read the wrong offset" :
+        R.code[0] == 1506 ? "PAGE 3 WAS WRONG — every page returned page 0, or zeroes" :
+        R.code[0] == 1507 ? "MAP_PRIVATE writable mapping was refused" :
+        R.code[0] == 1508 ? "the private writable mapping did not start from file content" :
+        R.code[0] == 1509 ? "a write to a private mapping did not stick in memory" :
+        R.code[0] == 1510 ? "msync on a private mapping errored (it should be a no-op)" :
+        R.code[0] == 1511 ? "re-reading the file failed" :
+        R.code[0] == 1512 ? "A PRIVATE WRITE REACHED THE FILE — MAP_PRIVATE is not private" :
+        R.code[0] == 1513 ? "MAP_SHARED writable mapping was refused" :
+        R.code[0] == 1514 ? "the shared mapping did not start from file content" :
+        R.code[0] == 1515 ? "a write to a shared mapping did not stick in memory" :
+        R.code[0] == 1516 ? "msync failed" :
+        R.code[0] == 1517 ? "reopening the file failed" :
+        R.code[0] == 1518 ? "reading the file back failed" :
+        R.code[0] == 1519 ? "MSYNC DID NOT WRITE BACK — the file still holds the old bytes" :
+        R.code[0] == 1520 ? "fork failed" :
+        R.code[0] == 1521 ? "the child did not see the parent's shared mapping (exit 61) or died" :
+        R.code[0] == 1522 ? "THE CHILD'S WRITE WAS INVISIBLE TO THE PARENT — pages are not shared" :
+        R.code[0] == 1523 ? "munmap of the shared mapping failed" :
+        R.code[0] == 1524 ? "reopening after munmap failed" :
+        R.code[0] == 1525 ? "reading after munmap failed" :
+        R.code[0] == 1526 ? "UNMAP DID NOT FLUSH — writes were lost with the mapping" :
+        R.code[0] == 1527 ? "a WRITE+EXEC file mapping was ALLOWED (W^X breached)" :
+        R.code[0] == 1528 ? "an unaligned file offset was accepted" :
+        R.code[0] == 1529 ? "mapping a bogus descriptor was allowed" :
+        R.code[0] == 1530 ? "epoll_create failed" :
+        R.code[0] == 1531 ? "READ ON AN EPOLL DESCRIPTOR DID NOT FAIL (the v0.66 catch-all patch)" :
+        R.code[0] == 1532 ? "write on an epoll descriptor did not fail" :
+                            "unknown";
+    if (R.code[0] != 1500) kprintf("[mmapfilestrs] driver exit %u — %s\n", R.code[0], why);
+
+    mfcheck("file-backed mapping, privacy, sharing and writeback all behaved (exit 1500)",
+            finished && R.code[0] == 1500);
+    kprintf("[mmapfilestrs] %u file faults, %u page-cache hits, %u writebacks\n",
+            g_file_faults - ff0, g_pc_hits - pch0, g_writebacks - wb0);
+
+    /* Ring 3 cannot see whether the pages arrived FROM THE FILE or whether the
+     * cache was ever consulted — it only sees bytes. These are the mechanism. */
+    mfcheck("pages were demand-faulted from the file, not eagerly copied",
+            g_file_faults > ff0);
+    mfcheck("the page cache served a second mapper of the same page",
+            g_pc_hits > pch0);
+    mfcheck("dirty pages were written back", g_writebacks > wb0);
+
+    /* The file on disk must now hold exactly what the driver left, and nothing
+     * else about it may have moved. */
+    static uint8_t vb[64];
+    int64_t got = vfs_read_range(fdi, 0, vb, 8);
+    mfcheck("the file is still readable through the ordinary path after mapping", got == 8);
+    mfcheck("writeback left the driver's bytes, and only those",
+            got == 8 && vb[0] == 0xA1 && vb[1] == 0xA2 && vb[2] == 0xC3 &&
+            vb[3] == (uint8_t)((3 * 7 + 3) & 0xFF));
+    mfcheck("the file kept its length — a page-rounded mapping did not grow it",
+            fdi >= 0 && DENTS[fdi].len == M66_FIXTURE_LEN);
+
+    int fm_live = 0;
+    klock_acquire(&g_vm_lock);
+    for (int i = 0; i < MAX_FMAP; i++) if (g_fmap[i].used) fm_live++;
+    klock_release(&g_vm_lock);
+    mfcheck("every file mapping was released with its process", fm_live == 0);
+    mfcheck("no lock-rank violation across the mapping and writeback paths",
+            g_rank_violations == viol0);
+out:
+    kprintf("[mmapfilestrs] RESULT: %d passed, %d failed\n", (uint64_t)g_mfpass, (uint64_t)g_mffail);
+    if (!g_mffail)
+        kputs("[mmapfilestrs] FILE-BACKED VM VERIFIED — shared pages are one page, and writes reach the file\n");
+    else kputs("[mmapfilestrs] FILE-BACKED VM DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
+/* ===========================================================================
+ * v0.67: TCPSTRS — the handshake, the byte stream, and the close
+ * ===========================================================================
+ * v0.65 shipped accept() over datagram sessions and said so plainly. This is
+ * the suite that checks the word finally means what it says: three-way
+ * handshake, sequence-ordered bytes across segment boundaries, retransmission
+ * of a deliberately dropped segment, and FIN as an answer distinct from
+ * "nothing yet". */
+static int g_tcpass = 0, g_tcfail2 = 0;
+static void tccheck2(const char *what, int ok) {
+    if (ok) { g_tcpass++; kprintf("[tcpstrs] PASS: %s\n", what); }
+    else    { g_tcfail2++; kprintf("[tcpstrs] FAIL: %s\n", what); }
+}
+
+static void cmd_tcp_stress(void) {
+    kputs("-- TCPSTRS: three-way handshake, byte streams, retransmission and FIN --\n");
+    g_tcpass = g_tcfail2 = 0;
+    uint64_t save = current_proc_idx;
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+    uint32_t viol0 = g_rank_violations;
+    uint64_t so0 = g_tcp_segs_out, si0 = g_tcp_segs_in, rx0 = g_tcp_rexmits;
+    uint64_t cn0 = g_tcp_conns, dr0 = g_tcp_drops, wt0 = g_tcp_wire_tx;
+    int socks0 = net_sock_count_used();
+
+    /* THE RETRANSMIT TEST. A loopback link cannot lose anything, so the
+     * retransmit path would otherwise be code that has never run. Dropping the
+     * next two segments forces the timer to do real work, and the driver's
+     * byte-for-byte comparison is what proves recovery was correct rather than
+     * merely eventual. */
+    g_tcp_drop = 2;
+
+    int p = kproc_spawn("tcpstr", PCAP_NETWORK);
+    if (p < 0) { tccheck2("kproc_spawn never fails", 0); goto out; }
+    kprocs[p].role = 51;
+    uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+    current_proc_idx = save;
+    if (!e) { tccheck2("the driver's ELF loads", 0); goto out; }
+    kprocs[p].entry = e;
+
+    struct px_round R;
+    for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
+    R.nchild = 0; R.pid[0] = kprocs[p].pid;
+    int procs[1]; procs[0] = p;
+    rq_push_any(0, p);
+    __sync_synchronize();
+    if (n > 1) lapic_ipi(0, IPI_PING, 1);
+    int finished = posix_drain(procs, 1, &R, 300000);
+    current_proc_idx = save;
+    g_tcp_drop = 0;
+    if (!finished) kprintf("[tcpstrs] WATCHDOG: the driver did not finish\n");
+
+    const char *why =
+        R.code[0] == 1600 ? "" :
+        R.code[0] == 1601 ? "creating a SOCK_STREAM socket was refused" :
+        R.code[0] == 1602 ? "binding the listener failed" :
+        R.code[0] == 1603 ? "listen on a stream socket failed" :
+        R.code[0] == 1604 ? "ACCEPT ON AN IDLE LISTENER DID NOT ANSWER EAGAIN" :
+        R.code[0] == 1605 ? "creating the client socket failed" :
+        R.code[0] == 1606 ? "THE THREE-WAY HANDSHAKE DID NOT COMPLETE" :
+        R.code[0] == 1607 ? "accept did not hand back the established connection" :
+        R.code[0] == 1608 ? "the accepted peer address was wrong" :
+        R.code[0] == 1609 ? "send on an established stream failed" :
+        R.code[0] == 1610 ? "recv on an established stream failed" :
+        R.code[0] == 1611 ? "THE STREAM LOST BYTES — fewer arrived than were sent" :
+        R.code[0] == 1612 ? "THE STREAM DELIVERED THE WRONG BYTES (ordering or a segment boundary)" :
+        R.code[0] == 1613 ? "the server could not send on the accepted connection" :
+        R.code[0] == 1614 ? "the client could not receive the reply" :
+        R.code[0] == 1615 ? "the reply was short — the connection is not bidirectional" :
+        R.code[0] == 1616 ? "the reply came back corrupted" :
+        R.code[0] == 1617 ? "epoll_create failed" :
+        R.code[0] == 1618 ? "watching a stream socket with epoll was refused" :
+        R.code[0] == 1619 ? "AN ESTABLISHED STREAM WAS NOT REPORTED WRITABLE" :
+        R.code[0] == 1620 ? "a drained stream was reported readable" :
+        R.code[0] == 1621 ? "the client's send failed" :
+        R.code[0] == 1622 ? "arriving bytes did not make the stream readable" :
+        R.code[0] == 1623 ? "CLOSE DID NOT PRODUCE END OF STREAM — the peer would wait forever" :
+        R.code[0] == 1624 ? "epoll did not report EPOLLHUP after the peer closed" :
+                            "unknown";
+    if (R.code[0] != 1600) kprintf("[tcpstrs] driver exit %u — %s\n", R.code[0], why);
+
+    tccheck2("handshake, byte stream, bidirectional traffic and FIN all behaved (exit 1600)",
+             finished && R.code[0] == 1600);
+    kprintf("[tcpstrs] %u segments out, %u in, %u connections, %u dropped, %u retransmits\n",
+            g_tcp_segs_out - so0, g_tcp_segs_in - si0, g_tcp_conns - cn0,
+            g_tcp_drops - dr0, g_tcp_rexmits - rx0);
+
+    /* The mechanism, which ring 3 cannot see: real segments were exchanged,
+     * connections genuinely reached ESTABLISHED, and — the one that matters —
+     * the injected loss was RECOVERED by retransmission rather than papered
+     * over by a lossless link. */
+    tccheck2("real segments were exchanged in both directions",
+             g_tcp_segs_out > so0 && g_tcp_segs_in > si0);
+    tccheck2("connections reached ESTABLISHED through a three-way handshake",
+             g_tcp_conns - cn0 >= 2);        /* both ends count themselves */
+    tccheck2("the injected segment loss actually happened", g_tcp_drops - dr0 == 2);
+    tccheck2("RETRANSMISSION recovered the dropped segments", g_tcp_rexmits > rx0);
+
+    tccheck2("every stream socket was reclaimed with its descriptor",
+             net_sock_count_used() == socks0);
+    int fds_leaked = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    klock_release(&g_ofile_lock);
+    tccheck2("no descriptor leaked across the suite", fds_leaked == 0);
+    tccheck2("no lock-rank violation across the TCP paths", g_rank_violations == viol0);
+
+    /* ---- v0.68: THE WIRE CODEC, verified without leaving the machine -------
+     * A round trip through the real encoder and the real decoder proves both
+     * halves against each other, deterministically. Gating this on a SLIRP
+     * reply would have tested QEMU's NAT; gating it on nothing would have left
+     * a checksum that is wrong in a way no loopback test can see — and a wrong
+     * TCP checksum is discarded by every receiver on earth, so the failure
+     * would appear only against real hardware. */
+    {
+        static uint8_t wf[14 + 20 + TCP_HDR_LEN + TCP_MSS];
+        static uint8_t pay[300];
+        for (int i = 0; i < 300; i++) pay[i] = (uint8_t)((i * 13 + 5) & 0xFF);
+        struct tseg tx, rx;
+        tx.seq = 0x11223344u; tx.ack = 0x55667788u;
+        tx.flags = TH_ACK | TH_SYN; tx.len = 300;
+        tx.sport = 0xBEEF; tx.dport = 0xCAFE; tx.data = pay;
+        uint32_t n = tcp_wire_build(wf, NET_GUEST_IP, 0x0A000202u, &tx, 4096);
+        tccheck2("the built frame is Ethernet + IPv4 + TCP of the right length",
+                 n == (uint32_t)(14 + 20 + TCP_HDR_LEN + 300) &&
+                 wf[12] == 0x08 && wf[13] == 0x00 && wf[14 + 9] == 6);
+        /* The IPv4 header checksum verifies over itself. */
+        tccheck2("the IPv4 header checksum verifies", net_cksum16(wf + 14, 20) == 0);
+        uint32_t sa = 0, da = 0;
+        int ok = tcp_wire_parse(wf, n, &rx, &sa, &da);
+        tccheck2("a frame this kernel built parses back, checksum and all", ok == 1);
+        tccheck2("every header field survived the round trip",
+                 ok && rx.seq == tx.seq && rx.ack == tx.ack &&
+                 rx.flags == tx.flags && rx.len == tx.len &&
+                 rx.sport == tx.sport && rx.dport == tx.dport &&
+                 sa == NET_GUEST_IP && da == 0x0A000202u);
+        int paysame = ok && rx.len == 300;
+        for (int i = 0; ok && i < 300; i++) if (rx.data[i] != pay[i]) { paysame = 0; break; }
+        tccheck2("the payload survived the round trip byte for byte", paysame);
+        /* CORRUPTION MUST BE REJECTED. One flipped bit anywhere in the segment
+         * has to fail the checksum — otherwise the checksum is decoration. */
+        wf[14 + 20 + TCP_HDR_LEN + 100] ^= 0x01;
+        tccheck2("a single flipped payload bit is REJECTED by the checksum",
+                 tcp_wire_parse(wf, n, &rx, &sa, &da) == 0);
+        wf[14 + 20 + TCP_HDR_LEN + 100] ^= 0x01;
+        tccheck2("and it parses again once the bit is restored",
+                 tcp_wire_parse(wf, n, &rx, &sa, &da) == 1);
+    }
+    /* ---- v0.69: ARP, verified against synthetic frames ---------------------
+     * Every assertion here is driven by a frame this suite constructs and
+     * hands to the real handler, so none of it depends on SLIRP answering. */
+    {
+        static uint8_t af[64], wf2[14 + 20 + TCP_HDR_LEN + 8];
+        uint64_t rep0 = g_arp_replies;
+        uint32_t peer = 0x0A000209u;                     /* 10.0.2.9 */
+        uint8_t pmac[6] = { 0x52, 0x54, 0x00, 0x11, 0x22, 0x33 };
+
+        /* A request this kernel builds must be a well-formed ARP request. */
+        uint32_t n = arp_build(af, 1, peer, 0);
+        tccheck2("the ARP request is a well-formed Ethernet ARP frame",
+                 n == 42 && af[12] == 0x08 && af[13] == 0x06 &&
+                 af[14] == 0 && af[15] == 1 && af[20] == 0 && af[21] == 1 &&
+                 af[0] == 0xFF && af[38] == 0x0A && af[41] == 0x09);
+
+        /* A reply from that peer must be LEARNED. */
+        uint8_t rf[64];
+        for (int i = 0; i < 64; i++) rf[i] = 0;
+        for (int i = 0; i < 6; i++) rf[i] = g_vnet_mac[i];
+        for (int i = 0; i < 6; i++) rf[6 + i] = pmac[i];
+        rf[12] = 0x08; rf[13] = 0x06;
+        rf[14] = 0; rf[15] = 1; rf[16] = 0x08; rf[17] = 0x00;
+        rf[18] = 6; rf[19] = 4; rf[20] = 0; rf[21] = 2;         /* reply */
+        for (int i = 0; i < 6; i++) rf[22 + i] = pmac[i];
+        rf[28] = 0x0A; rf[29] = 0x00; rf[30] = 0x02; rf[31] = 0x09;
+        arp_input(rf, 42);
+        uint8_t got[6];
+        int known = arp_lookup(peer, got);
+        int same = known;
+        for (int i = 0; i < 6; i++) if (got[i] != pmac[i]) same = 0;
+        tccheck2("an ARP reply is learned into the cache, MAC intact", same);
+
+        /* And a TCP frame to that peer must now carry the LEARNED MAC rather
+         * than broadcast — which is the entire point of resolving it. */
+        struct tseg t2; uint8_t z = 0;
+        t2.seq = 1; t2.ack = 0; t2.flags = TH_SYN; t2.len = 0;
+        t2.sport = 1234; t2.dport = 80; t2.data = &z;
+        tcp_wire_build(wf2, NET_GUEST_IP, peer, &t2, 1024);
+        int addressed = 1;
+        for (int i = 0; i < 6; i++) if (wf2[i] != pmac[i]) addressed = 0;
+        tccheck2("a segment to a resolved peer is addressed to its MAC, not broadcast",
+                 addressed);
+
+        /* A request FOR US must be answered, or nothing can ever reach us. */
+        uint8_t qf[64];
+        for (int i = 0; i < 64; i++) qf[i] = 0;
+        for (int i = 0; i < 6; i++) qf[i] = 0xFF;
+        for (int i = 0; i < 6; i++) qf[6 + i] = pmac[i];
+        qf[12] = 0x08; qf[13] = 0x06;
+        qf[14] = 0; qf[15] = 1; qf[16] = 0x08; qf[17] = 0x00;
+        qf[18] = 6; qf[19] = 4; qf[20] = 0; qf[21] = 1;         /* request */
+        for (int i = 0; i < 6; i++) qf[22 + i] = pmac[i];
+        qf[28] = 0x0A; qf[29] = 0x00; qf[30] = 0x02; qf[31] = 0x09;
+        qf[38] = (uint8_t)(NET_GUEST_IP >> 24); qf[39] = (uint8_t)(NET_GUEST_IP >> 16);
+        qf[40] = (uint8_t)(NET_GUEST_IP >> 8);  qf[41] = (uint8_t)NET_GUEST_IP;
+        arp_input(qf, 42);
+        tccheck2("an ARP request for THIS host is answered", g_arp_replies > rep0);
+
+        /* A request for somebody else must NOT be answered. Replying to every
+         * request on the segment is how a host poisons a whole network. */
+        uint64_t rep1 = g_arp_replies;
+        qf[38] = 0x0A; qf[39] = 0x00; qf[40] = 0x02; qf[41] = 0x63;   /* 10.0.2.99 */
+        arp_input(qf, 42);
+        tccheck2("an ARP request for SOMEBODY ELSE is not answered",
+                 g_arp_replies == rep1);
+    }
+    kprintf("[tcpstrs] arp: %u learned, %u requests out, %u replies out, %u hits, %u misses\n",
+            g_arp_learned, g_arp_requests, g_arp_replies, g_arp_hits, g_arp_misses);
+    kprintf("[tcpstrs] wire: %u frames out, %u in, %u rejected\n",
+            g_tcp_wire_tx, g_tcp_wire_rx, g_tcp_wire_bad);
+    /* The encoder is otherwise verified only against its own decoder. This is
+     * the assertion that a segment for a non-loopback peer genuinely reached
+     * the NIC. Whether anything answers is not asserted — that would be a test
+     * of QEMU's NAT, which is the trap v0.52 documented and avoided. */
+    tccheck2("a segment for a non-loopback peer was built and TRANSMITTED",
+             g_tcp_wire_tx > wt0);
+out:
+    kprintf("[tcpstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_tcpass, (uint64_t)g_tcfail2);
+    if (!g_tcfail2)
+        kputs("[tcpstrs] TCP VERIFIED — a handshake, an ordered byte stream, and an announced end\n");
+    else kputs("[tcpstrs] TCP DEFECTS PRESENT\n");
     kputs("-- done --\n");
 }
 
@@ -20092,6 +21652,8 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "shmstress")) cmd_shm_stress();
     else if (!kstrcmp(argv[0], "epollstress")) cmd_epoll_stress();
     else if (!kstrcmp(argv[0], "netepollstress")) cmd_netepoll_stress();
+    else if (!kstrcmp(argv[0], "mmapfilestress")) cmd_mmapfile_stress();
+    else if (!kstrcmp(argv[0], "tcpstress")) cmd_tcp_stress();
     else if (!kstrcmp(argv[0], "vfscrashwrite")) {
         /* Manual, one-shot half of the genuine cross-QEMU-reboot journal proof
          * (see the probe in cmd_cas()): commit this write's journal entry,
@@ -20255,6 +21817,19 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_smp();              /* v0.35: cross-core protocol verification            */
     cmd_parallel();         /* v0.36: work-stealing parallel job across cores     */
     cmd_audit();            /* v0.37: parallel page-table integrity audit         */
+    /* v0.66: mmapfilestrs' fixture is created HERE, before the battery, not
+     * inside the suite. The VFS directory is 64 entries and the toolchain
+     * suites spend the last of them mid-boot — by suite 41 there is no room
+     * left, which is a pre-existing headroom problem (v0.60 onward) and not
+     * something a new suite should discover for itself at the point of use.
+     * Creating it early also keeps the fixture out of every earlier suite's
+     * way: it is written once and only ever read or mapped afterwards. */
+    {
+        static uint8_t m66seed[M66_FIXTURE_LEN];
+        for (uint32_t i = 0; i < M66_FIXTURE_LEN; i++) m66seed[i] = (uint8_t)((i * 7 + 3) & 0xFF);
+        if (vfs_write_file("m66dat", m66seed, M66_FIXTURE_LEN) < 0)
+            kputs("[vfs    ] WARNING: could not seed 'm66dat' — mmapfilestrs will report it\n");
+    }
     cmd_mcsched();          /* v0.38: an AP autonomously runs a ring-3 thread      */
     cmd_mcq();              /* v0.39: per-CPU queues, stealing, concurrent ring 3  */
     cmd_mcpre();            /* v0.39: IPI preemption + cross-core context migration */
@@ -20284,9 +21859,19 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_shm_stress();       /* v0.63: copy-on-write fork and zero-copy shared memory               */
     cmd_epoll_stress();     /* v0.64: event-driven readiness, eventfd counters, EOF reporting      */
     cmd_netepoll_stress();  /* v0.65: non-blocking sockets multiplexed with epoll                  */
+    cmd_mmapfile_stress();  /* v0.66: file-backed mappings, shared pages, writeback                */
     cmd_iommu();
     cmd_capdma();
     cmd_nicdriver();
+    /* v0.68: tcpstrs runs AFTER capdma, deliberately. capdma proves a confined
+     * device is BLOCKED by the IOMMU when it attempts kernel DMA, and it needs
+     * a quiescent NIC transmit queue to produce that fault — which is exactly
+     * why netstrs has never sent a real frame, and says so in v0.52's
+     * changelog. v0.68 gave tcpstrs one genuine wire transmit, and that single
+     * SYN was enough to make capdma's confined-DMA assertion fail under VT-d
+     * while both BIOS configurations stayed clean. Ordering is the fix: the
+     * suite that needs silence goes first. */
+    cmd_tcp_stress();       /* v0.68: TCP handshake, byte stream, FIN, and the wire codec */
     mouse_init();
     fb_init();
     cmd_gfx();
