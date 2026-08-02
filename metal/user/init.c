@@ -128,6 +128,29 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_EPOLL_CTL           77
 #define SYS_EPOLL_WAIT          78
 #define SYS_EVENTFD             79
+#define SYS_FCNTL               80          /* v0.65 */
+#define SYS_LISTEN              81          /* v0.65 */
+#define SYS_ACCEPT              82          /* v0.65 */
+
+/* v0.65: descriptor flags and socket types. Values mirror Linux so the SDK
+ * headers can carry them verbatim. */
+#define O_NONBLOCK              04000
+#define F_GETFL                 3
+#define F_SETFL                 4
+#define SOCK_DGRAM              2
+#define SOCK_NONBLOCK           0x800
+#define AF_INET                 2
+#define IP_LOOPBACK             0x7F000001ull
+
+static int ofcntl(int fd, int cmd, int arg) {
+    return (int)(i64)sysc(SYS_FCNTL, (u64)fd, (u64)cmd, (u64)(u32)arg);
+}
+static int olisten(int fd, int backlog) {
+    return (int)(i64)sysc(SYS_LISTEN, (u64)fd, (u64)backlog, 0);
+}
+static int oaccept(int fd, u32 *peer, int flags) {
+    return (int)(i64)sysc(SYS_ACCEPT, (u64)fd, (u64)(void *)peer, (u64)flags);
+}
 #define EPOLLIN   0x001u
 #define EPOLLOUT  0x004u
 #define EPOLLERR  0x008u
@@ -2442,6 +2465,176 @@ static void shm_stress_worker(void) {
     sysc(SYS_EXIT, 970, 0, 0);
 }
 
+/* --- role 49: netepollstrs — sockets as descriptors, and epoll over them ---
+ *
+ * Everything here is loopback, deliberately. The socket layer's loopback path
+ * is synchronous, so an assertion that fails does so because the MECHANISM is
+ * wrong, not because SLIRP was slow — the same discipline v0.52 used for
+ * netstrs and v0.51 for audio. A round trip through QEMU's NAT would test
+ * QEMU's timing, not this kernel's readiness model.
+ *
+ * "Connection" here means a datagram SESSION: a peer (addr,port) a listener
+ * has heard from. There is no TCP in this system, so there is no handshake to
+ * perform and none is faked. What is real is everything the milestone is
+ * actually about — a descriptor that becomes readable when a peer arrives, an
+ * accept that answers EAGAIN when none has, and a wait that is WOKEN by the
+ * arrival instead of polling for it. */
+static u32 g_nep_srv_port, g_nep_cli_port;
+static int g_nep_cli_fd;
+
+/* Posts to the server from a second thread, late enough that the main thread
+ * has reached its park. Same shape as v0.64's ew_poster and for the same
+ * reason: only the kernel can tell a park from a spin, so the driver has to
+ * actually be asleep when the datagram lands. */
+static u64 nep_poster(u64 arg) {
+    (void)arg;
+    for (int i = 0; i < 600; i++) oyield();
+    u8 msg[8]; for (int i = 0; i < 8; i++) msg[i] = (u8)(0xA0 + i);
+    sysc(SYS_SEND, (u64)g_nep_cli_fd, (u64)(void *)msg, 8);
+    return 777;
+}
+
+static void netepoll_stress_worker(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    g_nep_srv_port = (u32)(5000 + (pid & 0x1FF));
+    g_nep_cli_port = g_nep_srv_port + 512;
+
+    /* (1) A NON-BLOCKING socket answers EAGAIN rather than waiting. This is
+     * the assertion the whole milestone rests on: before it, an empty socket
+     * burned 2000 ticks before admitting it had nothing. */
+    int sv = (int)(i64)sysc(SYS_SOCKET, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (sv < 0) sysc(SYS_EXIT, 1401, 0, 0);
+    u8 rb[64];
+    if ((i64)sysc(SYS_RECV, (u64)sv, (u64)(void *)rb, 64) != -11) sysc(SYS_EXIT, 1402, 0, 0);
+
+    /* (2) FCNTL round trip. F_GETFL must SEE the flag SOCK_NONBLOCK set at
+     * creation — two routes to one piece of state that must agree. */
+    if ((ofcntl(sv, F_GETFL, 0) & O_NONBLOCK) == 0) sysc(SYS_EXIT, 1403, 0, 0);
+    if (ofcntl(sv, F_SETFL, 0) != 0)                sysc(SYS_EXIT, 1404, 0, 0);
+    if (ofcntl(sv, F_GETFL, 0) & O_NONBLOCK)        sysc(SYS_EXIT, 1405, 0, 0);
+    if (ofcntl(sv, F_SETFL, O_NONBLOCK) != 0)       sysc(SYS_EXIT, 1406, 0, 0);
+    if ((ofcntl(sv, F_GETFL, 0) & O_NONBLOCK) == 0) sysc(SYS_EXIT, 1407, 0, 0);
+
+    /* (3) Bind and listen. */
+    if ((i64)sysc(SYS_BIND, (u64)sv, (u64)g_nep_srv_port, 0) != 0) sysc(SYS_EXIT, 1408, 0, 0);
+    if (olisten(sv, 4) != 0) sysc(SYS_EXIT, 1409, 0, 0);
+
+    /* (4) An idle listener has NOTHING to accept, and says so immediately. */
+    u32 peer[2];
+    if (oaccept(sv, peer, 0) != -11) sysc(SYS_EXIT, 1410, 0, 0);
+
+    /* (5) epoll must report an idle listener as NOT ready. A listener that
+     * claimed readiness with no peer would send a server into an accept loop
+     * that spins on EAGAIN forever — the exact bug epoll exists to prevent. */
+    int ep = oepoll_create();
+    if (ep < 0) sysc(SYS_EXIT, 1411, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, sv, EPOLLIN, 0x51) != 0) sysc(SYS_EXIT, 1412, 0, 0);
+    struct epoll_event evs[4];
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 1413, 0, 0);
+
+    /* (6) A client speaks. The listener becomes readable, and epoll says so. */
+    int cl = (int)(i64)sysc(SYS_SOCKET, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (cl < 0) sysc(SYS_EXIT, 1414, 0, 0);
+    if ((i64)sysc(SYS_BIND, (u64)cl, (u64)g_nep_cli_port, 0) != 0) sysc(SYS_EXIT, 1415, 0, 0);
+    if ((i64)sysc(SYS_CONNECT, (u64)cl, IP_LOOPBACK, (u64)g_nep_srv_port) != 0)
+        sysc(SYS_EXIT, 1416, 0, 0);
+    u8 hello[16]; for (int i = 0; i < 16; i++) hello[i] = (u8)(i * 7 + 1);
+    if ((i64)sysc(SYS_SEND, (u64)cl, (u64)(void *)hello, 16) != 16) sysc(SYS_EXIT, 1417, 0, 0);
+
+    int n = oepoll_wait(ep, evs, 4, 0);
+    if (n != 1)                       sysc(SYS_EXIT, 1418, 0, 0);
+    if (!(evs[0].events & EPOLLIN))   sysc(SYS_EXIT, 1419, 0, 0);
+    if (evs[0].data != 0x51)          sysc(SYS_EXIT, 1420, 0, 0);
+
+    /* (7) ACCEPT hands back a NEW descriptor carrying the peer's FIRST
+     * datagram. A server that had to read the opening message from the
+     * listener instead would have no way to attribute it to a peer. */
+    int cs = oaccept(sv, peer, SOCK_NONBLOCK);
+    if (cs < 0)                          sysc(SYS_EXIT, 1421, 0, 0);
+    if (cs == sv)                        sysc(SYS_EXIT, 1422, 0, 0);
+    if (peer[0] != (u32)IP_LOOPBACK)     sysc(SYS_EXIT, 1423, 0, 0);
+    if (peer[1] != g_nep_cli_port)       sysc(SYS_EXIT, 1424, 0, 0);
+    if ((i64)sysc(SYS_RECV, (u64)cs, (u64)(void *)rb, 64) != 16) sysc(SYS_EXIT, 1425, 0, 0);
+    for (int i = 0; i < 16; i++) if (rb[i] != hello[i]) sysc(SYS_EXIT, 1426, 0, 0);
+
+    /* (8) The listener is drained again, and the backlog really emptied. */
+    if (oaccept(sv, peer, 0) != -11)     sysc(SYS_EXIT, 1427, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 1428, 0, 0);
+
+    /* (9) ECHO. The accepted session replies to its peer, and the client — a
+     * different descriptor entirely — receives it. This is the round trip the
+     * milestone names, and it goes through the session socket, not the
+     * listener. */
+    if ((i64)sysc(SYS_SEND, (u64)cs, (u64)(void *)rb, 16) != 16) sysc(SYS_EXIT, 1429, 0, 0);
+    u8 eb[64];
+    if ((i64)sysc(SYS_RECV, (u64)cl, (u64)(void *)eb, 64) != 16) sysc(SYS_EXIT, 1430, 0, 0);
+    for (int i = 0; i < 16; i++) if (eb[i] != hello[i]) sysc(SYS_EXIT, 1431, 0, 0);
+
+    /* (10) EPOLLOUT: a connected socket can send, an unconnected one cannot.
+     * Reporting writable on a socket with no destination invites a send that
+     * can only fail. */
+    if (oepoll_ctl(ep, EPOLL_CTL_MOD, sv, EPOLLIN | EPOLLOUT, 0x51) != 0) sysc(SYS_EXIT, 1432, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 1433, 0, 0);   /* listener: never writable */
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, cl, EPOLLOUT, 0x52) != 0) sysc(SYS_EXIT, 1434, 0, 0);
+    n = oepoll_wait(ep, evs, 4, 0);
+    if (n != 1 || !(evs[0].events & EPOLLOUT) || evs[0].data != 0x52) sysc(SYS_EXIT, 1435, 0, 0);
+
+    /* (11) EDGE TRIGGERING over a socket. One report per arrival, not one per
+     * call — the distinction a level-triggered implementation fails. */
+    if (oepoll_ctl(ep, EPOLL_CTL_DEL, cl, 0, 0) != 0) sysc(SYS_EXIT, 1436, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, cl, EPOLLIN | EPOLLET, 0x53) != 0) sysc(SYS_EXIT, 1437, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 1438, 0, 0);   /* drained earlier */
+    if ((i64)sysc(SYS_SEND, (u64)cs, (u64)(void *)hello, 8) != 8) sysc(SYS_EXIT, 1439, 0, 0);
+    n = oepoll_wait(ep, evs, 4, 0);
+    if (n != 1 || evs[0].data != 0x53)   sysc(SYS_EXIT, 1440, 0, 0);   /* the edge */
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 1441, 0, 0);   /* no second edge */
+    if ((i64)sysc(SYS_RECV, (u64)cl, (u64)(void *)eb, 64) != 8) sysc(SYS_EXIT, 1442, 0, 0);
+
+    /* (12) SEND BACKPRESSURE. The receive ring is four deep; the fifth
+     * datagram has nowhere to go and must SAY so rather than vanish. A silent
+     * drop is legal for UDP and useless as a non-blocking contract. */
+    int sent = 0;
+    for (int i = 0; i < 8; i++) {
+        i64 r = (i64)sysc(SYS_SEND, (u64)cs, (u64)(void *)hello, 4);
+        if (r == -11) break;
+        if (r != 4) sysc(SYS_EXIT, 1443, 0, 0);
+        sent++;
+    }
+    if (sent == 0 || sent > 4) sysc(SYS_EXIT, 1444, 0, 0);   /* must fill, then refuse */
+    while ((i64)sysc(SYS_RECV, (u64)cl, (u64)(void *)eb, 64) > 0) { }   /* drain */
+
+    /* (13) THE PARK. Nothing is ready; a second thread sends only after this
+     * one has had time to fall asleep. The kernel half checks the park counter
+     * moved AND that no timeout fired — woken by the datagram, not the clock. */
+    g_nep_cli_fd = cs;
+    if (oepoll_ctl(ep, EPOLL_CTL_DEL, cl, 0, 0) != 0) sysc(SYS_EXIT, 1445, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, cl, EPOLLIN, 0x54) != 0) sysc(SYS_EXIT, 1446, 0, 0);
+    int wt = kthread_create(nep_poster, 0, 0);
+    if (wt < 0) sysc(SYS_EXIT, 1447, 0, 0);
+    n = oepoll_wait(ep, evs, 4, 30000);          /* backstop, not a race */
+    if (n != 1)                sysc(SYS_EXIT, 1448, 0, 0);
+    if (evs[0].data != 0x54)   sysc(SYS_EXIT, 1449, 0, 0);
+    u64 wc = 0;
+    if (kthread_join(wt, &wc) != 0) sysc(SYS_EXIT, 1450, 0, 0);
+    if (wc != 777)                  sysc(SYS_EXIT, 1451, 0, 0);
+
+    /* (14) A socket is a DESCRIPTOR: SYS_CLOSE releases it, and a closed
+     * socket is EBADF to every socket call. Before this milestone the only
+     * thing that ever reclaimed a socket was the owner dying. */
+    if ((i64)sysc(SYS_CLOSE, (u64)cl, 0, 0) != 0) sysc(SYS_EXIT, 1452, 0, 0);
+    if ((i64)sysc(SYS_RECV, (u64)cl, (u64)(void *)eb, 64) != -9) sysc(SYS_EXIT, 1453, 0, 0);
+
+    /* (15) Closing a LISTENER hangs up its sessions. The session descriptor is
+     * still ours and still valid — it reports end-of-conversation, it does not
+     * become a dangling fd. */
+    if ((i64)sysc(SYS_CLOSE, (u64)sv, 0, 0) != 0) sysc(SYS_EXIT, 1454, 0, 0);
+    if ((i64)sysc(SYS_RECV, (u64)cs, (u64)(void *)eb, 64) != 0) sysc(SYS_EXIT, 1455, 0, 0);
+
+    sysc(SYS_CLOSE, (u64)cs, 0, 0);
+    sysc(SYS_CLOSE, (u64)ep, 0, 0);
+    sysc(SYS_EXIT, 1400, 0, 0);
+}
+
 /* --- role 48: epollstrs — readiness, edges, and end-of-file ----------------
  *
  * Phase 1 driver. Every check is written so the failure mode is a WRONG
@@ -3673,6 +3866,7 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 40) { pipe_worker(); }                  /* v0.59 pipe mechanics: bounds, EOF, EPIPE, fork      */
     if (role == 41) { vsh_worker(); }                   /* v0.59 build /bin/vsh with occ and run a real script */
     if (role == 48) { epoll_stress_worker(); }         /* v0.64 epoll readiness, edges, eventfd, EOF        */
+    if (role == 49) { netepoll_stress_worker(); }      /* v0.65 non-blocking sockets multiplexed with epoll */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
     if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
     if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */
