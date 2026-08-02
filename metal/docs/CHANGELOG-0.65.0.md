@@ -134,49 +134,62 @@ resolver that both delivery and the send-side full check call, so the two
 cannot drift; the previous duplicated "is it full" test was a second copy of
 routing logic waiting to disagree with the first.
 
+## THE INTERMITTENT UNIPROCESSOR FAILURE, AND WHAT IT ACTUALLY WAS
+
+The first v0.65 matrix failed `posixstrs` round `'std fd table'` on
+uniprocessor, roughly one boot in three, with driver exit 964: `read()` of the
+VFS file `motd` returned no bytes. SMP-4 and IOMMU were clean. It looked like a
+regression from this milestone, because sockets now consume `ofile` slots where
+they consumed none and `netstrs` runs three positions before `posixstrs`.
+
+It was not. Instrumenting the failing read settled it in one line:
+
+```
+[rddiag ] pid 605: READ fd 0 dirent 18 'motd' len=0 nchunks=0 used=1 -> 0
+```
+
+The descriptor is perfect — resolved, owned, `VOL_ROOT`, pointing at the right
+dirent. **`motd` itself had been truncated to nothing.**
+
+The truncator is the syscall fuzzer. It opens `motd` to prove its targeted
+pointer checks, which returns descriptor **0**; it then runs 20,000 randomized
+`syscall_dispatch` calls over syscalls 0–15 with an adversarial argument pool.
+Syscall 7 is `SYS_WRITE_FILE` and the pool contains `0` — so sooner or later it
+issues `write(fd=0, ptr, len=0)` against its own live handle and empties the
+file. `posixstrs` reads it later and gets nothing.
+
+Three things follow, and they are why this was worth chasing rather than
+re-running until green:
+
+- **It is pre-existing, not a v0.65 regression.** The fuzzer, the pool and
+  `posixstrs`' dependence on `motd` all predate this milestone. What v0.65
+  changed was the *timing* — the fuzzer seeds `g_rng` from `RDTSC`, so adding a
+  suite changed the boot's clock and therefore the dice. Every earlier release
+  that reported a clean matrix was, on this specific hazard, lucky.
+- **A verification suite that corrupts shared state is not testing what it
+  claims.** The fuzzer's job is to prove the syscall *boundary* holds. Holding a
+  writable handle on a boot fixture while fuzzing writes tests something else.
+- **The failure was silent at the point of damage.** The write succeeded and was
+  legal; the assertion fired eleven suites later, in unrelated code.
+
+The fix is one line and one paragraph of comment: the fuzzer closes the
+descriptor before the randomized loop. Every later `fd` argument then lands on a
+descriptor it does not own and gets EBADF — which is the answer the fuzzer is
+testing for anyway. It also stops the fuzz process leaking a descriptor past its
+own teardown.
+
 ## VERIFICATION
 
-| config | suites | FAIL |
-| --- | --- | --- |
-| SMP-4 / BIOS | 40 | 0 |
-| q35 + VT-d IOMMU (`-smp 4`) | 42 | 0 |
-| uniprocessor / BIOS | 40 | **intermittent — see below** |
+40 suites, 0 FAIL on uniprocessor/BIOS, SMP-4/BIOS, and q35 + VT-d IOMMU
+(`-smp 4`, 42 suites). Each configuration differs from its v0.64 baseline by
+exactly one line — `[netepollstrs]`. Boot logs are in `docs/`.
 
-Each configuration differs from its v0.64 baseline by exactly one line —
-`[netepollstrs]`. Boot logs are in `docs/`.
-
-### The uniprocessor result is NOT clean, and this release is not tagged
-
-One UP boot in three fails `posixstrs` round `'std fd table'` with driver exit
-964: `oread()` on the VFS file `motd` returned no bytes, in all three rounds of
-that boot. The other two UP boots pass 11/11, and SMP-4 and IOMMU — which
-exercise every path this milestone touched harder, on four cores — are clean.
-
-**It is not root-caused, so `v0.65.0-metal` is deliberately not tagged.** What
-is known:
-
-- The failing assertion is a VFS file read. Nothing in this milestone touches
-  the VFS, CAS or block layer.
-- `posixstrs` runs at position 13; `netepollstrs` at 24. The new suite cannot
-  reach it.
-- `motd` is byte-identical in the failing and passing boots (same hash, same
-  copy-on-write repoint at the same log line).
-- No descriptor was force-closed in either boot, and `netstrs` reports 7/7 in
-  both.
-- The plausible new coupling is that sockets now consume `ofile` slots — the
-  table is 16 entries and global, and `netstrs` (position 10) allocates
-  descriptors where it previously allocated none. That would be a real
-  regression introduced here. It does not obviously explain *this* symptom,
-  because a failed `open` makes the driver skip the read rather than fail it,
-  but it is the first thing to rule out.
-- `posixstrs` has shown load-sensitive failures before (v0.63, SMP, exit 702).
-  That precedent is a reason to suspect the environment, not a reason to record
-  this as a flake — v0.61 recorded a genuine `g_execbuf` race as a "pipestrs
-  flake" and it cost a milestone to find.
-
-Next step is to instrument the `ofile` table occupancy at the point `posixstrs`
-runs and compare a failing boot against a passing one, then re-run the UP
-config enough times to establish whether the rate changes with v0.64's build.
+The uniprocessor config was additionally run **eight consecutive times** after
+the fuzzer fix, all clean, against a prior failure rate of roughly one boot in
+three. Eight passes does not prove a random hazard is gone, but combined with
+the mechanism being identified and closed it is the evidence available; the
+failing boot log is kept in `docs/` so the symptom stays recognisable if it
+ever returns.
 
 All of `netepollstrs` is loopback, deliberately: the loopback path is
 synchronous, so a failing assertion means the mechanism is wrong rather than
