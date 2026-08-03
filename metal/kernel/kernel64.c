@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.72.0-metal"
+#define KERNEL_VERSION "0.73.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -19986,6 +19986,34 @@ static void tccheck2(const char *what, int ok) {
     else    { g_tcfail2++; kprintf("[tcpstrs] FAIL: %s\n", what); }
 }
 
+/* v0.73: take a blank stream socket for a protocol fixture, or -1.
+ *
+ * Every caller releases it before returning — v0.72's usersstrs leaked five
+ * descriptors and broke nine assertions in three unrelated suites twenty
+ * minutes later, so a fixture that takes a slot from a shared table gives it
+ * back in the same block that took it. */
+static int tcpstrs_grab_sock(void) {
+    int si = -1;
+    klock_acquire(&g_net_lock);
+    for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) { si = i; break; }
+    if (si >= 0) {
+        cmemset(&g_sock[si], 0, sizeof g_sock[si]);
+        struct nsock *t = &g_sock[si];
+        t->used = 1; t->stream = 1; t->waiter_tid = -1; t->fd = -1;
+        t->connected = 1; t->bound = 1;
+        t->raddr = NET_LOOPBACK;
+        /* Ports nothing else in this suite binds, so tcp_output's loopback
+         * lookup finds no peer and the segment is simply dropped — these
+         * assertions are about the RECEIVE and SEND paths of one endpoint,
+         * not about delivery. */
+        t->lport = (uint16_t)(51000 + si * 2);
+        t->rport = (uint16_t)(51001 + si * 2);
+        t->snd_wnd = TCP_MSS;
+    }
+    klock_release(&g_net_lock);
+    return si;
+}
+
 static void cmd_tcp_stress(void) {
     kputs("-- TCPSTRS: three-way handshake, byte streams, retransmission and FIN --\n");
     g_tcpass = g_tcfail2 = 0;
@@ -20196,6 +20224,112 @@ static void cmd_tcp_stress(void) {
      * of QEMU's NAT, which is the trap v0.52 documented and avoided. */
     tccheck2("a segment for a non-loopback peer was built and TRANSMITTED",
              g_tcp_wire_tx > wt0);
+
+    /* ---- v0.73: the three things v0.67 and v0.68 listed as not done ----
+     *
+     * Each is driven through the REAL state machine on a socket this block
+     * sets up and tears down itself, rather than by reading back a field the
+     * test just wrote. A socket in a particular state is a fixture; what is
+     * asserted is what the protocol code does when a segment arrives at it. */
+    {
+        int ti = tcpstrs_grab_sock();
+        int armed = 0;
+        if (ti >= 0) {
+            klock_acquire(&g_net_lock);
+            struct nsock *t = &g_sock[ti];
+            t->state = TCPS_FIN_WAIT2; t->fin_sent = 1;
+            t->rcv_nxt = 1000; t->irs = 999;
+            t->iss = 500; t->snd_una = 501; t->snd_nxt = 501;
+            struct tseg f;
+            f.seq = 1000; f.ack = 501; f.flags = (uint16_t)(TH_FIN | TH_ACK);
+            f.len = 0; f.sport = t->rport; f.dport = t->lport;
+            f.win = TCP_MSS; f.data = 0;
+            tcp_input(ti, &f);                       /* the real close path */
+            armed = (t->state == TCPS_TIME_WAIT) && t->tw_ticks > 0;
+            klock_release(&g_net_lock);
+        }
+        tccheck2("a FIN in FIN_WAIT2 enters TIME_WAIT with its 2*MSL clock ARMED", armed);
+
+        /* And it must LEAVE on that clock. Before v0.73 the state was left
+         * until the descriptor closed, so this is the assertion that would
+         * have failed — and the one that fails again if the tw_ticks check is
+         * ever moved back below the retransmit guard, where a zero
+         * rexmit_ticks would skip the socket entirely. */
+        uint64_t tw0 = g_tcp_timewait_done;
+        for (int k = 0; k < TCP_TIMEWAIT_TICKS + 2; k++) tcp_timer_scan();
+        int expired = 0;
+        if (ti >= 0) {
+            klock_acquire(&g_net_lock);
+            expired = (g_sock[ti].state == TCPS_CLOSED) && g_sock[ti].tw_ticks == 0;
+            g_sock[ti].used = 0;
+            klock_release(&g_net_lock);
+        }
+        tccheck2("TIME_WAIT ends on the CLOCK, not on a descriptor close",
+                 expired && g_tcp_timewait_done > tw0);
+    }
+
+    {   /* FLOW CONTROL. A 100-byte window must hold back a 300-byte send. */
+        int wi = tcpstrs_grab_sock();
+        uint32_t took = 0, took2 = 0;
+        uint64_t st0 = g_tcp_win_stalls;
+        static uint8_t wbuf[300];
+        for (int i = 0; i < 300; i++) wbuf[i] = (uint8_t)(i * 5 + 1);
+        if (wi >= 0) {
+            klock_acquire(&g_net_lock);
+            struct nsock *t = &g_sock[wi];
+            t->state = TCPS_ESTAB;
+            t->snd_una = t->snd_nxt = 5000; t->rcv_nxt = 7000;
+            t->snd_wnd = 100;
+            took = tcp_send_data(wi, wbuf, 300);
+            /* A window of zero stops the sender dead — the case that
+             * distinguishes flow control from a size cap. */
+            t->snd_wnd = 0;
+            took2 = tcp_send_data(wi, wbuf, 300);
+            g_sock[wi].used = 0;
+            klock_release(&g_net_lock);
+        }
+        tccheck2("a send is capped by the peer's advertised window, not by the buffer",
+                 took == 100 && g_tcp_win_stalls > st0);
+        tccheck2("a ZERO window stops the sender completely", took2 == 0);
+    }
+
+    {   /* REASSEMBLY. A segment past a hole is kept, and the bytes come out in
+         * the right order once the hole is filled — the assertion a stack that
+         * merely stopped dropping would still fail. */
+        int ri = tcpstrs_grab_sock();
+        int queued_ok = 0, merged_ok = 0, bytes_ok = 0;
+        uint64_t q0 = g_tcp_ooo_queued, m0 = g_tcp_ooo_merged;
+        if (ri >= 0) {
+            klock_acquire(&g_net_lock);
+            struct nsock *t = &g_sock[ri];
+            t->state = TCPS_ESTAB;
+            t->snd_una = t->snd_nxt = 9000; t->snd_wnd = TCP_MSS;
+            t->rcv_nxt = 3000; t->irs = 2999;
+            static uint8_t segb[8], sega[8];
+            for (int i = 0; i < 8; i++) { sega[i] = (uint8_t)('A' + i); segb[i] = (uint8_t)('a' + i); }
+            struct tseg g2;
+            /* B first, ten bytes ahead: out of order. */
+            g2.seq = 3008; g2.ack = 9000; g2.flags = TH_ACK; g2.len = 8;
+            g2.sport = t->rport; g2.dport = t->lport; g2.win = TCP_MSS; g2.data = segb;
+            tcp_input(ri, &g2);
+            queued_ok = (g_tcp_ooo_queued > q0) && (t->rcount == 0) && (t->rcv_nxt == 3000);
+            /* Now A, which fills the hole and should release B behind it. */
+            g2.seq = 3000; g2.len = 8; g2.data = sega;
+            tcp_input(ri, &g2);
+            merged_ok = (g_tcp_ooo_merged > m0) && (t->rcount == 16) && (t->rcv_nxt == 3016);
+            bytes_ok = 1;
+            for (int i = 0; i < 8; i++)  if (t->rbuf[i] != (uint8_t)('A' + i)) bytes_ok = 0;
+            for (int i = 0; i < 8; i++)  if (t->rbuf[8 + i] != (uint8_t)('a' + i)) bytes_ok = 0;
+            g_sock[ri].used = 0;
+            klock_release(&g_net_lock);
+        }
+        tccheck2("a segment arriving past a hole is QUEUED, not dropped", queued_ok);
+        tccheck2("filling the hole releases what was queued behind it", merged_ok);
+        tccheck2("and the reassembled bytes are in the right order", bytes_ok);
+    }
+    kprintf("[tcpstrs] v0.73: %u timewait expiries, %u window stalls, %u ooo queued/%u merged/%u dropped\n",
+            g_tcp_timewait_done, g_tcp_win_stalls,
+            g_tcp_ooo_queued, g_tcp_ooo_merged, g_tcp_ooo_dropped);
 out:
     kprintf("[tcpstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_tcpass, (uint64_t)g_tcfail2);
     if (!g_tcfail2)
