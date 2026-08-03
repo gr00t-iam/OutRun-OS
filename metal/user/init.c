@@ -91,6 +91,122 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
  * -1 for the console; it is kproc state, so it survives SYS_EXECVE_PATH. */
 #define SYS_PIPE                62
 #define SYS_SETREDIR            63
+/* v0.61: thread synchronisation. SYS_THREAD_CREATE gained a third argument
+ * (a caller-supplied stack top; 0 = "kernel, give me one"), which is a pure
+ * extension — the two-argument form still means exactly what it did.
+ *
+ * SYS_FUTEX_WAIT(uaddr, val, timeout_ticks) sleeps only if *uaddr == val, and
+ * that compare-and-sleep is atomic against SYS_FUTEX_WAKE. Without the kernel
+ * doing the comparison there is no way to close the window between reading the
+ * word and going to sleep, which is the entire reason a futex is a syscall.
+ * A parked thread occupies no core; before this the only way to wait was to
+ * spin or yield in a loop, and on a uniprocessor spinning for a sibling thread
+ * is simply a deadlock.
+ *
+ * Every wait is bounded: 0 means "the kernel's default", never "forever". */
+#define SYS_FUTEX_WAIT          64
+#define SYS_FUTEX_WAKE          65
+#define SYS_THREAD_JOIN         66
+#define SYS_GETTID              67
+/* v0.62: job control + per-thread signal masks. SIGACTION/KILL/SIGRETURN keep
+ * the numbers they have had since v0.55 (49/50/51) — renumbering working
+ * syscalls would break every binary already compiled into the VFS. */
+#define SYS_SETPGID             68
+#define SYS_KILLPG              69
+#define SYS_SIGPROCMASK         70
+/* v0.63: dynamic virtual memory. mmap is ANONYMOUS ONLY here — there is no
+ * file-backed paging, and the kernel refuses rather than returning zeroes. */
+#define SYS_MMAP                71
+#define SYS_MUNMAP              72
+#define SYS_MPROTECT            73
+#define SYS_SHM_CREATE          74
+#define SYS_SHM_MAP             75
+/* v0.64: event-driven I/O. epoll_ctl and epoll_wait PACK their extra arguments
+ * because the syscall ABI has three argument registers; the wrappers below
+ * present the ordinary shapes over that. */
+#define SYS_EPOLL_CREATE        76
+#define SYS_EPOLL_CTL           77
+#define SYS_EPOLL_WAIT          78
+#define SYS_EVENTFD             79
+#define SYS_FCNTL               80          /* v0.65 */
+#define SYS_LISTEN              81          /* v0.65 */
+#define SYS_ACCEPT              82          /* v0.65 */
+#define SYS_MMAP_FILE           83          /* v0.66 */
+#define SYS_MSYNC               84          /* v0.66 */
+
+/* v0.66: SYS_MMAP_FILE packs fd/prot/flags into a0 because the dispatch ABI
+ * has three argument registers and the offset needs one of its own. */
+static u64 ommap_file(int kfd, u64 len, int prot, int flags, u64 off) {
+    u64 a0 = ((u64)(kfd & 0xFF)) | ((u64)(prot & 0xFF) << 8) | ((u64)(flags & 0xFFFF) << 16);
+    return sysc(SYS_MMAP_FILE, a0, len, off);
+}
+static int omsync(u64 addr, u64 len, int flags) {
+    return (int)(i64)sysc(SYS_MSYNC, addr, len, (u64)flags);
+}
+
+/* v0.65: descriptor flags and socket types. Values mirror Linux so the SDK
+ * headers can carry them verbatim. */
+#define O_NONBLOCK              04000
+#define F_GETFL                 3
+#define F_SETFL                 4
+#define SOCK_DGRAM              2
+#define SOCK_STREAM             1
+#define SOCK_NONBLOCK           0x800
+#define AF_INET                 2
+#define IP_LOOPBACK             0x7F000001ull
+
+static int ofcntl(int fd, int cmd, int arg) {
+    return (int)(i64)sysc(SYS_FCNTL, (u64)fd, (u64)cmd, (u64)(u32)arg);
+}
+static int olisten(int fd, int backlog) {
+    return (int)(i64)sysc(SYS_LISTEN, (u64)fd, (u64)backlog, 0);
+}
+static int oaccept(int fd, u32 *peer, int flags) {
+    return (int)(i64)sysc(SYS_ACCEPT, (u64)fd, (u64)(void *)peer, (u64)flags);
+}
+#define EPOLLIN   0x001u
+#define EPOLLOUT  0x004u
+#define EPOLLERR  0x008u
+#define EPOLLHUP  0x010u
+#define EPOLLET   0x80000000u
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+#define EPOLL_TTY_FD  (-2)   /* the console: it has no descriptor */
+
+struct epoll_event { u32 events; u32 _pad; u64 data; };
+
+static int oepoll_create(void) { return (int)(i64)sysc(SYS_EPOLL_CREATE, 0, 0, 0); }
+static int oepoll_ctl(int epfd, int op, int fd, u32 events, u64 cookie) {
+    return (int)(i64)sysc(SYS_EPOLL_CTL, (u64)epfd,
+                          ((u64)op << 32) | (u32)fd,
+                          (cookie << 32) | events);
+}
+/* Returns the number of events written, or -11 meaning "you slept and
+ * something changed — call again", the same retry contract SYS_THREAD_JOIN
+ * has and for the same reason: a woken task resumes with only RAX. */
+static int oepoll_wait(int epfd, struct epoll_event *ev, int maxev, int timeout_ms) {
+    return (int)(i64)sysc(SYS_EPOLL_WAIT, (u64)epfd, (u64)(void *)ev,
+                          ((u64)(u32)timeout_ms << 32) | (u32)maxev);
+}
+static int oeventfd(u64 initval, int flags) {
+    return (int)(i64)sysc(SYS_EVENTFD, initval, (u64)flags, 0);
+}
+static i64 oeventfd_write(int fd, u64 v) {
+    return (i64)sysc(SYS_WRITE_FILE, (u64)fd, (u64)(void *)&v, 8);
+}
+static i64 oeventfd_read(int fd, u64 *out) {
+    return (i64)sysc(SYS_READ, (u64)fd, (u64)(void *)out, 8);
+}
+#define PROT_READ  0x1
+#define PROT_WRITE 0x2
+#define PROT_EXEC  0x4
+#define MAP_SHARED    0x01
+#define MAP_PRIVATE   0x02
+#define MAP_ANONYMOUS 0x20
+#define MAP_FAILED ((u64)-1)
+#define EAGAIN_NEG    (-11)
+#define ETIMEDOUT_NEG (-62)
 /* Mirrors the kernel's HEAP_USER_V (kernel64.c is the master). */
 #define HEAP_USER_V_LO 0x0000570000000000ull
 
@@ -98,6 +214,7 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SIGKILL  9
 #define SIGSEGV 11
 #define SIGALRM 14
+#define SIGTERM 15
 #define SIGCHLD 17
 #define NSIG    32
 
@@ -1384,6 +1501,12 @@ static i64 oread(int fd, char *buf, u64 n) {
     if (g_ofd[fd] == OFD_CONSOLE) return 0;              /* no ring-3 tty input yet */
     return (i64)sysc(SYS_READ, (u64)g_ofd[fd], (u64)buf, n);
 }
+/* The userland table maps its own indices onto kernel descriptors; mmap needs
+ * the kernel one, since the kernel has never heard of the userland table. */
+static int okfd(int fd) {
+    if (fd < 0 || fd >= OFD_MAX) return -1;
+    return g_ofd[fd];
+}
 static int oclose(int fd) {
     if (fd < 3 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;  /* std three are not closable */
     sysc(SYS_CLOSE, (u64)g_ofd[fd], 0, 0);
@@ -1423,9 +1546,31 @@ static void *osbrk(u64 inc) {
     return old;
 }
 
+/* v0.63: allocations this large go straight to the kernel instead of through
+ * the heap. Two reasons, and the second is the one that matters: a multi-
+ * hundred-KiB block carved out of a first-fit arena leaves a hole almost
+ * nothing can reuse, and — because mmap is demand-zero — a big request that
+ * is only partly touched never costs the frames it did not use. Freeing one
+ * returns its address space outright rather than parking it on a free list. */
+#define OMMAP_MIN (128u * 1024u)
+#define OMMAP_MAGIC 0x4D4D4150ull                  /* "MMAP" */
+struct ommap_hdr { u64 magic; u64 len; };
+
 static void *omalloc(u64 n) {
     if (!n) return 0;
     n = (n + 15) & ~15ull;                        /* 16-byte payload alignment   */
+    if (n >= OMMAP_MIN) {
+        u64 total = n + sizeof(struct ommap_hdr);
+        u64 r = sysc(SYS_MMAP, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+        if (r == MAP_FAILED || (i64)r < 0) return 0;
+        /* The header is what lets ofree tell an mmap block from a heap block
+         * without a side table — and the magic is what stops it mistaking a
+         * heap block's bytes for one. */
+        struct ommap_hdr *h = (struct ommap_hdr *)r;
+        h->magic = OMMAP_MAGIC;
+        h->len = total;
+        return (void *)(r + sizeof(struct ommap_hdr));
+    }
     if (!g_heap_lo) osbrk(0);
     /* first fit over the block chain */
     for (u8 *p = g_heap_lo; p + sizeof(struct oblk) <= g_heap_hi; ) {
@@ -1461,6 +1606,19 @@ static void *omalloc(u64 n) {
 
 static void ofree(void *q) {
     if (!q) return;
+    /* v0.63: an mmap block carries its own header and is released to the
+     * kernel outright. Checked FIRST and by magic, because the alternative —
+     * treating every pointer as a heap block — would read a size field out of
+     * whatever happens to precede an mmap payload. */
+    {
+        struct ommap_hdr *h = (struct ommap_hdr *)((u8 *)q - sizeof(struct ommap_hdr));
+        if (h->magic == OMMAP_MAGIC) {
+            u64 len = h->len;
+            h->magic = 0;                       /* poison: catch a double free  */
+            sysc(SYS_MUNMAP, (u64)(void *)h, len, 0);
+            return;
+        }
+    }
     struct oblk *b = (struct oblk *)((u8 *)q - sizeof(struct oblk));
     b->size &= ~OH_USED;
     /* forward coalesce: absorb the next block while it is also free */
@@ -1511,16 +1669,34 @@ static const char *ogetenv(const char *key) {
     return 0;
 }
 
-/* ---- POSIX threads -------------------------------------------------------
- * SYS_THREAD_CREATE gives us a kernel thread sharing this address space with
- * its own ring-3 stack, entered with RSP pointing at the single argument the
- * kernel placed there. Everything else — the control blocks, the join
- * protocol, the mutexes — is userland, built on ordinary atomics over shared
- * memory, which is what makes it a real shim rather than a kernel service.  */
+/* ===========================================================================
+ * v0.62: libpthread — POSIX threads on the M61 kernel substrate
+ * ===========================================================================
+ * v0.55 shipped this API over BSP-only kernel threads and a mutex that spun
+ * through oyield(). Both halves are replaced here and the SIGNATURES are
+ * deliberately unchanged, so role 31 (posixstrs) compiles against the new
+ * engine without edits — which makes an existing suite a live test of it
+ * rather than a museum piece.
+ *
+ * What actually changed underneath:
+ *   - a thread is a run-queue entity (v0.61), so it runs on any core;
+ *   - the mutex has a syscall-free uncontended path and PARKS when contended,
+ *     instead of burning a core yielding;
+ *   - join asks the kernel instead of polling a userland flag;
+ *   - there is a condition variable, which there was no way to build before.
+ *
+ * GUARD PAGES: the kernel places thread N's stack at THR_USER_V + N*0x8000 and
+ * maps only the low 4 of those 8 pages. The 4 unmapped pages ABOVE each stack
+ * are the guard: a thread that overruns its stack downward from the top runs
+ * into the previous slot's guard hole and faults, rather than silently
+ * corrupting a sibling's stack. That geometry is the kernel's (v0.55) and is
+ * documented here because it is a property userland depends on and cannot see.
+ */
 #define PTHREAD_MAX 8
 #define THR_USER_V     0x0000560000000000ull      /* mirrors the kernel's window */
-#define THR_STK_STRIDE 0x8000ull
+#define THR_STK_STRIDE 0x8000ull                  /* 4 mapped + 4 guard pages    */
 typedef int pthread_t;
+
 struct pthr {
     void *(*fn)(void *);
     void *arg;
@@ -1529,15 +1705,88 @@ struct pthr {
 };
 static struct pthr g_pthr[PTHREAD_MAX];
 
-void pthread_body(struct pthr *t);                 /* called from the trampoline */
+/* ---- mutex ---------------------------------------------------------------
+ * Drepper's three-state mutex. 0 = free, 1 = held uncontended, 2 = held with
+ * waiters. The third state is the whole point: unlock only enters the kernel
+ * when it can SEE that somebody is parked, so an uncontended lock/unlock pair
+ * is two atomics and no syscall at all. */
+typedef struct { volatile u64 v; } pthread_mutex_t;
+
+static int pthread_mutex_init(pthread_mutex_t *m) { m->v = 0; __sync_synchronize(); return 0; }
+static int pthread_mutex_trylock(pthread_mutex_t *m) {
+    return __sync_bool_compare_and_swap(&m->v, 0, 1) ? 0 : -1;
+}
+static int pthread_mutex_lock(pthread_mutex_t *m) {
+    u64 c = __sync_val_compare_and_swap(&m->v, 0, 1);
+    if (c == 0) return 0;                          /* uncontended: no syscall  */
+    if (c != 2) c = __sync_lock_test_and_set(&m->v, 2);
+    while (c != 0) {
+        /* Sleep only while the word still reads 2. If unlock ran in between,
+         * the kernel's compare fails and we get -EAGAIN back immediately —
+         * that comparison is the reason a futex must be a syscall at all. */
+        sysc(SYS_FUTEX_WAIT, (u64)(void *)&m->v, 2, 4000);
+        c = __sync_lock_test_and_set(&m->v, 2);
+    }
+    return 0;
+}
+static int pthread_mutex_unlock(pthread_mutex_t *m) {
+    if (__sync_fetch_and_sub(&m->v, 1) != 1) {     /* was 2: someone is parked */
+        m->v = 0;
+        __sync_synchronize();
+        sysc(SYS_FUTEX_WAKE, (u64)(void *)&m->v, 1, 0);
+    }
+    return 0;
+}
+
+/* ---- condition variable --------------------------------------------------
+ * A sequence counter, and that is the entire state. The subtlety is the ORDER
+ * in pthread_cond_wait: the sequence is sampled while the mutex is STILL HELD,
+ * so any signaller that runs after we release it must have bumped the counter
+ * first — and the kernel's compare-and-sleep then declines to sleep and
+ * returns -EAGAIN. Sampling after the unlock instead would leave exactly the
+ * window where a signal can arrive with nobody yet asleep to receive it, which
+ * is the classic missed-wakeup and the reason a condvar cannot be built out of
+ * a plain sleep. */
+typedef struct { volatile u64 seq; } pthread_cond_t;
+
+static int pthread_cond_init(pthread_cond_t *c) { c->seq = 0; __sync_synchronize(); return 0; }
+static int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
+    u64 s = c->seq;                                /* sampled UNDER the mutex  */
+    pthread_mutex_unlock(m);
+    sysc(SYS_FUTEX_WAIT, (u64)(void *)&c->seq, s, 4000);
+    pthread_mutex_lock(m);                         /* POSIX: return holding it */
+    return 0;
+}
+static int pthread_cond_signal(pthread_cond_t *c) {
+    __sync_fetch_and_add(&c->seq, 1);
+    sysc(SYS_FUTEX_WAKE, (u64)(void *)&c->seq, 1, 0);
+    return 0;
+}
+static int pthread_cond_broadcast(pthread_cond_t *c) {
+    __sync_fetch_and_add(&c->seq, 1);
+    sysc(SYS_FUTEX_WAKE, (u64)(void *)&c->seq, 0, 0);   /* 0 = wake everyone */
+    return 0;
+}
+
+/* ---- thread lifecycle ----------------------------------------------------
+ * Threads are entered through RDI — the SysV first-argument register. v0.55
+ * had to use [rsp] because enter_user_thread set nothing but RIP and RSP; the
+ * kernel seeds a full register context now, so the ordinary calling
+ * convention is simply available. */
+void pthread_body(u64 i);                          /* called from the trampoline */
+void pthread_body(u64 i) {
+    if (i >= PTHREAD_MAX) return;
+    g_pthr[i].ret = g_pthr[i].fn(g_pthr[i].arg);
+    __sync_synchronize();
+    g_pthr[i].state = 2;
+}
 extern void pthread_tramp(void);
 __asm__(
     ".text\n"
     ".globl pthread_tramp\n"
     "pthread_tramp:\n"
-    "  mov (%rsp), %rdi\n"           /* the kernel put our struct pthr * here */
-    "  and $-16, %rsp\n"
-    "  call pthread_body\n"
+    "  and $-16, %rsp\n"             /* SysV: 16-byte aligned before the call  */
+    "  call pthread_body\n"          /* RDI already holds our slot index       */
     "  xor %edi, %edi\n"
     "  mov $53, %rax\n"              /* SYS_THREAD_EXIT(0) if the body returns */
     "  xor %esi, %esi\n"
@@ -1545,54 +1794,49 @@ __asm__(
     "  syscall\n"
     "1: jmp 1b\n"
 );
-void pthread_body(struct pthr *t) {
-    t->ret = t->fn(t->arg);
-    __sync_synchronize();
-    t->state = 2;
-}
 
-/* Which thread am I? Derived from the stack pointer: the kernel gives thread
- * slot N the stack window THR_USER_V + N*STRIDE, so the answer is arithmetic on
- * RSP — no TLS register and no kernel query needed. -1 means the process's
- * original (main) thread, whose stack is the ordinary one at USTK_V.         */
-static int pthread_self_slot(void) {
-    u64 sp;
-    __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
-    if (sp < THR_USER_V) return -1;
-    return (int)((sp - THR_USER_V) / THR_STK_STRIDE);
-}
-
-/* Slots are handed out monotonically and never recycled inside a process, so a
- * userland index always equals the kernel's stack-window index — which is what
- * makes pthread_self_slot() above valid. The two allocators are independent, so
- * we CHECK the agreement instead of assuming it: a mismatch fails the create
- * loudly rather than silently returning the wrong control block. */
 static volatile int g_pthr_n = 0;
+/* Slots are handed out monotonically and never recycled inside a process, so a
+ * userland index always equals the kernel's tid. The two allocators are
+ * independent, so their agreement is CHECKED rather than assumed: a mismatch
+ * would silently join the wrong thread. */
 static int pthread_create(pthread_t *out, void *(*fn)(void *), void *arg) {
     int i = __sync_fetch_and_add(&g_pthr_n, 1);
     if (i >= PTHREAD_MAX) { __sync_fetch_and_sub(&g_pthr_n, 1); return -11; }  /* EAGAIN */
     g_pthr[i].fn = fn; g_pthr[i].arg = arg; g_pthr[i].ret = 0; g_pthr[i].state = 1;
     __sync_synchronize();
-    i64 k = (i64)sysc(SYS_THREAD_CREATE, (u64)(void *)pthread_tramp, (u64)&g_pthr[i], 0);
-    if (k < 0)   { g_pthr[i].state = 0; __sync_fetch_and_sub(&g_pthr_n, 1); return (int)k; }
+    /* stack 0 = "kernel, give me one", which is also how the guard pages get
+     * arranged; a caller-supplied stack is the third argument and its guard is
+     * then the caller's business. */
+    i64 k = (i64)sysc(SYS_THREAD_CREATE, (u64)(void *)pthread_tramp, (u64)i, 0);
+    if (k < 0)   { g_pthr[i].state = 0; return (int)k; }
     if (k != i)  { g_pthr[i].state = 0; return -1; }   /* allocators desynced: refuse */
     if (out) *out = (pthread_t)i;
     return 0;
 }
+
+/* SYS_THREAD_JOIN answers -EAGAIN for "you slept, the state changed, ask
+ * again": a woken task resumes with only RAX to carry a result, and the waker
+ * is in another address space and cannot fill in our pointer. The loop is
+ * bounded so a join can FAIL rather than hang. */
 static int pthread_join(pthread_t t, void **ret) {
     if (t < 0 || t >= PTHREAD_MAX) return -1;
-    for (int spin = 0; spin < 200000; spin++) {
-        if (g_pthr[t].state >= 2) {
-            if (ret) *ret = g_pthr[t].ret;
-            g_pthr[t].state = 3;                  /* joined; the slot is NOT recycled */
-            return 0;
-        }
-        oyield();
+    u64 code = 0;
+    for (int k = 0; k < 20000; k++) {
+        i64 r = (i64)sysc(SYS_THREAD_JOIN, (u64)t, (u64)(void *)&code, 0);
+        if (r == EAGAIN_NEG) continue;
+        if (r != 0) return (int)r;
+        if (ret) *ret = g_pthr[t].ret;             /* the value, not the code */
+        g_pthr[t].state = 3;                       /* joined; slot NOT recycled */
+        return 0;
     }
-    return -11;                                   /* join timed out */
+    return ETIMEDOUT_NEG;
 }
+
+static pthread_t pthread_self(void) { return (pthread_t)sysc(SYS_GETTID, 0, 0, 0); }
+
 static void pthread_exit(void *ret) {
-    int i = pthread_self_slot();
+    int i = pthread_self();
     if (i >= 0 && i < PTHREAD_MAX) {
         g_pthr[i].ret = ret;
         __sync_synchronize();
@@ -1602,14 +1846,60 @@ static void pthread_exit(void *ret) {
     for (;;) { }
 }
 
-typedef struct { volatile int v; } pthread_mutex_t;
-static int pthread_mutex_init(pthread_mutex_t *m)    { m->v = 0; __sync_synchronize(); return 0; }
-static int pthread_mutex_trylock(pthread_mutex_t *m) { return __sync_bool_compare_and_swap(&m->v, 0, 1) ? 0 : -1; }
-static int pthread_mutex_lock(pthread_mutex_t *m) {
-    while (!__sync_bool_compare_and_swap(&m->v, 0, 1)) oyield();
-    return 0;
+/* ---- the low-level thread interface --------------------------------------
+ * pthread_create always asks the kernel for a stack, because that is what a
+ * portable program wants. This layer sits under it and exposes the third
+ * argument of SYS_THREAD_CREATE — a CALLER-SUPPLIED stack — which role 43
+ * exercises specifically to prove the kernel accepts one and does not reclaim
+ * memory it never mapped. Same trampoline shape, different argument passing:
+ * the body here takes and returns a u64, so the thread's exit CODE is its
+ * return value rather than a pointer parked in a table. */
+#define KTHR_MAX 8
+struct kthr { u64 (*fn)(u64); u64 arg; };
+static struct kthr g_kthr[KTHR_MAX];
+static volatile int g_kthr_n = 0;
+
+u64 kthr_body(u64 i);
+u64 kthr_body(u64 i) {
+    if (i >= KTHR_MAX) return 0;
+    return g_kthr[i].fn(g_kthr[i].arg);
 }
-static int pthread_mutex_unlock(pthread_mutex_t *m)   { __sync_synchronize(); m->v = 0; return 0; }
+extern void kthr_tramp(void);
+__asm__(
+    ".text\n"
+    ".globl kthr_tramp\n"
+    "kthr_tramp:\n"
+    "  and $-16, %rsp\n"
+    "  call kthr_body\n"
+    "  mov %rax, %rdi\n"             /* the body's return IS the exit code     */
+    "  mov $53, %rax\n"              /* SYS_THREAD_EXIT                        */
+    "  xor %esi, %esi\n"
+    "  xor %edx, %edx\n"
+    "  syscall\n"
+    "1: jmp 1b\n"
+);
+
+static int kthread_create(u64 (*fn)(u64), u64 arg, u64 stack_top) {
+    int i = __sync_fetch_and_add(&g_kthr_n, 1);
+    if (i >= KTHR_MAX) { __sync_fetch_and_sub(&g_kthr_n, 1); return EAGAIN_NEG; }
+    g_kthr[i].fn = fn; g_kthr[i].arg = arg;
+    __sync_synchronize();
+    return (int)(i64)sysc(SYS_THREAD_CREATE, (u64)(void *)kthr_tramp, (u64)i, stack_top);
+}
+static int kthread_join(int tid, u64 *code) {
+    for (int k = 0; k < 20000; k++) {
+        i64 r = (i64)sysc(SYS_THREAD_JOIN, (u64)tid, (u64)(void *)code, 0);
+        if (r == EAGAIN_NEG) continue;
+        return (int)r;
+    }
+    return ETIMEDOUT_NEG;
+}
+
+/* The bare-word futex mutex role 43 was written against. It is the SAME mutex
+ * pthread_mutex_t is — pthread_mutex_t is exactly one volatile u64 — so this
+ * is a cast and not a second implementation to keep in step. */
+static void fmutex_lock(volatile u64 *m)   { pthread_mutex_lock((pthread_mutex_t *)m); }
+static void fmutex_unlock(volatile u64 *m) { pthread_mutex_unlock((pthread_mutex_t *)m); }
 
 /* Load sentinels into callee-saved regs, cross the SYSCALL boundary, and check  */
 /* they survive — proving the kernel preserves (and does not leak into) them.    */
@@ -1784,6 +2074,950 @@ static void posix_thread_worker(void) {
     for (int i = 0; i < PW_THREADS; i++) if (!g_pw_ran[i]) sysc(SYS_EXIT, 904, 0, 0);
     if (g_pw_counter != (u64)PW_THREADS * PW_BUMPS)  sysc(SYS_EXIT, 903, 0, 0);
     sysc(SYS_EXIT, 900, 0, 0);
+}
+
+/* --- role 43: v0.61 threads — cross-core, futex-blocking, kernel join ------
+ *
+ * What separates this from role 31 is not "more threads": it is that these
+ * threads can SLEEP. Role 31's mutex spins through oyield(), so a contended
+ * lock keeps a core busy achieving nothing; here a waiter is parked in no run
+ * queue at all until the unlock that concerns it.
+ *
+ * Every assertion below is written so that the failure mode it guards against
+ * produces a WRONG ANSWER rather than a slow one — a counter that is short, a
+ * gate that was never observed, a wait that never expired. */
+#define TW_THREADS 4
+#define TW_BUMPS   150
+
+static volatile u64 g_tw_mutex   = 0;    /* the futex word: 0 free, 1 held, 2 contended */
+static volatile u64 g_tw_counter = 0;    /* guarded by g_tw_mutex                  */
+static volatile u64 g_tw_ran     = 0;    /* bit i = worker i executed              */
+static volatile u64 g_tw_gate    = 0;    /* futex word a thread parks on           */
+static volatile u64 g_tw_passed  = 0;    /* the gate thread's observation          */
+static volatile u64 g_tw_pid_bad = 0;    /* a thread saw a getpid() != the group's */
+static volatile u64 g_tw_pid     = 0;    /* the group's pid, sampled by main       */
+
+static u64 tw_body(u64 id) {
+    __sync_fetch_and_or(&g_tw_ran, 1ull << id);
+    /* POSIX: one pid per thread group, a distinct tid per thread. Both halves
+     * are checked, because reporting the slot's own pid from getpid() would
+     * make the answer depend on which thread asked. */
+    if (sysc(SYS_GETPID, 0, 0, 0) != g_tw_pid) g_tw_pid_bad = 1;
+    if (sysc(SYS_GETTID, 0, 0, 0) != id)       g_tw_pid_bad = 1;
+    for (int i = 0; i < TW_BUMPS; i++) {
+        fmutex_lock(&g_tw_mutex);
+        u64 v = g_tw_counter;
+        /* Read-modify-write ACROSS a reschedule. The point of the suite: if
+         * the critical section is not really exclusive, the final count comes
+         * out short and no amount of re-running hides it. */
+        if ((i & 15) == 0) oyield();
+        g_tw_counter = v + 1;
+        fmutex_unlock(&g_tw_mutex);
+    }
+    return 200 + id;
+}
+
+/* Parks until main opens the gate. This is the one that proves a wake actually
+ * reaches a SLEEPING thread — the mutex test alone could pass on a system
+ * where FUTEX_WAIT silently returned immediately every time. */
+static u64 tw_gate_body(u64 arg) {
+    (void)arg;
+    while (g_tw_gate == 0) sysc(SYS_FUTEX_WAIT, (u64)(void *)&g_tw_gate, 0, 6000);
+    g_tw_passed = 1;
+    __sync_synchronize();
+    return 300;
+}
+
+/* Runs on a stack this process allocated itself, not one the kernel handed
+ * out — the third argument to SYS_THREAD_CREATE. */
+static u64 tw_stack_body(u64 arg) {
+    u64 probe[16];
+    for (int i = 0; i < 16; i++) probe[i] = arg + i;   /* touch the caller's stack */
+    u64 s = 0;
+    for (int i = 0; i < 16; i++) s += probe[i];
+    return (s == arg * 16 + 120) ? arg + 1 : 0;
+}
+
+static void thread_stress_worker(void) {
+    g_tw_pid = sysc(SYS_GETPID, 0, 0, 0);
+    if (sysc(SYS_GETTID, 0, 0, 0) != 0) sysc(SYS_EXIT, 961, 0, 0);
+
+    int t[TW_THREADS];
+    for (int i = 0; i < TW_THREADS; i++) {
+        t[i] = kthread_create(tw_body, (u64)i, 0);
+        /* The kernel's tid allocator and the userland index allocator are
+         * independent, so their agreement is CHECKED rather than assumed —
+         * a mismatch would silently join the wrong thread. */
+        if (t[i] < 0 || t[i] != i) sysc(SYS_EXIT, 962, 0, 0);
+    }
+    for (int i = 0; i < TW_THREADS; i++) {
+        u64 code = 0;
+        if (kthread_join(t[i], &code) != 0) sysc(SYS_EXIT, 963, 0, 0);
+        if (code != (u64)(200 + i))         sysc(SYS_EXIT, 964, 0, 0);
+    }
+    if (g_tw_ran != ((1ull << TW_THREADS) - 1))          sysc(SYS_EXIT, 966, 0, 0);
+    if (g_tw_counter != (u64)TW_THREADS * TW_BUMPS)      sysc(SYS_EXIT, 965, 0, 0);
+    if (g_tw_pid_bad)                                    sysc(SYS_EXIT, 973, 0, 0);
+
+    /* A stack of our own. 16 KiB from the heap; the kernel must accept it,
+     * must NOT free it at thread exit, and the thread must actually run on it. */
+    u64 stk = (u64)omalloc(16384);
+    if (!stk) sysc(SYS_EXIT, 967, 0, 0);
+    u64 top = (stk + 16384) & ~15ull;
+    int ct = kthread_create(tw_stack_body, 0xC0DE, top);
+    if (ct < 0) sysc(SYS_EXIT, 967, 0, 0);
+    u64 sc = 0;
+    if (kthread_join(ct, &sc) != 0) sysc(SYS_EXIT, 968, 0, 0);
+    if (sc != 0xC0DE + 1)           sysc(SYS_EXIT, 968, 0, 0);
+
+    /* A wake that must reach a thread which is genuinely asleep. */
+    int gt = kthread_create(tw_gate_body, 0, 0);
+    if (gt < 0) sysc(SYS_EXIT, 969, 0, 0);
+    for (int i = 0; i < 300; i++) oyield();       /* let it get all the way parked */
+    if (g_tw_passed) sysc(SYS_EXIT, 970, 0, 0);   /* passed the gate before it opened */
+    g_tw_gate = 1;
+    __sync_synchronize();
+    sysc(SYS_FUTEX_WAKE, (u64)(void *)&g_tw_gate, 0, 0);   /* 0 = wake everyone */
+    u64 gc = 0;
+    if (kthread_join(gt, &gc) != 0)  sysc(SYS_EXIT, 970, 0, 0);
+    if (gc != 300 || !g_tw_passed)   sysc(SYS_EXIT, 970, 0, 0);
+
+    /* The two answers a futex must give WITHOUT sleeping forever. A kernel
+     * that got either of these wrong would hang the machine instead of
+     * failing a test, which is exactly why the timeout is not optional. */
+    {
+        static volatile u64 lonely = 7;
+        i64 r = (i64)sysc(SYS_FUTEX_WAIT, (u64)(void *)&lonely, 7, 400);
+        if (r != ETIMEDOUT_NEG) sysc(SYS_EXIT, 971, 0, 0);   /* nobody wakes it */
+        r = (i64)sysc(SYS_FUTEX_WAIT, (u64)(void *)&lonely, 8, 400);
+        if (r != EAGAIN_NEG)    sysc(SYS_EXIT, 972, 0, 0);   /* value mismatch  */
+    }
+    sysc(SYS_EXIT, 960, 0, 0);
+}
+
+/* --- role 44: pthreads_smp — mutex contention and a condition variable -----
+ *
+ * Role 43 (v0.61) proved threads RUN on every core. This one proves they can
+ * COORDINATE: a mutex whose critical section survives a reschedule, and a
+ * condition variable, which is the primitive you cannot build without the
+ * kernel closing the gap between "I released the lock" and "I am asleep".
+ *
+ * The condvar round is the interesting one. Workers block on a predicate that
+ * is false when they start, so every one of them MUST reach the wait; main
+ * then sets it and broadcasts. If cond_wait ever returned without the
+ * predicate holding, or a broadcast failed to reach a sleeper, the tally comes
+ * out wrong — it cannot come out right by luck. */
+#define PS_THREADS 4
+#define PS_BUMPS   200
+
+static pthread_mutex_t g_ps_mx;
+static pthread_cond_t  g_ps_cv;
+static volatile u64 g_ps_counter = 0;
+static volatile u64 g_ps_ready   = 0;   /* the predicate the condvar guards  */
+static volatile u64 g_ps_waiting = 0;   /* workers that reached the wait     */
+static volatile u64 g_ps_passed  = 0;   /* workers that got through it       */
+static volatile u64 g_ps_ran     = 0;   /* bit i = worker i executed         */
+static volatile u64 g_ps_tidbad  = 0;
+
+static void *ps_body(void *arg) {
+    int id = (int)(u64)arg;
+    __sync_fetch_and_or(&g_ps_ran, 1ull << id);
+    if (pthread_self() != id) g_ps_tidbad = 1;   /* tid must equal our index */
+
+    /* Phase 1: contend hard on the mutex, holding it across a reschedule. */
+    for (int i = 0; i < PS_BUMPS; i++) {
+        pthread_mutex_lock(&g_ps_mx);
+        u64 v = g_ps_counter;
+        if ((i & 15) == 0) oyield();
+        g_ps_counter = v + 1;
+        pthread_mutex_unlock(&g_ps_mx);
+    }
+
+    /* Phase 2: block on the condition variable until main says go. The loop
+     * around the wait is not decoration — a condvar may wake spuriously, and
+     * re-testing the predicate is the only correct way to use one. */
+    pthread_mutex_lock(&g_ps_mx);
+    __sync_fetch_and_add(&g_ps_waiting, 1);
+    /* The predicate is a COUNT, not a flag, and that is what makes the
+     * signal-versus-broadcast distinction testable: one permit must release
+     * exactly one waiter, however many are asleep. */
+    while (g_ps_ready == 0) pthread_cond_wait(&g_ps_cv, &g_ps_mx);
+    g_ps_ready = g_ps_ready - 1;                 /* consume one permit         */
+    __sync_fetch_and_add(&g_ps_passed, 1);
+    pthread_mutex_unlock(&g_ps_mx);              /* cond_wait returns holding it */
+    return (void *)(u64)(500 + id);
+}
+
+static void pthreads_smp_worker(void) {
+    pthread_mutex_init(&g_ps_mx);
+    pthread_cond_init(&g_ps_cv);
+    if (pthread_mutex_trylock(&g_ps_mx) != 0) sysc(SYS_EXIT, 941, 0, 0);
+    if (pthread_mutex_trylock(&g_ps_mx) == 0) sysc(SYS_EXIT, 941, 0, 0);
+    pthread_mutex_unlock(&g_ps_mx);
+
+    pthread_t t[PS_THREADS];
+    for (int i = 0; i < PS_THREADS; i++)
+        if (pthread_create(&t[i], ps_body, (void *)(u64)i) != 0) sysc(SYS_EXIT, 942, 0, 0);
+
+    /* Wait until every worker is actually parked on the condvar. If we
+     * broadcast before they arrive the test proves nothing — they would find
+     * the predicate already true and never exercise the wait at all. */
+    for (int i = 0; i < 200000 && g_ps_waiting < PS_THREADS; i++) oyield();
+    if (g_ps_waiting != PS_THREADS) sysc(SYS_EXIT, 943, 0, 0);
+    if (g_ps_passed  != 0)          sysc(SYS_EXIT, 944, 0, 0);   /* woke early */
+
+    /* ONE permit, released with cond_signal: exactly one worker may get through,
+     * and the other three must still be asleep afterwards. A signal that
+     * behaved like a broadcast would show up here as too many passing. */
+    pthread_mutex_lock(&g_ps_mx);
+    g_ps_ready = 1;
+    pthread_mutex_unlock(&g_ps_mx);
+    pthread_cond_signal(&g_ps_cv);
+    for (int i = 0; i < 200000 && g_ps_passed < 1; i++) oyield();
+    if (g_ps_passed != 1) sysc(SYS_EXIT, 938, 0, 0);   /* woke the wrong number */
+
+    /* The remaining three, released together. */
+    pthread_mutex_lock(&g_ps_mx);
+    g_ps_ready = PS_THREADS - 1;
+    pthread_mutex_unlock(&g_ps_mx);
+    pthread_cond_broadcast(&g_ps_cv);
+
+    for (int i = 0; i < PS_THREADS; i++) {
+        void *r = 0;
+        if (pthread_join(t[i], &r) != 0)      sysc(SYS_EXIT, 945, 0, 0);
+        if ((u64)r != (u64)(500 + i))         sysc(SYS_EXIT, 946, 0, 0);
+    }
+    if (g_ps_ran != ((1ull << PS_THREADS) - 1))          sysc(SYS_EXIT, 947, 0, 0);
+    if (g_ps_counter != (u64)PS_THREADS * PS_BUMPS)      sysc(SYS_EXIT, 948, 0, 0);
+    if (g_ps_passed  != PS_THREADS)                      sysc(SYS_EXIT, 949, 0, 0);
+    if (g_ps_tidbad)                                     sysc(SYS_EXIT, 939, 0, 0);
+    sysc(SYS_EXIT, 940, 0, 0);
+}
+
+/* --- role 45: sigstrs — masks, dispositions, and process groups ------------
+ *
+ * Role 30 (v0.55) covers handler execution, frames and SIGSEGV/SIGALRM. This
+ * suite covers what v0.62 adds and what role 30 cannot reach: sigprocmask's
+ * three modes, SIG_IGN, and process-group delivery — the mechanism that makes
+ * an interrupt reach a job and not the shell waiting on it. */
+static volatile int g_sg_hits = 0;
+static volatile int g_sg_last = 0;
+static void sg_handler(int s) { g_sg_last = s; __sync_fetch_and_add(&g_sg_hits, 1); }
+
+static void sig_stress_worker(void) {
+    /* (1) A handler runs, and SYS_SIGRETURN puts the interrupted context back.
+     * `witness` is a local: if the frame were restored wrongly it is the first
+     * thing that would come back as garbage. */
+    volatile int witness = 0x5EED;
+    osigaction(SIGTERM, sg_handler);
+    okill(ogetpid(), SIGTERM);
+    for (int i = 0; i < 40000 && g_sg_hits < 1; i++) oyield();
+    if (g_sg_hits != 1)          sysc(SYS_EXIT, 951, 0, 0);
+    if (g_sg_last != SIGTERM)    sysc(SYS_EXIT, 952, 0, 0);
+    if (witness != 0x5EED)       sysc(SYS_EXIT, 953, 0, 0);
+
+    /* (2) A blocked signal is HELD, not lost: unblocking must deliver it. */
+    sysc(SYS_SIGPROCMASK, 0, 1ull << SIGTERM, 0);          /* block */
+    int before = g_sg_hits;
+    okill(ogetpid(), SIGTERM);
+    for (int i = 0; i < 3000; i++) oyield();
+    if (g_sg_hits != before)     sysc(SYS_EXIT, 954, 0, 0);   /* leaked past the mask */
+    sysc(SYS_SIGPROCMASK, 1, 1ull << SIGTERM, 0);          /* unblock */
+    for (int i = 0; i < 40000 && g_sg_hits == before; i++) oyield();
+    if (g_sg_hits != before + 1) sysc(SYS_EXIT, 955, 0, 0);   /* dropped, not held */
+
+    /* (3) SETMASK replaces rather than merges, and returns the old mask. */
+    u64 prev = sysc(SYS_SIGPROCMASK, 2, 1ull << SIGTERM, 0);
+    u64 now  = sysc(SYS_SIGPROCMASK, 2, 0, 0);             /* clear, read back */
+    if (now != (1ull << SIGTERM)) sysc(SYS_EXIT, 956, 0, 0);
+    (void)prev;
+
+    /* (4) SIG_IGN discards outright — no handler call, no pending residue. */
+    osigaction(SIGTERM, 0);                                 /* SIG_DFL first   */
+    sysc(SYS_SIGACTION, SIGTERM, 1, 0);                     /* now SIG_IGN     */
+    before = g_sg_hits;
+    okill(ogetpid(), SIGTERM);
+    for (int i = 0; i < 3000; i++) oyield();
+    if (g_sg_hits != before)     sysc(SYS_EXIT, 957, 0, 0);
+    osigaction(SIGTERM, sg_handler);                        /* restore         */
+
+    /* (5) PROCESS GROUPS. Two children in one group, signalled as a unit with
+     * one call. They carry the DEFAULT disposition for SIGINT — terminate — so
+     * their exit codes prove delivery reached them and not merely the group. */
+    u32 kid[2];
+    for (int i = 0; i < 2; i++) {
+        i64 f = ofork();
+        if (f < 0) sysc(SYS_EXIT, 958, 0, 0);
+        if (f == 0) {
+            sysc(SYS_SIGACTION, SIGINT, 0, 0);              /* SIG_DFL: terminate */
+            sysc(SYS_SIGPROCMASK, 2, 0, 0);                 /* nothing blocked    */
+            for (int k = 0; k < 400000; k++) oyield();      /* wait to be killed  */
+            sysc(SYS_EXIT, 199, 0, 0);                      /* never signalled    */
+        }
+        kid[i] = (u32)f;
+    }
+    /* Both children into ONE group named after the first. */
+    int job = (int)kid[0];
+    for (int i = 0; i < 2; i++)
+        if (sysc(SYS_SETPGID, kid[i], (u64)job, 0) != 0) sysc(SYS_EXIT, 959, 0, 0);
+    i64 hit = (i64)sysc(SYS_KILLPG, (u64)job, SIGINT, 0);
+    if (hit != 2) sysc(SYS_EXIT, 960, 0, 0);                /* one call, both got it */
+    for (int i = 0; i < 2; i++) {
+        i64 st = owaitpid(kid[i], 400000);
+        if (st != 128 + SIGINT) sysc(SYS_EXIT, 961, 0, 0);  /* default action ran */
+    }
+    sysc(SYS_EXIT, 950, 0, 0);
+}
+
+/* --- role 46: mmapstrs — demand paging, protection, and release ------------
+ *
+ * The interesting assertion is the one about frames: a 1 MiB mapping that is
+ * never touched must cost NOTHING. That is checked from the kernel side, where
+ * the allocator's counters can see it; here the driver's job is to touch a
+ * known number of pages so the kernel has an exact number to expect. */
+#define MM_BIG (1024u * 1024u)                 /* 256 pages */
+#define MM_TOUCH 8                             /* ...of which we touch 8       */
+
+static struct ojmp g_mm_jb;
+static volatile int g_mm_segv = 0;
+static void mm_on_segv(int s) { (void)s; __sync_fetch_and_add(&g_mm_segv, 1); olongjmp(&g_mm_jb, 1); }
+
+static void mmap_stress_worker(void) {
+    /* (1) A large anonymous mapping succeeds and reads back as ZERO. Demand
+     * paging must not hand out a frame with somebody else's data in it. */
+    u64 a = sysc(SYS_MMAP, MM_BIG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (a == MAP_FAILED || (i64)a < 0) sysc(SYS_EXIT, 981, 0, 0);
+    if (a & 0xFFF)                     sysc(SYS_EXIT, 982, 0, 0);   /* not page aligned */
+    volatile u64 *p = (volatile u64 *)a;
+    for (int i = 0; i < MM_TOUCH; i++) if (p[i * 512] != 0) sysc(SYS_EXIT, 983, 0, 0);
+
+    /* (2) Write to exactly MM_TOUCH pages, then read them back. */
+    for (int i = 0; i < MM_TOUCH; i++) p[i * 512] = 0xA5A50000ull + i;
+    for (int i = 0; i < MM_TOUCH; i++)
+        if (p[i * 512] != 0xA5A50000ull + (u64)i) sysc(SYS_EXIT, 984, 0, 0);
+
+    /* (3) W^X is refused at the source, not discovered later. */
+    u64 wx = sysc(SYS_MMAP, 0x1000, PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (wx != MAP_FAILED && (i64)wx >= 0) sysc(SYS_EXIT, 985, 0, 0);
+
+    /* (4) mprotect to read-only, then a write must raise SIGSEGV — and the
+     * handler must be able to recover, which is what makes this a protection
+     * test rather than a crash test. */
+    u64 ro = sysc(SYS_MMAP, 0x2000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (ro == MAP_FAILED || (i64)ro < 0) sysc(SYS_EXIT, 986, 0, 0);
+    volatile u64 *rp = (volatile u64 *)ro;
+    rp[0] = 0x1234;                                        /* fault it in, writable */
+    if (sysc(SYS_MPROTECT, ro, 0x2000, PROT_READ) != 0) sysc(SYS_EXIT, 987, 0, 0);
+    if (rp[0] != 0x1234) sysc(SYS_EXIT, 988, 0, 0);        /* still readable        */
+    osigaction(SIGSEGV, mm_on_segv);
+    if (osetjmp(&g_mm_jb) == 0) {
+        rp[0] = 0xDEAD;                                    /* -> SIGSEGV            */
+        sysc(SYS_EXIT, 989, 0, 0);                         /* write to RO succeeded */
+    }
+    if (g_mm_segv != 1) sysc(SYS_EXIT, 990, 0, 0);
+    /* (5) ...and mprotect back to writable makes it work again. */
+    if (sysc(SYS_MPROTECT, ro, 0x2000, PROT_READ | PROT_WRITE) != 0) sysc(SYS_EXIT, 991, 0, 0);
+    rp[0] = 0xBEEF;
+    if (rp[0] != 0xBEEF) sysc(SYS_EXIT, 992, 0, 0);
+
+    /* (6) Release both. The kernel checks the frames actually came back. */
+    if (sysc(SYS_MUNMAP, a, MM_BIG, 0) != 0)   sysc(SYS_EXIT, 993, 0, 0);
+    if (sysc(SYS_MUNMAP, ro, 0x2000, 0) != 0)  sysc(SYS_EXIT, 994, 0, 0);
+
+    /* (7) malloc over the threshold must route through mmap, and free it. */
+    void *big = omalloc(OMMAP_MIN + 4096);
+    if (!big) sysc(SYS_EXIT, 995, 0, 0);
+    volatile u8 *bp = (volatile u8 *)big;
+    bp[0] = 7; bp[OMMAP_MIN] = 9;
+    if (bp[0] != 7 || bp[OMMAP_MIN] != 9) sysc(SYS_EXIT, 996, 0, 0);
+    ofree(big);
+    sysc(SYS_EXIT, 980, 0, 0);
+}
+
+/* --- role 47: shmstrs — zero copy between processes, and COW --------------- */
+#define SH_BYTES 8192
+
+static void shm_stress_worker(void) {
+    /* (1) COW: a value written BEFORE the fork is visible to the child; a value
+     * written by the child afterwards must NOT be visible to the parent. That
+     * second half is what proves the copy actually happened on write — a
+     * broken COW that simply shared the page would let the child's store
+     * through. */
+    static volatile u64 cow_probe = 0;
+    cow_probe = 0x1111;
+    i64 f = ofork();
+    if (f < 0) sysc(SYS_EXIT, 971, 0, 0);
+    if (f == 0) {
+        if (cow_probe != 0x1111) sysc(SYS_EXIT, 101, 0, 0);   /* pre-fork value lost */
+        cow_probe = 0x2222;                                   /* private from here on */
+        if (cow_probe != 0x2222) sysc(SYS_EXIT, 102, 0, 0);
+        sysc(SYS_EXIT, 100, 0, 0);
+    }
+    i64 st = owaitpid((u32)f, 400000);
+    if (st != 100)          sysc(SYS_EXIT, 972, 0, 0);
+    if (cow_probe != 0x1111) sysc(SYS_EXIT, 973, 0, 0);        /* child leaked through */
+
+    /* (2) Zero-copy shared memory between two distinct processes. */
+    i64 id = (i64)sysc(SYS_SHM_CREATE, SH_BYTES, 0, 0);
+    if (id < 0) sysc(SYS_EXIT, 974, 0, 0);
+    u64 base = sysc(SYS_SHM_MAP, (u64)id, 1, 0);
+    if ((i64)base < 0) sysc(SYS_EXIT, 975, 0, 0);
+    volatile u64 *sp = (volatile u64 *)base;
+    for (int i = 0; i < 8; i++) if (sp[i] != 0) sysc(SYS_EXIT, 976, 0, 0);  /* zeroed */
+    sp[0] = 0xC0FFEE;
+
+    i64 g = ofork();
+    if (g < 0) sysc(SYS_EXIT, 977, 0, 0);
+    if (g == 0) {
+        /* The child maps the SAME segment by id. It is not inherited — an
+         * attachment is explicit — so this is a genuine second mapper. */
+        u64 cb = sysc(SYS_SHM_MAP, (u64)id, 1, 0);
+        if ((i64)cb < 0) sysc(SYS_EXIT, 111, 0, 0);
+        volatile u64 *cp = (volatile u64 *)cb;
+        if (cp[0] != 0xC0FFEE) sysc(SYS_EXIT, 112, 0, 0);     /* parent's write unseen */
+        cp[1] = 0xBEEFBEEF;                                    /* reply, zero copy     */
+        sysc(SYS_EXIT, 110, 0, 0);
+    }
+    st = owaitpid((u32)g, 400000);
+    if (st != 110)            sysc(SYS_EXIT, 978, 0, 0);
+    if (sp[1] != 0xBEEFBEEF)  sysc(SYS_EXIT, 979, 0, 0);      /* child's write unseen */
+    sysc(SYS_EXIT, 970, 0, 0);
+}
+
+/* --- role 51: tcpstrs — a real stream, not a datagram in a stream's clothes --
+ *
+ * Everything is loopback and everything is deterministic. The assertions are
+ * written so that a stack which merely COPIED bytes between two sockets would
+ * fail them: byte-stream framing is checked across a payload larger than one
+ * segment, ordering is checked by content rather than by arrival, and
+ * end-of-stream is checked as a distinct answer from "nothing yet". */
+#define TCP_PORT_BASE 7000
+
+static void tcp_stress_worker(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    u16 sport = (u16)(TCP_PORT_BASE + (pid & 0x1FF));
+
+    /* (1) A listener. */
+    int ls = (int)(i64)sysc(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+    if (ls < 0) sysc(SYS_EXIT, 1601, 0, 0);
+    if ((i64)sysc(SYS_BIND, (u64)ls, (u64)sport, 0) != 0) sysc(SYS_EXIT, 1602, 0, 0);
+    if (olisten(ls, 4) != 0) sysc(SYS_EXIT, 1603, 0, 0);
+
+    /* An idle listener has nothing to accept and says so at once. */
+    u32 peer[2];
+    if (oaccept(ls, peer, 0) != -11) sysc(SYS_EXIT, 1604, 0, 0);
+
+    /* (2) THE HANDSHAKE. connect() on a stream is the one call that genuinely
+     * exchanges something before it can return. */
+    int cl = (int)(i64)sysc(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+    if (cl < 0) sysc(SYS_EXIT, 1605, 0, 0);
+    if ((i64)sysc(SYS_CONNECT, (u64)cl, IP_LOOPBACK, (u64)sport) != 0) sysc(SYS_EXIT, 1606, 0, 0);
+
+    /* The connection is ESTABLISHED before accept, not by it. */
+    int sv = oaccept(ls, peer, 0);
+    if (sv < 0) sysc(SYS_EXIT, 1607, 0, 0);
+    if (peer[0] != (u32)IP_LOOPBACK) sysc(SYS_EXIT, 1608, 0, 0);
+
+    /* (3) BYTE STREAM, not message boundaries. 1500 bytes is three segments at
+     * a 512-byte MSS, so a stack that preserved message framing — or that lost
+     * anything at a segment boundary — produces the wrong bytes here. */
+    static u8 big[1500], got[1500];
+    for (int i = 0; i < 1500; i++) big[i] = (u8)((i * 31 + 7) & 0xFF);
+    int sent = 0;
+    while (sent < 1500) {
+        i64 n = (i64)sysc(SYS_SEND, (u64)cl, (u64)(void *)(big + sent), (u64)(1500 - sent));
+        if (n == -11) { oyield(); continue; }        /* send buffer full: legal */
+        if (n <= 0) sysc(SYS_EXIT, 1609, 0, 0);
+        sent += (int)n;
+    }
+    int rcv = 0;
+    for (int guard = 0; guard < 20000 && rcv < 1500; guard++) {
+        i64 n = (i64)sysc(SYS_RECV, (u64)sv, (u64)(void *)(got + rcv), (u64)(1500 - rcv));
+        if (n == -11 || n == 0) { oyield(); continue; }
+        if (n < 0) sysc(SYS_EXIT, 1610, 0, 0);
+        rcv += (int)n;
+    }
+    if (rcv != 1500) sysc(SYS_EXIT, 1611, 0, 0);
+    for (int i = 0; i < 1500; i++) if (got[i] != big[i]) sysc(SYS_EXIT, 1612, 0, 0);
+
+    /* (4) BIDIRECTIONAL. The server answers on the same connection. */
+    u8 rep[16]; for (int i = 0; i < 16; i++) rep[i] = (u8)(0x40 + i);
+    if ((i64)sysc(SYS_SEND, (u64)sv, (u64)(void *)rep, 16) != 16) sysc(SYS_EXIT, 1613, 0, 0);
+    u8 cb[16]; int cr = 0;
+    for (int guard = 0; guard < 20000 && cr < 16; guard++) {
+        i64 n = (i64)sysc(SYS_RECV, (u64)cl, (u64)(void *)(cb + cr), (u64)(16 - cr));
+        if (n == -11 || n == 0) { oyield(); continue; }
+        if (n < 0) sysc(SYS_EXIT, 1614, 0, 0);
+        cr += (int)n;
+    }
+    if (cr != 16) sysc(SYS_EXIT, 1615, 0, 0);
+    for (int i = 0; i < 16; i++) if (cb[i] != rep[i]) sysc(SYS_EXIT, 1616, 0, 0);
+
+    /* (5) epoll over a stream: readable on data, writable when it can send. */
+    int ep = oepoll_create();
+    if (ep < 0) sysc(SYS_EXIT, 1617, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, sv, EPOLLIN | EPOLLOUT, 0x71) != 0) sysc(SYS_EXIT, 1618, 0, 0);
+    struct epoll_event evs[4];
+    int n2 = oepoll_wait(ep, evs, 4, 0);
+    if (n2 != 1 || !(evs[0].events & EPOLLOUT)) sysc(SYS_EXIT, 1619, 0, 0);  /* established = writable */
+    if (evs[0].events & EPOLLIN)                sysc(SYS_EXIT, 1620, 0, 0);  /* drained  = not readable */
+    if ((i64)sysc(SYS_SEND, (u64)cl, (u64)(void *)rep, 4) != 4) sysc(SYS_EXIT, 1621, 0, 0);
+    for (int guard = 0; guard < 20000; guard++) {
+        n2 = oepoll_wait(ep, evs, 4, 0);
+        if (n2 == 1 && (evs[0].events & EPOLLIN)) break;
+        oyield();
+    }
+    if (!(evs[0].events & EPOLLIN)) sysc(SYS_EXIT, 1622, 0, 0);
+    sysc(SYS_RECV, (u64)sv, (u64)(void *)cb, 4);
+
+    /* (6) ORDERLY CLOSE. Closing the client sends FIN; the server must read
+     * END OF STREAM — 0, distinct from EAGAIN — rather than waiting forever. */
+    sysc(SYS_CLOSE, (u64)cl, 0, 0);
+    int saw_eof = 0;
+    for (int guard = 0; guard < 20000; guard++) {
+        i64 n = (i64)sysc(SYS_RECV, (u64)sv, (u64)(void *)cb, 16);
+        if (n == 0) { saw_eof = 1; break; }
+        if (n == -11) { oyield(); continue; }
+        if (n < 0) break;
+    }
+    if (!saw_eof) sysc(SYS_EXIT, 1623, 0, 0);
+    /* And epoll must report the hang-up, not merely stop reporting readable. */
+    for (int guard = 0; guard < 2000; guard++) {
+        n2 = oepoll_wait(ep, evs, 4, 0);
+        if (n2 == 1 && (evs[0].events & EPOLLHUP)) break;
+        oyield();
+    }
+    if (!(evs[0].events & EPOLLHUP)) sysc(SYS_EXIT, 1624, 0, 0);
+
+    /* (7) THE WIRE. One non-blocking connect to an address that is NOT
+     * loopback, which forces tcp_output down the real encoder and onto the
+     * real NIC. Deliberately NOT gated on a reply: whether the SLIRP gateway
+     * answers is QEMU's business, and testing it would be testing QEMU. What
+     * is asserted, in the kernel half, is that a frame was genuinely built and
+     * transmitted — otherwise the encoder is verified only against itself. */
+    int ws = (int)(i64)sysc(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (ws >= 0) {
+        sysc(SYS_CONNECT, (u64)ws, 0x0A000202ull, 80);   /* 10.0.2.2:80, the gateway */
+        sysc(SYS_CLOSE, (u64)ws, 0, 0);
+    }
+
+    sysc(SYS_CLOSE, (u64)sv, 0, 0);
+    sysc(SYS_CLOSE, (u64)ls, 0, 0);
+    sysc(SYS_CLOSE, (u64)ep, 0, 0);
+    sysc(SYS_EXIT, 1600, 0, 0);
+}
+
+/* --- role 50: mmapfilestrs — memory that IS a file --------------------------
+ *
+ * The fixture 'm66dat' is created by the kernel half, deliberately: a suite
+ * that corrupts a shared file is exactly the hazard v0.65 spent a milestone
+ * chasing, so this one owns its own file and touches nothing else.
+ *
+ * Byte i of the file is (i*7+3)&0xFF, which is not constant within a page and
+ * not equal across pages — so a mapping that returned zeroes, or returned page
+ * 0 for every page, fails rather than accidentally passing. */
+#define M66_PAGES 4
+#define M66_LEN   (M66_PAGES * 4096)
+static u8 m66_expect(u64 i) { return (u8)((i * 7 + 3) & 0xFF); }
+
+static void mmapfile_stress_worker(void) {
+    int uf = oopen("m66dat");
+    if (uf < 0) sysc(SYS_EXIT, 1501, 0, 0);
+    int kf = okfd(uf);
+    if (kf < 0) sysc(SYS_EXIT, 1502, 0, 0);
+
+    /* (1) MAP_PRIVATE, read-only. The bytes must be the FILE's bytes — and the
+     * check reaches into page 3, which only demand paging at a nonzero offset
+     * can satisfy. */
+    u64 pa = ommap_file(kf, M66_LEN, PROT_READ, MAP_PRIVATE, 0);
+    if (pa == MAP_FAILED || (i64)pa < 0) sysc(SYS_EXIT, 1503, 0, 0);
+    volatile u8 *pp = (volatile u8 *)pa;
+    for (u64 i = 0; i < 64; i++)        if (pp[i] != m66_expect(i))        sysc(SYS_EXIT, 1504, 0, 0);
+    for (u64 i = 0; i < 64; i++)        if (pp[4096 + i] != m66_expect(4096 + i)) sysc(SYS_EXIT, 1505, 0, 0);
+    for (u64 i = 0; i < 64; i++)        if (pp[3 * 4096 + i] != m66_expect(3 * 4096 + i)) sysc(SYS_EXIT, 1506, 0, 0);
+
+    /* (2) A PRIVATE mapping is a copy: writing it must not reach the file. */
+    u64 pw = ommap_file(kf, M66_LEN, PROT_READ | PROT_WRITE, MAP_PRIVATE, 0);
+    if (pw == MAP_FAILED || (i64)pw < 0) sysc(SYS_EXIT, 1507, 0, 0);
+    volatile u8 *wp = (volatile u8 *)pw;
+    if (wp[0] != m66_expect(0)) sysc(SYS_EXIT, 1508, 0, 0);
+    wp[0] = 0xEE; wp[1] = 0xFF;
+    if (wp[0] != 0xEE)          sysc(SYS_EXIT, 1509, 0, 0);
+    if (omsync(pw, M66_LEN, 0) != 0) sysc(SYS_EXIT, 1510, 0, 0);   /* legal, and a no-op */
+    u8 chk[8];
+    if (oread(uf, (char *)chk, 8) != 8) sysc(SYS_EXIT, 1511, 0, 0);
+    if (chk[0] != m66_expect(0))        sysc(SYS_EXIT, 1512, 0, 0); /* PRIVATE leaked to the file */
+
+    /* (3) MAP_SHARED, writable: the write must reach the file, and only after
+     * it is asked to. */
+    u64 sa = ommap_file(kf, M66_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, 0);
+    if (sa == MAP_FAILED || (i64)sa < 0) sysc(SYS_EXIT, 1513, 0, 0);
+    volatile u8 *sp = (volatile u8 *)sa;
+    if (sp[0] != m66_expect(0)) sysc(SYS_EXIT, 1514, 0, 0);
+    sp[0] = 0xA1; sp[1] = 0xA2; sp[4096] = 0xB1;      /* two different pages */
+    if (sp[0] != 0xA1 || sp[4096] != 0xB1) sysc(SYS_EXIT, 1515, 0, 0);
+    if (omsync(sa, M66_LEN, 0) != 0) sysc(SYS_EXIT, 1516, 0, 0);
+
+    /* Re-read through the ORDINARY file path: writeback is only real if a
+     * reader that never mapped anything can see it. */
+    int uf2 = oopen("m66dat");
+    if (uf2 < 0) sysc(SYS_EXIT, 1517, 0, 0);
+    u8 rb[8];
+    if (oread(uf2, (char *)rb, 8) != 8) sysc(SYS_EXIT, 1518, 0, 0);
+    if (rb[0] != 0xA1 || rb[1] != 0xA2) sysc(SYS_EXIT, 1519, 0, 0);
+    oclose(uf2);
+
+    /* (4) CROSS-PROCESS SHARING. The child writes through its own mapping of
+     * the same file; the parent must see it through memory it mapped BEFORE
+     * the fork, with no syscall in between. That can only happen if both
+     * resolve to one frame — which is the entire content of MAP_SHARED and the
+     * thing a private-copy implementation fails. */
+    i64 r = ofork();
+    if (r == 0) {
+        /* The child maps the file ITSELF rather than reusing the inherited
+         * range. That is the real test: a second, independent mapping of the
+         * same file must resolve to the SAME frames, which only a page cache
+         * can arrange — an inherited mapping would agree even if every mapper
+         * got a private copy, because it agrees by descent rather than by
+         * sharing. */
+        u64 ca = ommap_file(kf, M66_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, 0);
+        if (ca == MAP_FAILED || (i64)ca < 0) sysc(SYS_EXIT, 62, 0, 0);
+        volatile u8 *cm = (volatile u8 *)ca;
+        if (cm[0] != 0xA1) sysc(SYS_EXIT, 61, 0, 0);   /* not the parent's page */
+        cm[2] = 0xC3;
+        sysc(SYS_EXIT, 60, 0, 0);
+    }
+    if (r < 0) sysc(SYS_EXIT, 1520, 0, 0);
+    if (owaitpid((u32)r, 400000) != 60) sysc(SYS_EXIT, 1521, 0, 0);
+    if (sp[2] != 0xC3)                  sysc(SYS_EXIT, 1522, 0, 0);  /* NOT shared */
+
+    /* (5) Unmapping a shared writable mapping flushes it — a process that
+     * forgets msync must not lose its writes. */
+    if ((i64)sysc(SYS_MUNMAP, sa, M66_LEN, 0) != 0) sysc(SYS_EXIT, 1523, 0, 0);
+    int uf3 = oopen("m66dat");
+    if (uf3 < 0) sysc(SYS_EXIT, 1524, 0, 0);
+    if (oread(uf3, (char *)rb, 8) != 8) sysc(SYS_EXIT, 1525, 0, 0);
+    if (rb[2] != 0xC3)                  sysc(SYS_EXIT, 1526, 0, 0);  /* child's write lost */
+    oclose(uf3);
+
+    /* (6) Refusals that must stay refusals. */
+    if ((i64)ommap_file(kf, M66_LEN, PROT_WRITE | PROT_EXEC, MAP_SHARED, 0) >= 0)
+        sysc(SYS_EXIT, 1527, 0, 0);                                  /* W^X */
+    if ((i64)ommap_file(kf, M66_LEN, PROT_READ, MAP_SHARED, 0x800) >= 0)
+        sysc(SYS_EXIT, 1528, 0, 0);                                  /* unaligned offset */
+    if ((i64)ommap_file(99, M66_LEN, PROT_READ, MAP_SHARED, 0) >= 0)
+        sysc(SYS_EXIT, 1529, 0, 0);                                  /* EBADF */
+
+    /* (7) The v0.66 catch-all patch, checked from ring 3: an epoll descriptor
+     * is not a byte stream and read() must say so rather than hand back
+     * device bytes. */
+    int ep = oepoll_create();
+    if (ep < 0) sysc(SYS_EXIT, 1530, 0, 0);
+    if ((i64)sysc(SYS_READ, (u64)ep, (u64)(void *)rb, 8) != -22) sysc(SYS_EXIT, 1531, 0, 0);
+    if ((i64)sysc(SYS_WRITE_FILE, (u64)ep, (u64)(void *)rb, 8) != -22) sysc(SYS_EXIT, 1532, 0, 0);
+    sysc(SYS_CLOSE, (u64)ep, 0, 0);
+
+    sysc(SYS_MUNMAP, pa, M66_LEN, 0);
+    sysc(SYS_MUNMAP, pw, M66_LEN, 0);
+    oclose(uf);
+    sysc(SYS_EXIT, 1500, 0, 0);
+}
+
+/* --- role 49: netepollstrs — sockets as descriptors, and epoll over them ---
+ *
+ * Everything here is loopback, deliberately. The socket layer's loopback path
+ * is synchronous, so an assertion that fails does so because the MECHANISM is
+ * wrong, not because SLIRP was slow — the same discipline v0.52 used for
+ * netstrs and v0.51 for audio. A round trip through QEMU's NAT would test
+ * QEMU's timing, not this kernel's readiness model.
+ *
+ * "Connection" here means a datagram SESSION: a peer (addr,port) a listener
+ * has heard from. There is no TCP in this system, so there is no handshake to
+ * perform and none is faked. What is real is everything the milestone is
+ * actually about — a descriptor that becomes readable when a peer arrives, an
+ * accept that answers EAGAIN when none has, and a wait that is WOKEN by the
+ * arrival instead of polling for it. */
+static u32 g_nep_srv_port, g_nep_cli_port;
+static int g_nep_cli_fd;
+
+/* Posts to the server from a second thread, late enough that the main thread
+ * has reached its park. Same shape as v0.64's ew_poster and for the same
+ * reason: only the kernel can tell a park from a spin, so the driver has to
+ * actually be asleep when the datagram lands. */
+static u64 nep_poster(u64 arg) {
+    (void)arg;
+    for (int i = 0; i < 600; i++) oyield();
+    u8 msg[8]; for (int i = 0; i < 8; i++) msg[i] = (u8)(0xA0 + i);
+    sysc(SYS_SEND, (u64)g_nep_cli_fd, (u64)(void *)msg, 8);
+    return 777;
+}
+
+static void netepoll_stress_worker(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    g_nep_srv_port = (u32)(5000 + (pid & 0x1FF));
+    g_nep_cli_port = g_nep_srv_port + 512;
+
+    /* (1) A NON-BLOCKING socket answers EAGAIN rather than waiting. This is
+     * the assertion the whole milestone rests on: before it, an empty socket
+     * burned 2000 ticks before admitting it had nothing. */
+    int sv = (int)(i64)sysc(SYS_SOCKET, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (sv < 0) sysc(SYS_EXIT, 1401, 0, 0);
+    u8 rb[64];
+    if ((i64)sysc(SYS_RECV, (u64)sv, (u64)(void *)rb, 64) != -11) sysc(SYS_EXIT, 1402, 0, 0);
+
+    /* (2) FCNTL round trip. F_GETFL must SEE the flag SOCK_NONBLOCK set at
+     * creation — two routes to one piece of state that must agree. */
+    if ((ofcntl(sv, F_GETFL, 0) & O_NONBLOCK) == 0) sysc(SYS_EXIT, 1403, 0, 0);
+    if (ofcntl(sv, F_SETFL, 0) != 0)                sysc(SYS_EXIT, 1404, 0, 0);
+    if (ofcntl(sv, F_GETFL, 0) & O_NONBLOCK)        sysc(SYS_EXIT, 1405, 0, 0);
+    if (ofcntl(sv, F_SETFL, O_NONBLOCK) != 0)       sysc(SYS_EXIT, 1406, 0, 0);
+    if ((ofcntl(sv, F_GETFL, 0) & O_NONBLOCK) == 0) sysc(SYS_EXIT, 1407, 0, 0);
+
+    /* (3) Bind and listen. */
+    if ((i64)sysc(SYS_BIND, (u64)sv, (u64)g_nep_srv_port, 0) != 0) sysc(SYS_EXIT, 1408, 0, 0);
+    if (olisten(sv, 4) != 0) sysc(SYS_EXIT, 1409, 0, 0);
+
+    /* (4) An idle listener has NOTHING to accept, and says so immediately. */
+    u32 peer[2];
+    if (oaccept(sv, peer, 0) != -11) sysc(SYS_EXIT, 1410, 0, 0);
+
+    /* (5) epoll must report an idle listener as NOT ready. A listener that
+     * claimed readiness with no peer would send a server into an accept loop
+     * that spins on EAGAIN forever — the exact bug epoll exists to prevent. */
+    int ep = oepoll_create();
+    if (ep < 0) sysc(SYS_EXIT, 1411, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, sv, EPOLLIN, 0x51) != 0) sysc(SYS_EXIT, 1412, 0, 0);
+    struct epoll_event evs[4];
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 1413, 0, 0);
+
+    /* (6) A client speaks. The listener becomes readable, and epoll says so. */
+    int cl = (int)(i64)sysc(SYS_SOCKET, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (cl < 0) sysc(SYS_EXIT, 1414, 0, 0);
+    if ((i64)sysc(SYS_BIND, (u64)cl, (u64)g_nep_cli_port, 0) != 0) sysc(SYS_EXIT, 1415, 0, 0);
+    if ((i64)sysc(SYS_CONNECT, (u64)cl, IP_LOOPBACK, (u64)g_nep_srv_port) != 0)
+        sysc(SYS_EXIT, 1416, 0, 0);
+    u8 hello[16]; for (int i = 0; i < 16; i++) hello[i] = (u8)(i * 7 + 1);
+    if ((i64)sysc(SYS_SEND, (u64)cl, (u64)(void *)hello, 16) != 16) sysc(SYS_EXIT, 1417, 0, 0);
+
+    int n = oepoll_wait(ep, evs, 4, 0);
+    if (n != 1)                       sysc(SYS_EXIT, 1418, 0, 0);
+    if (!(evs[0].events & EPOLLIN))   sysc(SYS_EXIT, 1419, 0, 0);
+    if (evs[0].data != 0x51)          sysc(SYS_EXIT, 1420, 0, 0);
+
+    /* (7) ACCEPT hands back a NEW descriptor carrying the peer's FIRST
+     * datagram. A server that had to read the opening message from the
+     * listener instead would have no way to attribute it to a peer. */
+    int cs = oaccept(sv, peer, SOCK_NONBLOCK);
+    if (cs < 0)                          sysc(SYS_EXIT, 1421, 0, 0);
+    if (cs == sv)                        sysc(SYS_EXIT, 1422, 0, 0);
+    if (peer[0] != (u32)IP_LOOPBACK)     sysc(SYS_EXIT, 1423, 0, 0);
+    if (peer[1] != g_nep_cli_port)       sysc(SYS_EXIT, 1424, 0, 0);
+    if ((i64)sysc(SYS_RECV, (u64)cs, (u64)(void *)rb, 64) != 16) sysc(SYS_EXIT, 1425, 0, 0);
+    for (int i = 0; i < 16; i++) if (rb[i] != hello[i]) sysc(SYS_EXIT, 1426, 0, 0);
+
+    /* (8) The listener is drained again, and the backlog really emptied. */
+    if (oaccept(sv, peer, 0) != -11)     sysc(SYS_EXIT, 1427, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 1428, 0, 0);
+
+    /* (9) ECHO. The accepted session replies to its peer, and the client — a
+     * different descriptor entirely — receives it. This is the round trip the
+     * milestone names, and it goes through the session socket, not the
+     * listener. */
+    if ((i64)sysc(SYS_SEND, (u64)cs, (u64)(void *)rb, 16) != 16) sysc(SYS_EXIT, 1429, 0, 0);
+    u8 eb[64];
+    if ((i64)sysc(SYS_RECV, (u64)cl, (u64)(void *)eb, 64) != 16) sysc(SYS_EXIT, 1430, 0, 0);
+    for (int i = 0; i < 16; i++) if (eb[i] != hello[i]) sysc(SYS_EXIT, 1431, 0, 0);
+
+    /* (10) EPOLLOUT: a connected socket can send, an unconnected one cannot.
+     * Reporting writable on a socket with no destination invites a send that
+     * can only fail. */
+    if (oepoll_ctl(ep, EPOLL_CTL_MOD, sv, EPOLLIN | EPOLLOUT, 0x51) != 0) sysc(SYS_EXIT, 1432, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 1433, 0, 0);   /* listener: never writable */
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, cl, EPOLLOUT, 0x52) != 0) sysc(SYS_EXIT, 1434, 0, 0);
+    n = oepoll_wait(ep, evs, 4, 0);
+    if (n != 1 || !(evs[0].events & EPOLLOUT) || evs[0].data != 0x52) sysc(SYS_EXIT, 1435, 0, 0);
+
+    /* (11) EDGE TRIGGERING over a socket. One report per arrival, not one per
+     * call — the distinction a level-triggered implementation fails. */
+    if (oepoll_ctl(ep, EPOLL_CTL_DEL, cl, 0, 0) != 0) sysc(SYS_EXIT, 1436, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, cl, EPOLLIN | EPOLLET, 0x53) != 0) sysc(SYS_EXIT, 1437, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 1438, 0, 0);   /* drained earlier */
+    if ((i64)sysc(SYS_SEND, (u64)cs, (u64)(void *)hello, 8) != 8) sysc(SYS_EXIT, 1439, 0, 0);
+    n = oepoll_wait(ep, evs, 4, 0);
+    if (n != 1 || evs[0].data != 0x53)   sysc(SYS_EXIT, 1440, 0, 0);   /* the edge */
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 1441, 0, 0);   /* no second edge */
+    if ((i64)sysc(SYS_RECV, (u64)cl, (u64)(void *)eb, 64) != 8) sysc(SYS_EXIT, 1442, 0, 0);
+
+    /* (12) SEND BACKPRESSURE. The receive ring is four deep; the fifth
+     * datagram has nowhere to go and must SAY so rather than vanish. A silent
+     * drop is legal for UDP and useless as a non-blocking contract. */
+    int sent = 0;
+    for (int i = 0; i < 8; i++) {
+        i64 r = (i64)sysc(SYS_SEND, (u64)cs, (u64)(void *)hello, 4);
+        if (r == -11) break;
+        if (r != 4) sysc(SYS_EXIT, 1443, 0, 0);
+        sent++;
+    }
+    if (sent == 0 || sent > 4) sysc(SYS_EXIT, 1444, 0, 0);   /* must fill, then refuse */
+    while ((i64)sysc(SYS_RECV, (u64)cl, (u64)(void *)eb, 64) > 0) { }   /* drain */
+
+    /* (13) THE PARK. Nothing is ready; a second thread sends only after this
+     * one has had time to fall asleep. The kernel half checks the park counter
+     * moved AND that no timeout fired — woken by the datagram, not the clock. */
+    g_nep_cli_fd = cs;
+    if (oepoll_ctl(ep, EPOLL_CTL_DEL, cl, 0, 0) != 0) sysc(SYS_EXIT, 1445, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, cl, EPOLLIN, 0x54) != 0) sysc(SYS_EXIT, 1446, 0, 0);
+    int wt = kthread_create(nep_poster, 0, 0);
+    if (wt < 0) sysc(SYS_EXIT, 1447, 0, 0);
+    n = oepoll_wait(ep, evs, 4, 30000);          /* backstop, not a race */
+    if (n != 1)                sysc(SYS_EXIT, 1448, 0, 0);
+    if (evs[0].data != 0x54)   sysc(SYS_EXIT, 1449, 0, 0);
+    u64 wc = 0;
+    if (kthread_join(wt, &wc) != 0) sysc(SYS_EXIT, 1450, 0, 0);
+    if (wc != 777)                  sysc(SYS_EXIT, 1451, 0, 0);
+
+    /* (14) A socket is a DESCRIPTOR: SYS_CLOSE releases it, and a closed
+     * socket is EBADF to every socket call. Before this milestone the only
+     * thing that ever reclaimed a socket was the owner dying. */
+    if ((i64)sysc(SYS_CLOSE, (u64)cl, 0, 0) != 0) sysc(SYS_EXIT, 1452, 0, 0);
+    if ((i64)sysc(SYS_RECV, (u64)cl, (u64)(void *)eb, 64) != -9) sysc(SYS_EXIT, 1453, 0, 0);
+
+    /* (15) Closing a LISTENER hangs up its sessions. The session descriptor is
+     * still ours and still valid — it reports end-of-conversation, it does not
+     * become a dangling fd. */
+    if ((i64)sysc(SYS_CLOSE, (u64)sv, 0, 0) != 0) sysc(SYS_EXIT, 1454, 0, 0);
+    if ((i64)sysc(SYS_RECV, (u64)cs, (u64)(void *)eb, 64) != 0) sysc(SYS_EXIT, 1455, 0, 0);
+
+    sysc(SYS_CLOSE, (u64)cs, 0, 0);
+    sysc(SYS_CLOSE, (u64)ep, 0, 0);
+    sysc(SYS_EXIT, 1400, 0, 0);
+}
+
+/* --- role 48: epollstrs — readiness, edges, and end-of-file ----------------
+ *
+ * Phase 1 driver. Every check is written so the failure mode is a WRONG
+ * ANSWER: a readiness bit that should not be set, a cookie that came back
+ * altered, a counter that did not drain. */
+static volatile int g_ew_fd = -1;
+/* Posts the eventfd after a delay long enough for the waiter to be genuinely
+ * parked rather than still on its way there. The delay is yields, not ticks:
+ * on a uniprocessor the waiter can only reach the park if this thread gives
+ * the core back, so yielding IS the thing that lets the race resolve. */
+/* The delay exists to lose a race deliberately: the main thread has to reach
+ * its park BEFORE this write lands, or it finds the event already waiting,
+ * returns without sleeping, and the kernel's park counter never moves — the
+ * one thing this round is for. It must not be so long that the waiter's
+ * deadline beats it, which is what happened on the first run: 4000 yields
+ * outlasted a 3 s park under TCG, the wait timed out, and the poster's write
+ * never appeared in the kernel's tally at all. Fewer yields here, a far larger
+ * backstop on the wait there — the timeout is a safety net, not the thing the
+ * test is racing. */
+static u64 ew_poster(u64 arg) {
+    (void)arg;
+    for (int i = 0; i < 600; i++) oyield();
+    u64 one = 1;
+    sysc(SYS_WRITE_FILE, (u64)g_ew_fd, (u64)(void *)&one, 8);
+    return 555;
+}
+
+static void epoll_stress_worker(void) {
+    /* (1) An eventfd accumulates writes and drains on read. */
+    int ef = oeventfd(0, 0);
+    if (ef < 0) sysc(SYS_EXIT, 921, 0, 0);
+    u64 v = 0;
+    if (oeventfd_read(ef, &v) != -11) sysc(SYS_EXIT, 922, 0, 0);   /* empty = EAGAIN */
+    if (oeventfd_write(ef, 7) != 8)   sysc(SYS_EXIT, 923, 0, 0);
+    if (oeventfd_write(ef, 5) != 8)   sysc(SYS_EXIT, 924, 0, 0);
+    if (oeventfd_read(ef, &v) != 8)   sysc(SYS_EXIT, 925, 0, 0);
+    if (v != 12)                      sysc(SYS_EXIT, 926, 0, 0);   /* writes ACCUMULATE */
+    if (oeventfd_read(ef, &v) != -11) sysc(SYS_EXIT, 927, 0, 0);   /* drained */
+
+    /* (2) epoll reports the eventfd readable only once it has been posted. */
+    int ep = oepoll_create();
+    if (ep < 0) sysc(SYS_EXIT, 928, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, ef, EPOLLIN, 0xAB) != 0) sysc(SYS_EXIT, 929, 0, 0);
+    struct epoll_event evs[4];
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 930, 0, 0);  /* nothing posted */
+    if (oeventfd_write(ef, 1) != 8)      sysc(SYS_EXIT, 931, 0, 0);
+    int n = oepoll_wait(ep, evs, 4, 0);
+    if (n != 1)                     sysc(SYS_EXIT, 932, 0, 0);
+    if (!(evs[0].events & EPOLLIN)) sysc(SYS_EXIT, 933, 0, 0);
+    if (evs[0].data != 0xAB)        sysc(SYS_EXIT, 934, 0, 0);     /* cookie verbatim */
+
+    /* (3) EPOLL_CTL_DEL really removes the watch. */
+    if (oepoll_ctl(ep, EPOLL_CTL_DEL, ef, 0, 0) != 0) sysc(SYS_EXIT, 935, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0)              sysc(SYS_EXIT, 936, 0, 0);
+
+    /* (4) A PIPE — the source epoll exists for. Empty is not readable; written
+     * is; and the read end must STILL report readable at END OF FILE, which is
+     * what stops a pipeline hanging on its last byte. */
+    u64 pfd[2];
+    if (sysc(SYS_PIPE, (u64)(void *)pfd, 0, 0) != 0) sysc(SYS_EXIT, 937, 0, 0);
+    int rd = (int)pfd[0], wr = (int)pfd[1];
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, rd, EPOLLIN, 0xCD) != 0) sysc(SYS_EXIT, 938, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 939, 0, 0);   /* empty pipe */
+    if (sysc(SYS_WRITE_FILE, (u64)wr, (u64)(void *)"hello", 5) != 5) sysc(SYS_EXIT, 940, 0, 0);
+    n = oepoll_wait(ep, evs, 4, 0);
+    if (n != 1 || !(evs[0].events & EPOLLIN) || evs[0].data != 0xCD) sysc(SYS_EXIT, 941, 0, 0);
+    char sink[8];
+    if (sysc(SYS_READ, (u64)rd, (u64)(void *)sink, 5) != 5) sysc(SYS_EXIT, 942, 0, 0);
+    sysc(SYS_CLOSE, (u64)wr, 0, 0);
+    n = oepoll_wait(ep, evs, 4, 0);
+    if (n != 1 || !(evs[0].events & EPOLLIN)) sysc(SYS_EXIT, 943, 0, 0);
+    if (!(evs[0].events & EPOLLHUP))          sysc(SYS_EXIT, 944, 0, 0);
+    /* Close the read end WITHOUT removing its watch first. The kernel must
+     * purge the watch, or a watch left behind on a dead descriptor answers
+     * EPOLLERR — which is reported whether or not it was asked for — on every
+     * subsequent wait, forever. */
+    sysc(SYS_CLOSE, (u64)rd, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 962, 0, 0);
+
+    /* (5) EDGE vs LEVEL. Re-arm the eventfd, this time edge-triggered: one
+     * report per transition, not one per call. Level triggering would answer
+     * the second wait identically to the first, which is exactly the
+     * distinction being checked. */
+    if (oeventfd_write(ef, 1) != 8) sysc(SYS_EXIT, 945, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, ef, EPOLLIN | EPOLLET, 0xEE) != 0) sysc(SYS_EXIT, 946, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 1) sysc(SYS_EXIT, 947, 0, 0);   /* the edge */
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 948, 0, 0);   /* no second edge */
+    if (oepoll_ctl(ep, EPOLL_CTL_MOD, ef, EPOLLIN, 0xEE) != 0) sysc(SYS_EXIT, 949, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 1) sysc(SYS_EXIT, 950, 0, 0);   /* level: still ready */
+    if (oeventfd_read(ef, &v) != 8)      sysc(SYS_EXIT, 951, 0, 0);   /* drain it */
+    if (oepoll_ctl(ep, EPOLL_CTL_DEL, ef, 0, 0) != 0) sysc(SYS_EXIT, 952, 0, 0);
+
+    /* (6) An idle console is NOT readable. The kernel half injects a keystroke
+     * and re-checks, which is the half this process cannot do for itself. */
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, EPOLL_TTY_FD, EPOLLIN, 0x77) != 0) sysc(SYS_EXIT, 953, 0, 0);
+    if (oepoll_wait(ep, evs, 4, 0) != 0) sysc(SYS_EXIT, 954, 0, 0);
+    if (oepoll_ctl(ep, EPOLL_CTL_DEL, EPOLL_TTY_FD, 0, 0) != 0) sysc(SYS_EXIT, 955, 0, 0);
+
+    /* (7) THE PARK. A worker thread posts the eventfd only after this thread
+     * has had time to fall asleep on it. The point is not that the event
+     * arrives — round 2 proved that — but that the waiter got there by
+     * SLEEPING: the kernel half checks its park counter moved, which it cannot
+     * if this loop merely span. */
+    g_ew_fd = ef;
+    if (oepoll_ctl(ep, EPOLL_CTL_ADD, ef, EPOLLIN, 0x99) != 0) sysc(SYS_EXIT, 956, 0, 0);
+    int wt = kthread_create(ew_poster, 0, 0);
+    if (wt < 0) sysc(SYS_EXIT, 957, 0, 0);
+    /* 30 s is a BACKSTOP, not an expectation: the wake should arrive in
+     * milliseconds. A tight timeout here would make the round a race between
+     * the poster and the clock, and the answer it gave would depend on how
+     * loaded the host running QEMU happened to be.
+     *
+     * No retry loop: SYS_EPOLL_WAIT restarts itself across a wake and returns
+     * POSIX's answer. The loop that used to be here is what proved the Phase 1
+     * -EAGAIN contract was the wrong shape — every caller had to know. */
+    int got = oepoll_wait(ep, evs, 4, 30000);
+    if (got != 1)                   sysc(SYS_EXIT, 958, 0, 0);
+    if (evs[0].data != 0x99)        sysc(SYS_EXIT, 959, 0, 0);
+    u64 wc = 0;
+    if (kthread_join(wt, &wc) != 0) sysc(SYS_EXIT, 960, 0, 0);
+    if (wc != 555)                  sysc(SYS_EXIT, 961, 0, 0);
+
+    sysc(SYS_CLOSE, (u64)ep, 0, 0);
+    sysc(SYS_CLOSE, (u64)ef, 0, 0);
+    sysc(SYS_EXIT, 920, 0, 0);
 }
 
 /* --- roles 32/33: execve with argv + envp ---------------------------------*/
@@ -2889,6 +4123,15 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 38) { posix_selfhost_worker(); }        /* v0.56 author -> compile -> run, natively           */
     if (role == 40) { pipe_worker(); }                  /* v0.59 pipe mechanics: bounds, EOF, EPIPE, fork      */
     if (role == 41) { vsh_worker(); }                   /* v0.59 build /bin/vsh with occ and run a real script */
+    if (role == 48) { epoll_stress_worker(); }         /* v0.64 epoll readiness, edges, eventfd, EOF        */
+    if (role == 49) { netepoll_stress_worker(); }      /* v0.65 non-blocking sockets multiplexed with epoll */
+    if (role == 50) { mmapfile_stress_worker(); }      /* v0.66 file-backed mappings and writeback           */
+    if (role == 51) { tcp_stress_worker(); }           /* v0.67 TCP: handshake, byte stream, FIN             */
+    if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
+    if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
+    if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */
+    if (role == 45) { sig_stress_worker(); }           /* v0.62 masks, SIG_IGN, process-group delivery      */
+    if (role == 43) { thread_stress_worker(); }        /* v0.61 futex threads, kernel join, own stack       */
     if (role == 42) { lang_stress_worker(); }           /* v0.60 sizeof/for-init/switch/unsigned + omake       */
     print("  [elf:r3] user_init.elf alive at ring 3\n");
     print(reg_preservation_ok() ? "  [elf:r3] callee-saved regs survive SYSCALL: PASS\n"
