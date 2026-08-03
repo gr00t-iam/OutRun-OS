@@ -17509,6 +17509,10 @@ static void cmd_users_stress(void) {
               vfs_permit(&d, 1001, 101, VFS_P_READ));
 
     /* ---- enforcement, through the real open path, as two real users ---- */
+    int fds0 = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int f = 0; f < 16; f++) if (g_ofiles[f].used) fds0++;
+    klock_release(&g_ofile_lock);
     int alice = kproc_spawn("u-alice", PCAP_FILESYSTEM);
     int bob   = kproc_spawn("u-bob",   PCAP_FILESYSTEM);
     current_proc_idx = save;
@@ -17518,7 +17522,14 @@ static void cmd_users_stress(void) {
         kprocs[alice].uid = 1000; kprocs[alice].gid = 100;
         kprocs[bob].uid   = 1001; kprocs[bob].gid   = 101;
 
+        /* Every descriptor this block takes is given back at the end. There
+         * are only 16 ofile slots system-wide; an earlier draft leaked five
+         * of them and starved the toolchain suites twenty minutes later,
+         * which reported itself as "could not create /src/t.c" and looked
+         * for all the world like a permission bug in this milestone. */
+        int held[6], nheld = 0;
         int fa = vfs_open_for("m72own", alice, 1);          /* alice creates it */
+        if (fa >= 0) held[nheld++] = fa;
         int di = vfs_find("m72own");
         usercheck("a file created by a user is owned by that user",
                   fa >= 0 && di >= 0 && DENTS[di].uid == 1000 && DENTS[di].gid == 100);
@@ -17527,6 +17538,7 @@ static void cmd_users_stress(void) {
 
         /* 0644: a stranger may read it. Permission is not ownership. */
         int fb = vfs_open_for("m72own", bob, 0);
+        if (fb >= 0) held[nheld++] = fb;
         usercheck("a stranger CAN open another user's 0644 file for reading", fb >= 0);
         usercheck("but the stranger has no write right to it",
                   di >= 0 && !vfs_permit(&DENTS[di], kprocs[bob].uid, kprocs[bob].gid, VFS_P_WRITE));
@@ -17536,18 +17548,33 @@ static void cmd_users_stress(void) {
         /* Tighten it, and the stranger loses the descriptor it could have had. */
         if (di >= 0) { klock_acquire(&g_vfs_lock); DENTS[di].mode = 0600; klock_release(&g_vfs_lock); }
         int fb2 = vfs_open_for("m72own", bob, 0);
+        if (fb2 >= 0) held[nheld++] = fb2;
         usercheck("after chmod 0600 the stranger can no longer open it at all", fb2 == -13);
-        usercheck("and the owner still can", vfs_open_for("m72own", alice, 0) >= 0);
+        int fa2 = vfs_open_for("m72own", alice, 0);
+        if (fa2 >= 0) held[nheld++] = fa2;
+        usercheck("and the owner still can", fa2 >= 0);
         /* Root is not stopped by a mode that stops everybody else. */
         int rooted = kproc_spawn("u-root", PCAP_FILESYSTEM);
         current_proc_idx = save;
+        int fr = -1;
         if (rooted >= 0) {
             kprocs[rooted].uid = 0; kprocs[rooted].gid = 0;
-            usercheck("root opens a 0600 file it does not own",
-                      vfs_open_for("m72own", rooted, 0) >= 0);
-            kprocs[rooted].exited = 1; kprocs[rooted].torn_down = 1;
+            fr = vfs_open_for("m72own", rooted, 0);
+            usercheck("root opens a 0600 file it does not own", fr >= 0);
         }
-        (void)fb;
+        /* Give every slot back, and prove it: the descriptor table must be
+         * exactly as full as it was before this suite ran. */
+        klock_acquire(&g_ofile_lock);
+        for (int h = 0; h < nheld; h++) {
+            ofile_drop_locked(held[h], alice);
+            ofile_drop_locked(held[h], bob);
+        }
+        if (fr >= 0 && rooted >= 0) ofile_drop_locked(fr, rooted);
+        int fds_now = 0;
+        for (int f = 0; f < 16; f++) if (g_ofiles[f].used) fds_now++;
+        klock_release(&g_ofile_lock);
+        usercheck("the suite returned every descriptor it took", fds_now == fds0);
+        if (rooted >= 0) { kprocs[rooted].exited = 1; kprocs[rooted].torn_down = 1; }
         kprocs[alice].exited = 1; kprocs[alice].torn_down = 1;
         kprocs[bob].exited   = 1; kprocs[bob].torn_down   = 1;
     }
