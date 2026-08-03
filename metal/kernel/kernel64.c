@@ -1951,8 +1951,25 @@ static uint64_t dbg_pid_of(uint64_t proc_idx) {
  * the kernel's own PML4 identity map. Those are reclaimed by their own
  * dedicated teardown (descriptor_teardown_kproc, dma_teardown_kproc,
  * page_free_tree) BEFORE this ever runs — kproc_reset only blanks the
- * bookkeeping struct itself, once nothing outside it still points in.      */
+ * bookkeeping struct itself, once nothing outside it still points in.
+ *
+ * v0.72: the zeroing below is a BACKSTOP, and the explicit assignments that
+ * follow it are the specification. Every field is still named on purpose —
+ * that is what documents which defaults are deliberate (-1 for a slot index,
+ * 1 for nthreads, HEAP_USER_V for the break) rather than incidentally zero.
+ *
+ * The backstop exists because this function enumerates fields by hand, and a
+ * field added to struct kproc and forgotten here was silently inherited from
+ * the slot's previous occupant. That is how uid/gid leaked in this release: a
+ * recycled slot kept a dead process's identity, which is a leak of AUTHORITY
+ * rather than of memory. An audit of every hand-rolled reset in this kernel
+ * found this was the only struct exposed to it — net_sock_release_locked
+ * already memsets, and ofile/widget/wmwin have every field unconditionally
+ * assigned at ALLOCATION, so an uncleared byte there cannot be observed.
+ * That audit is a snapshot; this line is the invariant.                    */
+static void cmemset(void *d, int v, uint64_t n);   /* fwd: defined with the string helpers */
 static void kproc_reset(struct kproc *p) {
+    cmemset(p, 0, sizeof *p);
     p->pid = 0;
     p->name[0] = 0;
     p->caps = 0;
