@@ -16129,6 +16129,25 @@ static uint64_t elf_load(int proc_idx, uint64_t img, uint64_t img_size) {
     int loaded = 0;
     for (int i = 0; i < eh->phnum; i++) {
         struct elf64_phdr *ph = (struct elf64_phdr *)(img + eh->phoff + (uint64_t)i * eh->phentsize);
+        /* v0.73: a binary that needs an INTERPRETER, or that carries
+         * relocations we cannot apply, must be REFUSED — not loaded halfway.
+         * The loop below skips every segment that is not PT_LOAD, so before
+         * this check a dynamically-linked ELF had its text and data mapped
+         * and was then entered at a point that expects a resolved GOT: it
+         * died as a page fault in userland with nothing naming the cause.
+         * There is no dynamic linker in this system yet (no PT_INTERP
+         * handling, no R_X86_64 relocation processing, no DT_NEEDED walk),
+         * and the honest answer to "can you run this?" is no, said out loud.
+         * Same principle as v0.66 refusing VOL_SOCK on read(): an error that
+         * names the missing feature beats a plausible-looking wrong answer. */
+        if (ph->type == 3) {                               /* PT_INTERP         */
+            kputs("[elf    ] reject: needs a dynamic interpreter — this system links statically\n");
+            return 0;
+        }
+        if (ph->type == 2) {                               /* PT_DYNAMIC        */
+            kputs("[elf    ] reject: PT_DYNAMIC present — no relocation processing in this kernel\n");
+            return 0;
+        }
         if (ph->type != 1) continue;                       /* PT_LOAD           */
         /* strict per-segment bounds checks (defend against hostile ELFs) */
         if (ph->offset > img_size || ph->filesz > img_size ||
