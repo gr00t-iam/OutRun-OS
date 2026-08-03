@@ -1996,6 +1996,17 @@ static void kproc_reset(struct kproc *p) {
     for (int g = 0; g < MAX_DMA_GRANTS; g++) p->dma_grants[g].used = 0;
     p->dma_grant_count = 0;
     p->torn_down = 0;
+    /* v0.72: a recycled slot MUST NOT inherit the dead occupant's identity.
+     * This function blanks fields one at a time rather than memset-ing, so a
+     * credential added to struct kproc and not added here is silently carried
+     * over from whoever held the slot last — which is not a leak of memory but
+     * a leak of AUTHORITY, and the worst possible bug for this milestone to
+     * ship. It was caught live: usersstrs left two slots owned by uid 1000 and
+     * 1001, the toolchain drivers recycled them, and a compiler that had
+     * always run as root suddenly could not write root-owned files.
+     * Root is the right default because every kproc_spawn is kernel-initiated;
+     * ring 3 acquires a non-zero uid only by asking. */
+    p->uid = 0; p->gid = 0;
     p->affinity = 0;                                   /* v0.49: unrestricted by default */
     for (int s = 0; s < SMP_SLOTS; s++) p->smp_slot_phys[s] = 0;
     p->vma_lock = 0;
@@ -17583,6 +17594,23 @@ static void cmd_users_stress(void) {
     /* ---- credentials on the process ---- */
     usercheck("the initial process runs as root",
               kprocs[tg_of((int)save)].uid == 0);
+
+    /* A RECYCLED slot must not inherit the identity of whoever held it last.
+     * kproc_reset blanks fields one at a time rather than memset-ing, so a
+     * credential added to struct kproc and forgotten here is carried over
+     * silently — a leak not of memory but of AUTHORITY. This is asserted
+     * immediately after the block above deliberately: those spawns are marked
+     * recyclable, so the very next spawn takes one of their slots, and if the
+     * reset were incomplete this is where it shows. */
+    int recyc = kproc_spawn("u-recycle", PCAP_FILESYSTEM);
+    current_proc_idx = save;
+    if (recyc >= 0) {
+        usercheck("a recycled process slot does not inherit the dead occupant's uid",
+                  kprocs[recyc].uid == 0 && kprocs[recyc].gid == 0);
+        kprocs[recyc].exited = 1; kprocs[recyc].torn_down = 1;
+    } else {
+        usercheck("a slot was available to test recycling", 0);
+    }
     /* setuid/setgid are exercised from ring 3 by role 52, which is the only
      * place the one-way rule can be observed the way an application sees it. */
 
