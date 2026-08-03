@@ -129,7 +129,7 @@ this, because no test places a string at a page boundary.
 ## VERIFICATION
 
 42 suites, 0 FAIL on uniprocessor/BIOS, SMP-4/BIOS, and q35 + VT-d IOMMU
-(`-smp 4`). No suite is added — `wimpstrs` grows from 18 assertions to 28 — so
+(`-smp 4`). No suite is added — `wimpstrs` grows from 18 assertions to 29 — so
 every configuration's suite set is identical to its v0.69 baseline. Boot logs
 are in `docs/`.
 
@@ -147,7 +147,14 @@ is the interface an application would use:
   content, which is the behaviour that distinguishes "disabled" from "absent";
 - a click on bare content is still a plain click, so the widget layer cannot be
   swallowing input generally;
-- destroying a window releases every widget it owned.
+- destroying a window releases every widget it owned;
+- and the compositor **actually paints them**. Every other assertion here
+  would pass with `wimp_draw_widgets` stubbed out to nothing — they exercise
+  declaration, routing and state, none of which touches the drawing path. That
+  would leave "the kernel draws them", the entire reason widgets live in the
+  compositor rather than in a library, as the one claim this release makes and
+  does not check. It composes a frame with widgets live and requires the draw
+  counter to move.
 
 That the disabled case and the bare-content case are both present matters
 together: a router that consumed every click passes the button test and fails

@@ -17329,6 +17329,22 @@ static void cmd_wimp_stress(void) {
         wimpcheck("widgets were created and clicks were counted",
                   g_wg_created > wgc0 && g_wg_clicks > clk0);
 
+        /* And the compositor must actually PAINT them. Every assertion above
+         * would still pass if wimp_draw_widgets were a no-op — they prove a
+         * widget exists, routes a click and reports its state, none of which
+         * touches the drawing path. That would leave "the kernel draws them",
+         * the entire reason widgets live here rather than in a library, as the
+         * one claim this release makes and does not check.
+         * Needs a bootloader framebuffer; skipped cleanly without one. */
+        if (g_gfx_ready && g_bb) {
+            uint64_t drawn0 = g_wg_drawn;
+            wimp_compose();
+            wimpcheck("the compositor painted this window's widgets",
+                      g_wg_drawn >= drawn0 + 2);
+        } else {
+            kputs("[wimpstrs] SKIP  widget paint (no bootloader framebuffer on this config)\n");
+        }
+
         /* And they must not outlive their window. */
         klock_acquire(&g_wm_lock); wm_destroy(d); klock_release(&g_wm_lock);
         wimpcheck("destroying a window releases every widget it owned",
