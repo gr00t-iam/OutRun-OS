@@ -7370,6 +7370,15 @@ struct npend {
 #define TCP_MSS         512          /* one segment's payload ceiling */
 #define TCP_RTO_TICKS   6            /* ~60 ms at 100 Hz: a lossless link needs no more */
 #define TCP_MAX_RETRIES 8
+/* v0.73: 2*MSL, in ticks. A real stack uses 2*MSL = 60 s (6000 ticks at
+ * 100 Hz). 60 ticks is 0.6 s, and the difference is stated rather than hidden:
+ * MSL bounds how long a duplicate segment can wander a WIDE-AREA network, and
+ * the only links this kernel has are loopback and an emulated NIC one hop from
+ * its peer, where a segment cannot outlive its connection by anything close to
+ * a minute. Holding a socket for a real 2*MSL here would test the scheduler's
+ * patience, not the protocol. What matters, and what is asserted, is that the
+ * state is left ON A CLOCK rather than on a descriptor close. */
+#define TCP_TIMEWAIT_TICKS 60
 #define TCP_HDR_LEN     20           /* no options are emitted or honoured */
 
 enum {
@@ -7386,7 +7395,34 @@ struct tseg {
     uint32_t seq, ack;
     uint16_t flags, len;
     uint16_t sport, dport;      /* who sent it, and to whom */
+    /* v0.73: the sender's free receive space. v0.68 put this on the wire and
+     * v0.68's own changelog admitted it was "emitted but not honoured on
+     * receipt" — because it stopped here: the wire codec wrote the field and
+     * `struct tseg` had nowhere to keep it, so tcp_input never saw one. It is
+     * a field of the SEGMENT, not of the connection, which is why it belongs
+     * here and not only in struct nsock. */
+    uint16_t win;
     const uint8_t *data;
+};
+
+/* v0.73: ONE out-of-order segment, held until the hole before it is filled.
+ *
+ * v0.67 dropped these and said so: "protocol-legal, since the peer
+ * retransmits, and adequate on a link that cannot reorder. This is the
+ * clearest difference between this and a production stack." Dropping is legal
+ * but it converts one lost segment into a retransmission of everything after
+ * it, because the sender learns nothing about what did arrive.
+ *
+ * FOUR slots, not a list. A bounded array cannot leak, cannot fragment, and
+ * needs no allocator on the receive path — the same reasoning as every other
+ * table in this kernel. Four segments at one MSS is 2 KB of hole coverage per
+ * socket, which is what a 2 KB receive buffer can use anyway. */
+#define TCP_OOO_MAX 4
+struct ooseg {
+    int      used;
+    uint32_t seq;
+    uint16_t len;
+    uint8_t  data[TCP_MSS];
 };
 
 struct nsock {
@@ -7420,6 +7456,14 @@ struct nsock {
     uint32_t rhead, rtail, rcount;
     int      fin_sent, fin_rcvd;
     int      rexmit_ticks, rexmit_count;
+    /* v0.73: the peer's advertised free space. Seeded to one MSS so the very
+     * first segment can go out before any window has been heard — the standard
+     * bootstrap, since our SYN carries no peer window with it. */
+    uint32_t snd_wnd;
+    /* v0.73: 2*MSL countdown. Non-zero ONLY in TIME_WAIT. */
+    int      tw_ticks;
+    /* v0.73: segments that arrived past a hole, waiting for it to be filled. */
+    struct ooseg ooo[TCP_OOO_MAX];
     int      acceptq[SOCK_BACKLOG];          /* listener: COMPLETED connections    */
     int      aq_head, aq_tail, aq_count;
     int      parent;                         /* child: its listener, or -1         */
@@ -7586,6 +7630,12 @@ static volatile uint64_t g_tcp_conns = 0, g_tcp_resets = 0, g_tcp_drops = 0;
  * code that has never once run. */
 static volatile int g_tcp_drop = 0;
 static volatile uint64_t g_tcp_wire_tx = 0, g_tcp_wire_rx = 0, g_tcp_wire_bad = 0;
+/* v0.73: what ring 3 cannot see. A TIME_WAIT that expired, a send the peer's
+ * window actually held back, and a segment buffered out of order and later
+ * delivered in order. Each of these paths can be written, compile, and never
+ * run — a counter that stays zero is the only way the suite can tell. */
+static volatile uint64_t g_tcp_timewait_done = 0, g_tcp_win_stalls = 0;
+static volatile uint64_t g_tcp_ooo_queued = 0, g_tcp_ooo_merged = 0, g_tcp_ooo_dropped = 0;
 
 static void tcp_input(int si, struct tseg *g);   /* fwd */
 static uint32_t tcp_wire_build(uint8_t *f, uint32_t saddr, uint32_t daddr,
@@ -7621,13 +7671,18 @@ static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len
     g.seq = s->snd_nxt; g.ack = s->rcv_nxt;
     g.flags = flags; g.len = len; g.data = data;
     g.sport = s->lport; g.dport = s->rport;
+    /* Our own free receive space, computed identically for loopback and wire.
+     * Loopback used to omit it entirely, which would have made the window
+     * assertions pass on the wire path and quietly do nothing on the path the
+     * suite actually exercises. */
+    g.win = (uint16_t)(TCP_BUFSZ - s->rcount);
     __sync_fetch_and_add(&g_tcp_segs_out, 1);
     if (g_tcp_drop > 0) { g_tcp_drop--; __sync_fetch_and_add(&g_tcp_drops, 1); return; }
     if (s->raddr != NET_LOOPBACK) {
         /* v0.68: a real frame on the real NIC. */
         static uint8_t wf[14 + 20 + TCP_HDR_LEN + TCP_MSS];
         if (!g_vnet_ready) return;
-        uint32_t n = tcp_wire_build(wf, NET_GUEST_IP, s->raddr, &g, (uint16_t)(TCP_BUFSZ - s->rcount));
+        uint32_t n = tcp_wire_build(wf, NET_GUEST_IP, s->raddr, &g, g.win);
         vnet_tx(wf, n);
         g_net_tx_frames++;
         __sync_fetch_and_add(&g_tcp_wire_tx, 1);
@@ -7643,6 +7698,21 @@ static uint32_t tcp_send_data(int si, const uint8_t *src, uint32_t len) {
     struct nsock *s = &g_sock[si];
     uint32_t space = TCP_BUFSZ - s->scount;
     if (len > space) len = space;
+    /* v0.73: FLOW CONTROL. The peer told us how much room it has; sending past
+     * it means the receiver drops and we retransmit, which is the behaviour
+     * v0.67 shipped and called out as a limit. The bytes already in flight are
+     * snd_nxt - snd_una, so what may still go out is the window minus that.
+     *
+     * This CAPS the send rather than refusing it: send() returning a short
+     * count is the POSIX contract, and a caller that wants the rest calls
+     * again — by which time an ACK has usually reopened the window. Refusing
+     * outright would turn flow control into a spurious error. */
+    uint32_t inflight = s->snd_nxt - s->snd_una;
+    uint32_t allowed = (s->snd_wnd > inflight) ? (s->snd_wnd - inflight) : 0;
+    if (len > allowed) {
+        __sync_fetch_and_add(&g_tcp_win_stalls, 1);
+        len = allowed;
+    }
     if (!len) return 0;
     /* Kept for retransmission until acknowledged — that buffer IS the reason a
      * lost segment can be recovered, and the reason send() can report how much
@@ -7697,6 +7767,14 @@ static void tcp_input(int si, struct tseg *g) {
     struct nsock *s = &g_sock[si];
     __sync_fetch_and_add(&g_tcp_segs_in, 1);
 
+    /* v0.73: learn the peer's free space from EVERY segment that carries it,
+     * before any state-specific handling — a window update is not conditional
+     * on the segment being interesting for any other reason, and a pure ACK
+     * carrying nothing but a reopened window is exactly how a stalled sender
+     * gets going again. A RST carries no meaningful window, which is why this
+     * sits after nothing and before everything else. */
+    if (!(g->flags & TH_RST)) s->snd_wnd = g->win;
+
     if (g->flags & TH_RST) {
         /* Abortive close: the connection is gone NOW, and a reader must be
          * told rather than left waiting for data that will never come. */
@@ -7730,6 +7808,9 @@ static void tcp_input(int si, struct tseg *g) {
         c->irs = g->seq; c->rcv_nxt = g->seq + 1;
         c->iss = (uint32_t)(g_ticks * 2654435761u) | 1u;
         c->snd_una = c->iss; c->snd_nxt = c->iss;
+        /* v0.73: the SYN we are answering carried a window, so use it rather
+         * than the bootstrap default — the peer has already told us. */
+        c->snd_wnd = g->win ? g->win : TCP_MSS;
         c->state = TCPS_SYN_RCVD;
         tcp_output(ci, TH_SYN | TH_ACK, 0, 0);
         c->snd_nxt++;                                        /* SYN consumes one */
@@ -7781,8 +7862,59 @@ static void tcp_input(int si, struct tseg *g) {
         }
         s->rcount += n;
         s->rcv_nxt += n;
+        /* v0.73: the hole is filled — anything queued behind it may now be in
+         * order too, and filling one hole can release several segments, so
+         * this repeats until no queued segment starts exactly at rcv_nxt.
+         * Delivering them here rather than waiting for the peer to retransmit
+         * is the entire point of having kept them. */
+        for (int again = 1; again; ) {
+            again = 0;
+            for (int k = 0; k < TCP_OOO_MAX; k++) {
+                struct ooseg *o = &s->ooo[k];
+                if (!o->used || o->seq != s->rcv_nxt) continue;
+                uint32_t sp = TCP_BUFSZ - s->rcount;
+                uint32_t m = o->len; if (m > sp) m = sp;
+                for (uint32_t i = 0; i < m; i++) {
+                    s->rbuf[s->rtail] = o->data[i];
+                    s->rtail = (s->rtail + 1) % TCP_BUFSZ;
+                }
+                s->rcount += m;
+                s->rcv_nxt += m;
+                o->used = 0;
+                __sync_fetch_and_add(&g_tcp_ooo_merged, 1);
+                again = 1;
+            }
+        }
         tcp_output(si, TH_ACK, 0, 0);
         if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
+    } else if (g->len && s->state >= TCPS_ESTAB && seq_lt(s->rcv_nxt, g->seq)) {
+        /* v0.73: ARRIVED PAST A HOLE. Keep it, and ACK what we still actually
+         * have — a duplicate ACK naming rcv_nxt, which is what tells the peer
+         * which segment to resend rather than everything from the hole on.
+         *
+         * Not stored: anything longer than one MSS (it cannot be, given our own
+         * MSS), a duplicate of something already queued, and anything at all
+         * once the four slots are full. A full queue drops exactly as v0.67
+         * always did, so the fallback is the old behaviour rather than a new
+         * failure. */
+        if (g->len <= TCP_MSS) {
+            int dup = 0, slot = -1;
+            for (int k = 0; k < TCP_OOO_MAX; k++) {
+                if (s->ooo[k].used && s->ooo[k].seq == g->seq) { dup = 1; break; }
+                if (!s->ooo[k].used && slot < 0) slot = k;
+            }
+            if (!dup && slot >= 0) {
+                struct ooseg *o = &s->ooo[slot];
+                o->used = 1; o->seq = g->seq; o->len = g->len;
+                for (uint32_t i = 0; i < g->len; i++) o->data[i] = g->data[i];
+                __sync_fetch_and_add(&g_tcp_ooo_queued, 1);
+            } else if (!dup) {
+                __sync_fetch_and_add(&g_tcp_ooo_dropped, 1);
+            }
+        } else {
+            __sync_fetch_and_add(&g_tcp_ooo_dropped, 1);
+        }
+        tcp_output(si, TH_ACK, 0, 0);          /* duplicate ACK: still at rcv_nxt */
     }
 
     /* A FIN occupies the sequence number immediately AFTER the segment's
@@ -7795,14 +7927,14 @@ static void tcp_input(int si, struct tseg *g) {
         tcp_output(si, TH_ACK, 0, 0);
         if (s->state == TCPS_ESTAB)          s->state = TCPS_CLOSE_WAIT;
         else if (s->state == TCPS_FIN_WAIT1) s->state = TCPS_CLOSING;
-        else if (s->state == TCPS_FIN_WAIT2) s->state = TCPS_TIME_WAIT;
+        else if (s->state == TCPS_FIN_WAIT2) { s->state = TCPS_TIME_WAIT; s->tw_ticks = TCP_TIMEWAIT_TICKS; }
         if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
     }
 
     /* Our own FIN being acknowledged advances the closing states. */
     if (s->fin_sent && seq_le(s->snd_nxt, g->ack)) {
         if (s->state == TCPS_FIN_WAIT1)     s->state = TCPS_FIN_WAIT2;
-        else if (s->state == TCPS_CLOSING)  s->state = TCPS_TIME_WAIT;
+        else if (s->state == TCPS_CLOSING)  { s->state = TCPS_TIME_WAIT; s->tw_ticks = TCP_TIMEWAIT_TICKS; }
         else if (s->state == TCPS_LAST_ACK) s->state = TCPS_CLOSED;
     }
 }
@@ -7818,7 +7950,25 @@ static void tcp_timer_scan(void) {
     klock_acquire(&g_net_lock);
     for (int i = 0; i < NSOCK; i++) {
         struct nsock *s = &g_sock[i];
-        if (!s->used || !s->stream || !s->rexmit_ticks) continue;
+        if (!s->used || !s->stream) continue;
+        /* v0.73: TIME_WAIT runs its own clock. Checked BEFORE the retransmit
+         * guard below, which used to `continue` on a zero rexmit_ticks and so
+         * would have skipped every socket in this state — the timer would have
+         * existed and never once fired. */
+        if (s->tw_ticks) {
+            if (!--s->tw_ticks) {
+                /* 2*MSL elapsed: the connection is genuinely over. The socket
+                 * OBJECT stays until its descriptor is closed, because a
+                 * descriptor must not dangle; what is released here is the
+                 * connection STATE, which is what TIME_WAIT holds. */
+                s->state = TCPS_CLOSED;
+                s->hup = 1;
+                __sync_fetch_and_add(&g_tcp_timewait_done, 1);
+                if (s->waiter_tid >= 0) woke[nw++] = i;
+            }
+            continue;                             /* never retransmits */
+        }
+        if (!s->rexmit_ticks) continue;
         if (--s->rexmit_ticks) continue;
         if (s->rexmit_count >= TCP_MAX_RETRIES) {
             /* A connection that cannot be reached is an ERROR, not a hang. */
@@ -8046,6 +8196,7 @@ static int tcp_wire_parse(const uint8_t *f, uint32_t len, struct tseg *out,
     out->ack = ((uint32_t)t[8] << 24) | ((uint32_t)t[9] << 16) |
                ((uint32_t)t[10] << 8) | t[11];
     out->flags = t[13];
+    out->win = (uint16_t)((t[14] << 8) | t[15]);   /* v0.73: was decoded nowhere */
     out->len = (uint16_t)(tlen - doff);
     out->data = t + doff;
     if (saddr_out) *saddr_out = sa;
@@ -12382,6 +12533,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                 c->raddr = addr; c->rport = port; c->connected = 1;
                 c->iss = (uint32_t)(g_ticks * 2246822519u) | 1u;
                 c->snd_una = c->iss; c->snd_nxt = c->iss;
+                /* v0.73: bootstrap. Nothing has been heard from the peer yet,
+                 * so one MSS is assumed — enough for the SYN and a first
+                 * segment, and corrected by the SYN-ACK's real window before
+                 * anything larger is sent. Seeding zero would deadlock the
+                 * connection against its own flow control. */
+                c->snd_wnd = TCP_MSS;
                 c->state = TCPS_SYN_SENT;
                 tcp_output(si, TH_SYN, 0, 0);
                 c->snd_nxt++;                               /* SYN consumes one */
