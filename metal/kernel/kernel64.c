@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.71.0-metal"
+#define KERNEL_VERSION "0.72.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -1756,6 +1756,15 @@ struct kproc {
     uint64_t pid;
     char     name[24];
     uint64_t caps;
+    /* v0.72: WHO this process is running as. Distinct from `caps`, and the
+     * distinction is the point: a capability says what a program is allowed to
+     * DRIVE (the NIC, the framebuffer, DMA), an identity says whose DATA it is
+     * entitled to touch. A driver may need PCAP_HARDWARE and have no business
+     * reading another user's files; a text editor is the reverse. Collapsing
+     * the two — as this kernel did for seventy-one releases by having only
+     * capabilities — means every program that needs any privilege gets all of
+     * it. */
+    uint32_t uid, gid;
     uint64_t cr3;       /* physical address of this process's PML4             */
     bool     used;
     uint64_t role;      /* 0=demo 1=userspace driver 2=surface app             */
@@ -2145,6 +2154,12 @@ static int kproc_spawn_thread(const char *name, int leader, int tid) {
     kprocs[i].redir_out = kprocs[leader].redir_out;
     kprocs[i].ppid_slot = kprocs[leader].ppid_slot;
     kprocs[i].pgid      = kprocs[leader].pgid;   /* v0.62: threads share the group */
+    /* v0.72: a thread is the same user as the process it belongs to. Not a
+     * copy that could later diverge — every credential check resolves through
+     * tg_of() to the leader, so this is the leader's identity mirrored for
+     * debuggers and for anything that reads a thread slot directly. */
+    kprocs[i].uid       = kprocs[leader].uid;
+    kprocs[i].gid       = kprocs[leader].gid;
     kprocs[i].tg_leader = leader;
     kprocs[i].tg_tid    = tid;
     kprocs[i].nthreads  = 0;                     /* the LEADER holds the count */
@@ -4356,10 +4371,31 @@ struct dirent {
      * restore all keep working unchanged, and a v0.55 volume still mounts. */
     uint64_t ind1_hash;                       /* -> 64 chunk hashes              */
     uint64_t ind2_hash;                       /* -> 64 single-indirect blocks    */
-    uint8_t  reserved[24];                    /* pad dirent to exactly 256 bytes  */
+    /* v0.72: ownership. Carved out of reserved[] exactly as v0.56 carved the
+     * indirect map, so the dirent stays EXACTLY 256 bytes and the on-disk
+     * directory layout, VFS_DIR_BLOCKS, the journal record and cas_mount's
+     * restore all keep working — a volume written by any earlier kernel still
+     * mounts.
+     *
+     * COMPATIBILITY RULE: on such a volume these three read as ZERO. uid 0 and
+     * gid 0 are exactly right (root owned everything before this release), but
+     * mode 0 would mean "nobody may do anything", which would make every
+     * pre-v0.72 file unreadable the moment permissions began to be enforced.
+     * So mode 0 is defined to mean UNSET and is read as VFS_MODE_DEFAULT. That
+     * is why vfs_mode_of() exists and why nothing reads dirent.mode directly. */
+    uint32_t uid;                             /* owning user                     */
+    uint32_t gid;                             /* owning group                    */
+    uint32_t mode;                            /* rwx triples, 0 = unset (legacy) */
+    uint8_t  reserved[12];                    /* pad dirent to exactly 256 bytes  */
 } __attribute__((packed));
 /* Compile-time guard: if this ever trips, the on-disk layout has been broken. */
 _Static_assert(sizeof(struct dirent) == 256, "dirent must stay exactly 256 bytes");
+
+/* v0.72: permission bits, POSIX values so the SDK headers can carry them
+ * verbatim and so nobody has to learn a second numbering. */
+#define VFS_MODE_DEFAULT 0644
+#define VFS_P_READ  4
+#define VFS_P_WRITE 2
 static uint8_t g_dir[VFS_MAXFILES * 256] __attribute__((aligned(512)));
 #define DENTS ((struct dirent *)g_dir)
 
@@ -4712,6 +4748,35 @@ static int vfs_find(const char *name) {
     for (int i = 0; i < VFS_MAXFILES; i++)
         if (DENTS[i].used && streq_n(DENTS[i].name, name, VFS_NAME_MAX)) return i;
     return -1;
+}
+
+/* v0.72: the effective mode of a dirent.
+ *
+ * NOTHING reads dirent.mode directly, and this function is why. A volume
+ * written before v0.72 has zeroes there, and a literal zero mode means "no
+ * access for anybody" — which would render every existing file unreadable the
+ * instant enforcement began, on a volume that was perfectly valid a release
+ * ago. Zero therefore means UNSET, and unset reads as the default. */
+static inline uint32_t vfs_mode_of(const struct dirent *d) {
+    return d->mode ? d->mode : (uint32_t)VFS_MODE_DEFAULT;
+}
+
+/* v0.72: may the calling process do `want` (VFS_P_READ / VFS_P_WRITE) to this
+ * file? Owner triple, then group, then other — first match wins, which is
+ * POSIX and is deliberately NOT "most permissive wins": a file mode 0604 must
+ * deny its owner write even though other is granted it, or an owner could
+ * never lock themselves out of their own file.
+ *
+ * uid 0 bypasses. That is the whole meaning of root, and stating it in one
+ * place beats scattering `if (uid == 0)` through every call site. */
+static int vfs_permit(const struct dirent *d, uint32_t uid, uint32_t gid, uint32_t want) {
+    if (uid == 0) return 1;
+    uint32_t m = vfs_mode_of(d);
+    uint32_t bits;
+    if (d->uid == uid)      bits = (m >> 6) & 7;
+    else if (d->gid == gid) bits = (m >> 3) & 7;
+    else                    bits =  m       & 7;
+    return (bits & want) == want;
 }
 static void ts_emit(int type, const char *who, const char *text);  /* Time-Stream (Phase 5) */
 
@@ -5776,13 +5841,32 @@ static int vfs_open_for(const char *name, int owner, int creat) {
      * "prove this name is gone" check silently created the name it was checking
      * for. The new dirent is claimed under the same lock that found it missing,
      * so two cores opening the same new path cannot both claim a slot. */
+    /* v0.72: whose open this is. `owner` is already the thread-group leader,
+     * so a thread and its process always answer identically. */
+    uint32_t o_uid = (owner >= 0 && owner < n_kproc) ? kprocs[owner].uid : 0;
+    uint32_t o_gid = (owner >= 0 && owner < n_kproc) ? kprocs[owner].gid : 0;
+    int created = 0;
     if (di < 0 && creat && name[0]) {   /* never create an unnamed dirent */
         for (int i = 0; i < VFS_MAXFILES; i++) if (!DENTS[i].used) {
             cmemset(&DENTS[i], 0, 256);
             kstrcpy_n(DENTS[i].name, name, VFS_NAME_MAX);
             DENTS[i].used = 1; DENTS[i].len = 0; DENTS[i].nchunks = 0;
-            di = i; break;
+            DENTS[i].uid = o_uid;          /* v0.72: a file belongs to its author */
+            DENTS[i].gid = o_gid;
+            DENTS[i].mode = VFS_MODE_DEFAULT;
+            di = i; created = 1; break;
         }
+    }
+    /* v0.72: opening an EXISTING file needs read permission. Checked here,
+     * under the lock that resolved the name, rather than at each read: a
+     * descriptor this process was never entitled to should not come into
+     * existence at all. Write permission is checked separately at write time,
+     * because an open in this kernel carries no declared intent that would let
+     * the two be distinguished here. A file just created is skipped — its
+     * author is by construction allowed to have it. */
+    if (di >= 0 && !created && !vfs_permit(&DENTS[di], o_uid, o_gid, VFS_P_READ)) {
+        klock_release(&g_vfs_lock);
+        return -13;                                            /* EACCES */
     }
     klock_release(&g_vfs_lock);                /* released BEFORE the fd claim  */
     if (di < 0) return -1;
@@ -10854,6 +10938,8 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
     kprocs[ch].entry     = kprocs[par].entry;
     kprocs[ch].affinity  = kprocs[par].affinity;
     kprocs[ch].pgid      = kprocs[par].pgid;     /* v0.62: fork stays in the job */
+    kprocs[ch].uid       = kprocs[par].uid;      /* v0.72: a child is the same user */
+    kprocs[ch].gid       = kprocs[par].gid;
     kprocs[ch].mmap_next = kprocs[par].mmap_next;  /* v0.63: inherited mmap regions */
     kprocs[ch].shm_next  = SHM_USER_V;             /* shm attachments are NOT inherited */
     for (int sg = 0; sg < NSIG; sg++) kprocs[ch].sig_handler[sg] = kprocs[par].sig_handler[sg];
@@ -11545,7 +11631,20 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int64_t r = -9;
         if (di >= 0) {
             /* v0.66: exhaustive, for the reason set out in SYS_READ above. */
-            if (vol == VOL_ROOT)      r = vfs_write_by_dirent(di, (const void *)a1, len);  /* COW */
+            if (vol == VOL_ROOT) {
+                /* v0.72: an open granted READ; writing is a separate right and
+                 * is checked here, at the moment of the write, because this
+                 * kernel's open carries no declared intent that could have
+                 * settled it earlier. A reader of a 0644 file someone else
+                 * owns therefore holds a perfectly valid descriptor it cannot
+                 * write through, which is the correct and useful outcome. */
+                int L = tg_of((int)current_proc_idx);
+                klock_acquire(&g_vfs_lock);
+                int ok = vfs_permit(&DENTS[di], kprocs[L].uid, kprocs[L].gid, VFS_P_WRITE);
+                klock_release(&g_vfs_lock);
+                r = ok ? vfs_write_by_dirent(di, (const void *)a1, len)     /* COW */
+                       : -13;                                              /* EACCES */
+            }
             else if (vol == VOL_TMP)  r = tmp_write_file(di, (const void *)a1, len);
             else if (vol == VOL_PIPE) r = pipe_write_fd(fd, (const void *)a1, len);        /* v0.59 */
             else if (vol == VOL_EVFD) r = evfd_write_fd(fd, (const void *)a1, len);        /* v0.64 */
@@ -11887,6 +11986,18 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         char name[64];
         if (copy_user_str(kprocs[current_proc_idx].cr3, a0, name, sizeof name) < 0) return (uint64_t)-14;
         if (path_has_prefix(name, "tmp/") || path_has_prefix(name, "dev/")) return (uint64_t)-1;  /* ROOT-only */
+        /* v0.72: removing a file is a WRITE to it. Checked before the witness
+         * is entered so a refused unlink is not recorded as a filesystem
+         * mutation that never happened. */
+        {
+            int L = tg_of((int)current_proc_idx);
+            klock_acquire(&g_vfs_lock);
+            int ui = vfs_find(name);
+            int denied = (ui >= 0) &&
+                         !vfs_permit(&DENTS[ui], kprocs[L].uid, kprocs[L].gid, VFS_P_WRITE);
+            klock_release(&g_vfs_lock);
+            if (denied) return (uint64_t)-13;                   /* EACCES */
+        }
         fs_witness_enter();
         int r = vfs_unlink(name);
         fs_witness_leave();
@@ -13551,6 +13662,73 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             char *u = (char *)a2;
             for (int i = 0; i < WG_TEXTLEN; i++) u[i] = tmp[i];
         }
+        return (uint64_t)rc;
+    }
+    /* ---- v0.72: process credentials -------------------------------------- *
+     * Identity lives on the thread-group LEADER, like every other shared
+     * property of a process, so a thread cannot hold a different uid from the
+     * process it belongs to. */
+    case 88: return (uint64_t)kprocs[tg_of((int)current_proc_idx)].uid;   /* SYS_GETUID */
+    case 89: return (uint64_t)kprocs[tg_of((int)current_proc_idx)].gid;   /* SYS_GETGID */
+    case 90:     /* SYS_SETUID(uid) -> 0, or negative */
+    case 91: {   /* SYS_SETGID(gid) -> 0, or negative */
+        int L = tg_of((int)current_proc_idx);
+        uint32_t want = (uint32_t)a0;
+        uint32_t cur  = (num == 90) ? kprocs[L].uid : kprocs[L].gid;
+        /* THE RULE, and the only one that matters: privilege is a one-way
+         * door. Root may become anybody; everybody else may only "become"
+         * who they already are. Without this a process could drop to an
+         * unprivileged id to look harmless and climb back at will, which is
+         * not a security model, it is a formality.
+         *
+         * Note this deliberately does NOT implement saved-set-uid — a real
+         * system lets a root program drop temporarily and regain. That needs
+         * a third stored id per process and a setuid-binary story to be worth
+         * having, and both are absent here; see the changelog. What is
+         * implemented is the half that is safe to rely on. */
+        if (kprocs[L].uid != 0 && want != cur) return (uint64_t)-1;   /* EPERM */
+        if (num == 90) {
+            kprocs[L].uid = want;
+            /* Mirror onto every thread of the group so a thread slot read
+             * directly never disagrees with its leader. */
+            for (int t = 0; t < n_kproc; t++)
+                if (kprocs[t].used && kprocs[t].tg_leader == L) kprocs[t].uid = want;
+        } else {
+            kprocs[L].gid = want;
+            for (int t = 0; t < n_kproc; t++)
+                if (kprocs[t].used && kprocs[t].tg_leader == L) kprocs[t].gid = want;
+        }
+        return 0;
+    }
+    case 92:     /* SYS_CHMOD(path, mode) -> 0, or negative */
+    case 93: {   /* SYS_CHOWN(path, uid, gid) -> 0, or negative */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+        char name[64];
+        if (copy_user_str(kprocs[current_proc_idx].cr3, a0, name, sizeof name) < 0) return (uint64_t)-14;
+        if (path_has_prefix(name, "tmp/") || path_has_prefix(name, "dev/")) return (uint64_t)-1;
+        int L = tg_of((int)current_proc_idx);
+        int64_t rc = 0;
+        klock_acquire(&g_vfs_lock);
+        int di = vfs_find(name);
+        if (di < 0) rc = -2;                                   /* ENOENT */
+        else if (num == 92) {
+            /* chmod: the OWNER or root. Not "anyone who can write the file" —
+             * write permission lets you change the contents, never the terms
+             * on which others may reach them. */
+            if (kprocs[L].uid != 0 && DENTS[di].uid != kprocs[L].uid) rc = -1;    /* EPERM */
+            else DENTS[di].mode = (uint32_t)a1 & 0777;
+        } else {
+            /* chown: ROOT ONLY, and that is not conservatism. If an owner
+             * could give a file away, any user could dispose of files they no
+             * longer want to be accountable for — and on a system with quotas
+             * they could charge them to somebody else. */
+            if (kprocs[L].uid != 0) rc = -1;                                     /* EPERM */
+            else { DENTS[di].uid = (uint32_t)a1; DENTS[di].gid = (uint32_t)a2; }
+        }
+        klock_release(&g_vfs_lock);
+        /* The directory is journalled, so a metadata change has to reach the
+         * disk the same way a content change does or it is lost at reboot. */
+        if (rc == 0) { fs_witness_enter(); vfs_journal_commit(); fs_witness_leave(); }
         return (uint64_t)rc;
     }
     case 83: {   /* v0.66: SYS_MMAP_FILE(fd_prot_flags, length, offset) -> base, or -1.
@@ -17269,6 +17447,123 @@ static int wm_seed(int owner, int x, int y, int w, int h) {
     }
     klock_release(&g_wm_lock);
     return id;
+}
+
+/* ===========================================================================
+ * v0.72: USERS STRESS — process credentials and file ownership
+ * ===========================================================================
+ * Two halves, because neither can cover the other.
+ *
+ * The DECISION TABLE half calls vfs_permit directly. It is a pure function of
+ * (mode, owner, group, asker), so every interesting combination can be stated
+ * as a table rather than staged through the filesystem — including the ones a
+ * live test would struggle to arrange, like a file whose owner has fewer
+ * rights than a stranger.
+ *
+ * The ENFORCEMENT half drives vfs_open_for, the same entry SYS_OPEN uses,
+ * under two spawned processes with different credentials. A decision table
+ * that is never consulted would pass the first half and fail this one. */
+static int g_userpass, g_userfail;
+static void usercheck(const char *n, int c) {
+    if (c) { g_userpass++; kprintf("[usersstrs]  PASS  %s\n", n); }
+    else   { g_userfail++; kprintf("[usersstrs]  FAIL  %s\n", n); }
+}
+
+static void cmd_users_stress(void) {
+    kputs("-- USERSSTRS: process credentials, file ownership and permission --\n");
+    g_userpass = g_userfail = 0;
+    uint64_t save = current_proc_idx;
+
+    /* ---- the permission rule, as a decision table ---- */
+    struct dirent d;
+    cmemset(&d, 0, sizeof d);
+    d.used = 1; d.uid = 1000; d.gid = 100; d.mode = 0640;
+    usercheck("owner may read and write its own 0640 file",
+              vfs_permit(&d, 1000, 100, VFS_P_READ) && vfs_permit(&d, 1000, 100, VFS_P_WRITE));
+    usercheck("the group may read a 0640 file but not write it",
+              vfs_permit(&d, 1001, 100, VFS_P_READ) && !vfs_permit(&d, 1001, 100, VFS_P_WRITE));
+    usercheck("a stranger may do neither to a 0640 file",
+              !vfs_permit(&d, 1001, 101, VFS_P_READ) && !vfs_permit(&d, 1001, 101, VFS_P_WRITE));
+    usercheck("root bypasses the mode entirely", vfs_permit(&d, 0, 0, VFS_P_WRITE));
+
+    /* First match wins, NOT most-permissive wins. 0046 is owner ---, group r--,
+     * other rw-: the owner must be denied a write that a STRANGER is granted,
+     * or the owner triple is advisory rather than binding and nobody can ever
+     * lock themselves out of their own file. This is the one assertion that
+     * separates a correct implementation from an OR of the three triples.
+     * (An earlier draft wrote 0604 here, which is owner rw- — the table caught
+     * the mistake in the test, which is the other thing a decision table is
+     * for.) */
+    d.mode = 0046;
+    usercheck("a 0046 file denies its OWNER a write it grants a stranger",
+              !vfs_permit(&d, 1000, 100, VFS_P_WRITE) && vfs_permit(&d, 1001, 101, VFS_P_WRITE));
+    usercheck("and the group triple beats `other` even when `other` is more permissive",
+              vfs_permit(&d, 1001, 100, VFS_P_READ) && !vfs_permit(&d, 1001, 100, VFS_P_WRITE));
+
+    /* A volume written before v0.72 has mode 0 everywhere. Read literally that
+     * denies everybody everything, which would make every pre-existing file
+     * unreachable the moment enforcement began. */
+    d.mode = 0;
+    usercheck("a legacy dirent (mode 0) reads as the default, not as no-access",
+              vfs_mode_of(&d) == (uint32_t)VFS_MODE_DEFAULT &&
+              vfs_permit(&d, 1001, 101, VFS_P_READ));
+
+    /* ---- enforcement, through the real open path, as two real users ---- */
+    int alice = kproc_spawn("u-alice", PCAP_FILESYSTEM);
+    int bob   = kproc_spawn("u-bob",   PCAP_FILESYSTEM);
+    current_proc_idx = save;
+    if (alice < 0 || bob < 0) {
+        usercheck("two test processes could be spawned", 0);
+    } else {
+        kprocs[alice].uid = 1000; kprocs[alice].gid = 100;
+        kprocs[bob].uid   = 1001; kprocs[bob].gid   = 101;
+
+        int fa = vfs_open_for("m72own", alice, 1);          /* alice creates it */
+        int di = vfs_find("m72own");
+        usercheck("a file created by a user is owned by that user",
+                  fa >= 0 && di >= 0 && DENTS[di].uid == 1000 && DENTS[di].gid == 100);
+        usercheck("a newly created file gets the default mode",
+                  di >= 0 && vfs_mode_of(&DENTS[di]) == (uint32_t)VFS_MODE_DEFAULT);
+
+        /* 0644: a stranger may read it. Permission is not ownership. */
+        int fb = vfs_open_for("m72own", bob, 0);
+        usercheck("a stranger CAN open another user's 0644 file for reading", fb >= 0);
+        usercheck("but the stranger has no write right to it",
+                  di >= 0 && !vfs_permit(&DENTS[di], kprocs[bob].uid, kprocs[bob].gid, VFS_P_WRITE));
+        usercheck("while the owner does",
+                  di >= 0 && vfs_permit(&DENTS[di], kprocs[alice].uid, kprocs[alice].gid, VFS_P_WRITE));
+
+        /* Tighten it, and the stranger loses the descriptor it could have had. */
+        if (di >= 0) { klock_acquire(&g_vfs_lock); DENTS[di].mode = 0600; klock_release(&g_vfs_lock); }
+        int fb2 = vfs_open_for("m72own", bob, 0);
+        usercheck("after chmod 0600 the stranger can no longer open it at all", fb2 == -13);
+        usercheck("and the owner still can", vfs_open_for("m72own", alice, 0) >= 0);
+        /* Root is not stopped by a mode that stops everybody else. */
+        int rooted = kproc_spawn("u-root", PCAP_FILESYSTEM);
+        current_proc_idx = save;
+        if (rooted >= 0) {
+            kprocs[rooted].uid = 0; kprocs[rooted].gid = 0;
+            usercheck("root opens a 0600 file it does not own",
+                      vfs_open_for("m72own", rooted, 0) >= 0);
+            kprocs[rooted].exited = 1; kprocs[rooted].torn_down = 1;
+        }
+        (void)fb;
+        kprocs[alice].exited = 1; kprocs[alice].torn_down = 1;
+        kprocs[bob].exited   = 1; kprocs[bob].torn_down   = 1;
+    }
+    current_proc_idx = save;
+
+    /* ---- credentials on the process ---- */
+    usercheck("the initial process runs as root",
+              kprocs[tg_of((int)save)].uid == 0);
+    /* setuid/setgid are exercised from ring 3 by role 52, which is the only
+     * place the one-way rule can be observed the way an application sees it. */
+
+    kprintf("[usersstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_userpass, (uint64_t)g_userfail);
+    if (!g_userfail)
+        kputs("[usersstrs] CREDENTIALS VERIFIED — identity, ownership, mode enforcement and legacy compatibility\n");
+    else kputs("[usersstrs] CREDENTIAL DEFECTS PRESENT\n");
+    kputs("-- done --\n");
 }
 
 static void cmd_wimp_stress(void) {
@@ -22206,6 +22501,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "audiostress")) cmd_audio_stress();
     else if (!kstrcmp(argv[0], "netstress")) cmd_net_stress();
     else if (!kstrcmp(argv[0], "wimpstress")) cmd_wimp_stress();
+    else if (!kstrcmp(argv[0], "usersstress")) cmd_users_stress();
     else if (!kstrcmp(argv[0], "appsstress")) cmd_apps_stress();
     else if (!kstrcmp(argv[0], "posixstress")) cmd_posix_stress();
     else if (!kstrcmp(argv[0], "toolchainstress")) cmd_selfhost_test();
@@ -22413,6 +22709,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_gpu_stress();       /* v0.50: virtio-gpu 2D resource/scanout/flush churn, incl. client faults */
     cmd_audio_stress();     /* v0.51: virtio-sound PCM configure/write churn, incl. client faults */
     cmd_net_stress();       /* v0.52: ring-3 datagram-socket bind/connect/send/recv churn, incl. client faults */
+    cmd_users_stress();     /* v0.72: process credentials, file ownership and permission enforcement */
     cmd_wimp_stress();      /* v0.53: ring-3 WIMP window create/manage/close churn + WM logic, incl. client faults */
     cmd_apps_stress();      /* v0.54: concurrent ring-3 GUI apps (terminal/sysmon/filer), incl. app crashes */
     cmd_posix_stress();     /* v0.55: fork/exec chains, signal frames, pthread mutexes under SMP */
