@@ -125,9 +125,12 @@ per-release patch.
 
 ## VERIFICATION
 
-42 suites (44 on VT-d), 0 FAIL on uniprocessor/BIOS, SMP-4/BIOS and
+43 suites (45 on VT-d), 0 FAIL on uniprocessor/BIOS, SMP-4/BIOS and
 q35 + VT-d IOMMU (`-smp 4`), each against a freshly formatted volume. One suite
-is added — `usersstrs`, 18 assertions. Boot logs are in `docs/`.
+is added — `usersstrs`, 18 assertions — and the count is 43 rather than v0.71's
+42 for exactly that reason and no other: diffing the suite list against the
+v0.71 baseline shows `usersstrs` as the sole addition. Boot logs are in
+`docs/`.
 
 The decision table is checked directly against `vfs_permit`, and the
 **end-to-end** behaviour is checked through `vfs_open_for`, which is what ring 3
