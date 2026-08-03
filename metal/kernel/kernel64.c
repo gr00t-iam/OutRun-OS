@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.69.0-metal"
+#define KERNEL_VERSION "0.70.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -8035,6 +8035,61 @@ struct wmwin {
     struct sevent q[8]; volatile uint32_t qw, qr;   /* routed input events for the owner */
 };
 static struct wmwin g_wmwin[NWMWIN];
+
+/* ===========================================================================
+ * v0.70: WIDGETS — a toolkit that needs no function pointers
+ * ===========================================================================
+ * The compositor has had windows, title bars, focus, dragging and z-order
+ * since v0.53, and an application still had to paint every pixel of its own
+ * interior and decode every click itself. That is a window system, not a user
+ * interface, and it is the gap between "there is a desktop" and "somebody
+ * could use this".
+ *
+ * THE SHAPE IS FORCED BY THE COMPILER. Every mainstream toolkit is callback
+ * driven — you hand it a function and it calls you back. `occ`, this system's
+ * own C compiler, CANNOT PRODUCE A FUNCTION POINTER, and `vsh` is compiled by
+ * occ. A callback toolkit would therefore be usable from `/bin/init` and from
+ * nothing this system can compile for itself, which is the wrong half of the
+ * OS to leave out.
+ *
+ * So the model is RETAINED and POLLED: an application declares a button once
+ * and asks "what happened?" in its own loop. No callbacks, no inversion of
+ * control, and the same API works from occ and from gcc-compiled code alike.
+ * That is not a compromise forced on the design — polled retained-mode is what
+ * a small system with one event queue per window wants anyway.
+ *
+ * THE KERNEL DRAWS THEM. A widget declared here is painted by the compositor,
+ * not by the application, so a program that declares a button and never draws
+ * anything still has a button that looks like every other button on the
+ * desktop. Consistency is the part of "user friendly" an application library
+ * cannot enforce on its own. */
+#define NWIDGET     32
+#define WG_LABEL    1
+#define WG_BUTTON   2
+#define WG_CHECK    3
+#define WG_PROGRESS 4
+#define WG_TEXTLEN  24
+
+struct widget {
+    int  used, win, kind;
+    int  x, y, w, h;                 /* window-content-relative */
+    char text[WG_TEXTLEN];
+    int  value;                      /* checkbox 0/1; progress 0..100 */
+    int  enabled;
+};
+static struct widget g_wg[NWIDGET];
+static volatile uint64_t g_wg_created = 0, g_wg_clicks = 0, g_wg_drawn = 0;
+
+static int wg_count_used(void) {
+    int n = 0;
+    for (int i = 0; i < NWIDGET; i++) if (g_wg[i].used) n++;
+    return n;
+}
+
+/* Release every widget belonging to a window. Caller holds g_wm_lock. */
+static void wg_release_win(int win) {
+    for (int i = 0; i < NWIDGET; i++) if (g_wg[i].used && g_wg[i].win == win) g_wg[i].used = 0;
+}
 static uint64_t g_wm_pagetab[NWMWIN][WIN_SURF_MAXPG];   /* phys of each window's surface pages */
 static struct klock g_wm_lock = { 0, "wm", 10, 0, 0 };
 static int g_wm_focus = -1;              /* window index with keyboard focus, or -1     */
@@ -8085,6 +8140,7 @@ static void wm_queue_event(int idx, int32_t type, int32_t x, int32_t y, int32_t 
 static void wm_destroy(int idx) {
     struct wmwin *W = &g_wmwin[idx];
     if (!W->used) return;
+    wg_release_win(idx);      /* v0.70: a widget cannot outlive its window */
     /* The surface pages are ordinary USER mappings in the owner's CR3, so
      * page_free_tree returns them to the frame free list at process exit —
      * exactly like the user stack. Nothing to revoke here; just drop refs. */
@@ -8106,13 +8162,16 @@ static void wimp_teardown_kproc(int proc_idx) {
             if (g_debug_wimp)
                 kprintf("[dbgwimp] pid %u: destroyed window %d (z %d)\n",
                         kprocs[proc_idx].pid, i, g_wmwin[i].z);
-            /* grant frames are reclaimed by dma_teardown_kproc; just drop refs */
-            if (g_wm_focus == i) g_wm_focus = -1;
-            if (g_wm_drag == i) g_wm_drag = -1;
-            g_wmwin[i].used = 0; g_wmwin[i].owner = -1;
-            g_wmwin[i].surf_vaddr = 0; g_wmwin[i].ppage = 0;
-            g_wmwin[i].cw = g_wmwin[i].ch = 0; g_wmwin[i].cpages = 0;
-            g_wmwin[i].focused = 0; g_wmwin[i].qw = g_wmwin[i].qr = 0;
+            /* v0.70: wm_destroy, not a second copy of what it does. This used
+             * to open-code the reset — a strict subset, missing `minimized`
+             * and, once widgets existed, missing wg_release_win. Every ring-3
+             * window in the system is torn down through HERE rather than
+             * through the close box, so the widget release that had been added
+             * to wm_destroy was the one path that never ran, and the table
+             * filled up over sixteen churn rounds. Two places that must agree
+             * is the defect; one teardown path is the fix.
+             * (Grant frames are reclaimed by dma_teardown_kproc.) */
+            wm_destroy(i);
         }
     }
     klock_release(&g_wm_lock);
@@ -13363,6 +13422,91 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                     kprocs[p].pid, len, prot, base);
         return base;
     }
+    case 85: {   /* v0.70: SYS_UI_ADD(win_and_kind, rect, text) -> widget id, or negative.
+                  *   a0 bits 0..15 window id, bits 16..31 kind
+                  *   a1 x | y<<16 | w<<32 | h<<48
+                  *   a2 pointer to a NUL-terminated label, or 0
+                  *
+                  * Retained: declared once, drawn by the compositor every frame
+                  * thereafter, and reported by id when clicked. No callback is
+                  * taken because occ cannot produce one — see the note on the
+                  * widget table. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        int p = tg_of((int)current_proc_idx);
+        int win = (int)(a0 & 0xFFFF), kind = (int)((a0 >> 16) & 0xFFFF);
+        if (win < 0 || win >= NWMWIN) return (uint64_t)-22;
+        if (kind < WG_LABEL || kind > WG_PROGRESS) return (uint64_t)-22;
+        int x = (int)(int16_t)(a1 & 0xFFFF),        y = (int)(int16_t)((a1 >> 16) & 0xFFFF);
+        int w = (int)(int16_t)((a1 >> 32) & 0xFFFF), h = (int)(int16_t)((a1 >> 48) & 0xFFFF);
+        if (w <= 0 || h <= 0) return (uint64_t)-22;
+        char lbl[WG_TEXTLEN];
+        for (int i = 0; i < WG_TEXTLEN; i++) lbl[i] = 0;
+        /* copy_user_str, not a bare access_ok + loop: it re-validates on every
+         * page crossing, so a label whose last byte sits at the end of a
+         * mapping cannot walk the kernel into an unmapped page. */
+        if (a2 && copy_user_str(kprocs[p].cr3, a2, lbl, WG_TEXTLEN) < 0) return (uint64_t)-14;
+        int id = -1;
+        klock_acquire(&g_wm_lock);
+        if (!g_wmwin[win].used || g_wmwin[win].owner != p) { klock_release(&g_wm_lock); return (uint64_t)-13; }
+        /* Clamped to the content rect at DECLARATION, not at draw time. A
+         * widget that silently vanished because it was two pixels too wide
+         * would be a layout bug with no error attached to it. */
+        if (x < 0 || y < 0 || x + w > g_wmwin[win].cw || y + h > g_wmwin[win].ch) {
+            klock_release(&g_wm_lock); return (uint64_t)-22;
+        }
+        for (int i = 0; i < NWIDGET; i++) if (!g_wg[i].used) { id = i; break; }
+        if (id >= 0) {
+            struct widget *g = &g_wg[id];
+            g->used = 1; g->win = win; g->kind = kind;
+            g->x = x; g->y = y; g->w = w; g->h = h;
+            for (int i = 0; i < WG_TEXTLEN; i++) g->text[i] = lbl[i];
+            g->value = 0; g->enabled = 1;
+        }
+        klock_release(&g_wm_lock);
+        if (id < 0) return (uint64_t)-11;                     /* EAGAIN: table full */
+        __sync_fetch_and_add(&g_wg_created, 1);
+        return (uint64_t)(int64_t)id;
+    }
+    case 86: {   /* v0.70: SYS_UI_SET(win_and_id, what, value) -> 0, or negative.
+                  * what: 0 = value, 1 = enabled, 2 = text (value is a pointer). */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        int p = tg_of((int)current_proc_idx);
+        int win = (int)(a0 & 0xFFFF), id = (int)((a0 >> 16) & 0xFFFF);
+        if (win < 0 || win >= NWMWIN || id < 0 || id >= NWIDGET) return (uint64_t)-22;
+        char lbl[WG_TEXTLEN];
+        if (a1 == 2) {
+            for (int i = 0; i < WG_TEXTLEN; i++) lbl[i] = 0;
+            if (!a2 || copy_user_str(kprocs[p].cr3, a2, lbl, WG_TEXTLEN) < 0) return (uint64_t)-14;
+        }
+        int64_t rc = 0;
+        klock_acquire(&g_wm_lock);
+        if (!g_wmwin[win].used || g_wmwin[win].owner != p) rc = -13;
+        else if (!g_wg[id].used || g_wg[id].win != win)    rc = -22;
+        else if (a1 == 0) g_wg[id].value   = (int)(int64_t)a2;
+        else if (a1 == 1) g_wg[id].enabled = a2 ? 1 : 0;
+        else if (a1 == 2) { for (int i = 0; i < WG_TEXTLEN; i++) g_wg[id].text[i] = lbl[i]; }
+        else rc = -22;
+        klock_release(&g_wm_lock);
+        return (uint64_t)rc;
+    }
+    case 87: {   /* v0.70: SYS_UI_GET(win_and_id, what, 0) -> value, or negative.
+                  * what: 0 = value, 1 = enabled. This is how a polled toolkit
+                  * reports a checkbox: the click already toggled it, and the
+                  * application asks what it now is. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        int p = tg_of((int)current_proc_idx);
+        int win = (int)(a0 & 0xFFFF), id = (int)((a0 >> 16) & 0xFFFF);
+        if (win < 0 || win >= NWMWIN || id < 0 || id >= NWIDGET) return (uint64_t)-22;
+        int64_t rc;
+        klock_acquire(&g_wm_lock);
+        if (!g_wmwin[win].used || g_wmwin[win].owner != p) rc = -13;
+        else if (!g_wg[id].used || g_wg[id].win != win)    rc = -22;
+        else if (a1 == 0) rc = g_wg[id].value;
+        else if (a1 == 1) rc = g_wg[id].enabled;
+        else rc = -22;
+        klock_release(&g_wm_lock);
+        return (uint64_t)rc;
+    }
     case 83: {   /* v0.66: SYS_MMAP_FILE(fd_prot_flags, length, offset) -> base, or -1.
                   *
                   *   a0 bits  0..7  fd
@@ -16774,6 +16918,53 @@ static void wimp_draw_cursor(void) {
 }
 
 /* Compose one desktop frame into the backbuffer and present it. */
+/* v0.70: paint a window's widgets over its content.
+ *
+ * Drawn from a SNAPSHOT of the window taken under the lock, but reading the
+ * widget table live and without the lock — deliberately. Widget state is four
+ * ints and a short string; the worst a concurrent SYS_UI_SET can do is make
+ * one frame show the old label, which the next compose corrects 60 times a
+ * second. Taking g_wm_lock here would put a lock (rank 10) around the draw
+ * primitives, and the compositor already goes to some trouble not to do that
+ * because drawing is slow and must never run under one. A torn pixel is worth
+ * far less than a held lock. */
+static void wimp_draw_widgets(const struct wmwin *W, int wi) {
+    if (!W->used || W->minimized) return;
+    int ox = W->x + 2, oy = W->y + WIN_TITLE_H;         /* content origin, screen space */
+    for (int k = 0; k < NWIDGET; k++) {
+        struct widget *g = &g_wg[k];
+        if (!g->used || g->win != wi) continue;
+        int gx = ox + g->x, gy = oy + g->y;
+        if (g->x < 0 || g->y < 0 || g->x + g->w > W->cw || g->y + g->h > W->ch) continue;
+        uint32_t ink = g->enabled ? W->accent : C_MUTE;
+        if (g->kind == WG_LABEL) {
+            draw_str(gx, gy, g->text, g->enabled ? C_CYAN : C_MUTE);
+        } else if (g->kind == WG_BUTTON) {
+            rect(gx, gy, g->w, g->h, C_OBS1);
+            hline(gx, gy, g->w, ink); hline(gx, gy + g->h - 1, g->w, ink);
+            vline(gx, gy, g->h, ink); vline(gx + g->w - 1, gy, g->h, ink);
+            draw_str(gx + 6, gy + (g->h - 8) / 2, g->text, ink);
+        } else if (g->kind == WG_CHECK) {
+            int b = 10;
+            rect(gx, gy + (g->h - b) / 2, b, b, C_OBS1);
+            hline(gx, gy + (g->h - b) / 2, b, ink);
+            hline(gx, gy + (g->h - b) / 2 + b - 1, b, ink);
+            vline(gx, gy + (g->h - b) / 2, b, ink);
+            vline(gx + b - 1, gy + (g->h - b) / 2, b, ink);
+            if (g->value) rect(gx + 3, gy + (g->h - b) / 2 + 3, b - 6, b - 6, ink);
+            draw_str(gx + b + 6, gy + (g->h - 8) / 2, g->text, g->enabled ? C_CYAN : C_MUTE);
+        } else if (g->kind == WG_PROGRESS) {
+            int v = g->value; if (v < 0) v = 0; if (v > 100) v = 100;
+            rect(gx, gy, g->w, g->h, C_OBS1);
+            hline(gx, gy, g->w, C_HAIR); hline(gx, gy + g->h - 1, g->w, C_HAIR);
+            vline(gx, gy, g->h, C_HAIR); vline(gx + g->w - 1, gy, g->h, C_HAIR);
+            int fillw = (g->w - 2) * v / 100;
+            if (fillw > 0) rect(gx + 1, gy + 1, fillw, g->h - 2, ink);
+        }
+        __sync_fetch_and_add(&g_wg_drawn, 1);
+    }
+}
+
 static void wimp_compose(void) {
     int W = g_fb_width, H = g_fb_height;
     if (!g_bb) return;
@@ -16802,7 +16993,11 @@ static void wimp_compose(void) {
         while (b >= 0 && snap[order[b]].z > snap[k].z) { order[b + 1] = order[b]; b--; }
         order[b + 1] = k;
     }
-    for (int a = 0; a < nord; a++) wimp_draw_window(&snap[order[a]], snap[order[a]].focused);
+    for (int a = 0; a < nord; a++) {
+        int wi = order[a];
+        wimp_draw_window(&snap[wi], snap[wi].focused);
+        wimp_draw_widgets(&snap[wi], wi);      /* v0.70: painted BY the system */
+    }
 
     /* taskbar across the bottom: one chip per used window */
     rect(0, H - WIN_TASKBAR_H, W, WIN_TASKBAR_H, C_OBS1);
@@ -16844,7 +17039,25 @@ static int wimp_pointer(int sx, int sy, int down) {
                 }
             } else {                                      /* content: focus + route click */
                 wm_raise(hit); wm_focus(hit);
-                wm_queue_event(hit, 1 /*click*/, lx, ly - WIN_TITLE_H, 0);
+                int cx = lx, cy = ly - WIN_TITLE_H;
+                /* v0.70: a widget under the pointer CONSUMES the click and
+                 * reports itself by id. The raw click is not also delivered —
+                 * an application that had to ignore clicks its own buttons
+                 * already handled would be doing the toolkit's job. */
+                int wg = -1;
+                for (int k = 0; k < NWIDGET; k++) {
+                    struct widget *g = &g_wg[k];
+                    if (!g->used || g->win != hit || !g->enabled) continue;
+                    if (g->kind == WG_LABEL || g->kind == WG_PROGRESS) continue;  /* not interactive */
+                    if (cx >= g->x && cx < g->x + g->w && cy >= g->y && cy < g->y + g->h) { wg = k; break; }
+                }
+                if (wg >= 0) {
+                    if (g_wg[wg].kind == WG_CHECK) g_wg[wg].value = !g_wg[wg].value;
+                    __sync_fetch_and_add(&g_wg_clicks, 1);
+                    wm_queue_event(hit, 3 /*widget*/, cx, cy, wg);
+                } else {
+                    wm_queue_event(hit, 1 /*click*/, cx, cy, 0);
+                }
             }
         }
     } else {
@@ -17006,6 +17219,123 @@ static void cmd_wimp_stress(void) {
     wimpcheck("hit-test picks the higher-z window in an overlap", top_overlap == b);
     wimpcheck("hit-test picks the sole window under a non-overlapping point", top_c == c);
     wimpcheck("hit-test returns -1 over empty desktop", top_none == -1);
+
+    /* ---- v0.70: WIDGETS. Declared through the real syscalls, clicked through
+     * the real pointer path, and read back through the real accessors — so
+     * what is verified is the interface an application would actually use, not
+     * a shortcut into the table behind it. ---- */
+    {
+        uint64_t wgc0 = g_wg_created, clk0 = g_wg_clicks;
+        int base_wg = wg_count_used();
+        /* The ring-3 rounds above have all exited by now — cleanly and via the
+         * fault path — and each of them declared widgets. If a single one
+         * survived its process the table would not be empty, and this is the
+         * assertion that says so before anything below can mask it. */
+        wimpcheck("no widget outlived the ring-3 process that declared it (clean OR faulted)",
+                  base_wg == 0);
+        uint64_t sv2 = current_proc_idx;
+        kprocs[save].caps |= PCAP_WIMP;          /* the seeded windows' owner */
+        current_proc_idx = save;
+        /* This block owns its own window and destroys it, rather than
+         * borrowing one the surrounding WM-logic assertions still need. An
+         * earlier draft reused c and then destroyed it to prove widget
+         * release, which left the minimize test below hit-testing a window
+         * that no longer existed. Placed clear of a, b and c so no hit-test
+         * or compose assertion changes meaning. */
+        int d = wm_seed((int)save, 600, 60, 200, 150);
+        wimpcheck("a window can be seeded for the widget fixture", d >= 0);
+        if (d < 0) { current_proc_idx = sv2; goto widgets_done; }
+        /* wm_seed makes a window with no content SURFACE, so cw/ch are zero and
+         * every widget would be refused for not fitting a zero-sized rect —
+         * the bounds check doing its job against an incomplete fixture. Give
+         * the seeded window the content rectangle SYS_WIN_CREATE would have
+         * computed; widgets need the geometry, not the pixels. */
+        klock_acquire(&g_wm_lock);
+        g_wmwin[d].cw = g_wmwin[d].w - 4;
+        g_wmwin[d].ch = g_wmwin[d].h - WIN_TITLE_H - 3;
+        klock_release(&g_wm_lock);
+
+        /* A button and a checkbox, laid out inside c's content rect. */
+        uint64_t r_btn = (uint64_t)(uint16_t)10 | ((uint64_t)(uint16_t)10 << 16) |
+                         ((uint64_t)(uint16_t)80 << 32) | ((uint64_t)(uint16_t)20 << 48);
+        uint64_t r_chk = (uint64_t)(uint16_t)10 | ((uint64_t)(uint16_t)40 << 16) |
+                         ((uint64_t)(uint16_t)80 << 32) | ((uint64_t)(uint16_t)16 << 48);
+        /* Labels are passed as NULL here: this suite runs in a kernel context,
+         * and a .rodata pointer is not user-mapped, so access_ok correctly
+         * refuses it. Text rendering is not what these assertions are for. */
+        int bid = (int)(int64_t)syscall_dispatch(85, (uint64_t)d | ((uint64_t)WG_BUTTON << 16),
+                                                 r_btn, 0);   /* label: see note */
+        int kid = (int)(int64_t)syscall_dispatch(85, (uint64_t)d | ((uint64_t)WG_CHECK << 16),
+                                                 r_chk, 0);
+        wimpcheck("a button and a checkbox can be declared on a window", bid >= 0 && kid >= 0);
+
+        /* A widget that would fall outside the content rect is REFUSED at
+         * declaration. Silently clipping it would be a layout bug with no
+         * error attached to it. */
+        uint64_t r_big = (uint64_t)(uint16_t)10 | ((uint64_t)(uint16_t)10 << 16) |
+                         ((uint64_t)(uint16_t)9000 << 32) | ((uint64_t)(uint16_t)20 << 48);
+        wimpcheck("a widget that would not fit the content rect is refused",
+                  (int64_t)syscall_dispatch(85, (uint64_t)d | ((uint64_t)WG_BUTTON << 16),
+                                            r_big, 0) < 0);
+
+        /* Click the BUTTON through the pointer path. It must arrive as a
+         * widget event naming that button — not as a raw click the
+         * application would have to hit-test for itself. */
+        klock_acquire(&g_wm_lock);
+        wm_raise(d);
+        int cxs = g_wmwin[d].x + 2, cys = g_wmwin[d].y + WIN_TITLE_H;
+        uint32_t qr0 = g_wmwin[d].qr, qw0 = g_wmwin[d].qw;
+        klock_release(&g_wm_lock);
+        (void)qr0;
+        wimp_pointer(cxs + 20, cys + 18, 1); wimp_pointer(cxs + 20, cys + 18, 0);
+        klock_acquire(&g_wm_lock);
+        int got_ev = 0, ev_type = 0, ev_code = -1;
+        if (g_wmwin[d].qw > qw0) {
+            struct sevent *e = &g_wmwin[d].q[qw0 % 8];
+            got_ev = 1; ev_type = e->type; ev_code = e->code;
+        }
+        klock_release(&g_wm_lock);
+        wimpcheck("clicking a button delivers a WIDGET event naming that button",
+                  got_ev && ev_type == 3 && ev_code == bid);
+
+        /* The checkbox toggles on click, and SYS_UI_GET reports the new state
+         * — which is how a polled toolkit answers "is it checked now?". */
+        int was = (int)(int64_t)syscall_dispatch(87, (uint64_t)d | ((uint64_t)kid << 16), 0, 0);
+        wimp_pointer(cxs + 20, cys + 46, 1); wimp_pointer(cxs + 20, cys + 46, 0);
+        int now = (int)(int64_t)syscall_dispatch(87, (uint64_t)d | ((uint64_t)kid << 16), 0, 0);
+        wimpcheck("clicking a checkbox toggles it, and the state reads back", was == 0 && now == 1);
+
+        /* A DISABLED widget is not clickable — the click falls through to the
+         * application as an ordinary content click instead of firing. */
+        syscall_dispatch(86, (uint64_t)d | ((uint64_t)bid << 16), 1, 0);   /* disable */
+        klock_acquire(&g_wm_lock); uint32_t qw1 = g_wmwin[d].qw; klock_release(&g_wm_lock);
+        wimp_pointer(cxs + 20, cys + 18, 1); wimp_pointer(cxs + 20, cys + 18, 0);
+        klock_acquire(&g_wm_lock);
+        int t2 = -1;
+        if (g_wmwin[d].qw > qw1) t2 = g_wmwin[d].q[qw1 % 8].type;
+        klock_release(&g_wm_lock);
+        wimpcheck("a disabled widget does not fire; the click falls through as content",
+                  t2 == 1);
+
+        /* A click on empty content is still an ordinary click. */
+        klock_acquire(&g_wm_lock); uint32_t qw2 = g_wmwin[d].qw; klock_release(&g_wm_lock);
+        wimp_pointer(cxs + 120, cys + 90, 1); wimp_pointer(cxs + 120, cys + 90, 0);
+        klock_acquire(&g_wm_lock);
+        int t3 = -1;
+        if (g_wmwin[d].qw > qw2) t3 = g_wmwin[d].q[qw2 % 8].type;
+        klock_release(&g_wm_lock);
+        wimpcheck("a click on bare content is delivered as a plain click", t3 == 1);
+
+        wimpcheck("widgets were created and clicks were counted",
+                  g_wg_created > wgc0 && g_wg_clicks > clk0);
+
+        /* And they must not outlive their window. */
+        klock_acquire(&g_wm_lock); wm_destroy(d); klock_release(&g_wm_lock);
+        wimpcheck("destroying a window releases every widget it owned",
+                  wg_count_used() == base_wg);
+        current_proc_idx = sv2;
+    }
+widgets_done: ;
 
     /* raise a to the front via a title-bar click, re-test the overlap */
     int hit = wimp_pointer(150, 105, 1); wimp_pointer(150, 105, 0);   /* title bar of a (or b) */
