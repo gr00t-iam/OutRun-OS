@@ -142,6 +142,8 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define WG_BUTTON               2
 #define WG_CHECK                3
 #define WG_PROGRESS             4
+#define WG_ENTRY                5           /* v0.71 */
+#define WG_TEXTLEN              24          /* mirrors the kernel's widget text buffer */
 
 /* v0.70: the widget calls pack a window id and a second small integer into a0
  * for the same reason SYS_MMAP_FILE packs its descriptor — three argument
@@ -159,6 +161,13 @@ static i64 oui_set(int win, int id, int what, u64 value) {
 static i64 oui_get(int win, int id, int what) {
     return (i64)sysc(SYS_UI_GET, ((u64)(win & 0xFFFF)) | ((u64)(id & 0xFFFF) << 16),
                      (u64)what, 0);
+}
+/* v0.71: read a widget's text into a caller buffer of at least WG_TEXTLEN
+ * bytes; returns the string length. This is how a program reads what was
+ * typed into a field. */
+static i64 oui_gettext(int win, int id, char *buf) {
+    return (i64)sysc(SYS_UI_GET, ((u64)(win & 0xFFFF)) | ((u64)(id & 0xFFFF) << 16),
+                     2, (u64)buf);
 }
 
 /* v0.66: SYS_MMAP_FILE packs fd/prot/flags into a0 because the dispatch ABI
@@ -1306,6 +1315,28 @@ static void wimp_driver(int fault_after_create) {
         int probe = 31;
         if (probe == (int)b || probe == (int)pr) probe = 29;
         if (oui_get((int)ids[0], probe, 0) >= 0)     sysc(SYS_EXIT, 1432, 0, 0);
+
+        /* v0.71: a text field, and the text read back out through the real
+         * syscall into a real user buffer. The kernel-side suite cannot do
+         * this half — it has no user-mapped destination to copy into — so
+         * without it SYS_UI_GET(what=2) would ship unexercised. */
+        i64 e = oui_add((int)ids[0], WG_ENTRY, 8, 52, 100, 18, "abc");
+        if (e < 0) sysc(SYS_EXIT, 1433, 0, 0);
+        char tb[WG_TEXTLEN];
+        for (int k = 0; k < WG_TEXTLEN; k++) tb[k] = 0x5A;   /* poison, so a
+                                                              * no-op copy is
+                                                              * detectable */
+        i64 n = oui_gettext((int)ids[0], (int)e, tb);
+        if (n != 3) sysc(SYS_EXIT, 1434, 0, 0);
+        if (tb[0] != 'a' || tb[1] != 'b' || tb[2] != 'c' || tb[3] != 0)
+            sysc(SYS_EXIT, 1435, 0, 0);
+        /* Relabelling through SYS_UI_SET must be visible to the same reader. */
+        if (oui_set((int)ids[0], (int)e, 2, (u64)"zz") < 0) sysc(SYS_EXIT, 1436, 0, 0);
+        if (oui_gettext((int)ids[0], (int)e, tb) != 2 || tb[0] != 'z' || tb[2] != 0)
+            sysc(SYS_EXIT, 1437, 0, 0);
+        /* A NULL destination is refused rather than written through. */
+        if ((i64)sysc(SYS_UI_GET, ((u64)ids[0] & 0xFFFF) | ((u64)(int)e << 16), 2, 0) >= 0)
+            sysc(SYS_EXIT, 1438, 0, 0);
     }
 
     if (fault_after_create) {

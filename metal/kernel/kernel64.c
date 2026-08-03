@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.70.0-metal"
+#define KERNEL_VERSION "0.71.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -8033,6 +8033,7 @@ struct wmwin {
     uint64_t surf_vaddr;                 /* surface base in the OWNER's address space  */
     uint64_t *ppage;                     /* -> g_wm_pagetab[id]: phys of each surface page */
     struct sevent q[8]; volatile uint32_t qw, qr;   /* routed input events for the owner */
+    int      focus_wg;                   /* v0.71: focused widget index, or -1         */
 };
 static struct wmwin g_wmwin[NWMWIN];
 
@@ -8068,6 +8069,7 @@ static struct wmwin g_wmwin[NWMWIN];
 #define WG_BUTTON   2
 #define WG_CHECK    3
 #define WG_PROGRESS 4
+#define WG_ENTRY    5                    /* v0.71: an editable text field */
 #define WG_TEXTLEN  24
 
 struct widget {
@@ -8089,6 +8091,28 @@ static int wg_count_used(void) {
 /* Release every widget belonging to a window. Caller holds g_wm_lock. */
 static void wg_release_win(int win) {
     for (int i = 0; i < NWIDGET; i++) if (g_wg[i].used && g_wg[i].win == win) g_wg[i].used = 0;
+}
+
+/* v0.71: is this kind something a user can put focus on and operate? Labels and
+ * progress bars display; everything else responds. */
+static int wg_interactive(int kind) {
+    return kind == WG_BUTTON || kind == WG_CHECK || kind == WG_ENTRY;
+}
+
+/* v0.71: the focused widget of window `wi`, or -1.
+ *
+ * `focus_wg` is only MEANINGFUL if it still names a live widget of this
+ * window. Validating it here, rather than clearing it at every site that
+ * allocates or recycles a window slot, is the same lesson v0.70 learned from
+ * having two teardown paths: one place that must be right beats N places that
+ * must agree. A recycled slot carrying a stale index is therefore harmless by
+ * construction rather than by everyone remembering. Caller holds g_wm_lock. */
+static int wg_focused(int wi) {
+    if (wi < 0 || wi >= NWMWIN) return -1;
+    int k = g_wmwin[wi].focus_wg;
+    if (k < 0 || k >= NWIDGET) return -1;
+    if (!g_wg[k].used || g_wg[k].win != wi) return -1;
+    return k;
 }
 static uint64_t g_wm_pagetab[NWMWIN][WIN_SURF_MAXPG];   /* phys of each window's surface pages */
 static struct klock g_wm_lock = { 0, "wm", 10, 0, 0 };
@@ -8149,6 +8173,7 @@ static void wm_destroy(int idx) {
     W->used = 0; W->owner = -1; W->surf_vaddr = 0; W->ppage = 0;
     W->cw = W->ch = 0; W->cpages = 0;
     W->focused = 0; W->minimized = 0; W->qw = W->qr = 0;
+    W->focus_wg = -1;                    /* v0.71 */
 }
 
 /* Called from every kproc exit path (clean AND fault): destroy every window the
@@ -13435,7 +13460,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int p = tg_of((int)current_proc_idx);
         int win = (int)(a0 & 0xFFFF), kind = (int)((a0 >> 16) & 0xFFFF);
         if (win < 0 || win >= NWMWIN) return (uint64_t)-22;
-        if (kind < WG_LABEL || kind > WG_PROGRESS) return (uint64_t)-22;
+        if (kind < WG_LABEL || kind > WG_ENTRY) return (uint64_t)-22;
         int x = (int)(int16_t)(a1 & 0xFFFF),        y = (int)(int16_t)((a1 >> 16) & 0xFFFF);
         int w = (int)(int16_t)((a1 >> 32) & 0xFFFF), h = (int)(int16_t)((a1 >> 48) & 0xFFFF);
         if (w <= 0 || h <= 0) return (uint64_t)-22;
@@ -13489,22 +13514,43 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         klock_release(&g_wm_lock);
         return (uint64_t)rc;
     }
-    case 87: {   /* v0.70: SYS_UI_GET(win_and_id, what, 0) -> value, or negative.
+    case 87: {   /* v0.70: SYS_UI_GET(win_and_id, what, arg) -> value, or negative.
                   * what: 0 = value, 1 = enabled. This is how a polled toolkit
                   * reports a checkbox: the click already toggled it, and the
-                  * application asks what it now is. */
+                  * application asks what it now is.
+                  * v0.71: what 2 = copy the widget's text into the user buffer
+                  * `arg` (WG_TEXTLEN bytes), returning its length — which is how
+                  * a program reads what was typed into a text field. what 3 =
+                  * the window's focused widget id, or -1. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
         int p = tg_of((int)current_proc_idx);
         int win = (int)(a0 & 0xFFFF), id = (int)((a0 >> 16) & 0xFFFF);
-        if (win < 0 || win >= NWMWIN || id < 0 || id >= NWIDGET) return (uint64_t)-22;
+        if (win < 0 || win >= NWMWIN) return (uint64_t)-22;
+        if (a1 != 3 && (id < 0 || id >= NWIDGET)) return (uint64_t)-22;
+        /* The text is copied out UNDER the lock into a kernel buffer and only
+         * then written to user memory: access_ok can fault, and faulting with a
+         * rank-10 lock held is how a compositor deadlocks. */
+        char tmp[WG_TEXTLEN]; int tlen = 0;
         int64_t rc;
         klock_acquire(&g_wm_lock);
         if (!g_wmwin[win].used || g_wmwin[win].owner != p) rc = -13;
+        else if (a1 == 3) rc = wg_focused(win);
         else if (!g_wg[id].used || g_wg[id].win != win)    rc = -22;
         else if (a1 == 0) rc = g_wg[id].value;
         else if (a1 == 1) rc = g_wg[id].enabled;
+        else if (a1 == 2) {
+            for (int i = 0; i < WG_TEXTLEN; i++) tmp[i] = g_wg[id].text[i];
+            tmp[WG_TEXTLEN - 1] = 0;
+            while (tlen < WG_TEXTLEN - 1 && tmp[tlen]) tlen++;
+            rc = tlen;
+        }
         else rc = -22;
         klock_release(&g_wm_lock);
+        if (a1 == 2 && rc >= 0) {
+            if (!a2 || !access_ok(kprocs[p].cr3, a2, WG_TEXTLEN, 1)) return (uint64_t)-14;
+            char *u = (char *)a2;
+            for (int i = 0; i < WG_TEXTLEN; i++) u[i] = tmp[i];
+        }
         return (uint64_t)rc;
     }
     case 83: {   /* v0.66: SYS_MMAP_FILE(fd_prot_flags, length, offset) -> base, or -1.
@@ -16931,6 +16977,10 @@ static void wimp_draw_cursor(void) {
 static void wimp_draw_widgets(const struct wmwin *W, int wi) {
     if (!W->used || W->minimized) return;
     int ox = W->x + 2, oy = W->y + WIN_TITLE_H;         /* content origin, screen space */
+    /* v0.71: which widget shows the caret. Validated the same way wg_focused
+     * validates, because this reads the snapshot without the lock. */
+    int wgf = W->focus_wg;
+    if (wgf < 0 || wgf >= NWIDGET || !g_wg[wgf].used || g_wg[wgf].win != wi) wgf = -1;
     for (int k = 0; k < NWIDGET; k++) {
         struct widget *g = &g_wg[k];
         if (!g->used || g->win != wi) continue;
@@ -16953,6 +17003,21 @@ static void wimp_draw_widgets(const struct wmwin *W, int wi) {
             vline(gx + b - 1, gy + (g->h - b) / 2, b, ink);
             if (g->value) rect(gx + 3, gy + (g->h - b) / 2 + 3, b - 6, b - 6, ink);
             draw_str(gx + b + 6, gy + (g->h - 8) / 2, g->text, g->enabled ? C_CYAN : C_MUTE);
+        } else if (g->kind == WG_ENTRY) {
+            /* Sunken field. The border brightens and a caret appears when it
+             * holds focus, so "where does my typing go" is answerable by
+             * looking rather than by remembering what was clicked last. */
+            int foc = (wgf == k);
+            rect(gx, gy, g->w, g->h, C_OBS0);
+            uint32_t bord = foc ? ink : C_HAIR;
+            hline(gx, gy, g->w, bord); hline(gx, gy + g->h - 1, g->w, bord);
+            vline(gx, gy, g->h, bord); vline(gx + g->w - 1, gy, g->h, bord);
+            draw_str(gx + 4, gy + (g->h - 8) / 2, g->text, g->enabled ? C_CYAN : C_MUTE);
+            if (foc) {
+                int n = 0; while (n < WG_TEXTLEN - 1 && g->text[n]) n++;
+                int cxp = gx + 4 + n * 8;                /* draw_str advances 8/glyph */
+                if (cxp < gx + g->w - 2) vline(cxp, gy + 3, g->h - 6, ink);
+            }
         } else if (g->kind == WG_PROGRESS) {
             int v = g->value; if (v < 0) v = 0; if (v > 100) v = 100;
             rect(gx, gy, g->w, g->h, C_OBS1);
@@ -17053,9 +17118,17 @@ static int wimp_pointer(int sx, int sy, int down) {
                 }
                 if (wg >= 0) {
                     if (g_wg[wg].kind == WG_CHECK) g_wg[wg].value = !g_wg[wg].value;
+                    /* v0.71: clicking a control also gives it keyboard focus,
+                     * which is what makes a text field typeable by clicking
+                     * into it. */
+                    W->focus_wg = wg;
                     __sync_fetch_and_add(&g_wg_clicks, 1);
                     wm_queue_event(hit, 3 /*widget*/, cx, cy, wg);
                 } else {
+                    /* v0.71: a click on bare content takes focus OFF whatever
+                     * held it. Otherwise a text field would keep swallowing
+                     * keystrokes after the user had visibly clicked away. */
+                    W->focus_wg = -1;
                     wm_queue_event(hit, 1 /*click*/, cx, cy, 0);
                 }
             }
@@ -17065,6 +17138,67 @@ static int wimp_pointer(int sx, int sy, int down) {
     }
     klock_release(&g_wm_lock);
     return hit;
+}
+
+/* v0.71: offer one keystroke to the focused window's focused WIDGET. Returns 1
+ * if a widget consumed it, 0 if it should be delivered to the application as an
+ * ordinary key event.
+ *
+ * Shared by the real input path and by wimpstrs, for exactly the reason
+ * wimp_pointer is: a suite that reimplemented this routing would be verifying
+ * its own copy of the logic and not the kernel's.
+ *
+ * A key is consumed only when a widget genuinely has a use for it. Everything
+ * else falls through — a toolkit that swallowed keys the focused control had no
+ * meaning for would silently break every application shortcut on the desktop. */
+static int wimp_key(int ch) {
+    int consumed = 0;
+    klock_acquire(&g_wm_lock);
+    int wi = g_wm_focus;
+    if (wi >= 0 && wi < NWMWIN && g_wmwin[wi].used) {
+        if (ch == '\t') {
+            /* Traversal. A desktop reachable only by pointer excludes anybody
+             * who cannot use one, which v0.70 named as an accessibility gap
+             * rather than leaving it to be noticed. */
+            int cur = wg_focused(wi), next = -1;
+            for (int n = 1; n <= NWIDGET; n++) {
+                int k = ((cur < 0 ? NWIDGET - 1 : cur) + n) % NWIDGET;
+                if (!g_wg[k].used || g_wg[k].win != wi || !g_wg[k].enabled) continue;
+                if (!wg_interactive(g_wg[k].kind)) continue;
+                next = k; break;
+            }
+            if (next >= 0) { g_wmwin[wi].focus_wg = next; consumed = 1; }
+        } else {
+            int k = wg_focused(wi);
+            if (k >= 0 && g_wg[k].enabled) {
+                struct widget *g = &g_wg[k];
+                if (g->kind == WG_ENTRY) {
+                    int n = 0; while (n < WG_TEXTLEN - 1 && g->text[n]) n++;
+                    if (ch == 8 || ch == 127) {              /* backspace / DEL */
+                        if (n > 0) g->text[n - 1] = 0;
+                        consumed = 1;                        /* empty field still eats it */
+                    } else if (ch >= 0x20 && ch < 0x7F) {    /* printable */
+                        if (n < WG_TEXTLEN - 1) { g->text[n] = (char)ch; g->text[n + 1] = 0; }
+                        consumed = 1;                        /* a FULL field eats it too:
+                                                              * overflowing into the
+                                                              * application would be worse
+                                                              * than dropping it */
+                    }
+                } else if (ch == '\n' || ch == '\r' || ch == ' ') {
+                    /* Enter or Space operates the focused control, exactly as a
+                     * click on it would — same toggle, same event, same
+                     * counter, so a keyboard user and a mouse user are
+                     * indistinguishable to the application. */
+                    if (g->kind == WG_CHECK) g->value = !g->value;
+                    __sync_fetch_and_add(&g_wg_clicks, 1);
+                    wm_queue_event(wi, 3 /*widget*/, 0, 0, k);
+                    consumed = 1;
+                }
+            }
+        }
+    }
+    klock_release(&g_wm_lock);
+    return consumed;
 }
 
 /* Process real pointer + keyboard hardware for the interactive desktop. */
@@ -17094,6 +17228,9 @@ static void wimp_input_step(void) {
 
     int ch;
     while ((ch = kbd_getc_nonblock()) >= 0) {             /* route keys to focus */
+        /* v0.71: the focused WIDGET gets first refusal. Only a key no widget
+         * wanted is delivered to the application. */
+        if (wimp_key(ch)) continue;
         klock_acquire(&g_wm_lock);
         if (g_wm_focus >= 0 && g_wmwin[g_wm_focus].used)
             wm_queue_event(g_wm_focus, 2 /*key*/, 0, 0, ch);
@@ -17128,7 +17265,7 @@ static int wm_seed(int owner, int x, int y, int w, int h) {
         struct wmwin *W = &g_wmwin[id];
         cmemset(W, 0, sizeof *W);
         W->used = 1; W->owner = owner; W->x = x; W->y = y; W->w = w; W->h = h;
-        W->z = g_wm_znext++; W->accent = C_MINT;
+        W->z = g_wm_znext++; W->accent = C_MINT; W->focus_wg = -1;
     }
     klock_release(&g_wm_lock);
     return id;
@@ -17344,6 +17481,91 @@ static void cmd_wimp_stress(void) {
         } else {
             kputs("[wimpstrs] SKIP  widget paint (no bootloader framebuffer on this config)\n");
         }
+
+        /* ---- v0.71: TEXT ENTRY and per-widget keyboard focus. Driven through
+         * the real wimp_key path, which is the same one the PS/2 and USB
+         * keyboards feed, so what is verified is the routing itself. ---- */
+        uint64_t r_ent = (uint64_t)(uint16_t)10 | ((uint64_t)(uint16_t)64 << 16) |
+                         ((uint64_t)(uint16_t)120 << 32) | ((uint64_t)(uint16_t)18 << 48);
+        int eid = (int)(int64_t)syscall_dispatch(85, (uint64_t)d | ((uint64_t)WG_ENTRY << 16),
+                                                 r_ent, 0);
+        wimpcheck("a text entry can be declared", eid >= 0);
+
+        /* Clicking into a field is how a user says "type here". */
+        wimp_pointer(cxs + 20, cys + 70, 1); wimp_pointer(cxs + 20, cys + 70, 0);
+        wimpcheck("clicking a text entry gives it keyboard focus",
+                  (int)(int64_t)syscall_dispatch(87, (uint64_t)d, 3, 0) == eid);
+
+        /* Typing reaches the field, and the field alone. */
+        int typed = wimp_key('h') && wimp_key('i');
+        klock_acquire(&g_wm_lock);
+        int txt_ok = (eid >= 0) && kstrcmp(g_wg[eid].text, "hi") == 0;
+        klock_release(&g_wm_lock);
+        wimpcheck("typing into a focused entry inserts the characters", typed && txt_ok);
+
+        wimp_key(8);                                        /* backspace */
+        klock_acquire(&g_wm_lock);
+        int bs_ok = (eid >= 0) && kstrcmp(g_wg[eid].text, "h") == 0;
+        klock_release(&g_wm_lock);
+        wimpcheck("backspace removes the last character", bs_ok);
+
+        /* A field that is full must DROP the excess, not run off the end of
+         * its own buffer. The overflow is the interesting case precisely
+         * because nothing above would notice it. */
+        for (int i = 0; i < WG_TEXTLEN * 2; i++) wimp_key('x');
+        klock_acquire(&g_wm_lock);
+        int len = 0; while (len < WG_TEXTLEN && g_wg[eid].text[len]) len++;
+        int cap_ok = (len == WG_TEXTLEN - 1) && g_wg[eid].text[WG_TEXTLEN - 1] == 0;
+        klock_release(&g_wm_lock);
+        wimpcheck("a full entry caps its text and stays NUL-terminated", cap_ok);
+
+        /* A DISABLED field ignores typing. Disabling that only greyed the
+         * pixels would be a lie the application could not detect. */
+        syscall_dispatch(86, (uint64_t)d | ((uint64_t)eid << 16), 1, 0);   /* disable */
+        klock_acquire(&g_wm_lock);
+        for (int i = 0; i < WG_TEXTLEN; i++) g_wg[eid].text[i] = 0;
+        g_wg[eid].text[0] = 'q'; g_wg[eid].text[1] = 0;
+        klock_release(&g_wm_lock);
+        wimp_key('z');
+        klock_acquire(&g_wm_lock);
+        int dis_ok = kstrcmp(g_wg[eid].text, "q") == 0;
+        klock_release(&g_wm_lock);
+        wimpcheck("a disabled entry ignores keystrokes", dis_ok);
+        syscall_dispatch(86, (uint64_t)d | ((uint64_t)eid << 16), 1, 1);   /* re-enable */
+
+        /* Clicking bare content takes focus off the field — otherwise it would
+         * keep eating keys after the user had visibly clicked away — and a key
+         * with nothing focused must FALL THROUGH to the application. */
+        wimp_pointer(cxs + 120, cys + 110, 1); wimp_pointer(cxs + 120, cys + 110, 0);
+        int nofocus = (int)(int64_t)syscall_dispatch(87, (uint64_t)d, 3, 0);
+        wimpcheck("clicking bare content clears widget focus", nofocus == -1);
+        wimpcheck("a key with no widget focused is NOT consumed (the app still gets it)",
+                  wimp_key('Z') == 0);
+
+        /* Tab traversal: reaches every enabled control, skips the disabled one.
+         * Asserted as a SET rather than a sequence so it does not depend on
+         * which table slots the widgets happened to land in. */
+        int f1 = -1, f2 = -1;
+        if (wimp_key('\t')) f1 = (int)(int64_t)syscall_dispatch(87, (uint64_t)d, 3, 0);
+        if (wimp_key('\t')) f2 = (int)(int64_t)syscall_dispatch(87, (uint64_t)d, 3, 0);
+        wimpcheck("Tab moves focus between the enabled controls and skips the disabled one",
+                  f1 >= 0 && f2 >= 0 && f1 != f2 && f1 != bid && f2 != bid &&
+                  ((f1 == kid && f2 == eid) || (f1 == eid && f2 == kid)));
+
+        /* Enter operates the focused control exactly as a click would, so a
+         * keyboard user and a mouse user look identical to the application. */
+        klock_acquire(&g_wm_lock);
+        g_wmwin[d].focus_wg = kid;
+        int kv0 = g_wg[kid].value; uint32_t qw3 = g_wmwin[d].qw;
+        klock_release(&g_wm_lock);
+        int ent = wimp_key('\n');
+        klock_acquire(&g_wm_lock);
+        int kv1 = g_wg[kid].value;
+        int t4 = (g_wmwin[d].qw > qw3) ? g_wmwin[d].q[qw3 % 8].type : -1;
+        int c4 = (g_wmwin[d].qw > qw3) ? g_wmwin[d].q[qw3 % 8].code : -1;
+        klock_release(&g_wm_lock);
+        wimpcheck("Enter on a focused checkbox toggles it and reports a WIDGET event",
+                  ent && kv1 != kv0 && t4 == 3 && c4 == kid);
 
         /* And they must not outlive their window. */
         klock_acquire(&g_wm_lock); wm_destroy(d); klock_release(&g_wm_lock);
