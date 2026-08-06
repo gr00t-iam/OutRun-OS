@@ -133,6 +133,42 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_ACCEPT              82          /* v0.65 */
 #define SYS_MMAP_FILE           83          /* v0.66 */
 #define SYS_MSYNC               84          /* v0.66 */
+#define SYS_UI_ADD              85          /* v0.70 */
+#define SYS_UI_SET              86          /* v0.70 */
+#define SYS_UI_GET              87          /* v0.70 */
+
+/* v0.70: widget kinds, mirroring the kernel's table. */
+#define WG_LABEL                1
+#define WG_BUTTON               2
+#define WG_CHECK                3
+#define WG_PROGRESS             4
+#define WG_ENTRY                5           /* v0.71 */
+#define WG_TEXTLEN              24          /* mirrors the kernel's widget text buffer */
+
+/* v0.70: the widget calls pack a window id and a second small integer into a0
+ * for the same reason SYS_MMAP_FILE packs its descriptor — three argument
+ * registers, and the rectangle needs one to itself. */
+static i64 oui_add(int win, int kind, int x, int y, int w, int h, const char *text) {
+    u64 a0 = ((u64)(win & 0xFFFF)) | ((u64)(kind & 0xFFFF) << 16);
+    u64 a1 = ((u64)(x & 0xFFFF)) | ((u64)(y & 0xFFFF) << 16) |
+             ((u64)(w & 0xFFFF) << 32) | ((u64)(h & 0xFFFF) << 48);
+    return (i64)sysc(SYS_UI_ADD, a0, a1, (u64)text);
+}
+static i64 oui_set(int win, int id, int what, u64 value) {
+    return (i64)sysc(SYS_UI_SET, ((u64)(win & 0xFFFF)) | ((u64)(id & 0xFFFF) << 16),
+                     (u64)what, value);
+}
+static i64 oui_get(int win, int id, int what) {
+    return (i64)sysc(SYS_UI_GET, ((u64)(win & 0xFFFF)) | ((u64)(id & 0xFFFF) << 16),
+                     (u64)what, 0);
+}
+/* v0.71: read a widget's text into a caller buffer of at least WG_TEXTLEN
+ * bytes; returns the string length. This is how a program reads what was
+ * typed into a field. */
+static i64 oui_gettext(int win, int id, char *buf) {
+    return (i64)sysc(SYS_UI_GET, ((u64)(win & 0xFFFF)) | ((u64)(id & 0xFFFF) << 16),
+                     2, (u64)buf);
+}
 
 /* v0.66: SYS_MMAP_FILE packs fd/prot/flags into a0 because the dispatch ABI
  * has three argument registers and the offset needs one of its own. */
@@ -1242,9 +1278,70 @@ static void wimp_driver(int fault_after_create) {
         sysc(SYS_WIN_DAMAGE, (u64)id, 0, 0);
     }
 
+    /* v0.70: declare widgets from real ring 3, with a real user-mapped label.
+     * wimpstrs' kernel half cannot pass one — a .rodata pointer in kernel
+     * context is correctly refused by access_ok — so this is the only place
+     * the string path is exercised at all. Any failure exits with a code the
+     * suite will not mistake for success. */
+    {
+        i64 dims = (i64)sysc(SYS_WIN_INFO, (u64)ids[0], 0, 0);
+        if (dims < 0) sysc(SYS_EXIT, 1420, 0, 0);
+        int wcw = (int)((u64)dims >> 16), wch = (int)((u64)dims & 0xFFFF);
+        i64 b = oui_add((int)ids[0], WG_BUTTON, 8, 8, 90, 20, "OK");
+        if (b < 0) sysc(SYS_EXIT, 1421, 0, 0);
+        i64 pr = oui_add((int)ids[0], WG_PROGRESS, 8, 34, 90, 12, 0);
+        if (pr < 0) sysc(SYS_EXIT, 1422, 0, 0);
+        /* A widget that runs off the bottom of the content rect is refused
+         * here exactly as it is in the kernel-side suite — same check, but
+         * reached through the real syscall boundary from ring 3. */
+        if (oui_add((int)ids[0], WG_BUTTON, 8, wch, 90, 20, "NO") >= 0)
+            sysc(SYS_EXIT, 1423, 0, 0);
+        if (wcw <= 0 || wch <= 0) sysc(SYS_EXIT, 1424, 0, 0);
+        /* A value written from ring 3 reads back through the accessor — this
+         * is the whole contract of a polled toolkit. */
+        if (oui_set((int)ids[0], (int)pr, 0, 60) < 0) sysc(SYS_EXIT, 1425, 0, 0);
+        if (oui_get((int)ids[0], (int)pr, 0) != 60)   sysc(SYS_EXIT, 1426, 0, 0);
+        if (oui_set((int)ids[0], (int)b, 2, (u64)"GO") < 0) sysc(SYS_EXIT, 1427, 0, 0);
+        /* Disabling and re-enabling must both be observable, or SYS_UI_SET
+         * could be writing nothing and the read-back would still agree. */
+        if (oui_set((int)ids[0], (int)b, 1, 0) < 0)  sysc(SYS_EXIT, 1428, 0, 0);
+        if (oui_get((int)ids[0], (int)b, 1) != 0)    sysc(SYS_EXIT, 1429, 0, 0);
+        if (oui_set((int)ids[0], (int)b, 1, 1) < 0)  sysc(SYS_EXIT, 1430, 0, 0);
+        if (oui_get((int)ids[0], (int)b, 1) != 1)    sysc(SYS_EXIT, 1431, 0, 0);
+        /* An id this window never declared is not readable through it. The
+         * probe steps aside from our own two ids rather than assuming a
+         * particular slot is free — the widget table is global and other
+         * processes are declaring into it concurrently. */
+        int probe = 31;
+        if (probe == (int)b || probe == (int)pr) probe = 29;
+        if (oui_get((int)ids[0], probe, 0) >= 0)     sysc(SYS_EXIT, 1432, 0, 0);
+
+        /* v0.71: a text field, and the text read back out through the real
+         * syscall into a real user buffer. The kernel-side suite cannot do
+         * this half — it has no user-mapped destination to copy into — so
+         * without it SYS_UI_GET(what=2) would ship unexercised. */
+        i64 e = oui_add((int)ids[0], WG_ENTRY, 8, 52, 100, 18, "abc");
+        if (e < 0) sysc(SYS_EXIT, 1433, 0, 0);
+        char tb[WG_TEXTLEN];
+        for (int k = 0; k < WG_TEXTLEN; k++) tb[k] = 0x5A;   /* poison, so a
+                                                              * no-op copy is
+                                                              * detectable */
+        i64 n = oui_gettext((int)ids[0], (int)e, tb);
+        if (n != 3) sysc(SYS_EXIT, 1434, 0, 0);
+        if (tb[0] != 'a' || tb[1] != 'b' || tb[2] != 'c' || tb[3] != 0)
+            sysc(SYS_EXIT, 1435, 0, 0);
+        /* Relabelling through SYS_UI_SET must be visible to the same reader. */
+        if (oui_set((int)ids[0], (int)e, 2, (u64)"zz") < 0) sysc(SYS_EXIT, 1436, 0, 0);
+        if (oui_gettext((int)ids[0], (int)e, tb) != 2 || tb[0] != 'z' || tb[2] != 0)
+            sysc(SYS_EXIT, 1437, 0, 0);
+        /* A NULL destination is refused rather than written through. */
+        if ((i64)sysc(SYS_UI_GET, ((u64)ids[0] & 0xFFFF) | ((u64)(int)e << 16), 2, 0) >= 0)
+            sysc(SYS_EXIT, 1438, 0, 0);
+    }
+
     if (fault_after_create) {
         volatile u32 *bad = (volatile u32 *)0x1;
-        *bad = 0xDEAD;                                       /* deliberate fault: windows must still be destroyed */
+        *bad = 0xDEAD;                                       /* deliberate fault: windows AND their widgets must still be released */
     }
 
     struct { int type, x, y, code; } ev;                    /* poll any routed events (none in headless) */

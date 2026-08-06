@@ -16,7 +16,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.69.0-metal"
+#define KERNEL_VERSION "0.73.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -1756,6 +1756,15 @@ struct kproc {
     uint64_t pid;
     char     name[24];
     uint64_t caps;
+    /* v0.72: WHO this process is running as. Distinct from `caps`, and the
+     * distinction is the point: a capability says what a program is allowed to
+     * DRIVE (the NIC, the framebuffer, DMA), an identity says whose DATA it is
+     * entitled to touch. A driver may need PCAP_HARDWARE and have no business
+     * reading another user's files; a text editor is the reverse. Collapsing
+     * the two — as this kernel did for seventy-one releases by having only
+     * capabilities — means every program that needs any privilege gets all of
+     * it. */
+    uint32_t uid, gid;
     uint64_t cr3;       /* physical address of this process's PML4             */
     bool     used;
     uint64_t role;      /* 0=demo 1=userspace driver 2=surface app             */
@@ -1942,8 +1951,25 @@ static uint64_t dbg_pid_of(uint64_t proc_idx) {
  * the kernel's own PML4 identity map. Those are reclaimed by their own
  * dedicated teardown (descriptor_teardown_kproc, dma_teardown_kproc,
  * page_free_tree) BEFORE this ever runs — kproc_reset only blanks the
- * bookkeeping struct itself, once nothing outside it still points in.      */
+ * bookkeeping struct itself, once nothing outside it still points in.
+ *
+ * v0.72: the zeroing below is a BACKSTOP, and the explicit assignments that
+ * follow it are the specification. Every field is still named on purpose —
+ * that is what documents which defaults are deliberate (-1 for a slot index,
+ * 1 for nthreads, HEAP_USER_V for the break) rather than incidentally zero.
+ *
+ * The backstop exists because this function enumerates fields by hand, and a
+ * field added to struct kproc and forgotten here was silently inherited from
+ * the slot's previous occupant. That is how uid/gid leaked in this release: a
+ * recycled slot kept a dead process's identity, which is a leak of AUTHORITY
+ * rather than of memory. An audit of every hand-rolled reset in this kernel
+ * found this was the only struct exposed to it — net_sock_release_locked
+ * already memsets, and ofile/widget/wmwin have every field unconditionally
+ * assigned at ALLOCATION, so an uncleared byte there cannot be observed.
+ * That audit is a snapshot; this line is the invariant.                    */
+static void cmemset(void *d, int v, uint64_t n);   /* fwd: defined with the string helpers */
 static void kproc_reset(struct kproc *p) {
+    cmemset(p, 0, sizeof *p);
     p->pid = 0;
     p->name[0] = 0;
     p->caps = 0;
@@ -1987,6 +2013,17 @@ static void kproc_reset(struct kproc *p) {
     for (int g = 0; g < MAX_DMA_GRANTS; g++) p->dma_grants[g].used = 0;
     p->dma_grant_count = 0;
     p->torn_down = 0;
+    /* v0.72: a recycled slot MUST NOT inherit the dead occupant's identity.
+     * This function blanks fields one at a time rather than memset-ing, so a
+     * credential added to struct kproc and not added here is silently carried
+     * over from whoever held the slot last — which is not a leak of memory but
+     * a leak of AUTHORITY, and the worst possible bug for this milestone to
+     * ship. It was caught live: usersstrs left two slots owned by uid 1000 and
+     * 1001, the toolchain drivers recycled them, and a compiler that had
+     * always run as root suddenly could not write root-owned files.
+     * Root is the right default because every kproc_spawn is kernel-initiated;
+     * ring 3 acquires a non-zero uid only by asking. */
+    p->uid = 0; p->gid = 0;
     p->affinity = 0;                                   /* v0.49: unrestricted by default */
     for (int s = 0; s < SMP_SLOTS; s++) p->smp_slot_phys[s] = 0;
     p->vma_lock = 0;
@@ -2145,6 +2182,12 @@ static int kproc_spawn_thread(const char *name, int leader, int tid) {
     kprocs[i].redir_out = kprocs[leader].redir_out;
     kprocs[i].ppid_slot = kprocs[leader].ppid_slot;
     kprocs[i].pgid      = kprocs[leader].pgid;   /* v0.62: threads share the group */
+    /* v0.72: a thread is the same user as the process it belongs to. Not a
+     * copy that could later diverge — every credential check resolves through
+     * tg_of() to the leader, so this is the leader's identity mirrored for
+     * debuggers and for anything that reads a thread slot directly. */
+    kprocs[i].uid       = kprocs[leader].uid;
+    kprocs[i].gid       = kprocs[leader].gid;
     kprocs[i].tg_leader = leader;
     kprocs[i].tg_tid    = tid;
     kprocs[i].nthreads  = 0;                     /* the LEADER holds the count */
@@ -4356,10 +4399,31 @@ struct dirent {
      * restore all keep working unchanged, and a v0.55 volume still mounts. */
     uint64_t ind1_hash;                       /* -> 64 chunk hashes              */
     uint64_t ind2_hash;                       /* -> 64 single-indirect blocks    */
-    uint8_t  reserved[24];                    /* pad dirent to exactly 256 bytes  */
+    /* v0.72: ownership. Carved out of reserved[] exactly as v0.56 carved the
+     * indirect map, so the dirent stays EXACTLY 256 bytes and the on-disk
+     * directory layout, VFS_DIR_BLOCKS, the journal record and cas_mount's
+     * restore all keep working — a volume written by any earlier kernel still
+     * mounts.
+     *
+     * COMPATIBILITY RULE: on such a volume these three read as ZERO. uid 0 and
+     * gid 0 are exactly right (root owned everything before this release), but
+     * mode 0 would mean "nobody may do anything", which would make every
+     * pre-v0.72 file unreadable the moment permissions began to be enforced.
+     * So mode 0 is defined to mean UNSET and is read as VFS_MODE_DEFAULT. That
+     * is why vfs_mode_of() exists and why nothing reads dirent.mode directly. */
+    uint32_t uid;                             /* owning user                     */
+    uint32_t gid;                             /* owning group                    */
+    uint32_t mode;                            /* rwx triples, 0 = unset (legacy) */
+    uint8_t  reserved[12];                    /* pad dirent to exactly 256 bytes  */
 } __attribute__((packed));
 /* Compile-time guard: if this ever trips, the on-disk layout has been broken. */
 _Static_assert(sizeof(struct dirent) == 256, "dirent must stay exactly 256 bytes");
+
+/* v0.72: permission bits, POSIX values so the SDK headers can carry them
+ * verbatim and so nobody has to learn a second numbering. */
+#define VFS_MODE_DEFAULT 0644
+#define VFS_P_READ  4
+#define VFS_P_WRITE 2
 static uint8_t g_dir[VFS_MAXFILES * 256] __attribute__((aligned(512)));
 #define DENTS ((struct dirent *)g_dir)
 
@@ -4712,6 +4776,35 @@ static int vfs_find(const char *name) {
     for (int i = 0; i < VFS_MAXFILES; i++)
         if (DENTS[i].used && streq_n(DENTS[i].name, name, VFS_NAME_MAX)) return i;
     return -1;
+}
+
+/* v0.72: the effective mode of a dirent.
+ *
+ * NOTHING reads dirent.mode directly, and this function is why. A volume
+ * written before v0.72 has zeroes there, and a literal zero mode means "no
+ * access for anybody" — which would render every existing file unreadable the
+ * instant enforcement began, on a volume that was perfectly valid a release
+ * ago. Zero therefore means UNSET, and unset reads as the default. */
+static inline uint32_t vfs_mode_of(const struct dirent *d) {
+    return d->mode ? d->mode : (uint32_t)VFS_MODE_DEFAULT;
+}
+
+/* v0.72: may the calling process do `want` (VFS_P_READ / VFS_P_WRITE) to this
+ * file? Owner triple, then group, then other — first match wins, which is
+ * POSIX and is deliberately NOT "most permissive wins": a file mode 0604 must
+ * deny its owner write even though other is granted it, or an owner could
+ * never lock themselves out of their own file.
+ *
+ * uid 0 bypasses. That is the whole meaning of root, and stating it in one
+ * place beats scattering `if (uid == 0)` through every call site. */
+static int vfs_permit(const struct dirent *d, uint32_t uid, uint32_t gid, uint32_t want) {
+    if (uid == 0) return 1;
+    uint32_t m = vfs_mode_of(d);
+    uint32_t bits;
+    if (d->uid == uid)      bits = (m >> 6) & 7;
+    else if (d->gid == gid) bits = (m >> 3) & 7;
+    else                    bits =  m       & 7;
+    return (bits & want) == want;
 }
 static void ts_emit(int type, const char *who, const char *text);  /* Time-Stream (Phase 5) */
 
@@ -5776,13 +5869,32 @@ static int vfs_open_for(const char *name, int owner, int creat) {
      * "prove this name is gone" check silently created the name it was checking
      * for. The new dirent is claimed under the same lock that found it missing,
      * so two cores opening the same new path cannot both claim a slot. */
+    /* v0.72: whose open this is. `owner` is already the thread-group leader,
+     * so a thread and its process always answer identically. */
+    uint32_t o_uid = (owner >= 0 && owner < n_kproc) ? kprocs[owner].uid : 0;
+    uint32_t o_gid = (owner >= 0 && owner < n_kproc) ? kprocs[owner].gid : 0;
+    int created = 0;
     if (di < 0 && creat && name[0]) {   /* never create an unnamed dirent */
         for (int i = 0; i < VFS_MAXFILES; i++) if (!DENTS[i].used) {
             cmemset(&DENTS[i], 0, 256);
             kstrcpy_n(DENTS[i].name, name, VFS_NAME_MAX);
             DENTS[i].used = 1; DENTS[i].len = 0; DENTS[i].nchunks = 0;
-            di = i; break;
+            DENTS[i].uid = o_uid;          /* v0.72: a file belongs to its author */
+            DENTS[i].gid = o_gid;
+            DENTS[i].mode = VFS_MODE_DEFAULT;
+            di = i; created = 1; break;
         }
+    }
+    /* v0.72: opening an EXISTING file needs read permission. Checked here,
+     * under the lock that resolved the name, rather than at each read: a
+     * descriptor this process was never entitled to should not come into
+     * existence at all. Write permission is checked separately at write time,
+     * because an open in this kernel carries no declared intent that would let
+     * the two be distinguished here. A file just created is skipped — its
+     * author is by construction allowed to have it. */
+    if (di >= 0 && !created && !vfs_permit(&DENTS[di], o_uid, o_gid, VFS_P_READ)) {
+        klock_release(&g_vfs_lock);
+        return -13;                                            /* EACCES */
     }
     klock_release(&g_vfs_lock);                /* released BEFORE the fd claim  */
     if (di < 0) return -1;
@@ -7258,6 +7370,15 @@ struct npend {
 #define TCP_MSS         512          /* one segment's payload ceiling */
 #define TCP_RTO_TICKS   6            /* ~60 ms at 100 Hz: a lossless link needs no more */
 #define TCP_MAX_RETRIES 8
+/* v0.73: 2*MSL, in ticks. A real stack uses 2*MSL = 60 s (6000 ticks at
+ * 100 Hz). 60 ticks is 0.6 s, and the difference is stated rather than hidden:
+ * MSL bounds how long a duplicate segment can wander a WIDE-AREA network, and
+ * the only links this kernel has are loopback and an emulated NIC one hop from
+ * its peer, where a segment cannot outlive its connection by anything close to
+ * a minute. Holding a socket for a real 2*MSL here would test the scheduler's
+ * patience, not the protocol. What matters, and what is asserted, is that the
+ * state is left ON A CLOCK rather than on a descriptor close. */
+#define TCP_TIMEWAIT_TICKS 60
 #define TCP_HDR_LEN     20           /* no options are emitted or honoured */
 
 enum {
@@ -7274,7 +7395,34 @@ struct tseg {
     uint32_t seq, ack;
     uint16_t flags, len;
     uint16_t sport, dport;      /* who sent it, and to whom */
+    /* v0.73: the sender's free receive space. v0.68 put this on the wire and
+     * v0.68's own changelog admitted it was "emitted but not honoured on
+     * receipt" — because it stopped here: the wire codec wrote the field and
+     * `struct tseg` had nowhere to keep it, so tcp_input never saw one. It is
+     * a field of the SEGMENT, not of the connection, which is why it belongs
+     * here and not only in struct nsock. */
+    uint16_t win;
     const uint8_t *data;
+};
+
+/* v0.73: ONE out-of-order segment, held until the hole before it is filled.
+ *
+ * v0.67 dropped these and said so: "protocol-legal, since the peer
+ * retransmits, and adequate on a link that cannot reorder. This is the
+ * clearest difference between this and a production stack." Dropping is legal
+ * but it converts one lost segment into a retransmission of everything after
+ * it, because the sender learns nothing about what did arrive.
+ *
+ * FOUR slots, not a list. A bounded array cannot leak, cannot fragment, and
+ * needs no allocator on the receive path — the same reasoning as every other
+ * table in this kernel. Four segments at one MSS is 2 KB of hole coverage per
+ * socket, which is what a 2 KB receive buffer can use anyway. */
+#define TCP_OOO_MAX 4
+struct ooseg {
+    int      used;
+    uint32_t seq;
+    uint16_t len;
+    uint8_t  data[TCP_MSS];
 };
 
 struct nsock {
@@ -7308,6 +7456,14 @@ struct nsock {
     uint32_t rhead, rtail, rcount;
     int      fin_sent, fin_rcvd;
     int      rexmit_ticks, rexmit_count;
+    /* v0.73: the peer's advertised free space. Seeded to one MSS so the very
+     * first segment can go out before any window has been heard — the standard
+     * bootstrap, since our SYN carries no peer window with it. */
+    uint32_t snd_wnd;
+    /* v0.73: 2*MSL countdown. Non-zero ONLY in TIME_WAIT. */
+    int      tw_ticks;
+    /* v0.73: segments that arrived past a hole, waiting for it to be filled. */
+    struct ooseg ooo[TCP_OOO_MAX];
     int      acceptq[SOCK_BACKLOG];          /* listener: COMPLETED connections    */
     int      aq_head, aq_tail, aq_count;
     int      parent;                         /* child: its listener, or -1         */
@@ -7474,6 +7630,12 @@ static volatile uint64_t g_tcp_conns = 0, g_tcp_resets = 0, g_tcp_drops = 0;
  * code that has never once run. */
 static volatile int g_tcp_drop = 0;
 static volatile uint64_t g_tcp_wire_tx = 0, g_tcp_wire_rx = 0, g_tcp_wire_bad = 0;
+/* v0.73: what ring 3 cannot see. A TIME_WAIT that expired, a send the peer's
+ * window actually held back, and a segment buffered out of order and later
+ * delivered in order. Each of these paths can be written, compile, and never
+ * run — a counter that stays zero is the only way the suite can tell. */
+static volatile uint64_t g_tcp_timewait_done = 0, g_tcp_win_stalls = 0;
+static volatile uint64_t g_tcp_ooo_queued = 0, g_tcp_ooo_merged = 0, g_tcp_ooo_dropped = 0;
 
 static void tcp_input(int si, struct tseg *g);   /* fwd */
 static uint32_t tcp_wire_build(uint8_t *f, uint32_t saddr, uint32_t daddr,
@@ -7509,13 +7671,18 @@ static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len
     g.seq = s->snd_nxt; g.ack = s->rcv_nxt;
     g.flags = flags; g.len = len; g.data = data;
     g.sport = s->lport; g.dport = s->rport;
+    /* Our own free receive space, computed identically for loopback and wire.
+     * Loopback used to omit it entirely, which would have made the window
+     * assertions pass on the wire path and quietly do nothing on the path the
+     * suite actually exercises. */
+    g.win = (uint16_t)(TCP_BUFSZ - s->rcount);
     __sync_fetch_and_add(&g_tcp_segs_out, 1);
     if (g_tcp_drop > 0) { g_tcp_drop--; __sync_fetch_and_add(&g_tcp_drops, 1); return; }
     if (s->raddr != NET_LOOPBACK) {
         /* v0.68: a real frame on the real NIC. */
         static uint8_t wf[14 + 20 + TCP_HDR_LEN + TCP_MSS];
         if (!g_vnet_ready) return;
-        uint32_t n = tcp_wire_build(wf, NET_GUEST_IP, s->raddr, &g, (uint16_t)(TCP_BUFSZ - s->rcount));
+        uint32_t n = tcp_wire_build(wf, NET_GUEST_IP, s->raddr, &g, g.win);
         vnet_tx(wf, n);
         g_net_tx_frames++;
         __sync_fetch_and_add(&g_tcp_wire_tx, 1);
@@ -7531,6 +7698,21 @@ static uint32_t tcp_send_data(int si, const uint8_t *src, uint32_t len) {
     struct nsock *s = &g_sock[si];
     uint32_t space = TCP_BUFSZ - s->scount;
     if (len > space) len = space;
+    /* v0.73: FLOW CONTROL. The peer told us how much room it has; sending past
+     * it means the receiver drops and we retransmit, which is the behaviour
+     * v0.67 shipped and called out as a limit. The bytes already in flight are
+     * snd_nxt - snd_una, so what may still go out is the window minus that.
+     *
+     * This CAPS the send rather than refusing it: send() returning a short
+     * count is the POSIX contract, and a caller that wants the rest calls
+     * again — by which time an ACK has usually reopened the window. Refusing
+     * outright would turn flow control into a spurious error. */
+    uint32_t inflight = s->snd_nxt - s->snd_una;
+    uint32_t allowed = (s->snd_wnd > inflight) ? (s->snd_wnd - inflight) : 0;
+    if (len > allowed) {
+        __sync_fetch_and_add(&g_tcp_win_stalls, 1);
+        len = allowed;
+    }
     if (!len) return 0;
     /* Kept for retransmission until acknowledged — that buffer IS the reason a
      * lost segment can be recovered, and the reason send() can report how much
@@ -7585,6 +7767,14 @@ static void tcp_input(int si, struct tseg *g) {
     struct nsock *s = &g_sock[si];
     __sync_fetch_and_add(&g_tcp_segs_in, 1);
 
+    /* v0.73: learn the peer's free space from EVERY segment that carries it,
+     * before any state-specific handling — a window update is not conditional
+     * on the segment being interesting for any other reason, and a pure ACK
+     * carrying nothing but a reopened window is exactly how a stalled sender
+     * gets going again. A RST carries no meaningful window, which is why this
+     * sits after nothing and before everything else. */
+    if (!(g->flags & TH_RST)) s->snd_wnd = g->win;
+
     if (g->flags & TH_RST) {
         /* Abortive close: the connection is gone NOW, and a reader must be
          * told rather than left waiting for data that will never come. */
@@ -7618,6 +7808,9 @@ static void tcp_input(int si, struct tseg *g) {
         c->irs = g->seq; c->rcv_nxt = g->seq + 1;
         c->iss = (uint32_t)(g_ticks * 2654435761u) | 1u;
         c->snd_una = c->iss; c->snd_nxt = c->iss;
+        /* v0.73: the SYN we are answering carried a window, so use it rather
+         * than the bootstrap default — the peer has already told us. */
+        c->snd_wnd = g->win ? g->win : TCP_MSS;
         c->state = TCPS_SYN_RCVD;
         tcp_output(ci, TH_SYN | TH_ACK, 0, 0);
         c->snd_nxt++;                                        /* SYN consumes one */
@@ -7669,8 +7862,59 @@ static void tcp_input(int si, struct tseg *g) {
         }
         s->rcount += n;
         s->rcv_nxt += n;
+        /* v0.73: the hole is filled — anything queued behind it may now be in
+         * order too, and filling one hole can release several segments, so
+         * this repeats until no queued segment starts exactly at rcv_nxt.
+         * Delivering them here rather than waiting for the peer to retransmit
+         * is the entire point of having kept them. */
+        for (int again = 1; again; ) {
+            again = 0;
+            for (int k = 0; k < TCP_OOO_MAX; k++) {
+                struct ooseg *o = &s->ooo[k];
+                if (!o->used || o->seq != s->rcv_nxt) continue;
+                uint32_t sp = TCP_BUFSZ - s->rcount;
+                uint32_t m = o->len; if (m > sp) m = sp;
+                for (uint32_t i = 0; i < m; i++) {
+                    s->rbuf[s->rtail] = o->data[i];
+                    s->rtail = (s->rtail + 1) % TCP_BUFSZ;
+                }
+                s->rcount += m;
+                s->rcv_nxt += m;
+                o->used = 0;
+                __sync_fetch_and_add(&g_tcp_ooo_merged, 1);
+                again = 1;
+            }
+        }
         tcp_output(si, TH_ACK, 0, 0);
         if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
+    } else if (g->len && s->state >= TCPS_ESTAB && seq_lt(s->rcv_nxt, g->seq)) {
+        /* v0.73: ARRIVED PAST A HOLE. Keep it, and ACK what we still actually
+         * have — a duplicate ACK naming rcv_nxt, which is what tells the peer
+         * which segment to resend rather than everything from the hole on.
+         *
+         * Not stored: anything longer than one MSS (it cannot be, given our own
+         * MSS), a duplicate of something already queued, and anything at all
+         * once the four slots are full. A full queue drops exactly as v0.67
+         * always did, so the fallback is the old behaviour rather than a new
+         * failure. */
+        if (g->len <= TCP_MSS) {
+            int dup = 0, slot = -1;
+            for (int k = 0; k < TCP_OOO_MAX; k++) {
+                if (s->ooo[k].used && s->ooo[k].seq == g->seq) { dup = 1; break; }
+                if (!s->ooo[k].used && slot < 0) slot = k;
+            }
+            if (!dup && slot >= 0) {
+                struct ooseg *o = &s->ooo[slot];
+                o->used = 1; o->seq = g->seq; o->len = g->len;
+                for (uint32_t i = 0; i < g->len; i++) o->data[i] = g->data[i];
+                __sync_fetch_and_add(&g_tcp_ooo_queued, 1);
+            } else if (!dup) {
+                __sync_fetch_and_add(&g_tcp_ooo_dropped, 1);
+            }
+        } else {
+            __sync_fetch_and_add(&g_tcp_ooo_dropped, 1);
+        }
+        tcp_output(si, TH_ACK, 0, 0);          /* duplicate ACK: still at rcv_nxt */
     }
 
     /* A FIN occupies the sequence number immediately AFTER the segment's
@@ -7683,14 +7927,14 @@ static void tcp_input(int si, struct tseg *g) {
         tcp_output(si, TH_ACK, 0, 0);
         if (s->state == TCPS_ESTAB)          s->state = TCPS_CLOSE_WAIT;
         else if (s->state == TCPS_FIN_WAIT1) s->state = TCPS_CLOSING;
-        else if (s->state == TCPS_FIN_WAIT2) s->state = TCPS_TIME_WAIT;
+        else if (s->state == TCPS_FIN_WAIT2) { s->state = TCPS_TIME_WAIT; s->tw_ticks = TCP_TIMEWAIT_TICKS; }
         if (s->waiter_tid >= 0) { int w = s->waiter_tid; s->waiter_tid = -1; thread_wake(w); }
     }
 
     /* Our own FIN being acknowledged advances the closing states. */
     if (s->fin_sent && seq_le(s->snd_nxt, g->ack)) {
         if (s->state == TCPS_FIN_WAIT1)     s->state = TCPS_FIN_WAIT2;
-        else if (s->state == TCPS_CLOSING)  s->state = TCPS_TIME_WAIT;
+        else if (s->state == TCPS_CLOSING)  { s->state = TCPS_TIME_WAIT; s->tw_ticks = TCP_TIMEWAIT_TICKS; }
         else if (s->state == TCPS_LAST_ACK) s->state = TCPS_CLOSED;
     }
 }
@@ -7706,7 +7950,25 @@ static void tcp_timer_scan(void) {
     klock_acquire(&g_net_lock);
     for (int i = 0; i < NSOCK; i++) {
         struct nsock *s = &g_sock[i];
-        if (!s->used || !s->stream || !s->rexmit_ticks) continue;
+        if (!s->used || !s->stream) continue;
+        /* v0.73: TIME_WAIT runs its own clock. Checked BEFORE the retransmit
+         * guard below, which used to `continue` on a zero rexmit_ticks and so
+         * would have skipped every socket in this state — the timer would have
+         * existed and never once fired. */
+        if (s->tw_ticks) {
+            if (!--s->tw_ticks) {
+                /* 2*MSL elapsed: the connection is genuinely over. The socket
+                 * OBJECT stays until its descriptor is closed, because a
+                 * descriptor must not dangle; what is released here is the
+                 * connection STATE, which is what TIME_WAIT holds. */
+                s->state = TCPS_CLOSED;
+                s->hup = 1;
+                __sync_fetch_and_add(&g_tcp_timewait_done, 1);
+                if (s->waiter_tid >= 0) woke[nw++] = i;
+            }
+            continue;                             /* never retransmits */
+        }
+        if (!s->rexmit_ticks) continue;
         if (--s->rexmit_ticks) continue;
         if (s->rexmit_count >= TCP_MAX_RETRIES) {
             /* A connection that cannot be reached is an ERROR, not a hang. */
@@ -7934,6 +8196,7 @@ static int tcp_wire_parse(const uint8_t *f, uint32_t len, struct tseg *out,
     out->ack = ((uint32_t)t[8] << 24) | ((uint32_t)t[9] << 16) |
                ((uint32_t)t[10] << 8) | t[11];
     out->flags = t[13];
+    out->win = (uint16_t)((t[14] << 8) | t[15]);   /* v0.73: was decoded nowhere */
     out->len = (uint16_t)(tlen - doff);
     out->data = t + doff;
     if (saddr_out) *saddr_out = sa;
@@ -8033,8 +8296,87 @@ struct wmwin {
     uint64_t surf_vaddr;                 /* surface base in the OWNER's address space  */
     uint64_t *ppage;                     /* -> g_wm_pagetab[id]: phys of each surface page */
     struct sevent q[8]; volatile uint32_t qw, qr;   /* routed input events for the owner */
+    int      focus_wg;                   /* v0.71: focused widget index, or -1         */
 };
 static struct wmwin g_wmwin[NWMWIN];
+
+/* ===========================================================================
+ * v0.70: WIDGETS — a toolkit that needs no function pointers
+ * ===========================================================================
+ * The compositor has had windows, title bars, focus, dragging and z-order
+ * since v0.53, and an application still had to paint every pixel of its own
+ * interior and decode every click itself. That is a window system, not a user
+ * interface, and it is the gap between "there is a desktop" and "somebody
+ * could use this".
+ *
+ * THE SHAPE IS FORCED BY THE COMPILER. Every mainstream toolkit is callback
+ * driven — you hand it a function and it calls you back. `occ`, this system's
+ * own C compiler, CANNOT PRODUCE A FUNCTION POINTER, and `vsh` is compiled by
+ * occ. A callback toolkit would therefore be usable from `/bin/init` and from
+ * nothing this system can compile for itself, which is the wrong half of the
+ * OS to leave out.
+ *
+ * So the model is RETAINED and POLLED: an application declares a button once
+ * and asks "what happened?" in its own loop. No callbacks, no inversion of
+ * control, and the same API works from occ and from gcc-compiled code alike.
+ * That is not a compromise forced on the design — polled retained-mode is what
+ * a small system with one event queue per window wants anyway.
+ *
+ * THE KERNEL DRAWS THEM. A widget declared here is painted by the compositor,
+ * not by the application, so a program that declares a button and never draws
+ * anything still has a button that looks like every other button on the
+ * desktop. Consistency is the part of "user friendly" an application library
+ * cannot enforce on its own. */
+#define NWIDGET     32
+#define WG_LABEL    1
+#define WG_BUTTON   2
+#define WG_CHECK    3
+#define WG_PROGRESS 4
+#define WG_ENTRY    5                    /* v0.71: an editable text field */
+#define WG_TEXTLEN  24
+
+struct widget {
+    int  used, win, kind;
+    int  x, y, w, h;                 /* window-content-relative */
+    char text[WG_TEXTLEN];
+    int  value;                      /* checkbox 0/1; progress 0..100 */
+    int  enabled;
+};
+static struct widget g_wg[NWIDGET];
+static volatile uint64_t g_wg_created = 0, g_wg_clicks = 0, g_wg_drawn = 0;
+
+static int wg_count_used(void) {
+    int n = 0;
+    for (int i = 0; i < NWIDGET; i++) if (g_wg[i].used) n++;
+    return n;
+}
+
+/* Release every widget belonging to a window. Caller holds g_wm_lock. */
+static void wg_release_win(int win) {
+    for (int i = 0; i < NWIDGET; i++) if (g_wg[i].used && g_wg[i].win == win) g_wg[i].used = 0;
+}
+
+/* v0.71: is this kind something a user can put focus on and operate? Labels and
+ * progress bars display; everything else responds. */
+static int wg_interactive(int kind) {
+    return kind == WG_BUTTON || kind == WG_CHECK || kind == WG_ENTRY;
+}
+
+/* v0.71: the focused widget of window `wi`, or -1.
+ *
+ * `focus_wg` is only MEANINGFUL if it still names a live widget of this
+ * window. Validating it here, rather than clearing it at every site that
+ * allocates or recycles a window slot, is the same lesson v0.70 learned from
+ * having two teardown paths: one place that must be right beats N places that
+ * must agree. A recycled slot carrying a stale index is therefore harmless by
+ * construction rather than by everyone remembering. Caller holds g_wm_lock. */
+static int wg_focused(int wi) {
+    if (wi < 0 || wi >= NWMWIN) return -1;
+    int k = g_wmwin[wi].focus_wg;
+    if (k < 0 || k >= NWIDGET) return -1;
+    if (!g_wg[k].used || g_wg[k].win != wi) return -1;
+    return k;
+}
 static uint64_t g_wm_pagetab[NWMWIN][WIN_SURF_MAXPG];   /* phys of each window's surface pages */
 static struct klock g_wm_lock = { 0, "wm", 10, 0, 0 };
 static int g_wm_focus = -1;              /* window index with keyboard focus, or -1     */
@@ -8085,6 +8427,7 @@ static void wm_queue_event(int idx, int32_t type, int32_t x, int32_t y, int32_t 
 static void wm_destroy(int idx) {
     struct wmwin *W = &g_wmwin[idx];
     if (!W->used) return;
+    wg_release_win(idx);      /* v0.70: a widget cannot outlive its window */
     /* The surface pages are ordinary USER mappings in the owner's CR3, so
      * page_free_tree returns them to the frame free list at process exit —
      * exactly like the user stack. Nothing to revoke here; just drop refs. */
@@ -8093,6 +8436,7 @@ static void wm_destroy(int idx) {
     W->used = 0; W->owner = -1; W->surf_vaddr = 0; W->ppage = 0;
     W->cw = W->ch = 0; W->cpages = 0;
     W->focused = 0; W->minimized = 0; W->qw = W->qr = 0;
+    W->focus_wg = -1;                    /* v0.71 */
 }
 
 /* Called from every kproc exit path (clean AND fault): destroy every window the
@@ -8106,13 +8450,16 @@ static void wimp_teardown_kproc(int proc_idx) {
             if (g_debug_wimp)
                 kprintf("[dbgwimp] pid %u: destroyed window %d (z %d)\n",
                         kprocs[proc_idx].pid, i, g_wmwin[i].z);
-            /* grant frames are reclaimed by dma_teardown_kproc; just drop refs */
-            if (g_wm_focus == i) g_wm_focus = -1;
-            if (g_wm_drag == i) g_wm_drag = -1;
-            g_wmwin[i].used = 0; g_wmwin[i].owner = -1;
-            g_wmwin[i].surf_vaddr = 0; g_wmwin[i].ppage = 0;
-            g_wmwin[i].cw = g_wmwin[i].ch = 0; g_wmwin[i].cpages = 0;
-            g_wmwin[i].focused = 0; g_wmwin[i].qw = g_wmwin[i].qr = 0;
+            /* v0.70: wm_destroy, not a second copy of what it does. This used
+             * to open-code the reset — a strict subset, missing `minimized`
+             * and, once widgets existed, missing wg_release_win. Every ring-3
+             * window in the system is torn down through HERE rather than
+             * through the close box, so the widget release that had been added
+             * to wm_destroy was the one path that never ran, and the table
+             * filled up over sixteen churn rounds. Two places that must agree
+             * is the defect; one teardown path is the fix.
+             * (Grant frames are reclaimed by dma_teardown_kproc.) */
+            wm_destroy(i);
         }
     }
     klock_release(&g_wm_lock);
@@ -10770,6 +11117,8 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
     kprocs[ch].entry     = kprocs[par].entry;
     kprocs[ch].affinity  = kprocs[par].affinity;
     kprocs[ch].pgid      = kprocs[par].pgid;     /* v0.62: fork stays in the job */
+    kprocs[ch].uid       = kprocs[par].uid;      /* v0.72: a child is the same user */
+    kprocs[ch].gid       = kprocs[par].gid;
     kprocs[ch].mmap_next = kprocs[par].mmap_next;  /* v0.63: inherited mmap regions */
     kprocs[ch].shm_next  = SHM_USER_V;             /* shm attachments are NOT inherited */
     for (int sg = 0; sg < NSIG; sg++) kprocs[ch].sig_handler[sg] = kprocs[par].sig_handler[sg];
@@ -11461,7 +11810,20 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int64_t r = -9;
         if (di >= 0) {
             /* v0.66: exhaustive, for the reason set out in SYS_READ above. */
-            if (vol == VOL_ROOT)      r = vfs_write_by_dirent(di, (const void *)a1, len);  /* COW */
+            if (vol == VOL_ROOT) {
+                /* v0.72: an open granted READ; writing is a separate right and
+                 * is checked here, at the moment of the write, because this
+                 * kernel's open carries no declared intent that could have
+                 * settled it earlier. A reader of a 0644 file someone else
+                 * owns therefore holds a perfectly valid descriptor it cannot
+                 * write through, which is the correct and useful outcome. */
+                int L = tg_of((int)current_proc_idx);
+                klock_acquire(&g_vfs_lock);
+                int ok = vfs_permit(&DENTS[di], kprocs[L].uid, kprocs[L].gid, VFS_P_WRITE);
+                klock_release(&g_vfs_lock);
+                r = ok ? vfs_write_by_dirent(di, (const void *)a1, len)     /* COW */
+                       : -13;                                              /* EACCES */
+            }
             else if (vol == VOL_TMP)  r = tmp_write_file(di, (const void *)a1, len);
             else if (vol == VOL_PIPE) r = pipe_write_fd(fd, (const void *)a1, len);        /* v0.59 */
             else if (vol == VOL_EVFD) r = evfd_write_fd(fd, (const void *)a1, len);        /* v0.64 */
@@ -11803,6 +12165,18 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         char name[64];
         if (copy_user_str(kprocs[current_proc_idx].cr3, a0, name, sizeof name) < 0) return (uint64_t)-14;
         if (path_has_prefix(name, "tmp/") || path_has_prefix(name, "dev/")) return (uint64_t)-1;  /* ROOT-only */
+        /* v0.72: removing a file is a WRITE to it. Checked before the witness
+         * is entered so a refused unlink is not recorded as a filesystem
+         * mutation that never happened. */
+        {
+            int L = tg_of((int)current_proc_idx);
+            klock_acquire(&g_vfs_lock);
+            int ui = vfs_find(name);
+            int denied = (ui >= 0) &&
+                         !vfs_permit(&DENTS[ui], kprocs[L].uid, kprocs[L].gid, VFS_P_WRITE);
+            klock_release(&g_vfs_lock);
+            if (denied) return (uint64_t)-13;                   /* EACCES */
+        }
         fs_witness_enter();
         int r = vfs_unlink(name);
         fs_witness_leave();
@@ -12159,6 +12533,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                 c->raddr = addr; c->rport = port; c->connected = 1;
                 c->iss = (uint32_t)(g_ticks * 2246822519u) | 1u;
                 c->snd_una = c->iss; c->snd_nxt = c->iss;
+                /* v0.73: bootstrap. Nothing has been heard from the peer yet,
+                 * so one MSS is assumed — enough for the SYN and a first
+                 * segment, and corrected by the SYN-ACK's real window before
+                 * anything larger is sent. Seeding zero would deadlock the
+                 * connection against its own flow control. */
+                c->snd_wnd = TCP_MSS;
                 c->state = TCPS_SYN_SENT;
                 tcp_output(si, TH_SYN, 0, 0);
                 c->snd_nxt++;                               /* SYN consumes one */
@@ -13362,6 +13742,179 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             kprintf("[dbgvm  ] mmap pid %u %X bytes prot %x -> %X (reserved, not backed)\n",
                     kprocs[p].pid, len, prot, base);
         return base;
+    }
+    case 85: {   /* v0.70: SYS_UI_ADD(win_and_kind, rect, text) -> widget id, or negative.
+                  *   a0 bits 0..15 window id, bits 16..31 kind
+                  *   a1 x | y<<16 | w<<32 | h<<48
+                  *   a2 pointer to a NUL-terminated label, or 0
+                  *
+                  * Retained: declared once, drawn by the compositor every frame
+                  * thereafter, and reported by id when clicked. No callback is
+                  * taken because occ cannot produce one — see the note on the
+                  * widget table. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        int p = tg_of((int)current_proc_idx);
+        int win = (int)(a0 & 0xFFFF), kind = (int)((a0 >> 16) & 0xFFFF);
+        if (win < 0 || win >= NWMWIN) return (uint64_t)-22;
+        if (kind < WG_LABEL || kind > WG_ENTRY) return (uint64_t)-22;
+        int x = (int)(int16_t)(a1 & 0xFFFF),        y = (int)(int16_t)((a1 >> 16) & 0xFFFF);
+        int w = (int)(int16_t)((a1 >> 32) & 0xFFFF), h = (int)(int16_t)((a1 >> 48) & 0xFFFF);
+        if (w <= 0 || h <= 0) return (uint64_t)-22;
+        char lbl[WG_TEXTLEN];
+        for (int i = 0; i < WG_TEXTLEN; i++) lbl[i] = 0;
+        /* copy_user_str, not a bare access_ok + loop: it re-validates on every
+         * page crossing, so a label whose last byte sits at the end of a
+         * mapping cannot walk the kernel into an unmapped page. */
+        if (a2 && copy_user_str(kprocs[p].cr3, a2, lbl, WG_TEXTLEN) < 0) return (uint64_t)-14;
+        int id = -1;
+        klock_acquire(&g_wm_lock);
+        if (!g_wmwin[win].used || g_wmwin[win].owner != p) { klock_release(&g_wm_lock); return (uint64_t)-13; }
+        /* Clamped to the content rect at DECLARATION, not at draw time. A
+         * widget that silently vanished because it was two pixels too wide
+         * would be a layout bug with no error attached to it. */
+        if (x < 0 || y < 0 || x + w > g_wmwin[win].cw || y + h > g_wmwin[win].ch) {
+            klock_release(&g_wm_lock); return (uint64_t)-22;
+        }
+        for (int i = 0; i < NWIDGET; i++) if (!g_wg[i].used) { id = i; break; }
+        if (id >= 0) {
+            struct widget *g = &g_wg[id];
+            g->used = 1; g->win = win; g->kind = kind;
+            g->x = x; g->y = y; g->w = w; g->h = h;
+            for (int i = 0; i < WG_TEXTLEN; i++) g->text[i] = lbl[i];
+            g->value = 0; g->enabled = 1;
+        }
+        klock_release(&g_wm_lock);
+        if (id < 0) return (uint64_t)-11;                     /* EAGAIN: table full */
+        __sync_fetch_and_add(&g_wg_created, 1);
+        return (uint64_t)(int64_t)id;
+    }
+    case 86: {   /* v0.70: SYS_UI_SET(win_and_id, what, value) -> 0, or negative.
+                  * what: 0 = value, 1 = enabled, 2 = text (value is a pointer). */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        int p = tg_of((int)current_proc_idx);
+        int win = (int)(a0 & 0xFFFF), id = (int)((a0 >> 16) & 0xFFFF);
+        if (win < 0 || win >= NWMWIN || id < 0 || id >= NWIDGET) return (uint64_t)-22;
+        char lbl[WG_TEXTLEN];
+        if (a1 == 2) {
+            for (int i = 0; i < WG_TEXTLEN; i++) lbl[i] = 0;
+            if (!a2 || copy_user_str(kprocs[p].cr3, a2, lbl, WG_TEXTLEN) < 0) return (uint64_t)-14;
+        }
+        int64_t rc = 0;
+        klock_acquire(&g_wm_lock);
+        if (!g_wmwin[win].used || g_wmwin[win].owner != p) rc = -13;
+        else if (!g_wg[id].used || g_wg[id].win != win)    rc = -22;
+        else if (a1 == 0) g_wg[id].value   = (int)(int64_t)a2;
+        else if (a1 == 1) g_wg[id].enabled = a2 ? 1 : 0;
+        else if (a1 == 2) { for (int i = 0; i < WG_TEXTLEN; i++) g_wg[id].text[i] = lbl[i]; }
+        else rc = -22;
+        klock_release(&g_wm_lock);
+        return (uint64_t)rc;
+    }
+    case 87: {   /* v0.70: SYS_UI_GET(win_and_id, what, arg) -> value, or negative.
+                  * what: 0 = value, 1 = enabled. This is how a polled toolkit
+                  * reports a checkbox: the click already toggled it, and the
+                  * application asks what it now is.
+                  * v0.71: what 2 = copy the widget's text into the user buffer
+                  * `arg` (WG_TEXTLEN bytes), returning its length — which is how
+                  * a program reads what was typed into a text field. what 3 =
+                  * the window's focused widget id, or -1. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        int p = tg_of((int)current_proc_idx);
+        int win = (int)(a0 & 0xFFFF), id = (int)((a0 >> 16) & 0xFFFF);
+        if (win < 0 || win >= NWMWIN) return (uint64_t)-22;
+        if (a1 != 3 && (id < 0 || id >= NWIDGET)) return (uint64_t)-22;
+        /* The text is copied out UNDER the lock into a kernel buffer and only
+         * then written to user memory: access_ok can fault, and faulting with a
+         * rank-10 lock held is how a compositor deadlocks. */
+        char tmp[WG_TEXTLEN]; int tlen = 0;
+        int64_t rc;
+        klock_acquire(&g_wm_lock);
+        if (!g_wmwin[win].used || g_wmwin[win].owner != p) rc = -13;
+        else if (a1 == 3) rc = wg_focused(win);
+        else if (!g_wg[id].used || g_wg[id].win != win)    rc = -22;
+        else if (a1 == 0) rc = g_wg[id].value;
+        else if (a1 == 1) rc = g_wg[id].enabled;
+        else if (a1 == 2) {
+            for (int i = 0; i < WG_TEXTLEN; i++) tmp[i] = g_wg[id].text[i];
+            tmp[WG_TEXTLEN - 1] = 0;
+            while (tlen < WG_TEXTLEN - 1 && tmp[tlen]) tlen++;
+            rc = tlen;
+        }
+        else rc = -22;
+        klock_release(&g_wm_lock);
+        if (a1 == 2 && rc >= 0) {
+            if (!a2 || !access_ok(kprocs[p].cr3, a2, WG_TEXTLEN, 1)) return (uint64_t)-14;
+            char *u = (char *)a2;
+            for (int i = 0; i < WG_TEXTLEN; i++) u[i] = tmp[i];
+        }
+        return (uint64_t)rc;
+    }
+    /* ---- v0.72: process credentials -------------------------------------- *
+     * Identity lives on the thread-group LEADER, like every other shared
+     * property of a process, so a thread cannot hold a different uid from the
+     * process it belongs to. */
+    case 88: return (uint64_t)kprocs[tg_of((int)current_proc_idx)].uid;   /* SYS_GETUID */
+    case 89: return (uint64_t)kprocs[tg_of((int)current_proc_idx)].gid;   /* SYS_GETGID */
+    case 90:     /* SYS_SETUID(uid) -> 0, or negative */
+    case 91: {   /* SYS_SETGID(gid) -> 0, or negative */
+        int L = tg_of((int)current_proc_idx);
+        uint32_t want = (uint32_t)a0;
+        uint32_t cur  = (num == 90) ? kprocs[L].uid : kprocs[L].gid;
+        /* THE RULE, and the only one that matters: privilege is a one-way
+         * door. Root may become anybody; everybody else may only "become"
+         * who they already are. Without this a process could drop to an
+         * unprivileged id to look harmless and climb back at will, which is
+         * not a security model, it is a formality.
+         *
+         * Note this deliberately does NOT implement saved-set-uid — a real
+         * system lets a root program drop temporarily and regain. That needs
+         * a third stored id per process and a setuid-binary story to be worth
+         * having, and both are absent here; see the changelog. What is
+         * implemented is the half that is safe to rely on. */
+        if (kprocs[L].uid != 0 && want != cur) return (uint64_t)-1;   /* EPERM */
+        if (num == 90) {
+            kprocs[L].uid = want;
+            /* Mirror onto every thread of the group so a thread slot read
+             * directly never disagrees with its leader. */
+            for (int t = 0; t < n_kproc; t++)
+                if (kprocs[t].used && kprocs[t].tg_leader == L) kprocs[t].uid = want;
+        } else {
+            kprocs[L].gid = want;
+            for (int t = 0; t < n_kproc; t++)
+                if (kprocs[t].used && kprocs[t].tg_leader == L) kprocs[t].gid = want;
+        }
+        return 0;
+    }
+    case 92:     /* SYS_CHMOD(path, mode) -> 0, or negative */
+    case 93: {   /* SYS_CHOWN(path, uid, gid) -> 0, or negative */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+        char name[64];
+        if (copy_user_str(kprocs[current_proc_idx].cr3, a0, name, sizeof name) < 0) return (uint64_t)-14;
+        if (path_has_prefix(name, "tmp/") || path_has_prefix(name, "dev/")) return (uint64_t)-1;
+        int L = tg_of((int)current_proc_idx);
+        int64_t rc = 0;
+        klock_acquire(&g_vfs_lock);
+        int di = vfs_find(name);
+        if (di < 0) rc = -2;                                   /* ENOENT */
+        else if (num == 92) {
+            /* chmod: the OWNER or root. Not "anyone who can write the file" —
+             * write permission lets you change the contents, never the terms
+             * on which others may reach them. */
+            if (kprocs[L].uid != 0 && DENTS[di].uid != kprocs[L].uid) rc = -1;    /* EPERM */
+            else DENTS[di].mode = (uint32_t)a1 & 0777;
+        } else {
+            /* chown: ROOT ONLY, and that is not conservatism. If an owner
+             * could give a file away, any user could dispose of files they no
+             * longer want to be accountable for — and on a system with quotas
+             * they could charge them to somebody else. */
+            if (kprocs[L].uid != 0) rc = -1;                                     /* EPERM */
+            else { DENTS[di].uid = (uint32_t)a1; DENTS[di].gid = (uint32_t)a2; }
+        }
+        klock_release(&g_vfs_lock);
+        /* The directory is journalled, so a metadata change has to reach the
+         * disk the same way a content change does or it is lost at reboot. */
+        if (rc == 0) { fs_witness_enter(); vfs_journal_commit(); fs_witness_leave(); }
+        return (uint64_t)rc;
     }
     case 83: {   /* v0.66: SYS_MMAP_FILE(fd_prot_flags, length, offset) -> base, or -1.
                   *
@@ -15750,6 +16303,25 @@ static uint64_t elf_load(int proc_idx, uint64_t img, uint64_t img_size) {
     int loaded = 0;
     for (int i = 0; i < eh->phnum; i++) {
         struct elf64_phdr *ph = (struct elf64_phdr *)(img + eh->phoff + (uint64_t)i * eh->phentsize);
+        /* v0.73: a binary that needs an INTERPRETER, or that carries
+         * relocations we cannot apply, must be REFUSED — not loaded halfway.
+         * The loop below skips every segment that is not PT_LOAD, so before
+         * this check a dynamically-linked ELF had its text and data mapped
+         * and was then entered at a point that expects a resolved GOT: it
+         * died as a page fault in userland with nothing naming the cause.
+         * There is no dynamic linker in this system yet (no PT_INTERP
+         * handling, no R_X86_64 relocation processing, no DT_NEEDED walk),
+         * and the honest answer to "can you run this?" is no, said out loud.
+         * Same principle as v0.66 refusing VOL_SOCK on read(): an error that
+         * names the missing feature beats a plausible-looking wrong answer. */
+        if (ph->type == 3) {                               /* PT_INTERP         */
+            kputs("[elf    ] reject: needs a dynamic interpreter — this system links statically\n");
+            return 0;
+        }
+        if (ph->type == 2) {                               /* PT_DYNAMIC        */
+            kputs("[elf    ] reject: PT_DYNAMIC present — no relocation processing in this kernel\n");
+            return 0;
+        }
         if (ph->type != 1) continue;                       /* PT_LOAD           */
         /* strict per-segment bounds checks (defend against hostile ELFs) */
         if (ph->offset > img_size || ph->filesz > img_size ||
@@ -16774,6 +17346,72 @@ static void wimp_draw_cursor(void) {
 }
 
 /* Compose one desktop frame into the backbuffer and present it. */
+/* v0.70: paint a window's widgets over its content.
+ *
+ * Drawn from a SNAPSHOT of the window taken under the lock, but reading the
+ * widget table live and without the lock — deliberately. Widget state is four
+ * ints and a short string; the worst a concurrent SYS_UI_SET can do is make
+ * one frame show the old label, which the next compose corrects 60 times a
+ * second. Taking g_wm_lock here would put a lock (rank 10) around the draw
+ * primitives, and the compositor already goes to some trouble not to do that
+ * because drawing is slow and must never run under one. A torn pixel is worth
+ * far less than a held lock. */
+static void wimp_draw_widgets(const struct wmwin *W, int wi) {
+    if (!W->used || W->minimized) return;
+    int ox = W->x + 2, oy = W->y + WIN_TITLE_H;         /* content origin, screen space */
+    /* v0.71: which widget shows the caret. Validated the same way wg_focused
+     * validates, because this reads the snapshot without the lock. */
+    int wgf = W->focus_wg;
+    if (wgf < 0 || wgf >= NWIDGET || !g_wg[wgf].used || g_wg[wgf].win != wi) wgf = -1;
+    for (int k = 0; k < NWIDGET; k++) {
+        struct widget *g = &g_wg[k];
+        if (!g->used || g->win != wi) continue;
+        int gx = ox + g->x, gy = oy + g->y;
+        if (g->x < 0 || g->y < 0 || g->x + g->w > W->cw || g->y + g->h > W->ch) continue;
+        uint32_t ink = g->enabled ? W->accent : C_MUTE;
+        if (g->kind == WG_LABEL) {
+            draw_str(gx, gy, g->text, g->enabled ? C_CYAN : C_MUTE);
+        } else if (g->kind == WG_BUTTON) {
+            rect(gx, gy, g->w, g->h, C_OBS1);
+            hline(gx, gy, g->w, ink); hline(gx, gy + g->h - 1, g->w, ink);
+            vline(gx, gy, g->h, ink); vline(gx + g->w - 1, gy, g->h, ink);
+            draw_str(gx + 6, gy + (g->h - 8) / 2, g->text, ink);
+        } else if (g->kind == WG_CHECK) {
+            int b = 10;
+            rect(gx, gy + (g->h - b) / 2, b, b, C_OBS1);
+            hline(gx, gy + (g->h - b) / 2, b, ink);
+            hline(gx, gy + (g->h - b) / 2 + b - 1, b, ink);
+            vline(gx, gy + (g->h - b) / 2, b, ink);
+            vline(gx + b - 1, gy + (g->h - b) / 2, b, ink);
+            if (g->value) rect(gx + 3, gy + (g->h - b) / 2 + 3, b - 6, b - 6, ink);
+            draw_str(gx + b + 6, gy + (g->h - 8) / 2, g->text, g->enabled ? C_CYAN : C_MUTE);
+        } else if (g->kind == WG_ENTRY) {
+            /* Sunken field. The border brightens and a caret appears when it
+             * holds focus, so "where does my typing go" is answerable by
+             * looking rather than by remembering what was clicked last. */
+            int foc = (wgf == k);
+            rect(gx, gy, g->w, g->h, C_OBS0);
+            uint32_t bord = foc ? ink : C_HAIR;
+            hline(gx, gy, g->w, bord); hline(gx, gy + g->h - 1, g->w, bord);
+            vline(gx, gy, g->h, bord); vline(gx + g->w - 1, gy, g->h, bord);
+            draw_str(gx + 4, gy + (g->h - 8) / 2, g->text, g->enabled ? C_CYAN : C_MUTE);
+            if (foc) {
+                int n = 0; while (n < WG_TEXTLEN - 1 && g->text[n]) n++;
+                int cxp = gx + 4 + n * 8;                /* draw_str advances 8/glyph */
+                if (cxp < gx + g->w - 2) vline(cxp, gy + 3, g->h - 6, ink);
+            }
+        } else if (g->kind == WG_PROGRESS) {
+            int v = g->value; if (v < 0) v = 0; if (v > 100) v = 100;
+            rect(gx, gy, g->w, g->h, C_OBS1);
+            hline(gx, gy, g->w, C_HAIR); hline(gx, gy + g->h - 1, g->w, C_HAIR);
+            vline(gx, gy, g->h, C_HAIR); vline(gx + g->w - 1, gy, g->h, C_HAIR);
+            int fillw = (g->w - 2) * v / 100;
+            if (fillw > 0) rect(gx + 1, gy + 1, fillw, g->h - 2, ink);
+        }
+        __sync_fetch_and_add(&g_wg_drawn, 1);
+    }
+}
+
 static void wimp_compose(void) {
     int W = g_fb_width, H = g_fb_height;
     if (!g_bb) return;
@@ -16802,7 +17440,11 @@ static void wimp_compose(void) {
         while (b >= 0 && snap[order[b]].z > snap[k].z) { order[b + 1] = order[b]; b--; }
         order[b + 1] = k;
     }
-    for (int a = 0; a < nord; a++) wimp_draw_window(&snap[order[a]], snap[order[a]].focused);
+    for (int a = 0; a < nord; a++) {
+        int wi = order[a];
+        wimp_draw_window(&snap[wi], snap[wi].focused);
+        wimp_draw_widgets(&snap[wi], wi);      /* v0.70: painted BY the system */
+    }
 
     /* taskbar across the bottom: one chip per used window */
     rect(0, H - WIN_TASKBAR_H, W, WIN_TASKBAR_H, C_OBS1);
@@ -16844,7 +17486,33 @@ static int wimp_pointer(int sx, int sy, int down) {
                 }
             } else {                                      /* content: focus + route click */
                 wm_raise(hit); wm_focus(hit);
-                wm_queue_event(hit, 1 /*click*/, lx, ly - WIN_TITLE_H, 0);
+                int cx = lx, cy = ly - WIN_TITLE_H;
+                /* v0.70: a widget under the pointer CONSUMES the click and
+                 * reports itself by id. The raw click is not also delivered —
+                 * an application that had to ignore clicks its own buttons
+                 * already handled would be doing the toolkit's job. */
+                int wg = -1;
+                for (int k = 0; k < NWIDGET; k++) {
+                    struct widget *g = &g_wg[k];
+                    if (!g->used || g->win != hit || !g->enabled) continue;
+                    if (g->kind == WG_LABEL || g->kind == WG_PROGRESS) continue;  /* not interactive */
+                    if (cx >= g->x && cx < g->x + g->w && cy >= g->y && cy < g->y + g->h) { wg = k; break; }
+                }
+                if (wg >= 0) {
+                    if (g_wg[wg].kind == WG_CHECK) g_wg[wg].value = !g_wg[wg].value;
+                    /* v0.71: clicking a control also gives it keyboard focus,
+                     * which is what makes a text field typeable by clicking
+                     * into it. */
+                    W->focus_wg = wg;
+                    __sync_fetch_and_add(&g_wg_clicks, 1);
+                    wm_queue_event(hit, 3 /*widget*/, cx, cy, wg);
+                } else {
+                    /* v0.71: a click on bare content takes focus OFF whatever
+                     * held it. Otherwise a text field would keep swallowing
+                     * keystrokes after the user had visibly clicked away. */
+                    W->focus_wg = -1;
+                    wm_queue_event(hit, 1 /*click*/, cx, cy, 0);
+                }
             }
         }
     } else {
@@ -16852,6 +17520,67 @@ static int wimp_pointer(int sx, int sy, int down) {
     }
     klock_release(&g_wm_lock);
     return hit;
+}
+
+/* v0.71: offer one keystroke to the focused window's focused WIDGET. Returns 1
+ * if a widget consumed it, 0 if it should be delivered to the application as an
+ * ordinary key event.
+ *
+ * Shared by the real input path and by wimpstrs, for exactly the reason
+ * wimp_pointer is: a suite that reimplemented this routing would be verifying
+ * its own copy of the logic and not the kernel's.
+ *
+ * A key is consumed only when a widget genuinely has a use for it. Everything
+ * else falls through — a toolkit that swallowed keys the focused control had no
+ * meaning for would silently break every application shortcut on the desktop. */
+static int wimp_key(int ch) {
+    int consumed = 0;
+    klock_acquire(&g_wm_lock);
+    int wi = g_wm_focus;
+    if (wi >= 0 && wi < NWMWIN && g_wmwin[wi].used) {
+        if (ch == '\t') {
+            /* Traversal. A desktop reachable only by pointer excludes anybody
+             * who cannot use one, which v0.70 named as an accessibility gap
+             * rather than leaving it to be noticed. */
+            int cur = wg_focused(wi), next = -1;
+            for (int n = 1; n <= NWIDGET; n++) {
+                int k = ((cur < 0 ? NWIDGET - 1 : cur) + n) % NWIDGET;
+                if (!g_wg[k].used || g_wg[k].win != wi || !g_wg[k].enabled) continue;
+                if (!wg_interactive(g_wg[k].kind)) continue;
+                next = k; break;
+            }
+            if (next >= 0) { g_wmwin[wi].focus_wg = next; consumed = 1; }
+        } else {
+            int k = wg_focused(wi);
+            if (k >= 0 && g_wg[k].enabled) {
+                struct widget *g = &g_wg[k];
+                if (g->kind == WG_ENTRY) {
+                    int n = 0; while (n < WG_TEXTLEN - 1 && g->text[n]) n++;
+                    if (ch == 8 || ch == 127) {              /* backspace / DEL */
+                        if (n > 0) g->text[n - 1] = 0;
+                        consumed = 1;                        /* empty field still eats it */
+                    } else if (ch >= 0x20 && ch < 0x7F) {    /* printable */
+                        if (n < WG_TEXTLEN - 1) { g->text[n] = (char)ch; g->text[n + 1] = 0; }
+                        consumed = 1;                        /* a FULL field eats it too:
+                                                              * overflowing into the
+                                                              * application would be worse
+                                                              * than dropping it */
+                    }
+                } else if (ch == '\n' || ch == '\r' || ch == ' ') {
+                    /* Enter or Space operates the focused control, exactly as a
+                     * click on it would — same toggle, same event, same
+                     * counter, so a keyboard user and a mouse user are
+                     * indistinguishable to the application. */
+                    if (g->kind == WG_CHECK) g->value = !g->value;
+                    __sync_fetch_and_add(&g_wg_clicks, 1);
+                    wm_queue_event(wi, 3 /*widget*/, 0, 0, k);
+                    consumed = 1;
+                }
+            }
+        }
+    }
+    klock_release(&g_wm_lock);
+    return consumed;
 }
 
 /* Process real pointer + keyboard hardware for the interactive desktop. */
@@ -16881,6 +17610,9 @@ static void wimp_input_step(void) {
 
     int ch;
     while ((ch = kbd_getc_nonblock()) >= 0) {             /* route keys to focus */
+        /* v0.71: the focused WIDGET gets first refusal. Only a key no widget
+         * wanted is delivered to the application. */
+        if (wimp_key(ch)) continue;
         klock_acquire(&g_wm_lock);
         if (g_wm_focus >= 0 && g_wmwin[g_wm_focus].used)
             wm_queue_event(g_wm_focus, 2 /*key*/, 0, 0, ch);
@@ -16915,10 +17647,171 @@ static int wm_seed(int owner, int x, int y, int w, int h) {
         struct wmwin *W = &g_wmwin[id];
         cmemset(W, 0, sizeof *W);
         W->used = 1; W->owner = owner; W->x = x; W->y = y; W->w = w; W->h = h;
-        W->z = g_wm_znext++; W->accent = C_MINT;
+        W->z = g_wm_znext++; W->accent = C_MINT; W->focus_wg = -1;
     }
     klock_release(&g_wm_lock);
     return id;
+}
+
+/* ===========================================================================
+ * v0.72: USERS STRESS — process credentials and file ownership
+ * ===========================================================================
+ * Two halves, because neither can cover the other.
+ *
+ * The DECISION TABLE half calls vfs_permit directly. It is a pure function of
+ * (mode, owner, group, asker), so every interesting combination can be stated
+ * as a table rather than staged through the filesystem — including the ones a
+ * live test would struggle to arrange, like a file whose owner has fewer
+ * rights than a stranger.
+ *
+ * The ENFORCEMENT half drives vfs_open_for, the same entry SYS_OPEN uses,
+ * under two spawned processes with different credentials. A decision table
+ * that is never consulted would pass the first half and fail this one. */
+static int g_userpass, g_userfail;
+static void usercheck(const char *n, int c) {
+    if (c) { g_userpass++; kprintf("[usersstrs]  PASS  %s\n", n); }
+    else   { g_userfail++; kprintf("[usersstrs]  FAIL  %s\n", n); }
+}
+
+static void cmd_users_stress(void) {
+    kputs("-- USERSSTRS: process credentials, file ownership and permission --\n");
+    g_userpass = g_userfail = 0;
+    uint64_t save = current_proc_idx;
+
+    /* ---- the permission rule, as a decision table ---- */
+    struct dirent d;
+    cmemset(&d, 0, sizeof d);
+    d.used = 1; d.uid = 1000; d.gid = 100; d.mode = 0640;
+    usercheck("owner may read and write its own 0640 file",
+              vfs_permit(&d, 1000, 100, VFS_P_READ) && vfs_permit(&d, 1000, 100, VFS_P_WRITE));
+    usercheck("the group may read a 0640 file but not write it",
+              vfs_permit(&d, 1001, 100, VFS_P_READ) && !vfs_permit(&d, 1001, 100, VFS_P_WRITE));
+    usercheck("a stranger may do neither to a 0640 file",
+              !vfs_permit(&d, 1001, 101, VFS_P_READ) && !vfs_permit(&d, 1001, 101, VFS_P_WRITE));
+    usercheck("root bypasses the mode entirely", vfs_permit(&d, 0, 0, VFS_P_WRITE));
+
+    /* First match wins, NOT most-permissive wins. 0046 is owner ---, group r--,
+     * other rw-: the owner must be denied a write that a STRANGER is granted,
+     * or the owner triple is advisory rather than binding and nobody can ever
+     * lock themselves out of their own file. This is the one assertion that
+     * separates a correct implementation from an OR of the three triples.
+     * (An earlier draft wrote 0604 here, which is owner rw- — the table caught
+     * the mistake in the test, which is the other thing a decision table is
+     * for.) */
+    d.mode = 0046;
+    usercheck("a 0046 file denies its OWNER a write it grants a stranger",
+              !vfs_permit(&d, 1000, 100, VFS_P_WRITE) && vfs_permit(&d, 1001, 101, VFS_P_WRITE));
+    usercheck("and the group triple beats `other` even when `other` is more permissive",
+              vfs_permit(&d, 1001, 100, VFS_P_READ) && !vfs_permit(&d, 1001, 100, VFS_P_WRITE));
+
+    /* A volume written before v0.72 has mode 0 everywhere. Read literally that
+     * denies everybody everything, which would make every pre-existing file
+     * unreachable the moment enforcement began. */
+    d.mode = 0;
+    usercheck("a legacy dirent (mode 0) reads as the default, not as no-access",
+              vfs_mode_of(&d) == (uint32_t)VFS_MODE_DEFAULT &&
+              vfs_permit(&d, 1001, 101, VFS_P_READ));
+
+    /* ---- enforcement, through the real open path, as two real users ---- */
+    int fds0 = 0;
+    klock_acquire(&g_ofile_lock);
+    for (int f = 0; f < 16; f++) if (g_ofiles[f].used) fds0++;
+    klock_release(&g_ofile_lock);
+    int alice = kproc_spawn("u-alice", PCAP_FILESYSTEM);
+    int bob   = kproc_spawn("u-bob",   PCAP_FILESYSTEM);
+    current_proc_idx = save;
+    if (alice < 0 || bob < 0) {
+        usercheck("two test processes could be spawned", 0);
+    } else {
+        kprocs[alice].uid = 1000; kprocs[alice].gid = 100;
+        kprocs[bob].uid   = 1001; kprocs[bob].gid   = 101;
+
+        /* Every descriptor this block takes is given back at the end. There
+         * are only 16 ofile slots system-wide; an earlier draft leaked five
+         * of them and starved the toolchain suites twenty minutes later,
+         * which reported itself as "could not create /src/t.c" and looked
+         * for all the world like a permission bug in this milestone. */
+        int held[6], nheld = 0;
+        int fa = vfs_open_for("m72own", alice, 1);          /* alice creates it */
+        if (fa >= 0) held[nheld++] = fa;
+        int di = vfs_find("m72own");
+        usercheck("a file created by a user is owned by that user",
+                  fa >= 0 && di >= 0 && DENTS[di].uid == 1000 && DENTS[di].gid == 100);
+        usercheck("a newly created file gets the default mode",
+                  di >= 0 && vfs_mode_of(&DENTS[di]) == (uint32_t)VFS_MODE_DEFAULT);
+
+        /* 0644: a stranger may read it. Permission is not ownership. */
+        int fb = vfs_open_for("m72own", bob, 0);
+        if (fb >= 0) held[nheld++] = fb;
+        usercheck("a stranger CAN open another user's 0644 file for reading", fb >= 0);
+        usercheck("but the stranger has no write right to it",
+                  di >= 0 && !vfs_permit(&DENTS[di], kprocs[bob].uid, kprocs[bob].gid, VFS_P_WRITE));
+        usercheck("while the owner does",
+                  di >= 0 && vfs_permit(&DENTS[di], kprocs[alice].uid, kprocs[alice].gid, VFS_P_WRITE));
+
+        /* Tighten it, and the stranger loses the descriptor it could have had. */
+        if (di >= 0) { klock_acquire(&g_vfs_lock); DENTS[di].mode = 0600; klock_release(&g_vfs_lock); }
+        int fb2 = vfs_open_for("m72own", bob, 0);
+        if (fb2 >= 0) held[nheld++] = fb2;
+        usercheck("after chmod 0600 the stranger can no longer open it at all", fb2 == -13);
+        int fa2 = vfs_open_for("m72own", alice, 0);
+        if (fa2 >= 0) held[nheld++] = fa2;
+        usercheck("and the owner still can", fa2 >= 0);
+        /* Root is not stopped by a mode that stops everybody else. */
+        int rooted = kproc_spawn("u-root", PCAP_FILESYSTEM);
+        current_proc_idx = save;
+        int fr = -1;
+        if (rooted >= 0) {
+            kprocs[rooted].uid = 0; kprocs[rooted].gid = 0;
+            fr = vfs_open_for("m72own", rooted, 0);
+            usercheck("root opens a 0600 file it does not own", fr >= 0);
+        }
+        /* Give every slot back, and prove it: the descriptor table must be
+         * exactly as full as it was before this suite ran. */
+        klock_acquire(&g_ofile_lock);
+        for (int h = 0; h < nheld; h++) {
+            ofile_drop_locked(held[h], alice);
+            ofile_drop_locked(held[h], bob);
+        }
+        if (fr >= 0 && rooted >= 0) ofile_drop_locked(fr, rooted);
+        int fds_now = 0;
+        for (int f = 0; f < 16; f++) if (g_ofiles[f].used) fds_now++;
+        klock_release(&g_ofile_lock);
+        usercheck("the suite returned every descriptor it took", fds_now == fds0);
+        if (rooted >= 0) { kprocs[rooted].exited = 1; kprocs[rooted].torn_down = 1; }
+        kprocs[alice].exited = 1; kprocs[alice].torn_down = 1;
+        kprocs[bob].exited   = 1; kprocs[bob].torn_down   = 1;
+    }
+    current_proc_idx = save;
+
+    /* ---- credentials on the process ---- */
+    usercheck("the initial process runs as root",
+              kprocs[tg_of((int)save)].uid == 0);
+
+    /* A RECYCLED slot must not inherit the identity of whoever held it last.
+     * kproc_reset blanks fields one at a time rather than memset-ing, so a
+     * credential added to struct kproc and forgotten here is carried over
+     * silently — a leak not of memory but of AUTHORITY. This is asserted
+     * immediately after the block above deliberately: those spawns are marked
+     * recyclable, so the very next spawn takes one of their slots, and if the
+     * reset were incomplete this is where it shows. */
+    int recyc = kproc_spawn("u-recycle", PCAP_FILESYSTEM);
+    current_proc_idx = save;
+    if (recyc >= 0) {
+        usercheck("a recycled process slot does not inherit the dead occupant's uid",
+                  kprocs[recyc].uid == 0 && kprocs[recyc].gid == 0);
+        kprocs[recyc].exited = 1; kprocs[recyc].torn_down = 1;
+    } else {
+        usercheck("a slot was available to test recycling", 0);
+    }
+    /* setuid/setgid are exercised from ring 3 by role 52, which is the only
+     * place the one-way rule can be observed the way an application sees it. */
+
+    kprintf("[usersstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_userpass, (uint64_t)g_userfail);
+    if (!g_userfail)
+        kputs("[usersstrs] CREDENTIALS VERIFIED — identity, ownership, mode enforcement and legacy compatibility\n");
+    else kputs("[usersstrs] CREDENTIAL DEFECTS PRESENT\n");
+    kputs("-- done --\n");
 }
 
 static void cmd_wimp_stress(void) {
@@ -17006,6 +17899,224 @@ static void cmd_wimp_stress(void) {
     wimpcheck("hit-test picks the higher-z window in an overlap", top_overlap == b);
     wimpcheck("hit-test picks the sole window under a non-overlapping point", top_c == c);
     wimpcheck("hit-test returns -1 over empty desktop", top_none == -1);
+
+    /* ---- v0.70: WIDGETS. Declared through the real syscalls, clicked through
+     * the real pointer path, and read back through the real accessors — so
+     * what is verified is the interface an application would actually use, not
+     * a shortcut into the table behind it. ---- */
+    {
+        uint64_t wgc0 = g_wg_created, clk0 = g_wg_clicks;
+        int base_wg = wg_count_used();
+        /* The ring-3 rounds above have all exited by now — cleanly and via the
+         * fault path — and each of them declared widgets. If a single one
+         * survived its process the table would not be empty, and this is the
+         * assertion that says so before anything below can mask it. */
+        wimpcheck("no widget outlived the ring-3 process that declared it (clean OR faulted)",
+                  base_wg == 0);
+        uint64_t sv2 = current_proc_idx;
+        kprocs[save].caps |= PCAP_WIMP;          /* the seeded windows' owner */
+        current_proc_idx = save;
+        /* This block owns its own window and destroys it, rather than
+         * borrowing one the surrounding WM-logic assertions still need. An
+         * earlier draft reused c and then destroyed it to prove widget
+         * release, which left the minimize test below hit-testing a window
+         * that no longer existed. Placed clear of a, b and c so no hit-test
+         * or compose assertion changes meaning. */
+        int d = wm_seed((int)save, 600, 60, 200, 150);
+        wimpcheck("a window can be seeded for the widget fixture", d >= 0);
+        if (d < 0) { current_proc_idx = sv2; goto widgets_done; }
+        /* wm_seed makes a window with no content SURFACE, so cw/ch are zero and
+         * every widget would be refused for not fitting a zero-sized rect —
+         * the bounds check doing its job against an incomplete fixture. Give
+         * the seeded window the content rectangle SYS_WIN_CREATE would have
+         * computed; widgets need the geometry, not the pixels. */
+        klock_acquire(&g_wm_lock);
+        g_wmwin[d].cw = g_wmwin[d].w - 4;
+        g_wmwin[d].ch = g_wmwin[d].h - WIN_TITLE_H - 3;
+        klock_release(&g_wm_lock);
+
+        /* A button and a checkbox, laid out inside c's content rect. */
+        uint64_t r_btn = (uint64_t)(uint16_t)10 | ((uint64_t)(uint16_t)10 << 16) |
+                         ((uint64_t)(uint16_t)80 << 32) | ((uint64_t)(uint16_t)20 << 48);
+        uint64_t r_chk = (uint64_t)(uint16_t)10 | ((uint64_t)(uint16_t)40 << 16) |
+                         ((uint64_t)(uint16_t)80 << 32) | ((uint64_t)(uint16_t)16 << 48);
+        /* Labels are passed as NULL here: this suite runs in a kernel context,
+         * and a .rodata pointer is not user-mapped, so access_ok correctly
+         * refuses it. Text rendering is not what these assertions are for. */
+        int bid = (int)(int64_t)syscall_dispatch(85, (uint64_t)d | ((uint64_t)WG_BUTTON << 16),
+                                                 r_btn, 0);   /* label: see note */
+        int kid = (int)(int64_t)syscall_dispatch(85, (uint64_t)d | ((uint64_t)WG_CHECK << 16),
+                                                 r_chk, 0);
+        wimpcheck("a button and a checkbox can be declared on a window", bid >= 0 && kid >= 0);
+
+        /* A widget that would fall outside the content rect is REFUSED at
+         * declaration. Silently clipping it would be a layout bug with no
+         * error attached to it. */
+        uint64_t r_big = (uint64_t)(uint16_t)10 | ((uint64_t)(uint16_t)10 << 16) |
+                         ((uint64_t)(uint16_t)9000 << 32) | ((uint64_t)(uint16_t)20 << 48);
+        wimpcheck("a widget that would not fit the content rect is refused",
+                  (int64_t)syscall_dispatch(85, (uint64_t)d | ((uint64_t)WG_BUTTON << 16),
+                                            r_big, 0) < 0);
+
+        /* Click the BUTTON through the pointer path. It must arrive as a
+         * widget event naming that button — not as a raw click the
+         * application would have to hit-test for itself. */
+        klock_acquire(&g_wm_lock);
+        wm_raise(d);
+        int cxs = g_wmwin[d].x + 2, cys = g_wmwin[d].y + WIN_TITLE_H;
+        uint32_t qr0 = g_wmwin[d].qr, qw0 = g_wmwin[d].qw;
+        klock_release(&g_wm_lock);
+        (void)qr0;
+        wimp_pointer(cxs + 20, cys + 18, 1); wimp_pointer(cxs + 20, cys + 18, 0);
+        klock_acquire(&g_wm_lock);
+        int got_ev = 0, ev_type = 0, ev_code = -1;
+        if (g_wmwin[d].qw > qw0) {
+            struct sevent *e = &g_wmwin[d].q[qw0 % 8];
+            got_ev = 1; ev_type = e->type; ev_code = e->code;
+        }
+        klock_release(&g_wm_lock);
+        wimpcheck("clicking a button delivers a WIDGET event naming that button",
+                  got_ev && ev_type == 3 && ev_code == bid);
+
+        /* The checkbox toggles on click, and SYS_UI_GET reports the new state
+         * — which is how a polled toolkit answers "is it checked now?". */
+        int was = (int)(int64_t)syscall_dispatch(87, (uint64_t)d | ((uint64_t)kid << 16), 0, 0);
+        wimp_pointer(cxs + 20, cys + 46, 1); wimp_pointer(cxs + 20, cys + 46, 0);
+        int now = (int)(int64_t)syscall_dispatch(87, (uint64_t)d | ((uint64_t)kid << 16), 0, 0);
+        wimpcheck("clicking a checkbox toggles it, and the state reads back", was == 0 && now == 1);
+
+        /* A DISABLED widget is not clickable — the click falls through to the
+         * application as an ordinary content click instead of firing. */
+        syscall_dispatch(86, (uint64_t)d | ((uint64_t)bid << 16), 1, 0);   /* disable */
+        klock_acquire(&g_wm_lock); uint32_t qw1 = g_wmwin[d].qw; klock_release(&g_wm_lock);
+        wimp_pointer(cxs + 20, cys + 18, 1); wimp_pointer(cxs + 20, cys + 18, 0);
+        klock_acquire(&g_wm_lock);
+        int t2 = -1;
+        if (g_wmwin[d].qw > qw1) t2 = g_wmwin[d].q[qw1 % 8].type;
+        klock_release(&g_wm_lock);
+        wimpcheck("a disabled widget does not fire; the click falls through as content",
+                  t2 == 1);
+
+        /* A click on empty content is still an ordinary click. */
+        klock_acquire(&g_wm_lock); uint32_t qw2 = g_wmwin[d].qw; klock_release(&g_wm_lock);
+        wimp_pointer(cxs + 120, cys + 90, 1); wimp_pointer(cxs + 120, cys + 90, 0);
+        klock_acquire(&g_wm_lock);
+        int t3 = -1;
+        if (g_wmwin[d].qw > qw2) t3 = g_wmwin[d].q[qw2 % 8].type;
+        klock_release(&g_wm_lock);
+        wimpcheck("a click on bare content is delivered as a plain click", t3 == 1);
+
+        wimpcheck("widgets were created and clicks were counted",
+                  g_wg_created > wgc0 && g_wg_clicks > clk0);
+
+        /* And the compositor must actually PAINT them. Every assertion above
+         * would still pass if wimp_draw_widgets were a no-op — they prove a
+         * widget exists, routes a click and reports its state, none of which
+         * touches the drawing path. That would leave "the kernel draws them",
+         * the entire reason widgets live here rather than in a library, as the
+         * one claim this release makes and does not check.
+         * Needs a bootloader framebuffer; skipped cleanly without one. */
+        if (g_gfx_ready && g_bb) {
+            uint64_t drawn0 = g_wg_drawn;
+            wimp_compose();
+            wimpcheck("the compositor painted this window's widgets",
+                      g_wg_drawn >= drawn0 + 2);
+        } else {
+            kputs("[wimpstrs] SKIP  widget paint (no bootloader framebuffer on this config)\n");
+        }
+
+        /* ---- v0.71: TEXT ENTRY and per-widget keyboard focus. Driven through
+         * the real wimp_key path, which is the same one the PS/2 and USB
+         * keyboards feed, so what is verified is the routing itself. ---- */
+        uint64_t r_ent = (uint64_t)(uint16_t)10 | ((uint64_t)(uint16_t)64 << 16) |
+                         ((uint64_t)(uint16_t)120 << 32) | ((uint64_t)(uint16_t)18 << 48);
+        int eid = (int)(int64_t)syscall_dispatch(85, (uint64_t)d | ((uint64_t)WG_ENTRY << 16),
+                                                 r_ent, 0);
+        wimpcheck("a text entry can be declared", eid >= 0);
+
+        /* Clicking into a field is how a user says "type here". */
+        wimp_pointer(cxs + 20, cys + 70, 1); wimp_pointer(cxs + 20, cys + 70, 0);
+        wimpcheck("clicking a text entry gives it keyboard focus",
+                  (int)(int64_t)syscall_dispatch(87, (uint64_t)d, 3, 0) == eid);
+
+        /* Typing reaches the field, and the field alone. */
+        int typed = wimp_key('h') && wimp_key('i');
+        klock_acquire(&g_wm_lock);
+        int txt_ok = (eid >= 0) && kstrcmp(g_wg[eid].text, "hi") == 0;
+        klock_release(&g_wm_lock);
+        wimpcheck("typing into a focused entry inserts the characters", typed && txt_ok);
+
+        wimp_key(8);                                        /* backspace */
+        klock_acquire(&g_wm_lock);
+        int bs_ok = (eid >= 0) && kstrcmp(g_wg[eid].text, "h") == 0;
+        klock_release(&g_wm_lock);
+        wimpcheck("backspace removes the last character", bs_ok);
+
+        /* A field that is full must DROP the excess, not run off the end of
+         * its own buffer. The overflow is the interesting case precisely
+         * because nothing above would notice it. */
+        for (int i = 0; i < WG_TEXTLEN * 2; i++) wimp_key('x');
+        klock_acquire(&g_wm_lock);
+        int len = 0; while (len < WG_TEXTLEN && g_wg[eid].text[len]) len++;
+        int cap_ok = (len == WG_TEXTLEN - 1) && g_wg[eid].text[WG_TEXTLEN - 1] == 0;
+        klock_release(&g_wm_lock);
+        wimpcheck("a full entry caps its text and stays NUL-terminated", cap_ok);
+
+        /* A DISABLED field ignores typing. Disabling that only greyed the
+         * pixels would be a lie the application could not detect. */
+        syscall_dispatch(86, (uint64_t)d | ((uint64_t)eid << 16), 1, 0);   /* disable */
+        klock_acquire(&g_wm_lock);
+        for (int i = 0; i < WG_TEXTLEN; i++) g_wg[eid].text[i] = 0;
+        g_wg[eid].text[0] = 'q'; g_wg[eid].text[1] = 0;
+        klock_release(&g_wm_lock);
+        wimp_key('z');
+        klock_acquire(&g_wm_lock);
+        int dis_ok = kstrcmp(g_wg[eid].text, "q") == 0;
+        klock_release(&g_wm_lock);
+        wimpcheck("a disabled entry ignores keystrokes", dis_ok);
+        syscall_dispatch(86, (uint64_t)d | ((uint64_t)eid << 16), 1, 1);   /* re-enable */
+
+        /* Clicking bare content takes focus off the field — otherwise it would
+         * keep eating keys after the user had visibly clicked away — and a key
+         * with nothing focused must FALL THROUGH to the application. */
+        wimp_pointer(cxs + 120, cys + 110, 1); wimp_pointer(cxs + 120, cys + 110, 0);
+        int nofocus = (int)(int64_t)syscall_dispatch(87, (uint64_t)d, 3, 0);
+        wimpcheck("clicking bare content clears widget focus", nofocus == -1);
+        wimpcheck("a key with no widget focused is NOT consumed (the app still gets it)",
+                  wimp_key('Z') == 0);
+
+        /* Tab traversal: reaches every enabled control, skips the disabled one.
+         * Asserted as a SET rather than a sequence so it does not depend on
+         * which table slots the widgets happened to land in. */
+        int f1 = -1, f2 = -1;
+        if (wimp_key('\t')) f1 = (int)(int64_t)syscall_dispatch(87, (uint64_t)d, 3, 0);
+        if (wimp_key('\t')) f2 = (int)(int64_t)syscall_dispatch(87, (uint64_t)d, 3, 0);
+        wimpcheck("Tab moves focus between the enabled controls and skips the disabled one",
+                  f1 >= 0 && f2 >= 0 && f1 != f2 && f1 != bid && f2 != bid &&
+                  ((f1 == kid && f2 == eid) || (f1 == eid && f2 == kid)));
+
+        /* Enter operates the focused control exactly as a click would, so a
+         * keyboard user and a mouse user look identical to the application. */
+        klock_acquire(&g_wm_lock);
+        g_wmwin[d].focus_wg = kid;
+        int kv0 = g_wg[kid].value; uint32_t qw3 = g_wmwin[d].qw;
+        klock_release(&g_wm_lock);
+        int ent = wimp_key('\n');
+        klock_acquire(&g_wm_lock);
+        int kv1 = g_wg[kid].value;
+        int t4 = (g_wmwin[d].qw > qw3) ? g_wmwin[d].q[qw3 % 8].type : -1;
+        int c4 = (g_wmwin[d].qw > qw3) ? g_wmwin[d].q[qw3 % 8].code : -1;
+        klock_release(&g_wm_lock);
+        wimpcheck("Enter on a focused checkbox toggles it and reports a WIDGET event",
+                  ent && kv1 != kv0 && t4 == 3 && c4 == kid);
+
+        /* And they must not outlive their window. */
+        klock_acquire(&g_wm_lock); wm_destroy(d); klock_release(&g_wm_lock);
+        wimpcheck("destroying a window releases every widget it owned",
+                  wg_count_used() == base_wg);
+        current_proc_idx = sv2;
+    }
+widgets_done: ;
 
     /* raise a to the front via a title-bar click, re-test the overlap */
     int hit = wimp_pointer(150, 105, 1); wimp_pointer(150, 105, 0);   /* title bar of a (or b) */
@@ -18875,6 +19986,34 @@ static void tccheck2(const char *what, int ok) {
     else    { g_tcfail2++; kprintf("[tcpstrs] FAIL: %s\n", what); }
 }
 
+/* v0.73: take a blank stream socket for a protocol fixture, or -1.
+ *
+ * Every caller releases it before returning — v0.72's usersstrs leaked five
+ * descriptors and broke nine assertions in three unrelated suites twenty
+ * minutes later, so a fixture that takes a slot from a shared table gives it
+ * back in the same block that took it. */
+static int tcpstrs_grab_sock(void) {
+    int si = -1;
+    klock_acquire(&g_net_lock);
+    for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) { si = i; break; }
+    if (si >= 0) {
+        cmemset(&g_sock[si], 0, sizeof g_sock[si]);
+        struct nsock *t = &g_sock[si];
+        t->used = 1; t->stream = 1; t->waiter_tid = -1; t->fd = -1;
+        t->connected = 1; t->bound = 1;
+        t->raddr = NET_LOOPBACK;
+        /* Ports nothing else in this suite binds, so tcp_output's loopback
+         * lookup finds no peer and the segment is simply dropped — these
+         * assertions are about the RECEIVE and SEND paths of one endpoint,
+         * not about delivery. */
+        t->lport = (uint16_t)(51000 + si * 2);
+        t->rport = (uint16_t)(51001 + si * 2);
+        t->snd_wnd = TCP_MSS;
+    }
+    klock_release(&g_net_lock);
+    return si;
+}
+
 static void cmd_tcp_stress(void) {
     kputs("-- TCPSTRS: three-way handshake, byte streams, retransmission and FIN --\n");
     g_tcpass = g_tcfail2 = 0;
@@ -19085,6 +20224,112 @@ static void cmd_tcp_stress(void) {
      * of QEMU's NAT, which is the trap v0.52 documented and avoided. */
     tccheck2("a segment for a non-loopback peer was built and TRANSMITTED",
              g_tcp_wire_tx > wt0);
+
+    /* ---- v0.73: the three things v0.67 and v0.68 listed as not done ----
+     *
+     * Each is driven through the REAL state machine on a socket this block
+     * sets up and tears down itself, rather than by reading back a field the
+     * test just wrote. A socket in a particular state is a fixture; what is
+     * asserted is what the protocol code does when a segment arrives at it. */
+    {
+        int ti = tcpstrs_grab_sock();
+        int armed = 0;
+        if (ti >= 0) {
+            klock_acquire(&g_net_lock);
+            struct nsock *t = &g_sock[ti];
+            t->state = TCPS_FIN_WAIT2; t->fin_sent = 1;
+            t->rcv_nxt = 1000; t->irs = 999;
+            t->iss = 500; t->snd_una = 501; t->snd_nxt = 501;
+            struct tseg f;
+            f.seq = 1000; f.ack = 501; f.flags = (uint16_t)(TH_FIN | TH_ACK);
+            f.len = 0; f.sport = t->rport; f.dport = t->lport;
+            f.win = TCP_MSS; f.data = 0;
+            tcp_input(ti, &f);                       /* the real close path */
+            armed = (t->state == TCPS_TIME_WAIT) && t->tw_ticks > 0;
+            klock_release(&g_net_lock);
+        }
+        tccheck2("a FIN in FIN_WAIT2 enters TIME_WAIT with its 2*MSL clock ARMED", armed);
+
+        /* And it must LEAVE on that clock. Before v0.73 the state was left
+         * until the descriptor closed, so this is the assertion that would
+         * have failed — and the one that fails again if the tw_ticks check is
+         * ever moved back below the retransmit guard, where a zero
+         * rexmit_ticks would skip the socket entirely. */
+        uint64_t tw0 = g_tcp_timewait_done;
+        for (int k = 0; k < TCP_TIMEWAIT_TICKS + 2; k++) tcp_timer_scan();
+        int expired = 0;
+        if (ti >= 0) {
+            klock_acquire(&g_net_lock);
+            expired = (g_sock[ti].state == TCPS_CLOSED) && g_sock[ti].tw_ticks == 0;
+            g_sock[ti].used = 0;
+            klock_release(&g_net_lock);
+        }
+        tccheck2("TIME_WAIT ends on the CLOCK, not on a descriptor close",
+                 expired && g_tcp_timewait_done > tw0);
+    }
+
+    {   /* FLOW CONTROL. A 100-byte window must hold back a 300-byte send. */
+        int wi = tcpstrs_grab_sock();
+        uint32_t took = 0, took2 = 0;
+        uint64_t st0 = g_tcp_win_stalls;
+        static uint8_t wbuf[300];
+        for (int i = 0; i < 300; i++) wbuf[i] = (uint8_t)(i * 5 + 1);
+        if (wi >= 0) {
+            klock_acquire(&g_net_lock);
+            struct nsock *t = &g_sock[wi];
+            t->state = TCPS_ESTAB;
+            t->snd_una = t->snd_nxt = 5000; t->rcv_nxt = 7000;
+            t->snd_wnd = 100;
+            took = tcp_send_data(wi, wbuf, 300);
+            /* A window of zero stops the sender dead — the case that
+             * distinguishes flow control from a size cap. */
+            t->snd_wnd = 0;
+            took2 = tcp_send_data(wi, wbuf, 300);
+            g_sock[wi].used = 0;
+            klock_release(&g_net_lock);
+        }
+        tccheck2("a send is capped by the peer's advertised window, not by the buffer",
+                 took == 100 && g_tcp_win_stalls > st0);
+        tccheck2("a ZERO window stops the sender completely", took2 == 0);
+    }
+
+    {   /* REASSEMBLY. A segment past a hole is kept, and the bytes come out in
+         * the right order once the hole is filled — the assertion a stack that
+         * merely stopped dropping would still fail. */
+        int ri = tcpstrs_grab_sock();
+        int queued_ok = 0, merged_ok = 0, bytes_ok = 0;
+        uint64_t q0 = g_tcp_ooo_queued, m0 = g_tcp_ooo_merged;
+        if (ri >= 0) {
+            klock_acquire(&g_net_lock);
+            struct nsock *t = &g_sock[ri];
+            t->state = TCPS_ESTAB;
+            t->snd_una = t->snd_nxt = 9000; t->snd_wnd = TCP_MSS;
+            t->rcv_nxt = 3000; t->irs = 2999;
+            static uint8_t segb[8], sega[8];
+            for (int i = 0; i < 8; i++) { sega[i] = (uint8_t)('A' + i); segb[i] = (uint8_t)('a' + i); }
+            struct tseg g2;
+            /* B first, ten bytes ahead: out of order. */
+            g2.seq = 3008; g2.ack = 9000; g2.flags = TH_ACK; g2.len = 8;
+            g2.sport = t->rport; g2.dport = t->lport; g2.win = TCP_MSS; g2.data = segb;
+            tcp_input(ri, &g2);
+            queued_ok = (g_tcp_ooo_queued > q0) && (t->rcount == 0) && (t->rcv_nxt == 3000);
+            /* Now A, which fills the hole and should release B behind it. */
+            g2.seq = 3000; g2.len = 8; g2.data = sega;
+            tcp_input(ri, &g2);
+            merged_ok = (g_tcp_ooo_merged > m0) && (t->rcount == 16) && (t->rcv_nxt == 3016);
+            bytes_ok = 1;
+            for (int i = 0; i < 8; i++)  if (t->rbuf[i] != (uint8_t)('A' + i)) bytes_ok = 0;
+            for (int i = 0; i < 8; i++)  if (t->rbuf[8 + i] != (uint8_t)('a' + i)) bytes_ok = 0;
+            g_sock[ri].used = 0;
+            klock_release(&g_net_lock);
+        }
+        tccheck2("a segment arriving past a hole is QUEUED, not dropped", queued_ok);
+        tccheck2("filling the hole releases what was queued behind it", merged_ok);
+        tccheck2("and the reassembled bytes are in the right order", bytes_ok);
+    }
+    kprintf("[tcpstrs] v0.73: %u timewait expiries, %u window stalls, %u ooo queued/%u merged/%u dropped\n",
+            g_tcp_timewait_done, g_tcp_win_stalls,
+            g_tcp_ooo_queued, g_tcp_ooo_merged, g_tcp_ooo_dropped);
 out:
     kprintf("[tcpstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_tcpass, (uint64_t)g_tcfail2);
     if (!g_tcfail2)
@@ -21638,6 +22883,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "audiostress")) cmd_audio_stress();
     else if (!kstrcmp(argv[0], "netstress")) cmd_net_stress();
     else if (!kstrcmp(argv[0], "wimpstress")) cmd_wimp_stress();
+    else if (!kstrcmp(argv[0], "usersstress")) cmd_users_stress();
     else if (!kstrcmp(argv[0], "appsstress")) cmd_apps_stress();
     else if (!kstrcmp(argv[0], "posixstress")) cmd_posix_stress();
     else if (!kstrcmp(argv[0], "toolchainstress")) cmd_selfhost_test();
@@ -21845,6 +23091,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_gpu_stress();       /* v0.50: virtio-gpu 2D resource/scanout/flush churn, incl. client faults */
     cmd_audio_stress();     /* v0.51: virtio-sound PCM configure/write churn, incl. client faults */
     cmd_net_stress();       /* v0.52: ring-3 datagram-socket bind/connect/send/recv churn, incl. client faults */
+    cmd_users_stress();     /* v0.72: process credentials, file ownership and permission enforcement */
     cmd_wimp_stress();      /* v0.53: ring-3 WIMP window create/manage/close churn + WM logic, incl. client faults */
     cmd_apps_stress();      /* v0.54: concurrent ring-3 GUI apps (terminal/sysmon/filer), incl. app crashes */
     cmd_posix_stress();     /* v0.55: fork/exec chains, signal frames, pthread mutexes under SMP */
