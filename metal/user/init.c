@@ -136,6 +136,26 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_UI_ADD              85          /* v0.70 */
 #define SYS_UI_SET              86          /* v0.70 */
 #define SYS_UI_GET              87          /* v0.70 */
+/* v0.72 added process credentials to the kernel but never published their
+ * numbers here, so ring 3 had no way to ask who it was. v0.74 completes the
+ * set and exposes both halves together — the identity a program HOLDS, and the
+ * authentication that establishes one in the first place.
+ *
+ * SYS_USERADD packs uid and gid into its third argument, (gid << 32) | uid,
+ * because the syscall ABI carries exactly three; see the kernel case for why
+ * widening it to four was not worth touching the assembly stub for. */
+#define SYS_GETUID              88          /* v0.72 */
+#define SYS_GETGID              89          /* v0.72 */
+#define SYS_SETUID              90          /* v0.72; v0.74 semantics: permanent drop */
+#define SYS_SETGID              91          /* v0.72 */
+#define SYS_CHMOD               92          /* v0.72 */
+#define SYS_CHOWN               93          /* v0.72 */
+#define SYS_GETEUID             94          /* v0.74 */
+#define SYS_GETEGID             95          /* v0.74 */
+#define SYS_SETEUID             96          /* v0.74: the REVERSIBLE drop */
+#define SYS_SETEGID             97          /* v0.74 */
+#define SYS_AUTH                98          /* v0.74: (name, password) -> uid, or negative */
+#define SYS_USERADD             99          /* v0.74: (name, password, (gid<<32)|uid) */
 
 /* v0.70: widget kinds, mirroring the kernel's table. */
 #define WG_LABEL                1

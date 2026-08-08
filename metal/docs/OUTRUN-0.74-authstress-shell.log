@@ -1,0 +1,1008 @@
+c[?7l[2J[0mSeaBIOS (version 1.16.3-debian-1.16.3-2)
+
+
+iPXE (https://ipxe.org) 00:04.0 CA00 PCI2.10 PnP PMM+1EFCAF10+1EF0AF10 CA00
+Press Ctrl-B to configure iPXE (PCI 00:04.0)...                                                                               
+
+
+Booting from Hard Disk...
+Boot failed: not a bootable disk
+
+Booting from Floppy...
+Boot failed: could not read the boot disk
+
+Booting from DVD/CD...
+[01;01H[2J[02;30HGNU [02;33H[02;34HGRUB  version 2.12[04;02H┌────────────────────────────────────────────────────────────────────────────┐[05;02H│[05;79H│[06;02H│[06;79H│[07;02H│[07;79H│[08;02H│[08;79H│[09;02H│[09;79H│[10;02H│[10;79H│[11;02H│[11;79H│[12;02H│[12;79H│[13;02H│[13;79H│[14;02H│[14;79H│[15;02H│[15;79H│[16;02H│[16;79H│[17;02H│[17;79H│[18;02H└────────────────────────────────────────────────────────────────────────────┘[20;02H     Use the ↑ and ↓ keys to select which entry is highlighted.          
+      Press enter to boot the selected OS, `e' to edit the commands       
+      before booting or `c' for a command-line.                           [05;80H [05;03H[0;30;47m*Outrun OS (kernel 0.30.0-metal)                                            [06;03H[0m                                                                            [07;03H                                                                            [08;03H                                                                            [09;03H                                                                            [10;03H                                                                            [11;03H                                                                            [12;03H                                                                            [13;03H                                                                            [14;03H                                                                            [15;03H                                                                            [16;03H                                                                            [17;03H                                                                            [17;80H 
+
+
+
+
+
+   The highlighted entry will be executed automatically in 2s.                 [05;78H
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   The highlighted entry will be executed automatically in 1s.                 [05;78H
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   The highlighted entry will be executed automatically in 0s.                 [01;01H[2J[2J
+  ....................................................................
+  :   OUTRUN OS  --  bare-metal kernel 0.73.0-metal                   :
+  :   Assembly bootstrap -> x86_64 long mode -> freestanding C core  :
+  ....................................................................
+
+[kernel ] long mode active, kernel at 1 MiB, first GiB identity-mapped
+[kernel ] IDT loaded (52 vectors incl. IPI 48-50 + slice tick 51), PIC remapped, PIT @ 100 Hz, IRQs on
+[kernel ] consoles: VGA text + COM1 serial (115200 8N1) — both live
+[kernel ] booted by: GRUB 2.12-1ubuntu7.3
+[kernel ] boot module 'user_init.elf' at phys 0000000000370000..000000000038bc90 (user ELF)
+[kernel ] physical memory map (Multiboot2):
+           0000000000000000 + 000000000009fc00  USABLE RAM
+           000000000009fc00 + 0000000000000400  reserved
+           00000000000f0000 + 0000000000010000  reserved
+           0000000000100000 + 000000001fedd000  USABLE RAM
+           000000001ffdd000 + 0000000000023000  reserved
+           00000000fffc0000 + 0000000000040000  reserved
+           000000fd00000000 + 0000000300000000  reserved
+           total usable: 511 MiB
+[kernel ] framebuffer: 1024x768 x32 bpp, pitch 4096, phys 00000000fe000000
+[acpi   ] RSDP (ACPI 1.0) provided by bootloader
+[kernel ] capability table initialized (16 slots, kernel-owned)
+[kernel ] paging: boot PML4 @ phys 000000000017e000; process frame pool from 16 MiB
+[kernel ] W^X enforced: kernel .text R+X, all other pages RW+NX
+[sweep  ] descriptor-table integrity sweep armed: 64 entries/tick @ 100 Hz
+
+-- real 4-level page-table hardware passthrough --
+[hw     ] device 'sensor0' registers at phys 0000000001002000, sentinel 0x00000000cafebabe, requires CAMERA
+[kernel ] spawned pid 1 'stream-app' caps 0000000000000003 — private PML4 @ phys 0000000001003000
+[kernel ] spawned pid 2 'sketchy-app' caps 0000000000000020 — private PML4 @ phys 0000000001004000
+
+[test   ] authorized process maps the device:
+[hw     ] GRANT  pid 1 'stream-app' -> 'sensor0': phys 0000000001002000 mapped at vaddr 0000400040000000 (1 pages)
+[paging ] 'stream-app' PTE: vaddr 0000400040000000 -> phys 0000000001002000
+[paging ] 'stream-app' read through its OWN address space: 0x00000000cafebabe  == sentinel (REAL mapping resolves)
+
+[test   ] unauthorized process attempts the same device:
+[hw     ] DENIED pid 2 'sketchy-app' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[paging ] 'sketchy-app' passthrough returned -2; device vaddr present in its space? NO (sandboxed, nothing mapped)
+-- done: authorized app holds a real MMIO mapping; unauthorized was dropped --
+[iommu  ] no DMAR table — platform has no VT-d remapping hardware
+
+[pci    ] enumerating bus 0 (config mechanism #1, ports 0xCF8/0xCFC):
+[pci    ]   0:00.0  vendor 8086 device 1237 class 600
+[pci    ]   1:00.0  vendor 8086 device 7000 class 601
+[pci    ]   2:00.0  vendor 1af4 device 1050 class 300
+[vgpu   ] virtio-gpu at 0:2.0 — bringing up control queue
+[vgpu   ] DRIVER_OK — controlq size 16, notify_off 0 — READY (2D resources only, polling completion)
+[pci    ]   3:00.0  vendor 1af4 device 1042 class 100
+[vblk   ] virtio-blk at 0:3.0 — bringing up modern driver
+[vblk   ] device features: hi 101 lo 30006e54 (VERSION_1=1)
+[vblk   ] capacity: 8192 sectors (4 MiB)
+[vblk   ] DRIVER_OK — queue0 size 64, notify_off 0, mult 4 — READY
+[vblk   ] interrupt-driven: INTx on IRQ 11 (vector 43), ISR reg mapped
+[pci    ]   4:00.0  vendor 1af4 device 1041 class 200
+[vnet   ] virtio-net at 0:4.0 — bringing up modern driver
+[vnet   ] MAC 52:54:0:ab:cd:ef
+[vnet   ] DRIVER_OK — rxq 16 txq 16, INTx IRQ 11 — READY
+[sched  ] round-robin up: main=tid0, idle=tid1 (PIT preemption on demand)
+[poly   ] C++ SPSC ring: pushed 12, popped 12 -> "polyglot-ipc" (depth 0)
+-- content-addressable storage on virtio-blk (Rust-hashed) --
+[cas    ] no volume signature; formatting a fresh CAS volume
+[cas    ] formatted 8192 blocks: bitmap@1(2) index@3(512) dir@515(48) vjrnl@563(49) cjrnl@612(4) data@648
+[cas    ]   raw-block scratch region: 32 block(s) at 616 (reserved, never allocated)
+[cas    ] put len 46 hash 155c834afdff66eb -> block 648 (stored)
+[cas    ] put len 47 hash bc6c7bd024077f72 -> block 649 (stored)
+[cas    ] put len 46 hash 155c834afdff66eb -> DEDUP to block 648 (no write)
+[cas    ] get 155c834afdff66eb -> "Hello, Outrun CAS! The content is the address." (46 bytes read from disk)
+[cas    ] dedup: hash(a)==hash(a')? YES ; blocks used this run +2
+[vblk   ] I/O completions delivered by INTERRUPT: 647
+-- done (state persisted to disk) --
+-- VFS: named files over CAS (multi-block, dedup, copy-on-write) --
+[cas    ] put len 512 hash fb2645c40612f95e -> block 650 (stored)
+[cas    ] put len 512 hash eb9b884cc447c6c7 -> block 651 (stored)
+[cas    ] put len 512 hash cde1a204aa16b0a8 -> block 652 (stored)
+[cas    ] put len 512 hash 553856047efd831a -> block 653 (stored)
+[cas    ] put len 512 hash 0f2129bd62d3c1b8 -> block 654 (stored)
+[cas    ] put len 512 hash 6179687a3c665625 -> block 655 (stored)
+[cas    ] put len 512 hash 571aae9483a28fb4 -> block 656 (stored)
+[cas    ] put len 512 hash 50eeae072fa302e7 -> block 657 (stored)
+[cas    ] put len 512 hash a2e7c1071716ffb5 -> block 658 (stored)
+[cas    ] put len 512 hash 896abd836d639cba -> block 659 (stored)
+[cas    ] put len 512 hash c695cf0bde06f1ff -> block 660 (stored)
+[cas    ] put len 512 hash f9aa9c273b7166b1 -> block 661 (stored)
+[cas    ] put len 512 hash 03a4c426d06462ab -> block 662 (stored)
+[cas    ] put len 512 hash e9ce2ecebc0ce3fe -> block 663 (stored)
+[cas    ] put len 512 hash 1f8ceb317b5eba0a -> block 664 (stored)
+[cas    ] put len 512 hash af6674acf49a635e -> block 665 (stored)
+[cas    ] put len 512 hash e3959a5f7b0dd6be -> block 666 (stored)
+[cas    ] put len 512 hash 1f21b1c1508e6853 -> block 667 (stored)
+[cas    ] put len 512 hash 4406ea9dde89a3d0 -> block 668 (stored)
+[cas    ] put len 512 hash e8b2830b9cdfb0f8 -> block 669 (stored)
+[cas    ] put len 512 hash b37b5f887a1b10ef -> block 670 (stored)
+[cas    ] put len 512 hash b90921dec4e7dd20 -> block 671 (stored)
+[cas    ] put len 512 hash 7292c2e9eb63a7b6 -> block 672 (stored)
+[cas    ] put len 512 hash 94022e50ed08f441 -> block 673 (stored)
+[cas    ] put len 512 hash 641b87f7fb0fa34f -> block 674 (stored)
+[cas    ] put len 512 hash 1259472145b3b010 -> block 675 (stored)
+[cas    ] put len 512 hash 5b16509c4f090d64 -> block 676 (stored)
+[cas    ] put len 512 hash 5dd93d335bf5a610 -> block 677 (stored)
+[cas    ] put len 512 hash ac674e17e4d16f2a -> block 678 (stored)
+[cas    ] put len 512 hash 1565f82cee11539b -> block 679 (stored)
+[cas    ] put len 512 hash 480ad48e4b84648d -> block 680 (stored)
+[cas    ] put len 512 hash f78c8b1c93db9338 -> block 681 (stored)
+[cas    ] put len 512 hash 25bf6397aaf6a6c8 -> block 682 (stored)
+[cas    ] put len 512 hash b4bde541d03fa292 -> block 683 (stored)
+[cas    ] put len 512 hash 65dd3726be6f27c9 -> block 684 (stored)
+[cas    ] put len 512 hash 8f6b4b67a6e3e3b4 -> block 685 (stored)
+[cas    ] put len 512 hash 3dde11a6a658c260 -> block 686 (stored)
+[cas    ] put len 512 hash 52d1723256061950 -> block 687 (stored)
+[cas    ] put len 512 hash 3ac459fc147dad2d -> block 688 (stored)
+[cas    ] put len 512 hash c75839b3bd41fe8e -> block 689 (stored)
+[cas    ] put len 512 hash 1bbc6290a649b223 -> block 690 (stored)
+[cas    ] put len 512 hash f7a16a4ddf2dfef9 -> block 691 (stored)
+[cas    ] put len 512 hash 9f5a9a9b4e8234c3 -> block 692 (stored)
+[cas    ] put len 512 hash 3e77e00ec8f042bf -> block 693 (stored)
+[cas    ] put len 512 hash 44bcf9dbff94b218 -> block 694 (stored)
+[cas    ] put len 512 hash 4c164cdb79423394 -> block 695 (stored)
+[cas    ] put len 512 hash e1da0f9173ca2148 -> block 696 (stored)
+[cas    ] put len 512 hash a8b88df74da4a4c9 -> block 697 (stored)
+[cas    ] put len 512 hash 9de95c410a900a4a -> block 698 (stored)
+[cas    ] put len 512 hash e12fe6496c0b12ad -> block 699 (stored)
+[cas    ] put len 512 hash 293325c207040601 -> block 700 (stored)
+[cas    ] put len 512 hash f6a6ac5ea6afb145 -> block 701 (stored)
+[cas    ] put len 512 hash 31374151cc2129e5 -> block 702 (stored)
+[cas    ] put len 512 hash 762f1d96f9fdc533 -> block 703 (stored)
+[cas    ] put len 512 hash 9a282769f2df3394 -> block 704 (stored)
+[cas    ] put len 512 hash c7e8e715821c449f -> block 705 (stored)
+[cas    ] put len 512 hash e456188ba5075f00 -> block 706 (stored)
+[cas    ] put len 512 hash 90e063dbb93afda3 -> block 707 (stored)
+[cas    ] put len 512 hash 184172d73c6cbc9d -> block 708 (stored)
+[cas    ] put len 512 hash fdabe49f5ff0798c -> block 709 (stored)
+[cas    ] put len 512 hash 727f111188dd88f8 -> block 710 (stored)
+[cas    ] put len 512 hash 036f9f912e3f527e -> block 711 (stored)
+[cas    ] put len 512 hash 1f039bffa928aada -> block 712 (stored)
+[cas    ] put len 512 hash e8f67840559fa0a6 -> block 713 (stored)
+[cas    ] put len 512 hash 7c60faa8aef4c7ad -> block 714 (stored)
+[cas    ] put len 512 hash 682f84e153aad741 -> block 715 (stored)
+[cas    ] put len 512 hash 03a564dea5646c36 -> block 716 (stored)
+[cas    ] put len 512 hash b8c4b1a3679a06cf -> block 717 (stored)
+[cas    ] put len 512 hash 91081d4db0dbb589 -> block 718 (stored)
+[cas    ] put len 512 hash 2af1975bb89c10c6 -> block 719 (stored)
+[cas    ] put len 512 hash 97e3c016619e9f0e -> block 720 (stored)
+[cas    ] put len 512 hash e56180bbb43dc9b9 -> block 721 (stored)
+[cas    ] put len 512 hash 0c90b055f2b50b58 -> block 722 (stored)
+[cas    ] put len 512 hash 46e53d98473b78f5 -> block 723 (stored)
+[cas    ] put len 512 hash bcf9d3e6cbebf995 -> block 724 (stored)
+[cas    ] put len 512 hash 190480e4b3518a4c -> block 725 (stored)
+[cas    ] put len 512 hash 7f63abf31cb0043e -> block 726 (stored)
+[cas    ] put len 512 hash 2d50c93e5f4e1537 -> block 727 (stored)
+[cas    ] put len 512 hash 7cb3c4332b71efec -> block 728 (stored)
+[cas    ] put len 512 hash fc5e9768e6383daa -> block 729 (stored)
+[cas    ] put len 512 hash da94acc6efae4476 -> block 730 (stored)
+[cas    ] put len 512 hash 30ca90fe5f3b16fe -> block 731 (stored)
+[cas    ] put len 512 hash 57a63c976ffd47b0 -> block 732 (stored)
+[cas    ] put len 512 hash 7da1aa464f55e9db -> block 733 (stored)
+[cas    ] put len 512 hash 4fed75256177555c -> block 734 (stored)
+[cas    ] put len 512 hash 44682487a0254f49 -> block 735 (stored)
+[cas    ] put len 512 hash 5014a86da4aa79ff -> block 736 (stored)
+[cas    ] put len 512 hash 2b984ca475384a7d -> block 737 (stored)
+[cas    ] put len 512 hash 0d9984c91f709ee1 -> block 738 (stored)
+[cas    ] put len 512 hash 2736bd31a5dbb834 -> block 739 (stored)
+[cas    ] put len 512 hash 3303b6cf2039749e -> block 740 (stored)
+[cas    ] put len 512 hash 72eedf9fcfe85857 -> block 741 (stored)
+[cas    ] put len 512 hash 5569f15a87a8831a -> block 742 (stored)
+[cas    ] put len 512 hash 096c7ba527b9e58e -> block 743 (stored)
+[cas    ] put len 512 hash 1128cab98d7d6721 -> block 744 (stored)
+[cas    ] put len 512 hash f625f83ebab4feff -> block 745 (stored)
+[cas    ] put len 512 hash e02ed81d6c4b871f -> block 746 (stored)
+[cas    ] put len 512 hash 243317a47a073a2a -> block 747 (stored)
+[cas    ] put len 512 hash 9b175973852ce0a0 -> block 748 (stored)
+[cas    ] put len 512 hash eb8eab7fe5a8d27f -> block 749 (stored)
+[cas    ] put len 512 hash eef1b51ba7ffef71 -> block 750 (stored)
+[cas    ] put len 512 hash 978937781e5727c6 -> block 751 (stored)
+[cas    ] put len 512 hash a25c25ddcc9382a5 -> block 752 (stored)
+[cas    ] put len 512 hash 61b84c8e3b9bb57c -> block 753 (stored)
+[cas    ] put len 512 hash 5caa06672599f80c -> block 754 (stored)
+[cas    ] put len 512 hash 3486931790066542 -> block 755 (stored)
+[cas    ] put len 512 hash 58576db7b821e381 -> block 756 (stored)
+[cas    ] put len 512 hash 80698aa7307da8fd -> block 757 (stored)
+[cas    ] put len 512 hash 4d875e7569391bcd -> block 758 (stored)
+[cas    ] put len 512 hash 300831f485732361 -> block 759 (stored)
+[cas    ] put len 512 hash f5cdaac3a52fa07f -> block 760 (stored)
+[cas    ] put len 512 hash ab94dbced4230ebd -> block 761 (stored)
+[cas    ] put len 512 hash 0ec3e7f46162c32e -> block 762 (stored)
+[cas    ] put len 512 hash cd98710d32280900 -> block 763 (stored)
+[cas    ] put len 512 hash 2716bb555e2df2f2 -> block 764 (stored)
+[cas    ] put len 512 hash 56304b54a296ebf7 -> block 765 (stored)
+[cas    ] put len 512 hash 603c1c92835d6a92 -> block 766 (stored)
+[cas    ] put len 512 hash ed37c5f510277301 -> block 767 (stored)
+[cas    ] put len 512 hash d028a622d1c656fb -> block 768 (stored)
+[cas    ] put len 512 hash e3d7191c876be7da -> block 769 (stored)
+[cas    ] put len 512 hash d58f06c43ed118e8 -> block 770 (stored)
+[cas    ] put len 512 hash 54a3b6c88293bd84 -> block 771 (stored)
+[cas    ] put len 512 hash e13d720206b2d868 -> block 772 (stored)
+[cas    ] put len 512 hash dddeb381c68155aa -> block 773 (stored)
+[cas    ] put len 512 hash 011e524e90682784 -> block 774 (stored)
+[cas    ] put len 512 hash a726516323a37e7a -> block 775 (stored)
+[cas    ] put len 512 hash 656383e3073838b6 -> block 776 (stored)
+[cas    ] put len 512 hash 2753330911fd6d63 -> block 777 (stored)
+[cas    ] put len 512 hash 16669c77741c0dbd -> block 778 (stored)
+[cas    ] put len 512 hash 375445675c8ed06c -> block 779 (stored)
+[cas    ] put len 512 hash feb1dea52c2e5eb8 -> block 780 (stored)
+[cas    ] put len 512 hash 2c905d767b3be947 -> block 781 (stored)
+[cas    ] put len 512 hash 4e407fa66a8a8d8b -> block 782 (stored)
+[cas    ] put len 512 hash 612695bfa58e02c4 -> block 783 (stored)
+[cas    ] put len 512 hash 78758b2682567f36 -> block 784 (stored)
+[cas    ] put len 512 hash 1868deec06ee3b4f -> block 785 (stored)
+[cas    ] put len 512 hash 6c3698a5ee70769c -> block 786 (stored)
+[cas    ] put len 512 hash 1d64f279aaaef2fd -> block 787 (stored)
+[cas    ] put len 512 hash 4ed19a5ad85ebb58 -> block 788 (stored)
+[cas    ] put len 512 hash 2c1ed0d23a4da940 -> block 789 (stored)
+[cas    ] put len 512 hash 6a283c65b2eec223 -> block 790 (stored)
+[cas    ] put len 512 hash 27aec73a7d86e78e -> block 791 (stored)
+[cas    ] put len 512 hash ffe573cbc58970ea -> block 792 (stored)
+[cas    ] put len 512 hash 825514835746ae32 -> block 793 (stored)
+[cas    ] put len 512 hash 9e15dd271ee30b4b -> block 794 (stored)
+[cas    ] put len 512 hash a4dc76d2ef70edf3 -> block 795 (stored)
+[cas    ] put len 512 hash de064dafad9bd537 -> block 796 (stored)
+[cas    ] put len 512 hash 1b22f77d87c16aa7 -> block 797 (stored)
+[cas    ] put len 512 hash e4587f518bf36333 -> block 798 (stored)
+[cas    ] put len 512 hash 9e8c6bbd1732343f -> block 799 (stored)
+[cas    ] put len 512 hash c9db3c78cf82820c -> block 800 (stored)
+[cas    ] put len 512 hash 5b956232ae8333e4 -> block 801 (stored)
+[cas    ] put len 512 hash 38d14c115481850d -> block 802 (stored)
+[cas    ] put len 512 hash 3656e2dbc89ff32f -> block 803 (stored)
+[cas    ] put len 512 hash 3053202df7e8be07 -> block 804 (stored)
+[cas    ] put len 512 hash db381efe4bff20af -> block 805 (stored)
+[cas    ] put len 512 hash 293c66e453ec25b2 -> block 806 (stored)
+[cas    ] put len 512 hash c0a42283c71cca1c -> block 807 (stored)
+[cas    ] put len 512 hash 9d55821dedbb87ab -> block 808 (stored)
+[cas    ] put len 512 hash 6eb2005b6dc6dc8d -> block 809 (stored)
+[cas    ] put len 512 hash ff6748dc7a2b5ad1 -> block 810 (stored)
+[cas    ] put len 512 hash b381e4ff9bd45af3 -> block 811 (stored)
+[cas    ] put len 512 hash c6cb014629176375 -> block 812 (stored)
+[cas    ] put len 512 hash 9e5cd6bb82815adf -> block 813 (stored)
+[cas    ] put len 512 hash cd883ade6715c53e -> block 814 (stored)
+[cas    ] put len 512 hash ebd5fdd3d0bb8a68 -> block 815 (stored)
+[cas    ] put len 512 hash 5def4873e64b0acf -> block 816 (stored)
+[cas    ] put len 512 hash 756a6797332e5d31 -> block 817 (stored)
+[cas    ] put len 512 hash 14fe313f44507124 -> block 818 (stored)
+[cas    ] put len 512 hash 8128658af28304e5 -> block 819 (stored)
+[cas    ] put len 512 hash b5709c20cc98ecf8 -> block 820 (stored)
+[cas    ] put len 512 hash e89bc2c35ae49fb6 -> block 821 (stored)
+[cas    ] put len 512 hash b4ea295028d339cc -> block 822 (stored)
+[cas    ] put len 512 hash c02b8764f13b5ddb -> block 823 (stored)
+[cas    ] put len 512 hash 4a66f62fea92e848 -> block 824 (stored)
+[cas    ] put len 512 hash fc8856a4fb68df19 -> block 825 (stored)
+[cas    ] put len 512 hash f9afb8e8d375f276 -> block 826 (stored)
+[cas    ] put len 512 hash dc146d9dd34fbcf0 -> block 827 (stored)
+[cas    ] put len 512 hash 161b8ef6841be37f -> block 828 (stored)
+[cas    ] put len 512 hash 86e853a4ee8d882c -> block 829 (stored)
+[cas    ] put len 512 hash e29530f90b29e176 -> block 830 (stored)
+[cas    ] put len 512 hash a5245c19694d5c95 -> block 831 (stored)
+[cas    ] put len 512 hash cb343b6d9eddd460 -> block 832 (stored)
+[cas    ] put len 512 hash ea0fd3fd3a0aad89 -> block 833 (stored)
+[cas    ] put len 512 hash 966f4dd399921622 -> block 834 (stored)
+[cas    ] put len 512 hash 9f7d60c3d7a4022f -> block 835 (stored)
+[cas    ] put len 512 hash 2e8a82bd010987a6 -> block 836 (stored)
+[cas    ] put len 512 hash 112167a3993970ef -> block 837 (stored)
+[cas    ] put len 512 hash f605c3b475cc2271 -> block 838 (stored)
+[cas    ] put len 512 hash 1edeaa529fbf2abd -> block 839 (stored)
+[cas    ] put len 512 hash d5d11d0f946b895c -> block 840 (stored)
+[cas    ] put len 512 hash 411f2e0c4fc352e1 -> block 841 (stored)
+[cas    ] put len 512 hash 80bfa9934dc294bd -> block 842 (stored)
+[cas    ] put len 512 hash 3d5185e462f372b8 -> block 843 (stored)
+[cas    ] put len 512 hash a67fee2a04adbdb8 -> block 844 (stored)
+[cas    ] put len 512 hash 51454e60de93109c -> block 845 (stored)
+[cas    ] put len 512 hash 9761b0f4bb6c9d2c -> block 846 (stored)
+[cas    ] put len 512 hash 79542573ca4676f0 -> block 847 (stored)
+[cas    ] put len 512 hash 356e6bed19caf1b2 -> block 848 (stored)
+[cas    ] put len 512 hash 7e7937fe7e8e809f -> block 849 (stored)
+[cas    ] put len 512 hash 316301e1838f60e3 -> block 850 (stored)
+[cas    ] put len 512 hash 528ff070daf381f7 -> block 851 (stored)
+[cas    ] put len 512 hash a84475772e20fd7f -> block 852 (stored)
+[cas    ] put len 512 hash c7d33f32004d6425 -> block 853 (stored)
+[cas    ] put len 512 hash 6c5739879b31cbce -> block 854 (stored)
+[cas    ] put len 512 hash 0a401405fb23ded5 -> block 855 (stored)
+[cas    ] put len 512 hash 5335d64e7bb26710 -> block 856 (stored)
+[cas    ] put len 512 hash 80b11f978c864eda -> block 857 (stored)
+[cas    ] put len 512 hash 27b5f86b178156fc -> block 858 (stored)
+[cas    ] put len 512 hash f239e574d5655074 -> block 859 (stored)
+[cas    ] put len 512 hash 122e9c79817d642f -> block 860 (stored)
+[cas    ] put len 512 hash deaae1876a82536a -> block 861 (stored)
+[cas    ] put len 512 hash ed13ba16cd0f8e39 -> block 862 (stored)
+[cas    ] put len 512 hash 3eb49aeaec17e767 -> block 863 (stored)
+[cas    ] put len 512 hash c4660c268a793e3e -> block 864 (stored)
+[cas    ] put len 512 hash 1815cab18460829e -> block 865 (stored)
+[cas    ] put len 512 hash 506ab38229512e0d -> block 866 (stored)
+[cas    ] put len 512 hash 5dbae41da738cd2a -> block 867 (stored)
+[cas    ] put len 512 hash 35aaf3e5df557ff4 -> block 868 (stored)
+[cas    ] put len 512 hash 21e04a69988083eb -> block 869 (stored)
+[cas    ] put len 512 hash 9ec2d0caa4a34b05 -> block 870 (stored)
+[cas    ] put len 512 hash c320c9b834c20bb1 -> block 871 (stored)
+[cas    ] put len 144 hash 791786f8f30044f4 -> block 872 (stored)
+[cas    ] put len 512 hash 6846430f295899fb -> block 873 (stored)
+[cas    ] put len 512 hash ac7a9e582c3d0e5f -> block 874 (stored)
+[cas    ] put len 512 hash 073a49cf207f01df -> block 875 (stored)
+[cas    ] put len 512 hash aa882d04d4e19948 -> block 876 (stored)
+[cas    ] put len 512 hash b6ffadbc736fe096 -> block 877 (stored)
+[cas    ] put len 512 hash fb2645c40612f95e -> DEDUP to block 650 (no write)
+[cas    ] put len 512 hash eb9b884cc447c6c7 -> DEDUP to block 651 (no write)
+[cas    ] put len 512 hash cde1a204aa16b0a8 -> DEDUP to block 652 (no write)
+[cas    ] put len 512 hash 553856047efd831a -> DEDUP to block 653 (no write)
+[cas    ] put len 512 hash 0f2129bd62d3c1b8 -> DEDUP to block 654 (no write)
+[cas    ] put len 512 hash 6179687a3c665625 -> DEDUP to block 655 (no write)
+[cas    ] put len 512 hash 571aae9483a28fb4 -> DEDUP to block 656 (no write)
+[cas    ] put len 512 hash 50eeae072fa302e7 -> DEDUP to block 657 (no write)
+[cas    ] put len 512 hash a2e7c1071716ffb5 -> DEDUP to block 658 (no write)
+[cas    ] put len 512 hash 896abd836d639cba -> DEDUP to block 659 (no write)
+[cas    ] put len 512 hash c695cf0bde06f1ff -> DEDUP to block 660 (no write)
+[cas    ] put len 512 hash f9aa9c273b7166b1 -> DEDUP to block 661 (no write)
+[cas    ] put len 512 hash 03a4c426d06462ab -> DEDUP to block 662 (no write)
+[cas    ] put len 512 hash e9ce2ecebc0ce3fe -> DEDUP to block 663 (no write)
+[cas    ] put len 512 hash 1f8ceb317b5eba0a -> DEDUP to block 664 (no write)
+[cas    ] put len 512 hash af6674acf49a635e -> DEDUP to block 665 (no write)
+[cas    ] put len 512 hash e3959a5f7b0dd6be -> DEDUP to block 666 (no write)
+[cas    ] put len 512 hash 1f21b1c1508e6853 -> DEDUP to block 667 (no write)
+[cas    ] put len 512 hash 4406ea9dde89a3d0 -> DEDUP to block 668 (no write)
+[cas    ] put len 512 hash e8b2830b9cdfb0f8 -> DEDUP to block 669 (no write)
+[cas    ] put len 512 hash b37b5f887a1b10ef -> DEDUP to block 670 (no write)
+[cas    ] put len 512 hash b90921dec4e7dd20 -> DEDUP to block 671 (no write)
+[cas    ] put len 512 hash 7292c2e9eb63a7b6 -> DEDUP to block 672 (no write)
+[cas    ] put len 512 hash 94022e50ed08f441 -> DEDUP to block 673 (no write)
+[cas    ] put len 512 hash 641b87f7fb0fa34f -> DEDUP to block 674 (no write)
+[cas    ] put len 512 hash 1259472145b3b010 -> DEDUP to block 675 (no write)
+[cas    ] put len 512 hash 5b16509c4f090d64 -> DEDUP to block 676 (no write)
+[cas    ] put len 512 hash 5dd93d335bf5a610 -> DEDUP to block 677 (no write)
+[cas    ] put len 512 hash ac674e17e4d16f2a -> DEDUP to block 678 (no write)
+[cas    ] put len 512 hash 1565f82cee11539b -> DEDUP to block 679 (no write)
+[cas    ] put len 512 hash 480ad48e4b84648d -> DEDUP to block 680 (no write)
+[cas    ] put len 512 hash f78c8b1c93db9338 -> DEDUP to block 681 (no write)
+[cas    ] put len 512 hash 25bf6397aaf6a6c8 -> DEDUP to block 682 (no write)
+[cas    ] put len 512 hash b4bde541d03fa292 -> DEDUP to block 683 (no write)
+[cas    ] put len 512 hash 65dd3726be6f27c9 -> DEDUP to block 684 (no write)
+[cas    ] put len 512 hash 8f6b4b67a6e3e3b4 -> DEDUP to block 685 (no write)
+[cas    ] put len 512 hash 3dde11a6a658c260 -> DEDUP to block 686 (no write)
+[cas    ] put len 512 hash 52d1723256061950 -> DEDUP to block 687 (no write)
+[cas    ] put len 512 hash 3ac459fc147dad2d -> DEDUP to block 688 (no write)
+[cas    ] put len 512 hash c75839b3bd41fe8e -> DEDUP to block 689 (no write)
+[cas    ] put len 512 hash 1bbc6290a649b223 -> DEDUP to block 690 (no write)
+[cas    ] put len 512 hash f7a16a4ddf2dfef9 -> DEDUP to block 691 (no write)
+[cas    ] put len 512 hash 9f5a9a9b4e8234c3 -> DEDUP to block 692 (no write)
+[cas    ] put len 512 hash 3e77e00ec8f042bf -> DEDUP to block 693 (no write)
+[cas    ] put len 512 hash 44bcf9dbff94b218 -> DEDUP to block 694 (no write)
+[cas    ] put len 512 hash 4c164cdb79423394 -> DEDUP to block 695 (no write)
+[cas    ] put len 512 hash e1da0f9173ca2148 -> DEDUP to block 696 (no write)
+[cas    ] put len 512 hash a8b88df74da4a4c9 -> DEDUP to block 697 (no write)
+[cas    ] put len 512 hash 9de95c410a900a4a -> DEDUP to block 698 (no write)
+[cas    ] put len 512 hash e12fe6496c0b12ad -> DEDUP to block 699 (no write)
+[cas    ] put len 512 hash 293325c207040601 -> DEDUP to block 700 (no write)
+[cas    ] put len 512 hash f6a6ac5ea6afb145 -> DEDUP to block 701 (no write)
+[cas    ] put len 512 hash 31374151cc2129e5 -> DEDUP to block 702 (no write)
+[cas    ] put len 512 hash 762f1d96f9fdc533 -> DEDUP to block 703 (no write)
+[cas    ] put len 512 hash 9a282769f2df3394 -> DEDUP to block 704 (no write)
+[cas    ] put len 512 hash c7e8e715821c449f -> DEDUP to block 705 (no write)
+[cas    ] put len 512 hash e456188ba5075f00 -> DEDUP to block 706 (no write)
+[cas    ] put len 512 hash 90e063dbb93afda3 -> DEDUP to block 707 (no write)
+[cas    ] put len 512 hash 184172d73c6cbc9d -> DEDUP to block 708 (no write)
+[cas    ] put len 512 hash fdabe49f5ff0798c -> DEDUP to block 709 (no write)
+[cas    ] put len 512 hash 727f111188dd88f8 -> DEDUP to block 710 (no write)
+[cas    ] put len 512 hash 036f9f912e3f527e -> DEDUP to block 711 (no write)
+[cas    ] put len 512 hash 1f039bffa928aada -> DEDUP to block 712 (no write)
+[cas    ] put len 512 hash e8f67840559fa0a6 -> DEDUP to block 713 (no write)
+[cas    ] put len 512 hash 7c60faa8aef4c7ad -> DEDUP to block 714 (no write)
+[cas    ] put len 512 hash 682f84e153aad741 -> DEDUP to block 715 (no write)
+[cas    ] put len 512 hash 03a564dea5646c36 -> DEDUP to block 716 (no write)
+[cas    ] put len 512 hash b8c4b1a3679a06cf -> DEDUP to block 717 (no write)
+[cas    ] put len 512 hash 91081d4db0dbb589 -> DEDUP to block 718 (no write)
+[cas    ] put len 512 hash 2af1975bb89c10c6 -> DEDUP to block 719 (no write)
+[cas    ] put len 512 hash 97e3c016619e9f0e -> DEDUP to block 720 (no write)
+[cas    ] put len 512 hash e56180bbb43dc9b9 -> DEDUP to block 721 (no write)
+[cas    ] put len 512 hash 0c90b055f2b50b58 -> DEDUP to block 722 (no write)
+[cas    ] put len 512 hash 46e53d98473b78f5 -> DEDUP to block 723 (no write)
+[cas    ] put len 512 hash bcf9d3e6cbebf995 -> DEDUP to block 724 (no write)
+[cas    ] put len 512 hash 190480e4b3518a4c -> DEDUP to block 725 (no write)
+[cas    ] put len 512 hash 7f63abf31cb0043e -> DEDUP to block 726 (no write)
+[cas    ] put len 512 hash 2d50c93e5f4e1537 -> DEDUP to block 727 (no write)
+[cas    ] put len 512 hash 7cb3c4332b71efec -> DEDUP to block 728 (no write)
+[cas    ] put len 512 hash fc5e9768e6383daa -> DEDUP to block 729 (no write)
+[cas    ] put len 512 hash da94acc6efae4476 -> DEDUP to block 730 (no write)
+[cas    ] put len 512 hash 30ca90fe5f3b16fe -> DEDUP to block 731 (no write)
+[cas    ] put len 512 hash 57a63c976ffd47b0 -> DEDUP to block 732 (no write)
+[cas    ] put len 512 hash 7da1aa464f55e9db -> DEDUP to block 733 (no write)
+[cas    ] put len 512 hash 4fed75256177555c -> DEDUP to block 734 (no write)
+[cas    ] put len 512 hash 44682487a0254f49 -> DEDUP to block 735 (no write)
+[cas    ] put len 512 hash 5014a86da4aa79ff -> DEDUP to block 736 (no write)
+[cas    ] put len 512 hash 2b984ca475384a7d -> DEDUP to block 737 (no write)
+[cas    ] put len 512 hash 0d9984c91f709ee1 -> DEDUP to block 738 (no write)
+[cas    ] put len 512 hash 2736bd31a5dbb834 -> DEDUP to block 739 (no write)
+[cas    ] put len 512 hash 3303b6cf2039749e -> DEDUP to block 740 (no write)
+[cas    ] put len 512 hash 72eedf9fcfe85857 -> DEDUP to block 741 (no write)
+[cas    ] put len 512 hash 5569f15a87a8831a -> DEDUP to block 742 (no write)
+[cas    ] put len 512 hash 096c7ba527b9e58e -> DEDUP to block 743 (no write)
+[cas    ] put len 512 hash 1128cab98d7d6721 -> DEDUP to block 744 (no write)
+[cas    ] put len 512 hash f625f83ebab4feff -> DEDUP to block 745 (no write)
+[cas    ] put len 512 hash e02ed81d6c4b871f -> DEDUP to block 746 (no write)
+[cas    ] put len 512 hash 243317a47a073a2a -> DEDUP to block 747 (no write)
+[cas    ] put len 512 hash 9b175973852ce0a0 -> DEDUP to block 748 (no write)
+[cas    ] put len 512 hash eb8eab7fe5a8d27f -> DEDUP to block 749 (no write)
+[cas    ] put len 512 hash eef1b51ba7ffef71 -> DEDUP to block 750 (no write)
+[cas    ] put len 512 hash 978937781e5727c6 -> DEDUP to block 751 (no write)
+[cas    ] put len 512 hash a25c25ddcc9382a5 -> DEDUP to block 752 (no write)
+[cas    ] put len 512 hash 61b84c8e3b9bb57c -> DEDUP to block 753 (no write)
+[cas    ] put len 512 hash 5caa06672599f80c -> DEDUP to block 754 (no write)
+[cas    ] put len 512 hash 3486931790066542 -> DEDUP to block 755 (no write)
+[cas    ] put len 512 hash 58576db7b821e381 -> DEDUP to block 756 (no write)
+[cas    ] put len 512 hash 80698aa7307da8fd -> DEDUP to block 757 (no write)
+[cas    ] put len 512 hash 4d875e7569391bcd -> DEDUP to block 758 (no write)
+[cas    ] put len 512 hash 300831f485732361 -> DEDUP to block 759 (no write)
+[cas    ] put len 512 hash f5cdaac3a52fa07f -> DEDUP to block 760 (no write)
+[cas    ] put len 512 hash ab94dbced4230ebd -> DEDUP to block 761 (no write)
+[cas    ] put len 512 hash 0ec3e7f46162c32e -> DEDUP to block 762 (no write)
+[cas    ] put len 512 hash cd98710d32280900 -> DEDUP to block 763 (no write)
+[cas    ] put len 512 hash 2716bb555e2df2f2 -> DEDUP to block 764 (no write)
+[cas    ] put len 512 hash 56304b54a296ebf7 -> DEDUP to block 765 (no write)
+[cas    ] put len 512 hash 603c1c92835d6a92 -> DEDUP to block 766 (no write)
+[cas    ] put len 512 hash ed37c5f510277301 -> DEDUP to block 767 (no write)
+[cas    ] put len 512 hash d028a622d1c656fb -> DEDUP to block 768 (no write)
+[cas    ] put len 512 hash e3d7191c876be7da -> DEDUP to block 769 (no write)
+[cas    ] put len 512 hash d58f06c43ed118e8 -> DEDUP to block 770 (no write)
+[cas    ] put len 512 hash 54a3b6c88293bd84 -> DEDUP to block 771 (no write)
+[cas    ] put len 512 hash e13d720206b2d868 -> DEDUP to block 772 (no write)
+[cas    ] put len 512 hash dddeb381c68155aa -> DEDUP to block 773 (no write)
+[cas    ] put len 512 hash 011e524e90682784 -> DEDUP to block 774 (no write)
+[cas    ] put len 512 hash a726516323a37e7a -> DEDUP to block 775 (no write)
+[cas    ] put len 512 hash 656383e3073838b6 -> DEDUP to block 776 (no write)
+[cas    ] put len 512 hash 2753330911fd6d63 -> DEDUP to block 777 (no write)
+[cas    ] put len 512 hash 16669c77741c0dbd -> DEDUP to block 778 (no write)
+[cas    ] put len 512 hash 375445675c8ed06c -> DEDUP to block 779 (no write)
+[cas    ] put len 512 hash feb1dea52c2e5eb8 -> DEDUP to block 780 (no write)
+[cas    ] put len 512 hash 2c905d767b3be947 -> DEDUP to block 781 (no write)
+[cas    ] put len 512 hash 4e407fa66a8a8d8b -> DEDUP to block 782 (no write)
+[cas    ] put len 512 hash 612695bfa58e02c4 -> DEDUP to block 783 (no write)
+[cas    ] put len 512 hash 78758b2682567f36 -> DEDUP to block 784 (no write)
+[cas    ] put len 512 hash 1868deec06ee3b4f -> DEDUP to block 785 (no write)
+[cas    ] put len 512 hash 6c3698a5ee70769c -> DEDUP to block 786 (no write)
+[cas    ] put len 512 hash 1d64f279aaaef2fd -> DEDUP to block 787 (no write)
+[cas    ] put len 512 hash 4ed19a5ad85ebb58 -> DEDUP to block 788 (no write)
+[cas    ] put len 512 hash 2c1ed0d23a4da940 -> DEDUP to block 789 (no write)
+[cas    ] put len 512 hash 6a283c65b2eec223 -> DEDUP to block 790 (no write)
+[cas    ] put len 512 hash 27aec73a7d86e78e -> DEDUP to block 791 (no write)
+[cas    ] put len 512 hash ffe573cbc58970ea -> DEDUP to block 792 (no write)
+[cas    ] put len 512 hash 825514835746ae32 -> DEDUP to block 793 (no write)
+[cas    ] put len 512 hash 9e15dd271ee30b4b -> DEDUP to block 794 (no write)
+[cas    ] put len 512 hash a4dc76d2ef70edf3 -> DEDUP to block 795 (no write)
+[cas    ] put len 512 hash de064dafad9bd537 -> DEDUP to block 796 (no write)
+[cas    ] put len 512 hash 1b22f77d87c16aa7 -> DEDUP to block 797 (no write)
+[cas    ] put len 512 hash e4587f518bf36333 -> DEDUP to block 798 (no write)
+[cas    ] put len 512 hash 9e8c6bbd1732343f -> DEDUP to block 799 (no write)
+[cas    ] put len 512 hash c9db3c78cf82820c -> DEDUP to block 800 (no write)
+[cas    ] put len 512 hash 5b956232ae8333e4 -> DEDUP to block 801 (no write)
+[cas    ] put len 512 hash 38d14c115481850d -> DEDUP to block 802 (no write)
+[cas    ] put len 512 hash 3656e2dbc89ff32f -> DEDUP to block 803 (no write)
+[cas    ] put len 512 hash 3053202df7e8be07 -> DEDUP to block 804 (no write)
+[cas    ] put len 512 hash db381efe4bff20af -> DEDUP to block 805 (no write)
+[cas    ] put len 512 hash 293c66e453ec25b2 -> DEDUP to block 806 (no write)
+[cas    ] put len 512 hash c0a42283c71cca1c -> DEDUP to block 807 (no write)
+[cas    ] put len 512 hash 9d55821dedbb87ab -> DEDUP to block 808 (no write)
+[cas    ] put len 512 hash 6eb2005b6dc6dc8d -> DEDUP to block 809 (no write)
+[cas    ] put len 512 hash ff6748dc7a2b5ad1 -> DEDUP to block 810 (no write)
+[cas    ] put len 512 hash b381e4ff9bd45af3 -> DEDUP to block 811 (no write)
+[cas    ] put len 512 hash c6cb014629176375 -> DEDUP to block 812 (no write)
+[cas    ] put len 512 hash 9e5cd6bb82815adf -> DEDUP to block 813 (no write)
+[cas    ] put len 512 hash cd883ade6715c53e -> DEDUP to block 814 (no write)
+[cas    ] put len 512 hash ebd5fdd3d0bb8a68 -> DEDUP to block 815 (no write)
+[cas    ] put len 512 hash 5def4873e64b0acf -> DEDUP to block 816 (no write)
+[cas    ] put len 512 hash 756a6797332e5d31 -> DEDUP to block 817 (no write)
+[cas    ] put len 512 hash 14fe313f44507124 -> DEDUP to block 818 (no write)
+[cas    ] put len 512 hash 8128658af28304e5 -> DEDUP to block 819 (no write)
+[cas    ] put len 512 hash b5709c20cc98ecf8 -> DEDUP to block 820 (no write)
+[cas    ] put len 512 hash e89bc2c35ae49fb6 -> DEDUP to block 821 (no write)
+[cas    ] put len 512 hash b4ea295028d339cc -> DEDUP to block 822 (no write)
+[cas    ] put len 512 hash c02b8764f13b5ddb -> DEDUP to block 823 (no write)
+[cas    ] put len 512 hash 4a66f62fea92e848 -> DEDUP to block 824 (no write)
+[cas    ] put len 512 hash fc8856a4fb68df19 -> DEDUP to block 825 (no write)
+[cas    ] put len 512 hash f9afb8e8d375f276 -> DEDUP to block 826 (no write)
+[cas    ] put len 512 hash dc146d9dd34fbcf0 -> DEDUP to block 827 (no write)
+[cas    ] put len 512 hash 161b8ef6841be37f -> DEDUP to block 828 (no write)
+[cas    ] put len 512 hash 86e853a4ee8d882c -> DEDUP to block 829 (no write)
+[cas    ] put len 512 hash e29530f90b29e176 -> DEDUP to block 830 (no write)
+[cas    ] put len 512 hash a5245c19694d5c95 -> DEDUP to block 831 (no write)
+[cas    ] put len 512 hash cb343b6d9eddd460 -> DEDUP to block 832 (no write)
+[cas    ] put len 512 hash ea0fd3fd3a0aad89 -> DEDUP to block 833 (no write)
+[cas    ] put len 512 hash 966f4dd399921622 -> DEDUP to block 834 (no write)
+[cas    ] put len 512 hash 9f7d60c3d7a4022f -> DEDUP to block 835 (no write)
+[cas    ] put len 512 hash 2e8a82bd010987a6 -> DEDUP to block 836 (no write)
+[cas    ] put len 512 hash 112167a3993970ef -> DEDUP to block 837 (no write)
+[cas    ] put len 512 hash f605c3b475cc2271 -> DEDUP to block 838 (no write)
+[cas    ] put len 512 hash 1edeaa529fbf2abd -> DEDUP to block 839 (no write)
+[cas    ] put len 512 hash d5d11d0f946b895c -> DEDUP to block 840 (no write)
+[cas    ] put len 512 hash 411f2e0c4fc352e1 -> DEDUP to block 841 (no write)
+[cas    ] put len 512 hash 80bfa9934dc294bd -> DEDUP to block 842 (no write)
+[cas    ] put len 512 hash 3d5185e462f372b8 -> DEDUP to block 843 (no write)
+[cas    ] put len 512 hash a67fee2a04adbdb8 -> DEDUP to block 844 (no write)
+[cas    ] put len 512 hash 51454e60de93109c -> DEDUP to block 845 (no write)
+[cas    ] put len 512 hash 9761b0f4bb6c9d2c -> DEDUP to block 846 (no write)
+[cas    ] put len 512 hash 79542573ca4676f0 -> DEDUP to block 847 (no write)
+[cas    ] put len 512 hash 356e6bed19caf1b2 -> DEDUP to block 848 (no write)
+[cas    ] put len 512 hash 7e7937fe7e8e809f -> DEDUP to block 849 (no write)
+[cas    ] put len 512 hash 316301e1838f60e3 -> DEDUP to block 850 (no write)
+[cas    ] put len 512 hash 528ff070daf381f7 -> DEDUP to block 851 (no write)
+[cas    ] put len 512 hash a84475772e20fd7f -> DEDUP to block 852 (no write)
+[cas    ] put len 512 hash c7d33f32004d6425 -> DEDUP to block 853 (no write)
+[cas    ] put len 512 hash 6c5739879b31cbce -> DEDUP to block 854 (no write)
+[cas    ] put len 512 hash 0a401405fb23ded5 -> DEDUP to block 855 (no write)
+[cas    ] put len 512 hash 5335d64e7bb26710 -> DEDUP to block 856 (no write)
+[cas    ] put len 512 hash 80b11f978c864eda -> DEDUP to block 857 (no write)
+[cas    ] put len 512 hash 27b5f86b178156fc -> DEDUP to block 858 (no write)
+[cas    ] put len 512 hash f239e574d5655074 -> DEDUP to block 859 (no write)
+[cas    ] put len 512 hash 122e9c79817d642f -> DEDUP to block 860 (no write)
+[cas    ] put len 512 hash deaae1876a82536a -> DEDUP to block 861 (no write)
+[cas    ] put len 512 hash ed13ba16cd0f8e39 -> DEDUP to block 862 (no write)
+[cas    ] put len 512 hash 3eb49aeaec17e767 -> DEDUP to block 863 (no write)
+[cas    ] put len 512 hash c4660c268a793e3e -> DEDUP to block 864 (no write)
+[cas    ] put len 512 hash 1815cab18460829e -> DEDUP to block 865 (no write)
+[cas    ] put len 512 hash 506ab38229512e0d -> DEDUP to block 866 (no write)
+[cas    ] put len 512 hash 5dbae41da738cd2a -> DEDUP to block 867 (no write)
+[cas    ] put len 512 hash 35aaf3e5df557ff4 -> DEDUP to block 868 (no write)
+[cas    ] put len 512 hash 21e04a69988083eb -> DEDUP to block 869 (no write)
+[cas    ] put len 512 hash 9ec2d0caa4a34b05 -> DEDUP to block 870 (no write)
+[cas    ] put len 512 hash c320c9b834c20bb1 -> DEDUP to block 871 (no write)
+[cas    ] put len 144 hash 791786f8f30044f4 -> DEDUP to block 872 (no write)
+[cas    ] put len 512 hash 6846430f295899fb -> DEDUP to block 873 (no write)
+[cas    ] put len 512 hash ac7a9e582c3d0e5f -> DEDUP to block 874 (no write)
+[cas    ] put len 512 hash 073a49cf207f01df -> DEDUP to block 875 (no write)
+[cas    ] put len 512 hash aa882d04d4e19948 -> DEDUP to block 876 (no write)
+[cas    ] put len 512 hash b6ffadbc736fe096 -> DEDUP to block 877 (no write)
+[cas    ] put len 512 hash d1a9fdb1b665802a -> block 878 (stored)
+[cas    ] put len 512 hash 63ef783144edd099 -> block 879 (stored)
+[cas    ] put len 512 hash e8cfd51f050a500e -> block 880 (stored)
+[cas    ] put len 512 hash 70ce5ccac17869b0 -> block 881 (stored)
+[cas    ] put len 512 hash 17928cf947ee6932 -> block 882 (stored)
+[cas    ] put len 512 hash 29ad20c62dec22db -> block 883 (stored)
+[cas    ] put len 244 hash 0e6c2f9aeeda2560 -> block 884 (stored)
+[cas    ] put len 512 hash 82f0c0b6af482e14 -> block 885 (stored)
+[cas    ] put len 512 hash e80301acf63cf8e0 -> block 886 (stored)
+[cas    ] put len 475 hash a9d431653e73b229 -> block 887 (stored)
+[cas    ] put len 512 hash d3b73aebeaffbaae -> block 888 (stored)
+[cas    ] put len 338 hash d6798ca1e451dba3 -> block 889 (stored)
+[cas    ] put len 236 hash 35eb625e4b55e0db -> block 890 (stored)
+[cas    ] put len 512 hash 6edbb92fea8476c3 -> block 891 (stored)
+[cas    ] put len 512 hash 0894a2cc2b750969 -> block 892 (stored)
+[cas    ] put len 512 hash 7204128ac106c6de -> block 893 (stored)
+[cas    ] put len 512 hash 37b0ba9254c454c1 -> block 894 (stored)
+[cas    ] put len 512 hash b59b831d63386aa7 -> block 895 (stored)
+[cas    ] put len 280 hash dd07f3d5dfedd694 -> block 896 (stored)
+[cas    ] put len 512 hash 92230377d5c0ec7b -> block 897 (stored)
+[cas    ] put len 405 hash 39d22a9edb87e795 -> block 898 (stored)
+[cas    ] put len 512 hash fbe25a5578ea3f14 -> block 899 (stored)
+[cas    ] put len 512 hash a7b0d7249c28285a -> block 900 (stored)
+[cas    ] put len 512 hash 0569f8a9a83d1b35 -> block 901 (stored)
+[cas    ] put len 151 hash d83e9880fe13b390 -> block 902 (stored)
+[cas    ] put len 512 hash 520755d8f9da9ef8 -> block 903 (stored)
+[cas    ] put len 512 hash 2e83bf92bc616d48 -> block 904 (stored)
+[cas    ] put len 512 hash 9fbb983eb1e356b6 -> block 905 (stored)
+[cas    ] put len 512 hash b10861fd841583ec -> block 906 (stored)
+[cas    ] put len 512 hash 8e6b22f6e9bdfad3 -> block 907 (stored)
+[cas    ] put len 512 hash 694342aa52d18e3c -> block 908 (stored)
+[cas    ] put len 512 hash 2b8cef2761f93e60 -> block 909 (stored)
+[cas    ] put len 512 hash 66a6e1e520959000 -> block 910 (stored)
+[cas    ] put len 512 hash a6adf3f1bcecd530 -> block 911 (stored)
+[cas    ] put len 512 hash 4eec2531d743dcdc -> block 912 (stored)
+[cas    ] put len 512 hash 47beb384699bd47e -> block 913 (stored)
+[cas    ] put len 512 hash 9d8c10288d8c073f -> block 914 (stored)
+[cas    ] put len 512 hash 714bfebb86507d37 -> block 915 (stored)
+[cas    ] put len 512 hash 9048f87fc5535aa0 -> block 916 (stored)
+[cas    ] put len 512 hash 686353cff7bb807b -> block 917 (stored)
+[cas    ] put len 3 hash 92fc2f19663598d2 -> block 918 (stored)
+[cas    ] put len 512 hash 1d0ce35c77705482 -> block 919 (stored)
+[cas    ] put len 495 hash 003da873f8b391fe -> block 920 (stored)
+[cas    ] put len 512 hash 24e4834191f04ba6 -> block 921 (stored)
+[cas    ] put len 512 hash f826136a59b7eecc -> block 922 (stored)
+[cas    ] put len 512 hash 2df31184e3ad4416 -> block 923 (stored)
+[cas    ] put len 512 hash fdecb435288e2f34 -> block 924 (stored)
+[cas    ] put len 512 hash 1141d8be0123ddc6 -> block 925 (stored)
+[cas    ] put len 512 hash 6919960a571ef501 -> block 926 (stored)
+[cas    ] put len 512 hash 33e4ea65b22cec51 -> block 927 (stored)
+[cas    ] put len 512 hash c209c5cc6c212f72 -> block 928 (stored)
+[cas    ] put len 512 hash 37acb9c3363b56f5 -> block 929 (stored)
+[cas    ] put len 512 hash b278fa30c6828290 -> block 930 (stored)
+[cas    ] put len 512 hash f92a06eedb6d1236 -> block 931 (stored)
+[cas    ] put len 512 hash 6f895203ac52d3fa -> block 932 (stored)
+[cas    ] put len 512 hash d1a10745d6b64339 -> block 933 (stored)
+[cas    ] put len 512 hash a9d12f5449cf82cc -> block 934 (stored)
+[cas    ] put len 512 hash 53179e3111346d80 -> block 935 (stored)
+[cas    ] put len 512 hash 034f1f6b44ad5f90 -> block 936 (stored)
+[cas    ] put len 512 hash 757c9bfade584b3e -> block 937 (stored)
+[cas    ] put len 512 hash e7bbde9934d36d08 -> block 938 (stored)
+[cas    ] put len 512 hash e58c3d57c9d5e599 -> block 939 (stored)
+[cas    ] put len 512 hash 973e88cd5385eabf -> block 940 (stored)
+[cas    ] put len 512 hash 3c0f7a62f6261495 -> block 941 (stored)
+[cas    ] put len 512 hash 1e7f2323b0ba3cd5 -> block 942 (stored)
+[cas    ] put len 512 hash 5b2f5a2b83a1c36a -> block 943 (stored)
+[cas    ] put len 512 hash 5e0553e4b81effa1 -> block 944 (stored)
+[cas    ] put len 512 hash 7413f92c150f4582 -> block 945 (stored)
+[cas    ] put len 512 hash 4b3ff8f69fb82aa0 -> block 946 (stored)
+[cas    ] put len 512 hash fa2e3aa8c83c145c -> block 947 (stored)
+[cas    ] put len 512 hash 2b64c71dc8bf81de -> block 948 (stored)
+[cas    ] put len 512 hash b1972bca7e1d74da -> block 949 (stored)
+[cas    ] put len 512 hash 35f3c539990d94d0 -> block 950 (stored)
+[cas    ] put len 512 hash 2be39fd4d6a07279 -> block 951 (stored)
+[cas    ] put len 512 hash be4fab103085ace0 -> block 952 (stored)
+[cas    ] put len 512 hash b8c9ca47430b4400 -> block 953 (stored)
+[cas    ] put len 512 hash 78e5b7ba67581a50 -> block 954 (stored)
+[cas    ] put len 512 hash 35a0bb005c51efc2 -> block 955 (stored)
+[cas    ] put len 512 hash 3fa86393f6b1ae50 -> block 956 (stored)
+[cas    ] put len 373 hash 207bc20d7eaeff91 -> block 957 (stored)
+[cas    ] put len 512 hash 3a6b410610f923f4 -> block 958 (stored)
+[cas    ] put len 512 hash e95ab1ca6b198bcd -> block 959 (stored)
+[cas    ] put len 512 hash 55d30a987421dacf -> block 960 (stored)
+[cas    ] put len 512 hash 3db43ba6bf886a28 -> block 961 (stored)
+[cas    ] put len 512 hash 716e174f66fb5c09 -> block 962 (stored)
+[cas    ] put len 512 hash 68bc605bf8ee55cd -> block 963 (stored)
+[cas    ] put len 512 hash 0a01a529ed928e3f -> block 964 (stored)
+[cas    ] put len 512 hash 0e3f9b20e3a82ee3 -> block 965 (stored)
+[cas    ] put len 512 hash d7e827eb3ab6516d -> block 966 (stored)
+[cas    ] put len 512 hash 9357f540456834f3 -> block 967 (stored)
+[cas    ] put len 512 hash e1390cda2088b036 -> block 968 (stored)
+[cas    ] put len 512 hash bfc44bdba34c5d55 -> block 969 (stored)
+[cas    ] put len 512 hash 9c2e1625e8841027 -> block 970 (stored)
+[cas    ] put len 512 hash 90d58b55e45c052d -> block 971 (stored)
+[cas    ] put len 512 hash 5dec2434199befad -> block 972 (stored)
+[cas    ] put len 512 hash bfd0057337d4433e -> block 973 (stored)
+[cas    ] put len 512 hash 4f0b8732739924da -> block 974 (stored)
+[cas    ] put len 512 hash 4921f5d51307d954 -> block 975 (stored)
+[cas    ] put len 512 hash cd21389e3671549c -> block 976 (stored)
+[cas    ] put len 512 hash 92008a7874c08805 -> block 977 (stored)
+[cas    ] put len 512 hash a1f801f42bcf1d38 -> block 978 (stored)
+[cas    ] put len 512 hash 2253ae5f6eff1a0d -> block 979 (stored)
+[cas    ] put len 512 hash 004725f2c401ce11 -> block 980 (stored)
+[cas    ] put len 512 hash 941e138f8ab81b44 -> block 981 (stored)
+[cas    ] put len 512 hash 413daab22d5eecab -> block 982 (stored)
+[cas    ] put len 512 hash 8487ec9e332bfbe6 -> block 983 (stored)
+[cas    ] put len 512 hash 268de19528a23919 -> block 984 (stored)
+[cas    ] put len 512 hash 654a73b385de960d -> block 985 (stored)
+[cas    ] put len 512 hash 0cdac22bd26cf0e5 -> block 986 (stored)
+[cas    ] put len 512 hash c6fce43173655e61 -> block 987 (stored)
+[cas    ] put len 512 hash 8beda11b1a625ef2 -> block 988 (stored)
+[cas    ] put len 512 hash cf03973ad4238af6 -> block 989 (stored)
+[cas    ] put len 512 hash 990a9e0b60f65753 -> block 990 (stored)
+[cas    ] put len 512 hash e6e04fe80cdd2bde -> block 991 (stored)
+[cas    ] put len 512 hash 1d0b4dd08dfe8b17 -> block 992 (stored)
+[cas    ] put len 512 hash cae8ea1c3fb5d1ed -> block 993 (stored)
+[cas    ] put len 512 hash c35352ca75eb78d1 -> block 994 (stored)
+[cas    ] put len 512 hash e9e6ab87432a04ae -> block 995 (stored)
+[cas    ] put len 512 hash 5105f864b579eba5 -> block 996 (stored)
+[cas    ] put len 512 hash 2fa6473e7d239cf8 -> block 997 (stored)
+[cas    ] put len 512 hash 85778a878e864369 -> block 998 (stored)
+[cas    ] put len 512 hash e11de4f2123e8f1c -> block 999 (stored)
+[cas    ] put len 512 hash 7a38ca5c3966a9fc -> block 1000 (stored)
+[cas    ] put len 512 hash c8a72c9c2380dfa5 -> block 1001 (stored)
+[cas    ] put len 512 hash d4dc05fee34162b7 -> block 1002 (stored)
+[cas    ] put len 512 hash 78b748bbb97c2cd9 -> block 1003 (stored)
+[cas    ] put len 512 hash 93d09f2a2582e5fc -> block 1004 (stored)
+[cas    ] put len 512 hash da355900519bb07a -> block 1005 (stored)
+[cas    ] put len 512 hash 6c86cd4c9ace75a7 -> block 1006 (stored)
+[cas    ] put len 512 hash 23a6f83de21b0ab5 -> block 1007 (stored)
+[cas    ] put len 274 hash 9cc014ad96bff0fb -> block 1008 (stored)
+[cas    ] put len 512 hash b743d74375880d58 -> block 1009 (stored)
+[cas    ] put len 512 hash 10cfefbbf5a36189 -> block 1010 (stored)
+[cas    ] put len 512 hash 6fb3614f68aa3732 -> block 1011 (stored)
+[cas    ] put len 512 hash 37de65b456ef0c46 -> block 1012 (stored)
+[cas    ] put len 512 hash 6921841e11b5ae81 -> block 1013 (stored)
+[cas    ] put len 512 hash 8a9fa59fb0d4c85a -> block 1014 (stored)
+[cas    ] put len 512 hash bbe650b46138c3b7 -> block 1015 (stored)
+[cas    ] put len 512 hash 2e1d5b1602560417 -> block 1016 (stored)
+[cas    ] put len 512 hash 1c24288fa6440950 -> block 1017 (stored)
+[cas    ] put len 512 hash c4e26fcfed1b29fc -> block 1018 (stored)
+[cas    ] put len 512 hash 27c2858a175612a8 -> block 1019 (stored)
+[cas    ] put len 512 hash 348a0cde5957de4d -> block 1020 (stored)
+[cas    ] put len 512 hash 64cf89d91cf59293 -> block 1021 (stored)
+[cas    ] put len 512 hash 71eefe5990b66670 -> block 1022 (stored)
+[cas    ] put len 512 hash 404bd2d8d8d4f57b -> block 1023 (stored)
+[cas    ] put len 512 hash 15f461abcd42f43f -> block 1024 (stored)
+[cas    ] put len 512 hash d2c974550d28c8a9 -> block 1025 (stored)
+[cas    ] put len 512 hash 26a4cee79560a544 -> block 1026 (stored)
+[cas    ] put len 512 hash 1bdb476353bd46bd -> block 1027 (stored)
+[cas    ] put len 512 hash 1dfa7ee3b0047808 -> block 1028 (stored)
+[cas    ] put len 512 hash cee00098244eb0d3 -> block 1029 (stored)
+[cas    ] put len 512 hash 549290676b8a296e -> block 1030 (stored)
+[cas    ] put len 512 hash a230231d562b006d -> block 1031 (stored)
+[cas    ] put len 512 hash e92efbba8a887bab -> block 1032 (stored)
+[cas    ] put len 512 hash 938beee55d30ae09 -> block 1033 (stored)
+[cas    ] put len 512 hash c405be691ab7c9ff -> block 1034 (stored)
+[cas    ] put len 512 hash f7d4554905b86f4a -> block 1035 (stored)
+[cas    ] put len 315 hash 269ca27320d31d79 -> block 1036 (stored)
+[cas    ] put len 512 hash 12d3a37a601240e6 -> block 1037 (stored)
+[cas    ] put len 512 hash 8680e78d375b9585 -> block 1038 (stored)
+[cas    ] put len 338 hash 22db749565fa5b12 -> block 1039 (stored)
+[cas    ] put len 160 hash daf5f63dbf2f0d8c -> block 1040 (stored)
+[cas    ] put len 286 hash b1a99739d1fb3603 -> block 1041 (stored)
+[cas    ] put len 221 hash bcbc801d317e12ac -> block 1042 (stored)
+[sdk    ] installed 16/16 SDK files (79346 bytes): 7 headers in /usr/include, the runtime + README in /usr/lib, the toolchain's and the shell's own sources in /src
+[cas    ] put len 70 hash 84244543d2d93a3d -> block 1043 (stored)
+[cas    ] put len 512 hash aea49363f1ef848d -> block 1044 (stored)
+[cas    ] put len 512 hash fb04efdab6d2ed4d -> block 1045 (stored)
+[cas    ] put len 376 hash 7f4fe244e98a0963 -> block 1046 (stored)
+[vfs    ] directory:
+[vfs    ]   /bin/init  (113808 bytes, 223 chunks, hash d669430fcfc12427)
+[vfs    ]   /bin/occ  (113808 bytes, 223 chunks, hash d669430fcfc12427)
+[vfs    ]   /usr/include/outrun_abi.h  (3316 bytes, 7 chunks, hash 317cca280e996074)
+[vfs    ]   /usr/include/stdio.h  (1499 bytes, 3 chunks, hash c1d0d51b961ff1fd)
+[vfs    ]   /usr/include/stdlib.h  (850 bytes, 2 chunks, hash 15d881c173141bd0)
+[vfs    ]   /usr/include/string.h  (236 bytes, 1 chunks, hash 35eb625e4b55e0db)
+[vfs    ]   /usr/include/unistd.h  (2840 bytes, 6 chunks, hash da675e1c041189cb)
+[vfs    ]   /usr/include/signal.h  (917 bytes, 2 chunks, hash 76fed0b6b26b35c7)
+[vfs    ]   /usr/include/pthread.h  (1687 bytes, 4 chunks, hash 67244b48cbfcdf92)
+[vfs    ]   /usr/lib/libc.oc  (7683 bytes, 16 chunks, hash 9e3771b906ddef71)
+[vfs    ]   /usr/lib/README  (1007 bytes, 2 chunks, hash f420065d37ac7407)
+[vfs    ]   /src/vedit.c  (18805 bytes, 37 chunks, hash 77077d3e94b6da6b)
+[vfs    ]   /src/omake.c  (25362 bytes, 50 chunks, hash f711df9647dcd1ad)
+[vfs    ]   /src/vsh.c  (13627 bytes, 27 chunks, hash dc2488675722b6b8)
+[vfs    ]   /src/demo.mk  (850 bytes, 2 chunks, hash 11fccd1f51732532)
+[vfs    ]   /src/hello.h  (160 bytes, 1 chunks, hash daf5f63dbf2f0d8c)
+[vfs    ]   /src/hello_a.c  (286 bytes, 1 chunks, hash b1a99739d1fb3603)
+[vfs    ]   /src/hello_b.c  (221 bytes, 1 chunks, hash bcbc801d317e12ac)
+[vfs    ]   motd  (70 bytes, 1 chunks, hash 84244543d2d93a3d)
+[vfs    ]   readme  (1400 bytes, 3 chunks, hash 0abbc20b3944d403)
+[vfs    ] read 'readme' (1400 bytes, spans 3 blocks): content verified
+[cas    ] put len 32 hash 50fc444c0771b178 -> block 1047 (stored)
+[vfs    ] copy-on-write 'motd': hash 84244543d2d93a3d -> 50fc444c0771b178 (immutable blocks, name repointed)
+[cas    ] put len 512 hash aea49363f1ef848d -> DEDUP to block 1044 (no write)
+[cas    ] put len 512 hash fb04efdab6d2ed4d -> DEDUP to block 1045 (no write)
+[cas    ] put len 376 hash 7f4fe244e98a0963 -> DEDUP to block 1046 (no write)
+[vfs    ] 'readme_copy' identical to 'readme' -> blocks used +0 (CAS dedup)
+-- done --
+-- preemptive scheduler + multiple outstanding I/O --
+[sched  ] submitted 8 reads without blocking; in-flight now 8
+[sched  ] all 8 done; PEAK concurrent in-flight tags = 8
+[worker ] tid5 did 4 write+read cycles: verified
+[worker ] tid2 did 4 write+read cycles: verified
+[worker ] tid3 did 4 write+read cycles: verified
+[worker ] tid4 did 4 write+read cycles: verified
+[sched  ] 4 worker threads completed; wakes routed to specific TIDs
+[sched  ] preemption proof: non-yielding spinner advanced to 52127571 while main
+[sched  ]   also ran (0 would mean no time-slicing occurred)
+[vblk   ] lifetime interrupt completions: 7482
+-- done --
+-- async IRQ routing: NIC interrupt wakes a parked thread --
+[netd   ] tid2 holds CAP_NETWORK; TX ARP who-has 10.0.2.2
+[netd   ] sys_wait_event(NET_RX): parking until the NIC interrupts...
+[netd   ] woken by IRQ; RX 76 bytes, ethertype 806
+[netd   ] ARP reply: 10.0.2.2 is-at 52:55:a:0:2:2 (parsed in place)
+[net    ] zero-copy IP/UDP router: DHCP round-trip through a port filter
+[dhcpd  ] tid2 bound UDP port 68 -> execution slot 0
+[dhcpd  ] TX DHCPDISCOVER (291 bytes), waiting on port-68 slot...
+[dhcpd  ] router delivered 548-byte UDP payload (zero-copy pointer)
+[dhcpd  ] DHCP OFFER: offered IP 10.0.2.15, server 10.0.2.2
+-- done --
+-- Time-Stream Engine: chronological index + local vector query --
+[stream ] chronological timeline (27 events, all vector-indexed):
+[stream ]  #0  t=778  FILE  vfs: wrote file /bin/init
+[stream ]  #1  t=1004  FILE  vfs: wrote file /bin/occ
+[stream ]  #2  t=1039  FILE  vfs: wrote file /usr/include/outrun_abi.h
+[stream ]  #3  t=1060  FILE  vfs: wrote file /usr/include/stdio.h
+[stream ]  #4  t=1077  FILE  vfs: wrote file /usr/include/stdlib.h
+[stream ]  #5  t=1095  FILE  vfs: wrote file /usr/include/string.h
+[stream ]  #6  t=1129  FILE  vfs: wrote file /usr/include/unistd.h
+[stream ]  #7  t=1149  FILE  vfs: wrote file /usr/include/signal.h
+[stream ]  #8  t=1176  FILE  vfs: wrote file /usr/include/pthread.h
+[stream ]  #9  t=1236  FILE  vfs: wrote file /usr/lib/libc.oc
+[stream ]  #10  t=1249  FILE  vfs: wrote file /usr/lib/README
+[stream ]  #11  t=1352  FILE  vfs: wrote file /src/vedit.c
+[stream ]  #12  t=1518  FILE  vfs: wrote file /src/omake.c
+[stream ]  #13  t=1620  FILE  vfs: wrote file /src/vsh.c
+[stream ]  #14  t=1640  FILE  vfs: wrote file /src/demo.mk
+[stream ]  #15  t=1658  FILE  vfs: wrote file /src/hello.h
+[stream ]  #16  t=1675  FILE  vfs: wrote file /src/hello_a.c
+[stream ]  #17  t=1692  FILE  vfs: wrote file /src/hello_b.c
+[stream ]  #18  t=1709  FILE  vfs: wrote file motd
+[stream ]  #19  t=1732  FILE  vfs: wrote file readme
+[stream ]  #20  t=1751  FILE  vfs: wrote file motd
+[stream ]  #21  t=1768  FILE  vfs: wrote file readme_copy
+[stream ]  #22  t=1793  COMM  Sarah: shared the Q3 revenue chart deck
+[stream ]  #23  t=1793  COMM  DevTeam: merged the microkernel scheduler patch
+[stream ]  #24  t=1793  COMM  Ops: flagged a network gateway DHCP change
+[stream ]  #25  t=1793  SYS   netd: received DHCP offer 10.0.2.15 from gateway
+[stream ]  #26  t=1793  SYS   sched: ran four concurrent worker threads
+[stream ] query "the Q3 chart Sarah sent":
+[stream ]   -> COMM Sarah: shared the Q3 revenue chart deck  (score 4)
+[stream ]   -> FILE vfs: wrote file /usr/include/pthread.h  (score 1)
+[stream ] query "scheduler patch":
+[stream ]   -> COMM DevTeam: merged the microkernel scheduler patch  (score 2)
+[stream ]   -> FILE vfs: wrote file /src/demo.mk  (score 1)
+[stream ] query "dhcp gateway address":
+[stream ]   -> COMM Ops: flagged a network gateway DHCP change  (score 2)
+[stream ]   -> SYS  netd: received DHCP offer 10.0.2.15 from gateway  (score 2)
+-- done --
+-- PRODUCTION VALIDATION MATRIX --
+[valid  ] capability audit:
+[kernel ] spawned pid 3 'audit-none' caps 0000000000000000 — private PML4 @ phys 0000000001018000
+[kernel ] spawned pid 4 'audit-fs' caps 0000000000000020 — private PML4 @ phys 0000000001019000
+[valid  ]  PASS  sys_open  denied w/o CAP_FILESYSTEM
+[valid  ]  PASS  sys_read  denied w/o CAP_FILESYSTEM
+[valid  ]  PASS  sys_write denied w/o CAP_FILESYSTEM
+[valid  ]  PASS  sys_wait_event denied w/o CAP_NETWORK
+[valid  ]  PASS  sys_map_fb denied w/o CAP_FRAMEBUFFER
+[valid  ]  PASS  sys_open  passes cap gate w/ CAP_FILESYSTEM
+[valid  ] ELF loader bounds-checking:
+[elf    ] PT_LOAD vaddr 0000500000000000 filesz 0000000000000000 memsz 0000000000001000 (ro) -> mapped USER (bounds ok)
+[valid  ]  PASS  valid minimal ELF accepted
+[elf    ] reject: image smaller than ELF header
+[valid  ]  PASS  reject: image smaller than header
+[elf    ] reject: program header table out of bounds
+[valid  ]  PASS  reject: phdr table out of bounds
+[elf    ] reject: segment file range out of bounds
+[valid  ]  PASS  reject: segment file range out of bounds
+[elf    ] reject: segment vaddr 0000000000001000 outside user range
+[valid  ]  PASS  reject: segment vaddr outside user range
+[elf    ] reject: entry 0000000000001000 outside user range
+[valid  ]  PASS  reject: entry outside user range
+[elf    ] reject: memsz < filesz
+[valid  ]  PASS  reject: memsz < filesz
+[valid  ] CAS/VFS round-trip integrity:
+[cas    ] put len 512 hash 6404ff35e8dec725 -> block 1048 (stored)
+[valid  ]  PASS  CAS put/get byte-exact round-trip
+[cas    ] put len 512 hash 6404ff35e8dec725 -> DEDUP to block 1048 (no write)
+[valid  ]  PASS  CAS dedup: identical put -> same hash
+[valid  ]  PASS  CAS dedup: identical put -> no new block
+[valid  ]  PASS  CAS get of unknown hash -> not found
+[cas    ] put len 512 hash 510b231af2415325 -> block 1049 (stored)
+[cas    ] put len 512 hash 510b231af2415325 -> DEDUP to block 1049 (no write)
+[cas    ] put len 276 hash ab06722f02efa055 -> block 1050 (stored)
+[valid  ]  PASS  VFS multi-block write/read round-trip
+[cas    ] put len 512 hash 510b231af2415325 -> DEDUP to block 1049 (no write)
+[cas    ] put len 388 hash 668072e4108a11d5 -> block 1051 (stored)
+[valid  ]  PASS  VFS copy-on-write changes file hash
+[valid  ] RESULT: 19 passed, 0 failed
+[valid  ] ALL CHECKS PASSED — image is production-verified
+-- done --
+-- EXHAUSTIVE ISOLATION & HARDENING INVARIANTS --
+[kernel ] spawned pid 5 'inv-cap' caps 0000000000000000 — private PML4 @ phys 0000000001023000
+[invar  ]  PASS  no cap-mask escalates sys_open
+[invar  ]  PASS  no cap-mask escalates sys_read
+[invar  ]  PASS  no cap-mask escalates sys_write_file
+[invar  ]  PASS  no cap-mask escalates sys_wait_event
+[invar  ]  PASS  no cap-mask escalates sys_map_framebuffer
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[hw     ] DENIED pid 5 'inv-cap' -> 'sensor0': lacks CAP_HW_PASSTHROUGH
+[invar  ]  PASS  no cap-mask escalates sys_hw_passthrough
+[invar  ] capability space swept: 192/192 denial checks held
+[kernel ] spawned pid 6 'inv-A' caps 0000000000000000 — private PML4 @ phys 0000000001024000
+[kernel ] spawned pid 7 'inv-B' caps 0000000000000000 — private PML4 @ phys 0000000001025000
+[invar  ]  PASS  same vaddr resolves to A's own frame in A
+[invar  ]  PASS  same vaddr resolves to B's own frame in B
+[invar  ]  PASS  processes get physically distinct frames
+[invar  ]  PASS  A-private page is NOT visible in B
+[invar  ]  PASS  user page PTE present + USER + WRITE
+[invar  ]  PASS  kernel page reachable via shared identity
+[invar  ]  PASS  kernel page is SUPERVISOR-only (ring3 blocked)
+[invar  ]  PASS  processes SHARE identity PML4[0]
+[invar  ]  PASS  processes SHARE device-MMIO PML4[0xC0]
+[invar  ]  PASS  processes have PRIVATE user PML4[0xA0]
+[kernel ] spawned pid 8 'inv-hw' caps 0000000000000003 — private PML4 @ phys 0000000001032000
+[kernel ] spawned pid 9 'inv-hw2' caps 0000000000000001 — private PML4 @ phys 0000000001033000
+[invar  ]  PASS  passthrough rejects invalid device handle
+[hw     ] GRANT  pid 8 'inv-hw' -> 'sensor0': phys 0000000001002000 mapped at vaddr 0000400200000000 (1 pages)
+[invar  ]  PASS  passthrough grants valid device w/ HW+device cap
+[hw     ] DENIED pid 9 'inv-hw2' -> 'sensor0': missing device capability
+[invar  ]  PASS  passthrough denies device w/o its device-cap (2-level gate)
+[invar  ]  PASS  granted device page is USER + cache-disabled
+[invar  ]  PASS  device mapping absent from an unrelated space
+[invar  ] RESULT: 21 passed, 0 failed
+[invar  ] CORE SECURITY BOUNDARY VERIFIED — isolation is airtight
+-- done --
+[kernel ] ring-3 enabled: GDT (8 TSS slots) + BSP TSS loaded, SYSCALL/SYSRET armed
+[kernel ]   STAR kern=0x08 user=0x1B, LSTAR=00000000001012f0, TSS0.rsp0=000000000025d1c0
+-- SMP GROUNDWORK: boot every core, prove the cross-core protocols --
+[smp    ] MADT: 1 enabled cpu(s): apic0
+[smp    ] BSP: apic id 0, LAPIC at 00000000fee00000 (virtual-wire kept: PIT/PIC unchanged)
+[smp    ] uniprocessor boot — APs: none
+-- done --
+
+Type 'help' for commands, 'demo' for the capability walk-through.
+outrun> authstress
+-- AUTHSTRS: password KDF, account lockout, and credential transitions --
+[authstrs]  PASS  two generated salts differ
+[authstrs]  PASS  the KDF is deterministic for one password and salt
+[authstrs]  PASS  the SAME password under a different salt gives a different digest
+[authstrs]  PASS  a one-character password change changes the digest
+[authstrs]  PASS  the constant-time compare rejects a difference in the LAST byte
+[authstrs]  PASS  and one in the FIRST byte
+[authstrs]  PASS  root can create an account
+[authstrs]  PASS  a second, distinct account
+[authstrs]  PASS  a duplicate account name is refused
+[authstrs]  PASS  an empty account name is refused
+[authstrs]  PASS  two accounts sharing a password hold different digests
+[authstrs]  PASS  the right password authenticates and returns the uid
+[authstrs]  PASS  the wrong password is refused
+[authstrs]  PASS  an unknown user is refused with the SAME code as a wrong password
+[authstrs]  PASS  a successful auth does not change the caller's credentials
+[authstrs]  PASS  two failures short of the limit do not lock the account
+[authstrs]  PASS  a success clears the consecutive-failure count
+[auth   ] account 'm74bob' LOCKED after 3 consecutive failures
+[authstrs]  PASS  UDB_MAX_FAILS consecutive failures lock the account
+[authstrs]  PASS  the lockout was counted
+[authstrs]  PASS  a LOCKED account refuses even the correct password
+[authstrs]  PASS  and the other accounts are unaffected by it
+[kernel ] spawned pid 10 'u-cred' caps 0000000000000020 — private PML4 @ phys 0000000001039000
+[authstrs]  PASS  a fresh process is root in all six ids
+[authstrs]  PASS  root may seteuid to an unprivileged id
+[authstrs]  PASS  ...which moves ONLY the effective id
+[authstrs]  PASS  ...and the process is no longer privileged
+[authstrs]  PASS  it may return to the SAVED id
+[authstrs]  PASS  an unprivileged process may NOT seteuid to an unrelated id
+[authstrs]  PASS  ...but may return to its real id
+[authstrs]  PASS  privileged setuid sets all three ids
+[authstrs]  PASS  after a permanent drop, root cannot be regained by setuid
+[authstrs]  PASS  nor by seteuid
+[authstrs]  PASS  egid 0 does NOT make a process privileged for setgid
+[authstrs]  PASS  SYS_GETUID reports the real id and SYS_GETEUID the effective
+[authstrs]  PASS  an unprivileged process may not create an account
+[kernel ] spawned pid 11 'u-credrecyc' caps 0000000000000020 — private PML4 @ phys 000000000103a000
+[authstrs]  PASS  a recycled slot inherits no effective or saved id
+[authstrs] RESULT: 35 passed, 0 failed
+[authstrs] AUTH VERIFIED — salted KDF, constant-time verify, lockout, and a one-way privilege door
+-- done --
+outrun> qemu-system-x86_64: terminating on signal 15 from pid 1104 (timeout)
