@@ -864,6 +864,24 @@ extern uint64_t cpp_ring_depth(void);
 /* reach them directly.                                                         */
 static uint64_t g_next_frame = 0x01000000; /* 16 MiB: clear of kernel + stack */
 
+/* v0.75: the ceiling this allocator has always ASSUMED and never enforced.
+ *
+ * boot.asm identity-maps exactly the first 1 GiB with 2 MiB pages, and the
+ * comment above says page tables and scratch "all live below 1 GiB so BOTH the
+ * kernel CR3 and every process CR3 can reach them directly". That was a
+ * statement of intent with nothing behind it: g_next_frame starts at 16 MiB and
+ * grows monotonically with no upper bound, so a boot that allocates enough
+ * frames walks the bump pointer straight off the end of the mapped window. The
+ * first address past it is 0x40000000 EXACTLY, and every access to a frame at
+ * or beyond that point faults not-present — the allocator's own zeroing loop
+ * writes there before any caller ever sees the pointer.
+ *
+ * Strictly `<`: an allocation is legal only if every byte it hands out lies
+ * below the limit, so a frame based at 0x3FFFF000 is the last valid one and an
+ * extent ENDING at 0x40000000 is fine (the end is exclusive), while one ending
+ * at 0x40001000 is not. */
+#define IDENT_MAP_LIMIT 0x40000000ull      /* 1 GiB — see boot.asm's page tables */
+
 /* v0.41: the bump pointer is claimed with LOCK XADD, so any core may allocate
  * concurrently — two cores can no longer be handed the same frame, and a
  * multi-frame claim stays contiguous because the whole extent is reserved in
@@ -871,6 +889,23 @@ static uint64_t g_next_frame = 0x01000000; /* 16 MiB: clear of kernel + stack */
  * happens outside any lock: the frames are exclusively ours once claimed.    */
 static uint64_t alloc_frames(uint64_t n) {
     uint64_t base = __sync_fetch_and_add(&g_next_frame, n * 0x1000);
+    uint64_t end  = base + n * 0x1000;      /* exclusive                        */
+    /* v0.75: enforce the identity-map ceiling BEFORE the zeroing loop below,
+     * because that loop is itself the first thing to touch the frames — an
+     * unbounded bump pointer does not fail at the caller, it faults inside the
+     * allocator, writing to the first unmapped address. Halting here converts a
+     * silent walk off the end of the mapped window into one line naming the
+     * exact request that exhausted it.
+     *
+     * `end > IDENT_MAP_LIMIT` rather than `>=`: the end is exclusive, so an
+     * extent finishing exactly at 0x40000000 touched nothing at or past it.
+     * The overflow test catches an absurd `n` wrapping the addition. */
+    if (end < base || end > IDENT_MAP_LIMIT) {
+        kprintf("\n[frame  ] OUT OF IDENTITY-MAPPED RAM: request for %u frame(s) at %X would end "
+                "at %X, past the 1 GiB limit %X -- halting\n",
+                n, base, end, (uint64_t)IDENT_MAP_LIMIT);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
     uint64_t *p = (uint64_t *)base;         /* identity mapped -> phys == virt  */
     for (uint64_t i = 0; i < n * 512; i++) p[i] = 0;
     return base;
@@ -2048,6 +2083,38 @@ static uint64_t dbg_pid_of(uint64_t proc_idx) {
     return kprocs[proc_idx].pid;
 }
 
+/* v0.75: is `pa` a physical address this kernel can actually dereference right
+ * now, from a fault handler, without risking a second fault?
+ *
+ * Three conditions, and all three are things a corrupted CR3 or page-table entry
+ * routinely violates:
+ *   - non-zero. A zeroed CR3 or a cleared entry reads as 0, and 0 is never a
+ *     page-table root here (the pool starts at 16 MiB and the kernel's own
+ *     tables sit in .bss).
+ *   - 4 KiB aligned. Every table this kernel builds comes from the frame
+ *     allocator, so a low-bit-dirty value is garbage rather than an address —
+ *     and it is exactly what a partially-overwritten entry looks like.
+ *   - below the 1 GiB identity map. Page tables are reached as phys == virt, so
+ *     anything at or beyond IDENT_MAP_LIMIT is not addressable at all: reading
+ *     it is the very fault we are trying to report on.
+ *
+ * Deliberately conservative. A false negative costs one skipped diagnostic line;
+ * a false positive costs the whole dump. */
+static int panic_phys_ok(uint64_t pa) {
+    if (!pa)                     return 0;
+    if (pa & 0xFFFull)           return 0;
+    if (pa >= IDENT_MAP_LIMIT)   return 0;
+    return 1;
+}
+
+/* Which of the three it failed, so the log says why rather than just "bad". */
+static const char *panic_phys_why(uint64_t pa) {
+    if (!pa)                   return "null";
+    if (pa & 0xFFFull)         return "not 4 KiB aligned";
+    if (pa >= IDENT_MAP_LIMIT) return "at or beyond the 1 GiB identity map";
+    return "ok";
+}
+
 /* v0.75: what a fatal fault prints. This used to be vector, error code and rip,
  * and that is not enough to act on — "page fault in posix_drain" does not
  * distinguish a bug in posix_drain from posix_drain merely being the code that
@@ -2082,19 +2149,66 @@ static void panic_dump(struct isr_frame *f) {
      * every legitimate CR3 this kernel installs. If it is absent, the CR3 in use
      * is not an address space at all — it is a freed frame something else has
      * already written over, and THAT is the bug rather than whatever instruction
-     * happened to touch memory next. */
-    {
+     * happened to touch memory next.
+     *
+     * v0.75: EVERY pointer below is validated before it is dereferenced. This
+     * code runs when the machine is already broken, and the most likely thing to
+     * be broken is exactly the state it wants to read — a corrupt CR3 is one of
+     * the failures it exists to diagnose. Dereferencing it unchecked faults
+     * INSIDE the fault handler, and the second fault arrives with the console
+     * half-written: the dump truncates and takes its own evidence with it.
+     * (Observed: a run whose output stopped dead after the first line, which is
+     * what prompted this.) A rejected pointer prints its raw value and skips the
+     * walk, so the log still says what CR3 was. */
+    if (!panic_phys_ok(cr3_now & ADDR_MASK)) {
+        kprintf("[panic ] CR3 %X is not a usable page-table root (raw frame %X): "
+                "%s — skipping the page-table walk\n",
+                cr3_now, cr3_now & ADDR_MASK, panic_phys_why(cr3_now & ADDR_MASK));
+    } else {
         uint64_t *pml4 = (uint64_t *)(cr3_now & ADDR_MASK);
-        uint64_t *kp   = (uint64_t *)(kernel_cr3 & ADDR_MASK);
-        kprintf("[panic ] pml4[0]=%X (kernel %X)  pml4[0xC0]=%X (kernel %X)\n",
-                pml4[0], kp[0], pml4[0xC0], kp[0xC0]);
-        if (!(pml4[0] & 1))
+        uint64_t kp0 = 0, kpc0 = 0;
+        int kok = panic_phys_ok(kernel_cr3 & ADDR_MASK);
+        if (kok) {
+            uint64_t *kp = (uint64_t *)(kernel_cr3 & ADDR_MASK);
+            kp0 = kp[0]; kpc0 = kp[0xC0];
+        }
+        kprintf("[panic ] pml4[0]=%X (kernel %X)  pml4[0xC0]=%X (kernel %X)%s\n",
+                pml4[0], kp0, pml4[0xC0], kpc0, kok ? "" : "  [kernel_cr3 unreadable]");
+        if (!(pml4[0] & PTE_PRESENT))
             kprintf("[panic ] *** PML4 ENTRY 0 NOT PRESENT: the live CR3 has lost the kernel\n"
                     "[panic ] *** identity map. This address space was torn down or recycled\n"
                     "[panic ] *** while this core was still running in it.\n");
-        else if (cr3_now != kernel_cr3 && pml4[0] != kp[0])
+        else if (kok && cr3_now != kernel_cr3 && pml4[0] != kp0)
             kprintf("[panic ] *** PML4[0] DISAGREES with the kernel's: this CR3's entry 0 is\n"
                     "[panic ] *** stale or overwritten.\n");
+
+        /* Walk CR2 and say WHERE translation died. On a #14 this turns "not
+         * present" into the specific level that was missing, which is the
+         * difference between "some pointer was wrong" and "the PDPT covering
+         * this range was never installed". Each table pointer is validated
+         * before the step that would dereference it. */
+        if (f->vector == 14) {
+            uint64_t va = cr2;
+            uint64_t idx[4] = { (va >> 39) & 0x1FF, (va >> 30) & 0x1FF,
+                                (va >> 21) & 0x1FF, (va >> 12) & 0x1FF };
+            const char *lvl[4] = { "PML4", "PDPT", "PD", "PT" };
+            uint64_t tbl = cr3_now & ADDR_MASK;
+            kprintf("[panic ] walk of cr2=%X: pml4[%u] pdpt[%u] pd[%u] pt[%u]\n",
+                    va, idx[0], idx[1], idx[2], idx[3]);
+            for (int L = 0; L < 4; L++) {
+                if (!panic_phys_ok(tbl)) {
+                    kprintf("[panic ]   %s table at %X unusable (%s) — walk stops\n",
+                            lvl[L], tbl, panic_phys_why(tbl));
+                    break;
+                }
+                uint64_t e = ((uint64_t *)tbl)[idx[L]];
+                kprintf("[panic ]   %s[%u] = %X%s%s\n", lvl[L], idx[L], e,
+                        (e & PTE_PRESENT) ? "" : "  <-- NOT PRESENT, translation dies here",
+                        (e & PTE_HUGE)    ? "  (huge leaf)" : "");
+                if (!(e & PTE_PRESENT) || (e & PTE_HUGE)) break;
+                tbl = e & ADDR_MASK;
+            }
+        }
     }
 
     /* Poor-man's backtrace: -O2 without frame pointers makes an rbp chain
