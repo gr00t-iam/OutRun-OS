@@ -3170,6 +3170,9 @@ static inline void execbuf_acquire(void) {
 }
 static inline void execbuf_release(void) { __sync_lock_release(&g_execbuf_lock); }
 
+/* v0.75: imbalance counters, reported by klock_release below. */
+static volatile uint64_t g_rank_underflow = 0, g_rank_mismatch = 0;
+
 /* Rank bookkeeping storage for the CURRENT context (see the pcb comment).    */
 static inline uint8_t *rank_ctx(uint8_t **sp) {
     if (cpu_idx() == 0 && g_sched_on) { *sp = &curthr->rank_sp;         return curthr->rank_stack; }
@@ -3208,9 +3211,42 @@ static void klock_acquire(struct klock *l) {
     if (*sp < 8) st[(*sp)++] = l->rank;
 }
 
+/* v0.75: catch the imbalance AT THE RELEASE, which is the only place that can
+ * see it. The acquire-side warning says "rank 9 is already held" long after the
+ * fact and names whoever noticed, not whoever left it — 887 of 927 violations
+ * pointed at tcp_timer_scan for that reason, and it is merely the most frequent
+ * acquirer on the BSP.
+ *
+ * Two distinct faults are reported here, because they have different causes:
+ *   UNDERFLOW — a release with nothing recorded as held. The push and the pop
+ *               went to different stacks (rank_ctx picks per-thread storage on
+ *               cpu 0 and per-CPU elsewhere), or the lock was released twice.
+ *   MISMATCH  — the top of the stack is not this lock's rank, i.e. releases are
+ *               not LIFO. That leaves the deeper entry stranded, which is
+ *               exactly the phantom hold the acquire side keeps tripping over.
+ * Both print the caller so the offending path names itself. */
 static void klock_release(struct klock *l) {
-    uint8_t *sp; rank_ctx(&sp);
-    if (*sp > 0) (*sp)--;                              /* LIFO release          */
+    uint8_t *sp, *st = rank_ctx(&sp);
+    if (*sp == 0) {
+        __sync_fetch_and_add(&g_rank_underflow, 1);
+        kprintf("[klock  ] RANK UNDERFLOW: releasing '%s' (rank %d) with an EMPTY held-stack "
+                "| caller=%X cpu=%u\n",
+                l->name, (uint64_t)l->rank, (uint64_t)__builtin_return_address(0),
+                (uint64_t)cpu_idx());
+    } else {
+        if (st[*sp - 1] != l->rank) {
+            __sync_fetch_and_add(&g_rank_mismatch, 1);
+            kprintf("[klock  ] RANK MISMATCH: releasing '%s' (rank %d) but the top of the "
+                    "held-stack is rank %d | caller=%X cpu=%u depth=%u held=[%d %d %d %d %d %d %d %d]\n",
+                    l->name, (uint64_t)l->rank, (uint64_t)st[*sp - 1],
+                    (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx(), (uint64_t)*sp,
+                    (uint64_t)(int64_t)st[0], (uint64_t)(int64_t)st[1],
+                    (uint64_t)(int64_t)st[2], (uint64_t)(int64_t)st[3],
+                    (uint64_t)(int64_t)st[4], (uint64_t)(int64_t)st[5],
+                    (uint64_t)(int64_t)st[6], (uint64_t)(int64_t)st[7]);
+        }
+        (*sp)--;                                       /* LIFO release          */
+    }
     __sync_lock_release(&l->v);
 }
 
