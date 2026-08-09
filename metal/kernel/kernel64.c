@@ -3103,18 +3103,39 @@ struct klock {
     uint8_t           rank;
     volatile uint32_t acq;                   /* successful acquisitions        */
     volatile uint32_t contended;             /* acquisitions that had to wait  */
+    /* v0.75: WHERE THIS LOCK'S RANK ENTRY LIVES, recorded at acquire.
+     *
+     * rank_ctx() chooses per-thread or per-CPU storage by evaluating
+     * (cpu_idx()==0 && g_sched_on) at the moment it is called. Acquire and
+     * release call it separately, so a lock held across anything that changes
+     * that predicate — a scheduler transition, work that reaches a context
+     * switch — pushed onto one stack and popped from another: the pop
+     * underflowed and the push was stranded permanently. That stranded rank is
+     * what every later acquire on the thread tripped over, and it is why the
+     * acquire-side warning always accused whoever NOTICED rather than whoever
+     * left it (measured: tcp_timer_scan + 268 and gpu_teardown_kproc + 56).
+     *
+     * A klock is held by exactly one context at a time, so the lock itself is
+     * the one place that can remember the answer. These are written under the
+     * lock, after it is acquired, and read before it is released — so release
+     * pops the exact slot acquire pushed, whatever the context has become since.
+     * Appended to the struct so the 13 five-field initialisers below still
+     * zero-fill them. */
+    uint8_t          *rank_st;               /* the stack it was pushed on     */
+    uint8_t          *rank_spp;              /* that stack's depth cursor      */
+    uint8_t           rank_idx;              /* the index it was pushed at     */
 };
-static struct klock g_ofile_lock = { 0, "ofile", 1, 0, 0 };
-static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0 };
-static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0 };
-static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0 };
-static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0 };
+static struct klock g_ofile_lock = { 0, "ofile", 1, 0, 0, 0, 0, 0 };
+static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0, 0, 0, 0 };
+static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0, 0, 0, 0 };
+static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0, 0, 0, 0 };
+static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0, 0, 0, 0 };
 /* v0.66. Rank 12: ABOVE every lock this ever needs, because it is never held
  * across one. Filling a page reads the VFS and flushing one writes it, and
  * both happen with this released — collect under the lock, do the I/O outside
  * it, re-check on the way back in. Holding it across g_vfs_lock (rank 2) would
  * be a real inversion, not a bookkeeping nicety. */
-static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0 };
+static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0, 0, 0, 0 };
 static volatile uint32_t g_rank_violations = 0;
 
 /* Back off without monopolizing the core that must make our progress: the BSP
@@ -3208,7 +3229,21 @@ static void klock_acquire(struct klock *l) {
         do { krelax(); } while (l->v || __sync_lock_test_and_set(&l->v, 1));
     }
     l->acq++;                                          /* under the lock        */
-    if (*sp < 8) st[(*sp)++] = l->rank;
+    /* v0.75: bind the slot to the LOCK. Everything below runs with the lock
+     * held, so these three fields have exactly one writer. `st`/`sp` are the
+     * ones resolved on THIS side; release will not resolve them again. A depth
+     * already at the 8-entry ceiling records no slot (rank_spp = 0) and release
+     * correspondingly pops nothing — the old code pushed nothing but popped
+     * anyway, which drifted the depth down and hid later violations. */
+    if (*sp < 8) {
+        l->rank_st  = st;
+        l->rank_spp = sp;
+        l->rank_idx = *sp;
+        st[(*sp)++] = l->rank;
+    } else {
+        l->rank_st  = 0;
+        l->rank_spp = 0;
+    }
 }
 
 /* v0.75: catch the imbalance AT THE RELEASE, which is the only place that can
@@ -3225,27 +3260,36 @@ static void klock_acquire(struct klock *l) {
  *               not LIFO. That leaves the deeper entry stranded, which is
  *               exactly the phantom hold the acquire side keeps tripping over.
  * Both print the caller so the offending path names itself. */
+/* v0.75: pop EXACTLY the slot acquire pushed. rank_ctx() is deliberately not
+ * called here — re-deriving the context is the entire defect this replaces.
+ *
+ * The checks that remain are real invariants rather than the old guesswork:
+ * a lock whose recorded depth is not one below the current top is being
+ * released out of LIFO order, which is worth saying out loud. Truncating to our
+ * own index in that case is the conservative choice: it guarantees this lock's
+ * entry can never be stranded, which is the failure that produced hundreds of
+ * phantom violations from two underflows. */
 static void klock_release(struct klock *l) {
-    uint8_t *sp, *st = rank_ctx(&sp);
-    if (*sp == 0) {
-        __sync_fetch_and_add(&g_rank_underflow, 1);
-        kprintf("[klock  ] RANK UNDERFLOW: releasing '%s' (rank %d) with an EMPTY held-stack "
-                "| caller=%X cpu=%u\n",
-                l->name, (uint64_t)l->rank, (uint64_t)__builtin_return_address(0),
-                (uint64_t)cpu_idx());
-    } else {
-        if (st[*sp - 1] != l->rank) {
+    uint8_t *st  = l->rank_st;
+    uint8_t *spp = l->rank_spp;
+    uint8_t  idx = l->rank_idx;
+    l->rank_st = 0; l->rank_spp = 0;                   /* consumed              */
+
+    if (spp) {
+        if (st[idx] != l->rank) {
             __sync_fetch_and_add(&g_rank_mismatch, 1);
-            kprintf("[klock  ] RANK MISMATCH: releasing '%s' (rank %d) but the top of the "
-                    "held-stack is rank %d | caller=%X cpu=%u depth=%u held=[%d %d %d %d %d %d %d %d]\n",
-                    l->name, (uint64_t)l->rank, (uint64_t)st[*sp - 1],
-                    (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx(), (uint64_t)*sp,
-                    (uint64_t)(int64_t)st[0], (uint64_t)(int64_t)st[1],
-                    (uint64_t)(int64_t)st[2], (uint64_t)(int64_t)st[3],
-                    (uint64_t)(int64_t)st[4], (uint64_t)(int64_t)st[5],
-                    (uint64_t)(int64_t)st[6], (uint64_t)(int64_t)st[7]);
+            kprintf("[klock  ] RANK MISMATCH: releasing '%s' (rank %d); its recorded slot %u "
+                    "holds rank %d | caller=%X cpu=%u\n",
+                    l->name, (uint64_t)l->rank, (uint64_t)idx, (uint64_t)(int64_t)st[idx],
+                    (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx());
+        } else if (*spp != (uint8_t)(idx + 1)) {
+            __sync_fetch_and_add(&g_rank_mismatch, 1);
+            kprintf("[klock  ] OUT-OF-ORDER RELEASE: '%s' (rank %d) sits at slot %u but the "
+                    "held depth is %u | caller=%X cpu=%u\n",
+                    l->name, (uint64_t)l->rank, (uint64_t)idx, (uint64_t)*spp,
+                    (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx());
         }
-        (*sp)--;                                       /* LIFO release          */
+        if (*spp > idx) *spp = idx;                    /* never strand our entry */
     }
     __sync_lock_release(&l->v);
 }
@@ -5338,7 +5382,7 @@ static struct udbent g_udb[UDB_MAX];
  * complaint through a null pointer. It never fired, because every acquisition
  * here happens with no other lock held — which is exactly the kind of latent
  * fault that surfaces years later when someone adds the first caller that does. */
-static struct klock  g_udb_lock = { 0, "udb", 13, 0, 0 };
+static struct klock  g_udb_lock = { 0, "udb", 13, 0, 0, 0, 0, 0 };
 static volatile uint64_t g_auth_ok = 0, g_auth_bad = 0, g_auth_lockouts = 0;
 
 /* Salt source. Not a CSPRNG and not claimed to be one: it is rdtsc (which no
@@ -6764,7 +6808,7 @@ static struct ipc_shmem g_ipc_shm[MAX_IPC_SHMEM];
  * unrelated raw spinlock, not part of this ranked array — no actual
  * collision, just two independent numbering schemes that happen to reuse
  * the same next integer.) */
-static struct klock g_ipc_lock = { 0, "ipc", 6, 0, 0 };
+static struct klock g_ipc_lock = { 0, "ipc", 6, 0, 0, 0, 0, 0 };
 
 static void ipc_queue_clear(int idx) {
     struct ipc_queue *q = &g_ipc_q[idx];
@@ -7057,7 +7101,7 @@ struct vgpu_resource_unref {
     uint32_t resource_id, padding;
 } __attribute__((packed));
 
-static struct klock g_gpu_lock = { 0, "gpu", 7, 0, 0 };
+static struct klock g_gpu_lock = { 0, "gpu", 7, 0, 0, 0, 0, 0 };
 static volatile uint8_t *g_gpu_common = 0, *g_gpu_notify = 0;
 static uint32_t          g_gpu_notify_mul = 0;
 static struct vq         g_gpu_ctrl;
@@ -7734,7 +7778,7 @@ struct virtio_snd_pcm_set_params {
 struct virtio_snd_pcm_status { uint32_t status, latency_bytes; } __attribute__((packed));
 struct virtio_snd_pcm_xfer   { uint32_t stream_id; } __attribute__((packed));
 
-static struct klock g_audio_lock = { 0, "audio", 8, 0, 0 };
+static struct klock g_audio_lock = { 0, "audio", 8, 0, 0, 0, 0, 0 };
 static volatile uint8_t *g_snd_common = 0, *g_snd_notify = 0;
 static uint32_t g_snd_notify_mul = 0;
 /* g_snd_isr / snd_isr_drain() are forward-declared above, right before
@@ -8161,7 +8205,7 @@ struct nsock {
 };
 static struct nsock g_sock[NSOCK];
 static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len); /* fwd: v0.67 */
-static struct klock g_net_lock = { 0, "net", 9, 0, 0 };
+static struct klock g_net_lock = { 0, "net", 9, 0, 0, 0, 0, 0 };
 static volatile uint64_t g_net_tx_frames = 0;
 static volatile uint64_t g_net_loop_deliveries = 0;
 /* v0.65: the numbers the suite cannot see from ring 3. An EAGAIN count that
@@ -9069,7 +9113,7 @@ static int wg_focused(int wi) {
     return k;
 }
 static uint64_t g_wm_pagetab[NWMWIN][WIN_SURF_MAXPG];   /* phys of each window's surface pages */
-static struct klock g_wm_lock = { 0, "wm", 10, 0, 0 };
+static struct klock g_wm_lock = { 0, "wm", 10, 0, 0, 0, 0, 0 };
 static int g_wm_focus = -1;              /* window index with keyboard focus, or -1     */
 static int g_wm_znext = 1;               /* monotonically increasing z stamp            */
 static int g_wm_drag = -1, g_wm_drag_dx = 0, g_wm_drag_dy = 0;   /* window being dragged */
@@ -12407,7 +12451,7 @@ static void posix_sigcheck_on_return(struct sysframe *sf, uint64_t rv) {
  * could not fully read. */
 #define REDIR_STAGE_MAX 32768
 static uint8_t g_redir_stage[REDIR_STAGE_MAX];
-static struct klock g_redir_lock = { 0, "redir", 0, 0, 0 };
+static struct klock g_redir_lock = { 0, "redir", 0, 0, 0, 0, 0, 0 };
 
 static int64_t redirect_write_bytes(int fd, const void *data, uint32_t len) {
     int vol = VOL_ROOT;
@@ -24137,6 +24181,11 @@ static void shell_run(void) {
      * every log rather than something a future reader has to re-derive. */
     kprintf("[excur  ] BSP thread switches during a live ring-3 excursion: %u\n",
             g_excur_switch);
+    /* v0.75: the three rank-bookkeeping counters, printed every boot so a
+     * verification run reads them straight out of the log instead of inferring
+     * them from the absence of warnings. All three must be 0. */
+    kprintf("[klock  ] rank violations=%u underflow=%u mismatch=%u\n",
+            g_rank_violations, g_rank_underflow, g_rank_mismatch);
     kputs("\nType 'help' for commands, 'demo' for the capability walk-through.\n");
     kputs("outrun> ");
     for (;;) {
