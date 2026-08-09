@@ -2988,6 +2988,28 @@ static int thread_create_ex(const char *name, void (*entry)(void *), void *arg,
         t->id = i; t->name = name; t->entry = entry; t->arg = arg;
         t->cr3 = kernel_cr3; t->stack = g_tstacks[i]; t->wait_tag = 0;
         t->proc = 0; t->uthread = 0; t->rsp0 = 0; t->ksrsp = 0;
+        /* v0.75: RESET THE LOCK-RANK BOOKKEEPING. rank_sp was assigned nowhere
+         * in the tree — not here, not in sched_init, nowhere — so it was correct
+         * only by virtue of g_threads[] being zero-initialised at boot. PCB
+         * slots are RECYCLED (thread_trampoline marks T_FREE, the CAS above
+         * reclaims), so any depth the previous occupant left behind became the
+         * new thread's starting depth, and the ranks under it became ranks the
+         * new thread was considered to be holding.
+         *
+         * A thread that leaves a non-zero depth behind hands its successor a
+         * permanent phantom hold: every acquire that thread ever makes compares
+         * against a rank nothing owns, and reports a violation for a lock that
+         * is demonstrably free. That is the shape of the data in PR #64 — 854 of
+         * 937 violations from one site, all on cpu 0, none of them deadlocking,
+         * and the teardown "inversions" (ipc/gpu/audio/descriptor/net_teardown)
+         * all reported under the same phantom rank 9 because cpu_exec_proc's
+         * exit path calls them one after another on that same thread.
+         *
+         * Zeroing the stack as well as the depth is deliberate: the depth alone
+         * would be enough for correctness, but a stale rank sitting above sp is
+         * exactly what makes a future off-by-one unreadable in a log. */
+        t->rank_sp = 0;
+        for (int r = 0; r < 8; r++) t->rank_stack[r] = 0;
         uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
         t->canary = ((((uint64_t)hi << 32) | lo) * 0x9E3779B97F4A7C15ull)
                     ^ (0xC0FFEE0000ull + (uint64_t)i * 0x100000001B3ull);   /* per-thread entropy */
@@ -3201,6 +3223,18 @@ static void sched_init(void) {
     g_threads[0].cr3 = kernel_cr3; g_threads[0].stack = 0;
     g_threads[0].proc = 0; g_threads[0].uthread = 0;
     g_threads[0].rsp0 = 0; g_threads[0].ksrsp = 0;   /* boot-default trap stacks */
+    /* v0.75: HAND THE RANK BOOKKEEPING OVER, do not restart it. The line below
+     * sets g_sched_on, and that single assignment silently moves cpu 0 from the
+     * per-CPU rank stack to this thread's (see rank_ctx). Anything the boot
+     * context holds at this instant was recorded in the per-CPU stack and will
+     * be RELEASED against the per-thread one, so the depth has to come across or
+     * the release underflows and the acquire is remembered forever on a stack
+     * nothing reads again. Nothing is held here today — sched_init runs from
+     * kernel_main with no lock taken — which is exactly why copying costs
+     * nothing and stops the handover being a latent trap for whoever does take
+     * one before this point. */
+    g_threads[0].rank_sp = g_cpu[0].rank_sp;
+    for (int r = 0; r < 8; r++) g_threads[0].rank_stack[r] = g_cpu[0].rank_stack[r];
     g_cur = 0;
     g_idle_id = thread_create("idle", idle_fn, 0);
     g_sched_on = 1;                           /* cooperative switching live      */
