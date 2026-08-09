@@ -11482,6 +11482,22 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
     if (!sf) return (uint64_t)-1;                       /* no user context: kernel caller */
     int par = (int)current_proc_idx;
     if (par < 0 || par >= n_kproc || !kprocs[par].used) return (uint64_t)-1;
+    /* v0.75 DEFECT C. fork() is a PROCESS operation, so from here on `par` is the
+     * calling thread's group leader, not the slot that happened to make the
+     * syscall. Everything read out of `par` below is process-level — name, caps,
+     * cr3, role, credentials, the break, the process group, the redirections —
+     * and a thread slot carries either a mirror of those or, for heap_brk and
+     * entry, a freshly-reset value that is simply wrong for the process. The
+     * child's REGISTERS still come from `sf`, which is right: the child resumes
+     * where the caller was, and that is genuinely per-thread.
+     *
+     * This is not cosmetic. The guard below reads nthreads, and the LEADER holds
+     * that count — kproc_spawn_thread sets a thread's own nthreads to 0. So on
+     * the raw slot the test was `0 > 1`, false, and a thread of a multi-threaded
+     * process sailed straight past a refusal that exists precisely to stop it,
+     * forking a child parented to a thread slot. Resolving first is what makes
+     * the refusal mean what its comment says. */
+    par = tg_of(par);
     if (kprocs[par].nthreads > 1) return (uint64_t)-11; /* fork from a threaded process: refused, not lied about */
 
     int ch = kproc_spawn(kprocs[par].name, kprocs[par].caps);
@@ -11533,10 +11549,13 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
     klock_acquire(&g_ofile_lock);
     int inherited = 0;
     /* v0.64 Phase 2: the descriptors to hand on are the PROCESS's, so the mask
-     * is read against the thread-group leader. `par` is the calling slot, which
-     * is the leader for an ordinary fork and is not when a thread forks — and
-     * in that case the parent's own bit is unset, so the child would inherit
-     * nothing at all. */
+     * is read against the thread-group leader — v0.64 got here first, by the
+     * route v0.75 defect C generalises: a thread's own bit is never set, so a
+     * forking thread's child would inherit nothing at all.
+     * v0.75: `par` is now already the leader, so this resolves to itself. Kept
+     * as a tg_of() call rather than quietly aliased to `par`, because it states
+     * which identity the fd mask is indexed by, and that is the thing v0.64
+     * discovered the hard way. */
     int par_fds = tg_of(par);
     for (int fd = 0; fd < 16; fd++) {
         if (!g_ofiles[fd].used || !(g_ofiles[fd].owner_mask & (1ull << par_fds))) continue;
@@ -13550,7 +13569,13 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     case 50: {   /* SYS_KILL(pid, signo) -> 0 ok, negative. Permitted targets: SELF, or
                   * a process whose parent is the caller — a real containment property,
                   * not a stub: a ring-3 task cannot signal an unrelated process. */
-        int me = (int)current_proc_idx;
+        /* v0.75 defect C: containment is a property of the PROCESS, so the
+         * caller resolves to its leader — as SYS_SETPGID and SYS_KILLPG already
+         * did. On the raw slot a thread failed `tgt != me` against its own
+         * leader and then failed the parent test too, so a thread could not
+         * signal its own process; and a child forked by the process was not
+         * "its" child from a sibling thread's point of view either. */
+        int me = tg_of((int)current_proc_idx);
         int sg = (int)(int64_t)a1;
         int tgt = -1;
         for (int i = 0; i < n_kproc; i++)
@@ -13558,8 +13583,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (tgt < 0) return (uint64_t)-3;                       /* ESRCH */
         /* v0.75 defect B: this is an AUTHORITY check, so a stale link is worse
          * here than a wrong getppid — it would let a task signal a stranger that
-         * merely inherited its dead parent's slot. */
-        if (tgt != me && ppid_live(tgt) != me) return (uint64_t)-13;  /* EPERM */
+         * merely inherited its dead parent's slot.
+         * v0.75 defect C: compare the TARGET's process too, so naming a thread
+         * of a permitted process is neither a way in nor a spurious refusal. */
+        int tgtL = tg_of(tgt);
+        if (tgtL != me && ppid_live(tgtL) != me) return (uint64_t)-13;  /* EPERM */
         return (uint64_t)(int64_t)sig_raise(tgt, sg);
     }
     case 52: {   /* SYS_THREAD_CREATE(entry, arg, stack) -> the new thread's tid within
@@ -13746,17 +13774,32 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         {
             /* v0.75 defect B: ppid_live() rejects a parent slot that has been
              * recycled since the link was made. The old test was `used`, which
-             * a recycled slot also passes, so this returned a stranger's pid. */
-            int par = ppid_live((int)current_proc_idx);
+             * a recycled slot also passes, so this returned a stranger's pid.
+             * v0.75 defect C: resolved through tg_of() so a thread answers as
+             * its PROCESS, matching getpid() (case 16) and the credential
+             * syscalls. A thread does mirror its leader's parent link, so this
+             * agreed by luck; it now agrees by construction, and stops depending
+             * on that mirror being maintained. */
+            int par = ppid_live(tg_of((int)current_proc_idx));
             return par >= 0 ? kprocs[par].pid : 0;
         }
     case 56: {   /* SYS_WAITPID(pid) -> child's exit code, -11 (EAGAIN) if still running,
                   * -10 (ECHILD) if it is not a child of ours. Non-blocking by design:
                   * this kernel has no sleep/wake queue for ring 3 yet, so a ring-3
                   * waiter polls (which is what the pthread shim does too). */
-        int me = (int)current_proc_idx;
+        /* v0.75 defect C: waiting is a PROCESS operation. `me` is the caller's
+         * thread-group leader, so any thread of a process can reap that
+         * process's children — the whole point of the defect — and a child
+         * forked before the process grew threads is still matched. */
+        int me = tg_of((int)current_proc_idx);
         for (int i = 0; i < n_kproc; i++) {
             if (!kprocs[i].used || kprocs[i].pid != (uint32_t)a0) continue;
+            /* v0.75 defect C: and only a PROCESS is waitable. Without this a
+             * thread's pid — distinct from its leader's, and carrying the
+             * leader's inherited parent link — would match here and report a
+             * thread's exit as if a child process had ended. Threads are joined,
+             * not waited on. */
+            if (tg_of(i) != i) continue;
             /* v0.75 defect B: a stale link must read as ECHILD, not as a match.
              * ppid_live() returns -1 for a recycled parent, and `me` is a valid
              * slot index, so the comparison rejects it. */
@@ -19227,6 +19270,11 @@ static void px_sample(int *procs, int nproc, struct px_round *R) {
     for (int i = 0; i < n_kproc; i++) {
         struct kproc *k = &kprocs[i];
         if (!k->used) continue;
+        /* v0.75 defect C: fork produces PROCESSES, so only leaders are counted
+         * as children. A thread inherits its leader's parent link, so a child
+         * that went on to create threads would otherwise have each of them
+         * counted as a separate child of the same worker. */
+        if (tg_of(i) != i) continue;
         /* v0.75: ppid_live() resolves the (slot, generation) pair, so a previous
          * round's child pointing at a slot this round's workers now occupy no
          * longer resolves at all. This used to read k->ppid_slot raw and lean on

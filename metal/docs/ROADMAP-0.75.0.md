@@ -126,6 +126,16 @@ and B (an index used as an identity), and because `posixstrs` runs twelve
 threads per round, so the day something forks or waits from a thread it becomes
 real.
 
+> **Correction, made while fixing it:** "latent rather than active" was wrong.
+> `sys_fork`'s own guard, `if (kprocs[par].nthreads > 1) return -11;`, reads the
+> raw slot as well — and `kproc_spawn_thread` sets a thread's own `nthreads` to
+> **0**, because the leader holds the count. On a thread the test was therefore
+> `0 > 1`, false, so a thread of a multi-threaded process walked straight past
+> the refusal that exists to stop it and forked a child parented to a thread
+> slot. Nothing exercised it only because nothing in the tree forks from a
+> thread yet; it was reachable from ring 3 the whole time. See the PHASE 1
+> RESULT section for what was done.
+
 ## INSTRUMENTATION PLAN
 
 Ordered so that each step either proves or kills a hypothesis before any fix is
@@ -257,11 +267,29 @@ change makes `sys_fork` consistent with it.
   merely inherited its dead parent's slot. `posixstrs` drops its pid-monotonicity
   workaround and asks the kernel directly — that workaround depended on pids
   being unique, i.e. on defect A never firing.
-- **C (raw slot vs `tg_of()`)** — untouched, still latent, still on the list.
-  Deliberately out of scope here: it is an identity-resolution question
-  (which slot *is* the caller) rather than a staleness one, and `sys_fork` writes
-  the raw slot too, so the two agree today. It becomes real the day something
-  forks or waits from a non-leader thread.
+- **C (raw slot vs `tg_of()`)** — **FIXED**, and it was not latent. Every
+  identity decision on the fork/wait/signal paths now resolves through `tg_of()`,
+  matching `getpid` (case 16), `fd_owner()` and the credential accessors:
+  - `sys_fork` resolves `par` to the leader immediately after its bounds check,
+    so the `nthreads > 1` refusal reads the count from the slot that holds it.
+    This was the live bug — on a thread the test was `0 > 1` and a threaded
+    process could fork after all. Everything else `sys_fork` copies is
+    process-level and now comes from the leader too; the child's registers still
+    come from `sf`, which is correctly per-thread.
+  - `SYS_GETPPID` and `SYS_WAITPID` resolve the caller to its leader, so any
+    thread can reap the process's children. `waitpid` additionally matches only
+    thread-group leaders: a thread's pid is distinct and carries the leader's
+    inherited parent link, so without that filter a thread's exit could be
+    reported as a child process ending. Threads are joined, not waited on.
+  - `SYS_KILL` resolves both caller and target to their leaders, as
+    `SYS_SETPGID` and `SYS_KILLPG` already did.
+  - `posixstrs`' child accounting counts leaders only, so a child that created
+    threads is one child rather than several.
+
+  **What this does NOT do:** fork from a multi-threaded process is still
+  refused, and now refused correctly rather than by accident of which slot was
+  asked. Allowing it is a separate feature — POSIX gives the child only the
+  calling thread — and is not what defect C describes.
 
 The scaffolding for both A and B was removed rather than left half-wired; the
 findings are recorded in comments at `struct kproc` and at `g_next_pid`.
