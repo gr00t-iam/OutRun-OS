@@ -3158,8 +3158,25 @@ static void klock_acquire(struct klock *l) {
     uint8_t *sp, *st = rank_ctx(&sp);                  /* our context's stack;  */
     if (*sp > 0 && st[*sp - 1] >= l->rank) {           /* still ours after any  */
         __sync_fetch_and_add(&g_rank_violations, 1);   /* yield below — a yield */
-        kprintf("[klock  ] RANK VIOLATION: acquiring '%s' (rank %d) while holding rank %d\n",
-                l->name, (uint64_t)l->rank, (uint64_t)st[*sp - 1]);
+        /* v0.75: the CALLER. "acquiring net while holding net" names the lock
+         * and not the path, and the path is the whole question when one lock is
+         * reachable from the timer scan, the receive path, several syscalls and
+         * the suite itself. A previous attempt at this bug guessed the path from
+         * reading and was disproven by a 20-boot run; this is the datum that
+         * would have settled it in one. Resolve with nm/addr2line on the ELF.
+         *
+         * Also prints the whole held-rank stack, because with more than two
+         * locks involved "while holding rank 9" does not say what else is held
+         * underneath it — and a rank INVERSION (taking rank 1 under rank 9) is a
+         * different bug from re-entrancy on the same lock. */
+        kprintf("[klock  ] RANK VIOLATION: acquiring '%s' (rank %d) while holding rank %d "
+                "| caller=%X cpu=%u depth=%u held=[%d %d %d %d %d %d %d %d]\n",
+                l->name, (uint64_t)l->rank, (uint64_t)st[*sp - 1],
+                (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx(), (uint64_t)*sp,
+                (uint64_t)(int64_t)st[0], (uint64_t)(int64_t)st[1],
+                (uint64_t)(int64_t)st[2], (uint64_t)(int64_t)st[3],
+                (uint64_t)(int64_t)st[4], (uint64_t)(int64_t)st[5],
+                (uint64_t)(int64_t)st[6], (uint64_t)(int64_t)st[7]);
     }                                                  /* resumes THIS thread   */
     if (__sync_lock_test_and_set(&l->v, 1)) {
         __sync_fetch_and_add(&l->contended, 1);
