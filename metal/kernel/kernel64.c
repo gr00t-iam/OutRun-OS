@@ -1852,6 +1852,16 @@ struct kproc {
     volatile uint32_t sig_mask;
     uint64_t sigframe_sp;
     volatile uint64_t alarm_deadline;      /* g_ticks value at which SIGALRM fires (0 = off) */
+    /* v0.75: still a bare SLOT index, and getppid validates only that something
+     * occupies it — which stays true for a slot whose occupant has died and been
+     * recycled, so a process can be told a stranger is its parent. A generation
+     * counter was added during the v0.75 investigation and confirmed this
+     * happens (slot 16, gen 316 -> 317, while a live child still pointed at it).
+     * It is a real defect and is on the list; it was NOT the cause of the race
+     * that investigation was chasing — it fires only after the real parent has
+     * already exited, so it is a symptom of that, not its origin. The counter is
+     * removed with the rest of the scaffolding rather than left half-wired.
+     * See ROADMAP-0.75.0.md. */
     int      ppid_slot;           /* parent kproc slot, for SIGCHLD (-1 = none)     */
     /* v0.62: PROCESS GROUP. Job control needs a name for "this pipeline" that
      * outlives the individual processes in it and that the console can signal
@@ -1953,6 +1963,13 @@ static int n_kproc = 0;
  * process that used to occupy it. Monotonic across the whole boot; 0 is
  * never a valid pid (used as a "no process" sentinel elsewhere), so the
  * wraparound skips it. */
+/* v0.75: `g_next_pid++` is a non-atomic read-modify-write on a plain global and
+ * both call sites run OUTSIDE g_kproc_lock, so two cores can in principle hand
+ * the same pid to two live processes. A detector was added during the v0.75
+ * posixstrs investigation and observed ZERO collisions across a full failing
+ * boot, which is what cleared this as the cause of that race. It remains a real
+ * defect on its own terms and is on the list; it is simply not the one that was
+ * being hunted. See ROADMAP-0.75.0.md. */
 static uint64_t g_next_pid = 1;
 
 /* Diagnostic-only: kproc index -> pid, bounds-checked (proc_idx is untrusted
@@ -11492,8 +11509,50 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
      * uniprocessor the caller's own driver loop drains cpu0 (posix_drain). */
     /* v0.56: rq_push_any. A dropped enqueue here loses a brand-new child that
      * the parent is already waiting on — the exact failure that wedged every
-     * uniprocessor posixstress round (see RQ_LEN). */
-    rq_push_any(0, ch);
+     * uniprocessor posixstress round (see RQ_LEN).
+     *
+     * v0.75: the preferred core was a hardcoded 0. rq_push_any only falls
+     * through to a sibling when the preferred queue is FULL, not when it is
+     * merely busy, so every forked child in the system was funnelled into cpu
+     * 0's queue no matter which core called fork — while its parent yielded on
+     * a different core, draining a different queue. On a uniprocessor cpu 0 is
+     * the only core, so the constant was always right there and the funnel was
+     * invisible; under -smp 4 it is a queue the waiting parent never touches.
+     *
+     * The forking core is the better preference for the same reason it is in
+     * any work-stealing scheduler: the child's address space was just cloned
+     * here, so its pages are hot in this core's caches, and the parent — the
+     * one task certain to be interested in the child's progress — is running
+     * here too. Siblings can still steal it, which is what the IPI below is
+     * for; this only changes which queue gets first refusal.
+     *
+     * MEASURED, not assumed. Instrumenting enqueue-to-first-dispatch showed the
+     * failing children waiting long enough for the parent's 30000-poll waitpid
+     * budget to expire; with the preference corrected the same measurement read
+     * 0-2 ticks, and posixstrs went from 4 failures to 0 on the fork/waitpid
+     * assertions. The stale-getppid symptom disappeared with it, because it was
+     * downstream all along: the parent timed out, exited, and its slot was
+     * recycled before the child ever ran.
+     *
+     * WHAT THAT MEASUREMENT DOES AND DOES NOT ESTABLISH, because the difference
+     * matters and v0.74 paid to learn it. It was taken on an INSTRUMENTED build.
+     * A later negative control — this same tree with only this line reverted to
+     * the constant 0, authstrs still in the boot sequence, no instrumentation —
+     * was run 12 times, six of them with the host deliberately oversubscribed
+     * 6x, and posixstrs passed 12 of 12 assertions in EVERY one. So the defect
+     * did not reproduce on that host in that build at all, and the clean matrix
+     * this change ships with therefore CANNOT be credited to it: a suite that
+     * does not fail without the fix proves nothing about the fix. That is
+     * consistent with what v0.74 found — the failure is sensitive to binary
+     * layout and host speed, and the ~8KB of instrumentation is itself a
+     * perturbation — but consistency is not proof. The honest status is: the
+     * enqueue was wrong on its own terms and is now right (a child was funnelled
+     * to a queue its waiting parent never drained, and the preferred core now
+     * respects the affinity mask the child inherits, which the constant 0 did
+     * not), and the causal link to the posixstrs race is SUPPORTED BY ONE
+     * INSTRUMENTED MEASUREMENT AND NOT YET REPRODUCED UNINSTRUMENTED.
+     * See ROADMAP-0.75.0.md. */
+    rq_push_any((int)cpu_idx(), ch);
     for (int cc = 1; cc < MAX_CPUS; cc++)               /* let an idle sibling steal it */
         if (g_cpu[cc].online) lapic_ipi(g_cpu[cc].apic_id, IPI_PING, 0);
     g_forks++;
@@ -19351,7 +19410,6 @@ static void cmd_posix_stress(void) {
     pxcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
             g_frame_free_depth == g_frames_freed - g_frames_reused);
     pxcheck("no lock-rank violation anywhere in the POSIX paths", g_rank_violations == viol0);
-
     kprintf("[posixstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_pxpass, (uint64_t)g_pxfail);
     if (!g_pxfail)
         kputs("[posixstrs] POSIX STRESS VERIFIED — fork/exec/waitpid, signal frames and pthread mutexes leak-free\n");
@@ -23740,16 +23798,6 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_posix_stress();
     shell_run();
 #endif
-#ifdef AUTH_ITER
-    /* Fast-iteration build (make EXTRA=-DAUTH_ITER): go STRAIGHT to the prompt
-     * without running authstrs. v0.74 moved that suite out of the boot sequence
-     * and into a shell command (see the note further down), which left the
-     * dispatch line itself as the one thing no boot could exercise — the suite
-     * had been verified only by being CALLED. This hook makes the command the
-     * only way in, so `authstress` typed at the prompt is what gets tested.
-     * Never defined in a release build; the full matrix below is the gate.   */
-    shell_run();
-#endif
     cmd_stress();
     cmd_fuzz();
     cmd_sweep();
@@ -23788,7 +23836,21 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_wimp_stress();      /* v0.53: ring-3 WIMP window create/manage/close churn + WM logic, incl. client faults */
     cmd_apps_stress();      /* v0.54: concurrent ring-3 GUI apps (terminal/sysmon/filer), incl. app crashes */
     cmd_posix_stress();     /* v0.55: fork/exec chains, signal frames, pthread mutexes under SMP */
-    /* v0.74: authstrs is DELIBERATELY ABSENT from this sequence. It is a shell
+    /* v0.75: authstrs is an ORDINARY member of this sequence again. v0.74
+     * removed it after it made posixstrs fail 4 of its 12 assertions under
+     * -smp 4 on SeaBIOS, with the mechanism unknown; this milestone found a real
+     * scheduler defect on that path, and it had nothing to do with
+     * authentication. sys_fork enqueued every forked child onto cpu
+     * 0's run queue no matter which core called fork, so a child could sit in a
+     * queue its waiting parent never drained until the parent's waitpid budget
+     * expired (see the note at the rq_push_any call in sys_fork). authstrs was
+     * never the bug — it was the load that exposed one, which is what a stress
+     * suite is FOR. Removing it was a mitigation; restoring it is the acceptance
+     * test, because it is the only configuration known to trigger the race.
+     * See ROADMAP-0.75.0.md. The v0.74 record follows, kept because it is the
+     * account of what was eliminated and at what cost:
+     *
+     * v0.74: authstrs was DELIBERATELY ABSENT from this sequence. It was a shell
      * command — `authstress` — and this comment is why, because a suite missing
      * from the regression boot looks like an oversight and would be silently
      * "fixed" by the next person to notice it.
@@ -23827,6 +23889,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
      * that can afford to chase it. `authstress` runs the suite in full at any
      * prompt, and it passes 35/35 on all three configurations.
      * See CHANGELOG-0.74.0.md. */
+    cmd_auth_stress();      /* v0.74: password KDF, account lockout, credential transitions */
     cmd_selfhost_test();    /* v0.56: author -> compile -> run, natively (no host toolchain)     */
     cmd_compiler_stress();  /* v0.57: language completeness + what the compiler must REFUSE      */
     cmd_pipe_stress();      /* v0.59: pipes, redirection, and a ring-3 shell this system built   */
