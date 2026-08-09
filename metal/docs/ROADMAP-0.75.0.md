@@ -195,9 +195,143 @@ boots at ~1 hour each:
 
 They stay available if steps 1–3 come back empty.
 
+## PHASE 1 RESULT — WHAT WAS ACTUALLY FOUND
+
+The instrumentation plan above was followed and it did not land where the
+analysis predicted. This section is the correction; the analysis is left intact
+above rather than rewritten, because what it eliminated is as much the result as
+what it found.
+
+### The defect: fork enqueued every child onto cpu 0
+
+`sys_fork` ended with a hardcoded preferred core:
+
+```c
+    rq_push_any(0, ch);          /* was */
+    rq_push_any((int)cpu_idx(), ch);   /* is */
+```
+
+`rq_push_any` falls through to a sibling only when the preferred queue is
+**full**, not when it is merely busy. Every forked child in the system was
+therefore funnelled into cpu 0's run queue no matter which core called `fork` —
+while its parent yielded on a different core, draining a different queue. On a
+uniprocessor cpu 0 is the only core, so the constant was always right and the
+funnel was invisible; under `-smp 4` it is a queue the waiting parent never
+touches.
+
+Two independent reasons this line was wrong regardless of the race:
+
+1. **Locality.** The child's address space was just cloned on the forking core
+   and the parent — the one task certain to care — is running there.
+2. **Affinity.** A child inherits its parent's affinity mask
+   (`kprocs[ch].affinity = kprocs[par].affinity`), and `rq_push_any` does **not**
+   check affinity for its *preferred* core, only for the siblings it falls back
+   to. A parent pinned to cpu 2 forking a child that inherits that pin had the
+   child pushed to cpu 0 — outside its own mask. The forking core is by
+   construction inside the mask, so the new preference is affinity-correct where
+   the constant was not.
+
+`rq_push_any((int)cpu_idx(), p)` is already the idiom used by the futex wake
+path (`kernel/kernel64.c`, the `rq_push_any` call in the futex requeue); this
+change makes `sys_fork` consistent with it.
+
+### Status of defects A, B and C
+
+- **A (non-atomic `g_next_pid`)** — a duplicate-pid detector was added per step 1
+  and observed **zero collisions across a full failing boot**. Not the cause.
+  Still a real defect: a non-atomic RMW on a plain global handing out identities,
+  with both call sites outside `g_kproc_lock`. Still on the list, unfixed.
+- **B (`ppid_slot` has no generation counter)** — a generation counter was added
+  per step 3 and **confirmed stale resolution happens** (slot 16, gen 316→317,
+  while a live child still pointed at it). But it fires only *after* the real
+  parent has already exited, which makes it a symptom of the timeout rather than
+  its origin. Still a real defect, still on the list, unfixed.
+- **C (raw slot vs `tg_of()`)** — untouched, still latent, still on the list.
+
+The scaffolding for both A and B was removed rather than left half-wired; the
+findings are recorded in comments at `struct kproc` and at `g_next_pid`.
+
+### VERIFICATION — AND WHAT IT DOES NOT SHOW
+
+Read this section before citing the clean matrix as evidence the race is cured,
+because it is not.
+
+Twenty-one boots, all reaching the shell prompt, each from a freshly created
+disk image. Two builds, differing **only** in the one line above (kernel ELF
+md5 `09377b34…` fixed, `03a92f9f…` reverted):
+
+| build | runs | posixstrs |
+|---|---|---|
+| fixed | 9 (5 smp4-bios, 3 smp4-iommu, 1 uni) | 12/12 every run (11/11 uni) |
+| reverted (negative control) | 12 (10 smp4-bios, 2 smp4-iommu), 6 of them with the host oversubscribed 6x | 12/12 every run |
+
+Three-config matrix on the fixed build, uncontended, **0 FAIL**:
+
+| configuration | suites | failed |
+|---|---|---|
+| uniprocessor | 44 | **0** |
+| `-smp 4`, SeaBIOS | 44 | **0** |
+| `-smp 4`, q35 + VT-d | 46 | **0** |
+
+`authstrs` is inside those counts — it is back in the boot sequence, which was
+the acceptance test Tier 1 asked for.
+
+**The negative control did not reproduce the defect.** With the fix reverted and
+`authstrs` in the boot sequence — the configuration v0.74 recorded as failing
+roughly 3 runs in 4 — posixstrs passed 12 of 12 assertions in all twelve runs,
+including six under 6x host oversubscription deliberately intended to slow the
+guest the way v0.74's slow host did. A suite that does not fail without the fix
+cannot certify the fix. The clean matrix above establishes **no regression**, not
+a cure.
+
+The one measurement that does support the causal claim was taken on an
+INSTRUMENTED build: enqueue-to-first-dispatch showed failing children waiting
+past the parent's 30000-poll `waitpid` budget, and 0–2 ticks once the preference
+was corrected, with posixstrs going 4 failures → 0. v0.74 established that this
+failure is sensitive to binary layout and host speed, and instrumentation is
+itself ~8KB of perturbation — so the instrumented build reproducing while the
+uninstrumented one does not is *consistent*, but consistency is not proof.
+
+Honest status: **the enqueue was wrong on its own terms and is now right; the
+causal link to the posixstrs race rests on a single instrumented measurement and
+has not been reproduced uninstrumented.**
+
+### TWO PRE-EXISTING DEFECTS THIS EXPOSED (neither caused by the fix)
+
+Both were reproduced on the **reverted** build under the same load, which is what
+rules the fix out as their cause. Both need only a sufficiently slow host, and
+neither appears in any committed v0.73/v0.74 log (all of which show zero).
+
+1. **`g_net_lock` is re-entered under load.** `[klock] RANK VIOLATION: acquiring
+   'net' (rank 9) while holding rank 9`, in bursts (84 and 976 occurrences on the
+   fixed build; 873 on the reverted one), clustering at the TCP retransmission
+   test and failing `[tcpstrs] no lock-rank violation across the TCP paths`. Two
+   paths take `g_net_lock` at top level — `net_rx_tcp` (NIC bottom half) and
+   `tcp_timer_scan` (idle path) — and each documents that it must be entered
+   without the lock held. One violation is a rank *inversion* (`ofile` rank 1
+   taken while holding rank 9), consistent with re-entering an fd path from
+   inside the net lock. Only observed on `-smp 4` + VT-d so far.
+2. **Toolchain suites time out under contention.** `[langstrs] 8 passed, 2
+   failed` (`exit 970`, the driver's compile-run-validate step), plus
+   `[toolstrs]` and `[pipestrs]` failures at 6x oversubscription with the
+   explicit message `TIMED OUT waiting for the compiler`. These are wall-clock
+   budgets in the self-hosting suites, not correctness failures, but they are
+   what will break a regression run on a loaded machine.
+
+Neither is in scope for the fork fix and neither is fixed here.
+
 ## MILESTONE PLAN
 
 ### Tier 1 — the race, and restoring the suite
+
+> **Status:** steps 1 and 2 are done and step 4 is done (`authstrs` is back in the
+> boot sequence, the `AUTH_ITER` hook is gone, and the three-config matrix is at
+> 0 FAIL). Step 3 is **NOT satisfied**: three consecutive clean smp4-bios runs
+> were obtained, but so were twelve clean runs with the fix reverted, so the runs
+> do not distinguish "fixed" from "did not fire". See PHASE 1 RESULT above. What
+> Tier 1 still needs is a configuration that reproduces the failure without
+> instrumentation — the most likely lever, per v0.74, is a slower host or a
+> different binary layout, not more runs on this one.
 
 1. **Instrument** per steps 1–3 above. One boot per step on smp4-bios; the
    failure reproduces in roughly 3 runs out of 4 with `authstrs` in the boot
