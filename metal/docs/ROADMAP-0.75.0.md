@@ -354,6 +354,18 @@ neither appears in any committed v0.73/v0.74 log (all of which show zero).
    without the lock held. One violation is a rank *inversion* (`ofile` rank 1
    taken while holding rank 9), consistent with re-entering an fd path from
    inside the net lock. Only observed on `-smp 4` + VT-d so far.
+
+   > **Escalated, measured during the Tier 2 work.** It is no longer
+   > contention-only and no longer IOMMU-only: on `-smp 4` SeaBIOS with a single
+   > guest and an idle host it now reproduces in **3 runs out of 5**. Ten runs,
+   > alternating the Tier 2 build against `origin/main` so any host drift hit
+   > both arms equally, gave the SAME distribution for each: 1 clean, 3 with the
+   > tcpstrs rank-violation failure, 1 panic (below). So it is squarely in
+   > `main` and nothing in Tier 2 touches it — but it means **`main` currently
+   > does not meet the release gate on this configuration**, which matters more
+   > than where it was first seen. Whatever changed is host- or timing-related,
+   > since the same tree ran this config clean five times earlier in the
+   > milestone.
 2. **Toolchain suites time out under contention.** `[langstrs] 8 passed, 2
    failed` (`exit 970`, the driver's compile-run-validate step), plus
    `[toolstrs]` and `[pipestrs]` failures at 6x oversubscription with the
@@ -361,7 +373,25 @@ neither appears in any committed v0.73/v0.74 log (all of which show zero).
    budgets in the self-hosting suites, not correctness failures, but they are
    what will break a regression run on a loaded machine.
 
-Neither is in scope for the fork fix and neither is fixed here.
+3. **An intermittent page-fault panic late in the `-smp 4` boot.** Found during
+   the Tier 2 work, on `origin/main` and on the Tier 2 branch alike, once each
+   across five runs of each build:
+
+   ```
+   [panic ] CPU EXCEPTION 14: Page Fault (err=0) at rip=0000000000122cb8
+   [panic ] system halted — the fault was contained to this core
+   ```
+
+   It lands after ~38 suites, around the final ring-3 `user_init.elf` stage, and
+   the guest halts without reaching the prompt — so a run that hits it is not a
+   failing matrix, it is an ABSENT one, and any harness that waits for the shell
+   banner will sit there until its timeout rather than reporting anything. `err=0`
+   means a not-present page on a read, in kernel context. Not diagnosed. This is
+   the most serious open item in this file: the other two produce a wrong answer,
+   this one stops the machine.
+
+Neither the net-lock re-entrancy nor the toolchain budgets is in scope for the
+fork fix, and none of the three is fixed here.
 
 ## MILESTONE PLAN
 
@@ -400,6 +430,28 @@ Neither is in scope for the fork fix and neither is fixed here.
    other. `udb_kdf()` is the only function that changes; the schema, both
    syscalls, the lockout and all 35 `authstrs` assertions stay as they are —
    that was the stated point of building the structure first.
+
+   > **Status: the PRIMITIVE is landed and verified; the KDF is NOT yet wired.**
+   > This is the ordering the item asks for, split into two steps on purpose.
+   >
+   > `sha256_init/update/final` plus a one-shot `sha256()` wrapper sit in their
+   > own section ahead of the user database. `shastrs` runs before `authstrs` in
+   > the boot sequence (and as `shastress` at the prompt) and asserts the FIPS
+   > 180-4 / CAVP digests verbatim — empty, `"abc"`, the 56-byte B.2 message
+   > whose padding spills into a second block, the 112-byte CAVP message, and
+   > B.3's one million `'a'` streamed. Because a one-shot vector test cannot see
+   > a partial-block carry bug, it also asserts that chunked `update()` equals
+   > one-shot across every length 0..200 × chunk 1..17 (3417 splits).
+   >
+   > Independently cross-checked on the host: the section was extracted verbatim
+   > from `kernel64.c`, compiled natively, and matched against coreutils
+   > `sha256sum` on the published vectors, 1 KiB and 100 KiB of urandom, and 201
+   > random messages covering every length 0..200. All match.
+   >
+   > **Next step:** point `udb_kdf()` at it. `authstrs` is 35/35 today with
+   > FNV-1a; after the swap it must be 35/35 again, and if it is not, `shastrs`
+   > being green says the hash is fine and the KDF is not. That is the whole
+   > reason these are two commits.
 6. **Persist the user database.** In-memory today, so no account survives a
    boot. Needs an on-disk format and a decision the CAS design forces: the
    volume is content-addressed with no timestamps, so a password change must not
