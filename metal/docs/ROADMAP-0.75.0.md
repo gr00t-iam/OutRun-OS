@@ -431,8 +431,57 @@ fork fix, and none of the three is fixed here.
    syscalls, the lockout and all 35 `authstrs` assertions stay as they are —
    that was the stated point of building the structure first.
 
-   > **Status: the PRIMITIVE is landed and verified; the KDF is NOT yet wired.**
-   > This is the ordering the item asks for, split into two steps on purpose.
+   > **Status: DONE.** Landed as the two attributable steps this item asks for —
+   > the primitive first, verified on its own, then the KDF pointed at it.
+   >
+   > **Step 2 (the swap).** `udb_kdf()` is now **PBKDF2-HMAC-SHA-256**
+   > (RFC 8018), c = `UDB_KDF_ROUNDS` = 4096, dkLen = 32. PBKDF2 rather than the
+   > old four-lane shape ported onto SHA-256, for one reason: a bespoke KDF can
+   > only ever be checked against itself, whereas PBKDF2 has published vectors
+   > and independent implementations to check against. Every property the v0.74
+   > design comment claimed is preserved by the standard instead of by argument —
+   > the U-chain is serial so the work factor cannot be parallelised within a
+   > candidate, and the password is the HMAC key on every iteration so no
+   > attacker precomputes past the input and amortises the rounds across guesses.
+   > `HMAC-SHA-256` (RFC 2104) was added because PBKDF2 is defined over a PRF.
+   >
+   > **No truncation anywhere.** dkLen equals the PRF output equals
+   > `UDB_HASH_LEN` equals 32, so the derived key is one whole HMAC output with
+   > nothing discarded and no multi-block concatenation. `shastrs` asserts
+   > `UDB_HASH_LEN == SHA256_DIGEST` so a future schema change cannot silently
+   > start truncating.
+   >
+   > **`udb_kdf()` really was the only function that changed.** `UDB_MAX`,
+   > `UDB_NAME_MAX`, `UDB_SALT_LEN`, `UDB_HASH_LEN`, `UDB_KDF_ROUNDS`,
+   > `UDB_MAX_FAILS`, `struct udbent`, `udb_make_salt()`, `udb_ct_eq()`,
+   > `udb_add()`, `udb_auth()`, the lockout state machine and both syscalls are
+   > untouched — and **all 35 `authstrs` assertions still pass, unmodified and
+   > still numbering 35.** The digests they compare are different values now, but
+   > none of them ever asserted a value; they assert relationships (same input →
+   > same digest, different salt → different digest, one character changes it),
+   > which is precisely what made the primitive swappable.
+   >
+   > **Verification of the swap:** `shastrs` grew from 9 to 19 assertions —
+   > RFC 4231 HMAC test cases 1, 2, 3 and 6 (6 being the longer-than-block key
+   > that exercises the hash-the-key branch), the published PBKDF2-HMAC-SHA256
+   > `"password"`/`"salt"` series at c=1, c=2 and c=4096 (c=2 is what catches an
+   > implementation returning `Uc` instead of `U1^...^Uc`), and `udb_kdf()`
+   > itself end to end against digests from an independent implementation.
+   > Separately, HMAC, PBKDF2 **and `udb_kdf()` itself** were extracted verbatim
+   > from `kernel64.c`, compiled natively and diffed against CPython/OpenSSL's
+   > `hashlib`: 11 of 11 values bit-identical.
+   >
+   > Uniprocessor boot: **45 suites, 0 FAIL**, `authstrs` 35/35, `shastrs` 19/19.
+   > The KDF costs ~15s of extra boot time across the whole suite, which is a
+   > work factor doing its job.
+   >
+   > **Still not done, and still the honest next step:** PBKDF2 is *not*
+   > memory-hard. It buys serial CPU cost only, so GPUs and ASICs still enjoy a
+   > large advantage over a defender, and 4096 iterations is modest by modern
+   > standards. The "then Argon2 or scrypt over it" half of the v0.74 sentence
+   > remains open.
+   >
+   > *(Historical note: the status below described step 1 alone.)*
    >
    > `sha256_init/update/final` plus a one-shot `sha256()` wrapper sit in their
    > own section ahead of the user database. `shastrs` runs before `authstrs` in
@@ -452,12 +501,44 @@ fork fix, and none of the three is fixed here.
    > FNV-1a; after the swap it must be 35/35 again, and if it is not, `shastrs`
    > being green says the hash is fine and the KDF is not. That is the whole
    > reason these are two commits.
+   >
+   > *(Done — see the DONE status above. It was 35/35 again, and the split paid
+   > for itself in an unexpected way: the first cross-check run came back with
+   > one of eleven values wrong, and because the primitive vectors were separate
+   > it was immediately clear the failure was a transcribed message length in the
+   > TEST — RFC 4231 TC6's message is 54 bytes, not 53 — and not the HMAC.)*
 6. **Persist the user database.** In-memory today, so no account survives a
    boot. Needs an on-disk format and a decision the CAS design forces: the
    volume is content-addressed with no timestamps, so a password change must not
    be inferable from dedup behaviour — two accounts with the same password
    already produce different digests (per-user salts), which helps, but the file
    as a whole wants thought before it is written.
+
+### WHERE v0.75 STANDS
+
+| item | state |
+|---|---|
+| Tier 1 · defect A — non-atomic `g_next_pid` | **done** (`pid_alloc`, atomic RMW) |
+| Tier 1 · defect B — stale `ppid_slot` | **done** ((slot, generation) + `ppid_live()`) |
+| Tier 1 · defect C — raw slot vs `tg_of()` | **done**, and it was not latent |
+| Tier 1 · the fork enqueue funnel | **fixed**, causality NOT reproduced uninstrumented |
+| Tier 1 · step 3, three clean smp4-bios runs | **NOT satisfied** — see PHASE 1 RESULT |
+| Tier 2 · item 5, SHA-256 + KDF | **done** — primitive and KDF, both vector-verified |
+| Tier 2 · item 6, persist the user database | **not started** |
+
+Open defects found along the way, none of them fixed, in the order they should
+be taken seriously:
+
+1. **The intermittent `-smp 4` page-fault panic.** It stops the machine and
+   produces no matrix at all. Present in `main` independent of any Tier 2 work.
+2. **`g_net_lock` re-entrancy**, now reproducing uncontended on smp4-bios 3 runs
+   in 5 — which is why `main` does not currently meet the release gate there.
+3. **Toolchain suites' wall-clock budgets** on a loaded host.
+
+The next milestone-shaped piece of work is Tier 2 item 6 (persistence). The next
+CORRECTNESS-shaped piece is (1) above, and it should probably come first: a
+release gate cannot mean anything while one configuration in three intermittently
+halts before reaching the prompt.
 
 ### Explicitly deferred past v0.75
 
