@@ -239,14 +239,29 @@ change makes `sys_fork` consistent with it.
 
 - **A (non-atomic `g_next_pid`)** — a duplicate-pid detector was added per step 1
   and observed **zero collisions across a full failing boot**. Not the cause.
-  Still a real defect: a non-atomic RMW on a plain global handing out identities,
-  with both call sites outside `g_kproc_lock`. Still on the list, unfixed.
+  **FIXED** on its own terms: both spawn sites now call `pid_alloc()`, a single
+  `__sync_fetch_and_add`. The old wrap guard (`if (!g_next_pid) g_next_pid = 1;`)
+  was itself racy — two cores wrapping together would both store 1 and both hand
+  out 1 — and is replaced by a per-caller retry that skips a zero without ever
+  writing the counter back.
 - **B (`ppid_slot` has no generation counter)** — a generation counter was added
   per step 3 and **confirmed stale resolution happens** (slot 16, gen 316→317,
-  while a live child still pointed at it). But it fires only *after* the real
-  parent has already exited, which makes it a symptom of the timeout rather than
-  its origin. Still a real defect, still on the list, unfixed.
+  while a live child still pointed at it). It fires only *after* the real parent
+  has already exited, which makes it a symptom of the timeout rather than its
+  origin. **FIXED**: the parent link is now a (slot, generation) pair. `gen` is
+  bumped by `kproc_reset` on every recycle, `ppid_gen` records the parent's
+  generation when the link was made, and `ppid_live()` is the only sanctioned
+  resolver — every reader goes through it, including the three signal-authority
+  checks (`SYS_KILL`, `SYS_SETPGID`, `SYS_KILLPG`), where a stale link was worse
+  than a wrong `getppid` because it granted a task authority over a stranger that
+  merely inherited its dead parent's slot. `posixstrs` drops its pid-monotonicity
+  workaround and asks the kernel directly — that workaround depended on pids
+  being unique, i.e. on defect A never firing.
 - **C (raw slot vs `tg_of()`)** — untouched, still latent, still on the list.
+  Deliberately out of scope here: it is an identity-resolution question
+  (which slot *is* the caller) rather than a staleness one, and `sys_fork` writes
+  the raw slot too, so the two agree today. It becomes real the day something
+  forks or waits from a non-leader thread.
 
 The scaffolding for both A and B was removed rather than left half-wired; the
 findings are recorded in comments at `struct kproc` and at `g_next_pid`.
