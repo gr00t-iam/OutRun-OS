@@ -1852,17 +1852,30 @@ struct kproc {
     volatile uint32_t sig_mask;
     uint64_t sigframe_sp;
     volatile uint64_t alarm_deadline;      /* g_ticks value at which SIGALRM fires (0 = off) */
-    /* v0.75: still a bare SLOT index, and getppid validates only that something
-     * occupies it — which stays true for a slot whose occupant has died and been
-     * recycled, so a process can be told a stranger is its parent. A generation
-     * counter was added during the v0.75 investigation and confirmed this
-     * happens (slot 16, gen 316 -> 317, while a live child still pointed at it).
-     * It is a real defect and is on the list; it was NOT the cause of the race
-     * that investigation was chasing — it fires only after the real parent has
-     * already exited, so it is a symptom of that, not its origin. The counter is
-     * removed with the rest of the scaffolding rather than left half-wired.
+    /* v0.75 DEFECT B, FIXED. ppid_slot is a SLOT INDEX, and slots are recycled.
+     * Every reader used to validate it with `kprocs[par].used`, which stays true
+     * for a slot whose occupant died and was replaced — so a process could be
+     * told a stranger was its parent, and, worse, could be granted authority
+     * over one (the signal paths use this link to decide who may signal whom).
+     * The v0.75 investigation instrumented it and confirmed it really happens:
+     * slot 16, generation 316 -> 317, while a live child still pointed at it.
+     *
+     * A slot index alone cannot express "the process that was here", so the link
+     * is now a (slot, generation) PAIR. `gen` is bumped by kproc_reset on every
+     * recycle, ppid_gen records what the parent's generation was when the link
+     * was made, and ppid_live() below is the only sanctioned way to resolve it —
+     * a mismatch means the parent is gone and the child is an orphan.
+     *
+     * This was NOT the cause of the race v0.75 was chasing: it fires only after
+     * the real parent has already exited, which made it a symptom of that
+     * timeout rather than its origin. Fixed here on its own merits.
      * See ROADMAP-0.75.0.md. */
     int      ppid_slot;           /* parent kproc slot, for SIGCHLD (-1 = none)     */
+    uint32_t ppid_gen;            /* parent's `gen` when the link was made          */
+    /* Bumped on every recycle of this slot, by kproc_reset. NOT cleared there —
+     * it is the one field whose whole purpose is to survive the wipe and count
+     * it, so it is set apart from the blanking loop deliberately. */
+    uint32_t gen;
     /* v0.62: PROCESS GROUP. Job control needs a name for "this pipeline" that
      * outlives the individual processes in it and that the console can signal
      * as a unit — which is exactly what a process group is, and why Ctrl+C
@@ -1963,14 +1976,58 @@ static int n_kproc = 0;
  * process that used to occupy it. Monotonic across the whole boot; 0 is
  * never a valid pid (used as a "no process" sentinel elsewhere), so the
  * wraparound skips it. */
-/* v0.75: `g_next_pid++` is a non-atomic read-modify-write on a plain global and
- * both call sites run OUTSIDE g_kproc_lock, so two cores can in principle hand
- * the same pid to two live processes. A detector was added during the v0.75
- * posixstrs investigation and observed ZERO collisions across a full failing
- * boot, which is what cleared this as the cause of that race. It remains a real
- * defect on its own terms and is on the list; it is simply not the one that was
- * being hunted. See ROADMAP-0.75.0.md. */
-static uint64_t g_next_pid = 1;
+/* v0.75 DEFECT A, FIXED. This used to be `uint64_t pid = g_next_pid++` at both
+ * spawn sites, a non-atomic read-modify-write on a plain global, with both call
+ * sites running OUTSIDE g_kproc_lock — so two cores could read the same value
+ * and hand THE SAME PID TO TWO LIVE PROCESSES. That matters beyond tidiness:
+ * SYS_WAITPID finds its child by scanning for the first slot whose pid matches,
+ * so a duplicate lets a parent be told about the wrong process, and posixstrs'
+ * own harness disambiguates recycled ppid_slots by assuming pids are unique and
+ * monotonic.
+ *
+ * It was never observed to fire: the v0.75 investigation ran a duplicate-pid
+ * detector across a full failing boot and counted zero collisions, which is what
+ * cleared it as the cause of that race. It is fixed here because a shared
+ * counter handing out identities without atomicity is a bug on its own terms,
+ * not because it was the one being hunted. See ROADMAP-0.75.0.md. */
+static volatile uint64_t g_next_pid = 1;
+
+/* The only way to obtain a pid. A single atomic RMW — no lock needed, and none
+ * of the callers hold one.
+ *
+ * The retry replaces the old `if (!g_next_pid) g_next_pid = 1;`, which was
+ * itself racy: two cores that wrapped together would both store 1 and both hand
+ * out 1. Skipping a zero we were handed personally is local to this caller, so
+ * concurrent wrappers step over 0 independently and still get distinct values.
+ * 0 is never a valid pid — it is the "no process" sentinel elsewhere — and at
+ * 64 bits the wrap is unreachable in practice; the loop is here so the sentinel
+ * rule holds by construction rather than by arithmetic that happens to be big
+ * enough. */
+static uint64_t pid_alloc(void) {
+    uint64_t pid;
+    do { pid = __sync_fetch_and_add(&g_next_pid, 1); } while (!pid);
+    return pid;
+}
+
+/* v0.75 defect B: resolve a child's parent link, or -1 if it has none LIVE.
+ *
+ * The ONLY sanctioned way to turn a ppid_slot into a slot index. Reading
+ * kprocs[c].ppid_slot directly and checking `used` is exactly the bug this
+ * exists to prevent, because `used` is true for a recycled slot holding a
+ * different process entirely. The generation compare is what distinguishes
+ * "my parent" from "whoever lives at my parent's old address now".
+ *
+ * Returning -1 collapses three cases readers already had to handle the same way
+ * — never had a parent, parent's slot out of range, parent died and its slot
+ * was reused — into one answer: this process is an orphan. */
+static int ppid_live(int c) {
+    if (c < 0 || c >= n_kproc) return -1;
+    int par = kprocs[c].ppid_slot;
+    if (par < 0 || par >= n_kproc) return -1;
+    if (!kprocs[par].used) return -1;
+    if (kprocs[par].gen != kprocs[c].ppid_gen) return -1;   /* slot recycled */
+    return par;
+}
 
 /* Diagnostic-only: kproc index -> pid, bounds-checked (proc_idx is untrusted
  * at a fault: the very thing being debugged may be a stale/out-of-range
@@ -2028,7 +2085,13 @@ static void kproc_reset(struct kproc *p) {
      * one thread in the group, per-thread stacks start below the main stack. */
     for (int sg = 0; sg < NSIG; sg++) p->sig_handler[sg] = 0;
     p->sig_pending = 0; p->sig_mask = 0; p->sigframe_sp = 0;
-    p->alarm_deadline = 0; p->ppid_slot = -1; p->pgid = 0;
+    p->alarm_deadline = 0; p->ppid_slot = -1; p->ppid_gen = 0; p->pgid = 0;
+    /* v0.75 defect B: this slot is about to hold a DIFFERENT process, so anyone
+     * still pointing at it as a parent must stop resolving. Incremented, never
+     * blanked — the counter's value is the whole point, and a memset here would
+     * silently reinstate the bug. Wraps at 2^32 recycles of one slot, which at
+     * this kernel's spawn rate is not reachable in a boot. */
+    p->gen++;
     p->nthreads = 1; p->ustack_next = 0; p->argc = 0; p->exit_authoritative = 0;
     /* v0.61: a fresh slot is its OWN thread-group leader. kproc_spawn fixes up
      * tg_leader to the real index right after this returns (kproc_reset takes a
@@ -2137,8 +2200,7 @@ static int kproc_spawn(const char *name, uint64_t caps) {
     }
     kproc_unlock();
     kproc_reset(&kprocs[i]);
-    uint64_t pid = g_next_pid++;
-    if (!g_next_pid) g_next_pid = 1;      /* wrap-safe: pid 0 is never valid */
+    uint64_t pid = pid_alloc();           /* v0.75: atomic; see pid_alloc()  */
     kprocs[i].pid  = pid;
     kstrcpy_n(kprocs[i].name, name, sizeof kprocs[i].name);
     kprocs[i].caps = caps;
@@ -2230,8 +2292,7 @@ static int kproc_spawn_thread(const char *name, int leader, int tid) {
     kproc_unlock();
     if (i == leader) return -1;                  /* cannot thread onto itself */
     kproc_reset(&kprocs[i]);
-    uint64_t pid = g_next_pid++;
-    if (!g_next_pid) g_next_pid = 1;
+    uint64_t pid = pid_alloc();                  /* v0.75: atomic; see pid_alloc() */
     kprocs[i].pid  = pid;                        /* its OWN pid == its tid    */
     kstrcpy_n(kprocs[i].name, name, sizeof kprocs[i].name);
     kprocs[i].caps      = kprocs[leader].caps;
@@ -2240,7 +2301,11 @@ static int kproc_spawn_thread(const char *name, int leader, int tid) {
     kprocs[i].affinity  = kprocs[leader].affinity;
     kprocs[i].redir_in  = kprocs[leader].redir_in;
     kprocs[i].redir_out = kprocs[leader].redir_out;
+    /* v0.75: a thread inherits its leader's parent link, and must inherit the
+     * GENERATION with it — the slot index alone would resolve against whatever
+     * lives at that index now. */
     kprocs[i].ppid_slot = kprocs[leader].ppid_slot;
+    kprocs[i].ppid_gen  = kprocs[leader].ppid_gen;
     kprocs[i].pgid      = kprocs[leader].pgid;   /* v0.62: threads share the group */
     /* v0.72: a thread is the same user as the process it belongs to. Not a
      * copy that could later diverge — every credential check resolves through
@@ -9203,8 +9268,11 @@ static void posix_reap_record(int p) {
 static void posix_proc_reaped(int p) {
     if (p < 0 || p >= n_kproc) return;
     posix_reap_record(p);
-    int par = kprocs[p].ppid_slot;
-    if (par >= 0 && par < n_kproc && kprocs[par].used && !kprocs[par].exited)
+    /* v0.75 defect B: without the generation check this delivered SIGCHLD to
+     * whoever had inherited the dead parent's slot — a signal about a process
+     * that stranger never forked. */
+    int par = ppid_live(p);
+    if (par >= 0 && !kprocs[par].exited)
         sig_raise(par, SIGCHLD);
 }
 
@@ -11426,6 +11494,7 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
     }
     kprocs[ch].role      = kprocs[par].role;
     kprocs[ch].ppid_slot = par;
+    kprocs[ch].ppid_gen  = kprocs[par].gen;      /* v0.75: pin the link to THIS parent */
     /* v0.59: the break comes across with the pages. Cloning the heap's contents
      * but resetting the child's brk to the base would hand the child's next
      * malloc() an address range its own live data already occupies. */
@@ -13487,7 +13556,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         for (int i = 0; i < n_kproc; i++)
             if (kprocs[i].used && !kprocs[i].exited && kprocs[i].pid == (uint32_t)a0) { tgt = i; break; }
         if (tgt < 0) return (uint64_t)-3;                       /* ESRCH */
-        if (tgt != me && kprocs[tgt].ppid_slot != me) return (uint64_t)-13;  /* EPERM */
+        /* v0.75 defect B: this is an AUTHORITY check, so a stale link is worse
+         * here than a wrong getppid — it would let a task signal a stranger that
+         * merely inherited its dead parent's slot. */
+        if (tgt != me && ppid_live(tgt) != me) return (uint64_t)-13;  /* EPERM */
         return (uint64_t)(int64_t)sig_raise(tgt, sg);
     }
     case 52: {   /* SYS_THREAD_CREATE(entry, arg, stack) -> the new thread's tid within
@@ -13672,8 +13744,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     }
     case 55:     /* SYS_GETPPID() -> parent pid, or 0 if this process has no live parent */
         {
-            int par = kprocs[current_proc_idx].ppid_slot;
-            return (par >= 0 && par < n_kproc && kprocs[par].used) ? kprocs[par].pid : 0;
+            /* v0.75 defect B: ppid_live() rejects a parent slot that has been
+             * recycled since the link was made. The old test was `used`, which
+             * a recycled slot also passes, so this returned a stranger's pid. */
+            int par = ppid_live((int)current_proc_idx);
+            return par >= 0 ? kprocs[par].pid : 0;
         }
     case 56: {   /* SYS_WAITPID(pid) -> child's exit code, -11 (EAGAIN) if still running,
                   * -10 (ECHILD) if it is not a child of ours. Non-blocking by design:
@@ -13682,7 +13757,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int me = (int)current_proc_idx;
         for (int i = 0; i < n_kproc; i++) {
             if (!kprocs[i].used || kprocs[i].pid != (uint32_t)a0) continue;
-            if (kprocs[i].ppid_slot != me) return (uint64_t)-10;
+            /* v0.75 defect B: a stale link must read as ECHILD, not as a match.
+             * ppid_live() returns -1 for a recycled parent, and `me` is a valid
+             * slot index, so the comparison rejects it. */
+            if (ppid_live(i) != me) return (uint64_t)-10;
             if (!kprocs[i].exited) return (uint64_t)-11;
             return kprocs[i].exit_code;
         }
@@ -14606,7 +14684,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             /* Containment, as SYS_KILL has it: a process may place ITSELF or a
              * CHILD in a group, never an unrelated process — otherwise any task
              * could drag another into a group it then signals. */
-            if (tgt != meL && kprocs[tgt].ppid_slot != meL) return (uint64_t)-13;  /* EPERM */
+            if (tgt != meL && ppid_live(tgt) != meL) return (uint64_t)-13;  /* v0.75: EPERM */
         }
         int g = (int)(int64_t)a1;
         if (g < 0) return (uint64_t)-1;
@@ -14637,8 +14715,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         for (int i = 0; i < n_kproc; i++) {
             if (!kprocs[i].used || kprocs[i].exited || kprocs[i].torn_down) continue;
             if (kprocs[i].pgid != g || tg_of(i) != i) continue;
-            if (i != meL && kprocs[i].ppid_slot != meL && kprocs[i].pgid != kprocs[meL].pgid)
-                continue;                                     /* not ours to signal */
+            if (i != meL && ppid_live(i) != meL && kprocs[i].pgid != kprocs[meL].pgid)
+                continue;                       /* v0.75: not ours to signal */
             if (sig_raise(i, sg) == 0) n++;
         }
         return (uint64_t)(int64_t)n;
@@ -19149,14 +19227,16 @@ static void px_sample(int *procs, int nproc, struct px_round *R) {
     for (int i = 0; i < n_kproc; i++) {
         struct kproc *k = &kprocs[i];
         if (!k->used) continue;
-        int par = k->ppid_slot, pi = -1;
+        /* v0.75: ppid_live() resolves the (slot, generation) pair, so a previous
+         * round's child pointing at a slot this round's workers now occupy no
+         * longer resolves at all. This used to read k->ppid_slot raw and lean on
+         * a pid-monotonicity argument to disambiguate — "a genuine child always
+         * has a higher pid than its parent" — which was sound but depended on
+         * pids being unique and monotonic, i.e. on defect A never firing. The
+         * kernel now answers the question directly, so the suite asks it. */
+        int par = ppid_live(i), pi = -1;
         for (int j = 0; j < nproc; j++) if (par == procs[j]) pi = j;
         if (pi < 0) continue;
-        /* ppid_slot is a SLOT index, and slots are recycled across rounds — a
-         * previous round's child can therefore point at a slot this round's
-         * workers now occupy. pids are monotonic, so a genuine child of this
-         * worker always has a higher pid than its parent; that disambiguates. */
-        if (k->pid <= R->pid[pi]) continue;
         int slot = -1;
         for (int c = 0; c < R->nchild; c++) if (R->cpid[c] == k->pid) { slot = c; break; }
         if (slot < 0) {
@@ -19356,10 +19436,15 @@ static void cmd_posix_stress(void) {
          * round cannot re-count the same child. */
         for (int c = 0; c < R.nchild; c++)
             if (R.cgot[c] == 1 && R.cframes[c] == 0) reclaim_ok = 0;
+        /* v0.75: keying this on pid is only safe because pids are now allocated
+         * atomically (defect A). Under duplicates it could sever the parent link
+         * of an unrelated LIVE process that happened to share the pid. Clearing
+         * the slot is enough to orphan the link — ppid_live() rejects a negative
+         * slot before it looks at the generation. */
         for (int i = 0; i < n_kproc; i++) {
             if (!kprocs[i].used) continue;
             for (int c = 0; c < R.nchild; c++)
-                if (kprocs[i].pid == R.cpid[c]) kprocs[i].ppid_slot = -1;
+                if (kprocs[i].pid == R.cpid[c]) { kprocs[i].ppid_slot = -1; kprocs[i].ppid_gen = 0; }
         }
     }
 
