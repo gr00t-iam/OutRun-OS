@@ -13406,8 +13406,36 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                      * enabled underneath it; sched_yield gives the rest of the
                      * system a turn and cannot wedge if that bet is wrong. */
                     for (int t = 0; t < 64 && c->state == TCPS_SYN_SENT; t++) {
+                        /* v0.75 INSTRUMENTATION: this release/yield/re-acquire
+                         * window is where the last residual rank violation is
+                         * reported (klock_acquire below, kernel64.c:13412). The
+                         * acquire finds rank 9 still on THIS thread's stack even
+                         * though the release two lines up should have popped it,
+                         * and no amount of reading has explained how. So measure
+                         * it: the depth on each side of both operations, and the
+                         * thread identity across the yield. Prints only on an
+                         * anomaly, so a clean boot stays silent.
+                         *
+                         *   d0 -> d1  should differ by exactly 1 (the pop)
+                         *   d1 -> d2  should not change (nothing else is ours)
+                         *   tid0 == tid1, or we came back as a different thread
+                         *     and the stack we are about to check is not the one
+                         *     we released against. */
+                        uint8_t *dsp; (void)rank_ctx(&dsp);
+                        uint8_t d0 = *dsp;
+                        int tid0 = g_cur;
                         klock_release(&g_net_lock);
+                        uint8_t d1 = *dsp;
                         sched_yield();
+                        uint8_t *dsp2; (void)rank_ctx(&dsp2);
+                        uint8_t d2 = *dsp2;
+                        int tid1 = g_cur;
+                        if (d1 != (uint8_t)(d0 - 1) || d2 != d1 || tid0 != tid1 || dsp != dsp2)
+                            kprintf("[connwin] t=%d depth %u->%u (release) ->%u (after yield) "
+                                    "| tid %d->%d | stack %s | cpu=%u\n",
+                                    (uint64_t)(int64_t)t, (uint64_t)d0, (uint64_t)d1, (uint64_t)d2,
+                                    (uint64_t)(int64_t)tid0, (uint64_t)(int64_t)tid1,
+                                    dsp == dsp2 ? "same" : "CHANGED", (uint64_t)cpu_idx());
                         klock_acquire(&g_net_lock);
                         if (c->state != TCPS_SYN_SENT) break;
                         c->snd_nxt = c->iss;
