@@ -2013,6 +2013,18 @@ struct kproc {
      * critical section rather than an implicit invariant, and is the seam a
      * future multi-threaded-per-process model would actually need. */
     volatile int      vma_lock;
+    /* v0.75: lock ranks held by THIS TASK. The rank stack has to live on the
+     * thing that MIGRATES, and a ring-3 task is it: a syscall can drop a lock,
+     * yield, and resume on a DIFFERENT core, at which point per-CPU storage
+     * belongs to the wrong core and curthr is the BSP's kernel thread rather
+     * than this task. Measured, not argued — the [connwin] trace showed the same
+     * tid and correct depth arithmetic either side of one sched_yield() with a
+     * DIFFERENT stack pointer, which is the migration.
+     *
+     * Resolved through tg_of() so a thread answers with its process's stack, the
+     * same rule every other identity in this kernel follows since defect C. */
+    uint8_t  rank_stack[8];
+    uint8_t  rank_sp;
 };
 #define MAX_KPROC 64                  /* v0.41: +6 cio workers; v0.43: +10 smp_stress workers */
 static struct kproc kprocs[MAX_KPROC];
@@ -2280,6 +2292,10 @@ static void kproc_reset(struct kproc *p) {
     for (int sg = 0; sg < NSIG; sg++) p->sig_handler[sg] = 0;
     p->sig_pending = 0; p->sig_mask = 0; p->sigframe_sp = 0;
     p->alarm_deadline = 0; p->ppid_slot = -1; p->ppid_gen = 0; p->pgid = 0;
+    /* v0.75: a recycled slot must not inherit the dead task's held ranks — the
+     * same lesson thread_create_ex learned for PCBs, one struct over. */
+    p->rank_sp = 0;
+    for (int rr = 0; rr < 8; rr++) p->rank_stack[rr] = 0;
     /* v0.75 defect B: this slot is about to hold a DIFFERENT process, so anyone
      * still pointing at it as a parent must stop resolving. Incremented, never
      * blanked — the counter's value is the whole point, and a memset here would
@@ -2988,6 +3004,28 @@ static int thread_create_ex(const char *name, void (*entry)(void *), void *arg,
         t->id = i; t->name = name; t->entry = entry; t->arg = arg;
         t->cr3 = kernel_cr3; t->stack = g_tstacks[i]; t->wait_tag = 0;
         t->proc = 0; t->uthread = 0; t->rsp0 = 0; t->ksrsp = 0;
+        /* v0.75: RESET THE LOCK-RANK BOOKKEEPING. rank_sp was assigned nowhere
+         * in the tree — not here, not in sched_init, nowhere — so it was correct
+         * only by virtue of g_threads[] being zero-initialised at boot. PCB
+         * slots are RECYCLED (thread_trampoline marks T_FREE, the CAS above
+         * reclaims), so any depth the previous occupant left behind became the
+         * new thread's starting depth, and the ranks under it became ranks the
+         * new thread was considered to be holding.
+         *
+         * A thread that leaves a non-zero depth behind hands its successor a
+         * permanent phantom hold: every acquire that thread ever makes compares
+         * against a rank nothing owns, and reports a violation for a lock that
+         * is demonstrably free. That is the shape of the data in PR #64 — 854 of
+         * 937 violations from one site, all on cpu 0, none of them deadlocking,
+         * and the teardown "inversions" (ipc/gpu/audio/descriptor/net_teardown)
+         * all reported under the same phantom rank 9 because cpu_exec_proc's
+         * exit path calls them one after another on that same thread.
+         *
+         * Zeroing the stack as well as the depth is deliberate: the depth alone
+         * would be enough for correctness, but a stale rank sitting above sp is
+         * exactly what makes a future off-by-one unreadable in a log. */
+        t->rank_sp = 0;
+        for (int r = 0; r < 8; r++) t->rank_stack[r] = 0;
         uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
         t->canary = ((((uint64_t)hi << 32) | lo) * 0x9E3779B97F4A7C15ull)
                     ^ (0xC0FFEE0000ull + (uint64_t)i * 0x100000001B3ull);   /* per-thread entropy */
@@ -3081,18 +3119,39 @@ struct klock {
     uint8_t           rank;
     volatile uint32_t acq;                   /* successful acquisitions        */
     volatile uint32_t contended;             /* acquisitions that had to wait  */
+    /* v0.75: WHERE THIS LOCK'S RANK ENTRY LIVES, recorded at acquire.
+     *
+     * rank_ctx() chooses per-thread or per-CPU storage by evaluating
+     * (cpu_idx()==0 && g_sched_on) at the moment it is called. Acquire and
+     * release call it separately, so a lock held across anything that changes
+     * that predicate — a scheduler transition, work that reaches a context
+     * switch — pushed onto one stack and popped from another: the pop
+     * underflowed and the push was stranded permanently. That stranded rank is
+     * what every later acquire on the thread tripped over, and it is why the
+     * acquire-side warning always accused whoever NOTICED rather than whoever
+     * left it (measured: tcp_timer_scan + 268 and gpu_teardown_kproc + 56).
+     *
+     * A klock is held by exactly one context at a time, so the lock itself is
+     * the one place that can remember the answer. These are written under the
+     * lock, after it is acquired, and read before it is released — so release
+     * pops the exact slot acquire pushed, whatever the context has become since.
+     * Appended to the struct so the 13 five-field initialisers below still
+     * zero-fill them. */
+    uint8_t          *rank_st;               /* the stack it was pushed on     */
+    uint8_t          *rank_spp;              /* that stack's depth cursor      */
+    uint8_t           rank_idx;              /* the index it was pushed at     */
 };
-static struct klock g_ofile_lock = { 0, "ofile", 1, 0, 0 };
-static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0 };
-static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0 };
-static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0 };
-static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0 };
+static struct klock g_ofile_lock = { 0, "ofile", 1, 0, 0, 0, 0, 0 };
+static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0, 0, 0, 0 };
+static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0, 0, 0, 0 };
+static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0, 0, 0, 0 };
+static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0, 0, 0, 0 };
 /* v0.66. Rank 12: ABOVE every lock this ever needs, because it is never held
  * across one. Filling a page reads the VFS and flushing one writes it, and
  * both happen with this released — collect under the lock, do the I/O outside
  * it, re-check on the way back in. Holding it across g_vfs_lock (rank 2) would
  * be a real inversion, not a bookkeeping nicety. */
-static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0 };
+static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0, 0, 0, 0 };
 static volatile uint32_t g_rank_violations = 0;
 
 /* Back off without monopolizing the core that must make our progress: the BSP
@@ -3148,30 +3207,183 @@ static inline void execbuf_acquire(void) {
 }
 static inline void execbuf_release(void) { __sync_lock_release(&g_execbuf_lock); }
 
+/* v0.75: imbalance counters, reported by klock_release below. */
+static volatile uint64_t g_rank_underflow = 0, g_rank_mismatch = 0;
+
 /* Rank bookkeeping storage for the CURRENT context (see the pcb comment).    */
+/* v0.75: THE STORAGE MUST BELONG TO WHATEVER CAN HOLD A LOCK ACROSS A YIELD.
+ *
+ * This used to be `cpu_idx()==0 && g_sched_on ? curthr : per-CPU`, which picks
+ * by CORE. A ring-3 task's syscall can drop a lock, yield, and resume on a
+ * different core — so the two halves of one hold resolved to two different
+ * stacks, the push was never popped from the one it landed on, and the leftover
+ * rank was what every later acquire tripped over. That is measured, not
+ * inferred: the [connwin] trace showed identical tid and correct depth
+ * arithmetic on both sides of a single sched_yield(), with the stack POINTER
+ * changed.
+ *
+ * Three contexts, in the order they must be tested:
+ *
+ *   SERVICING A RING-3 TASK — excur_depth is non-zero exactly when this core is
+ *     inside a ring-3 excursion, so the syscall running now belongs to
+ *     cur_proc. That task is the entity that migrates, so the ranks live on it,
+ *     resolved through tg_of() so threads of one process share one stack the
+ *     way they share every other identity. Correct on the BSP and on APs alike,
+ *     and correct across a migration because the task is the key, not the core.
+ *
+ *   BSP KERNEL THREAD — no excursion, so this is the BSP's own scheduler thread
+ *     doing its own work. It can park holding a lock while another BSP thread
+ *     runs, which is why this was per-thread to begin with; that reasoning is
+ *     unchanged and so is the storage.
+ *
+ *   PRE-SCHEDULER, or an AP with no task — per-CPU. Nothing else exists yet, and
+ *     nothing in these contexts survives a yield.
+ *
+ * Deliberately NOT keyed on curthr for APs: g_threads/g_cur are the BSP
+ * scheduler's, and an AP touching them would race the BSP on its own thread's
+ * state — the kernel's cpu_local comment says as much ("APs only; the BSP
+ * tracks per-THREAD in the PCB"). */
 static inline uint8_t *rank_ctx(uint8_t **sp) {
-    if (cpu_idx() == 0 && g_sched_on) { *sp = &curthr->rank_sp;         return curthr->rank_stack; }
-    struct cpu_local *me = &g_cpu[cpu_idx()]; *sp = &me->rank_sp;       return me->rank_stack;
+    struct cpu_local *me = &g_cpu[cpu_idx()];
+    if (g_sched_on) {
+        if (me->excur_depth) {                        /* a ring-3 task's kernel side */
+            uint64_t p = me->cur_proc;
+            if (p < (uint64_t)n_kproc && kprocs[p].used) {
+                int L = tg_of((int)p);
+                *sp = &kprocs[L].rank_sp;
+                return kprocs[L].rank_stack;
+            }
+        }
+        if (cpu_idx() == 0) { *sp = &curthr->rank_sp; return curthr->rank_stack; }
+    }
+    *sp = &me->rank_sp;
+    return me->rank_stack;
+}
+
+/* v0.75: the rank stack is shared with INTERRUPT CONTEXT and must be touched
+ * atomically with respect to it.
+ *
+ * On cpu 0 rank_ctx() resolves to curthr->rank_stack, and an ISR on that core
+ * runs on whatever thread it interrupted — so a softirq taking a klock pushes
+ * and pops the INTERRUPTED THREAD's stack while that thread is mid-update. The
+ * push/pop pairs are individually balanced, so the damage is not corruption of
+ * the depth but a torn READ: the last verification caught the acquire-side
+ * check firing and then printing `depth=0`, which the guard `*sp > 0` cannot
+ * produce. The stack had changed underneath between the test and the report.
+ *
+ * Masking local interrupts across each read-modify-write is enough, and is
+ * cheaper than a second per-CPU ISR stack: the sections are a compare and an
+ * increment, the ISR cannot then land inside one, and every push still pairs
+ * with its own pop on the same stack. Callers already in interrupt context
+ * (IF off) are unaffected — the flags are saved and restored, never forced on.
+ * Deliberately NOT held across the spin below, which must keep interrupts in
+ * whatever state the caller had or a contended lock would stall the timer. */
+static inline uint64_t klock_irq_save(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void klock_irq_restore(uint64_t f) {
+    if (f & 0x200ull) __asm__ volatile("sti" ::: "memory");
 }
 
 static void klock_acquire(struct klock *l) {
     uint8_t *sp, *st = rank_ctx(&sp);                  /* our context's stack;  */
+    uint64_t rf = klock_irq_save();                    /* v0.75: vs ISR on cpu 0 */
     if (*sp > 0 && st[*sp - 1] >= l->rank) {           /* still ours after any  */
         __sync_fetch_and_add(&g_rank_violations, 1);   /* yield below — a yield */
-        kprintf("[klock  ] RANK VIOLATION: acquiring '%s' (rank %d) while holding rank %d\n",
-                l->name, (uint64_t)l->rank, (uint64_t)st[*sp - 1]);
+        /* v0.75: the CALLER. "acquiring net while holding net" names the lock
+         * and not the path, and the path is the whole question when one lock is
+         * reachable from the timer scan, the receive path, several syscalls and
+         * the suite itself. A previous attempt at this bug guessed the path from
+         * reading and was disproven by a 20-boot run; this is the datum that
+         * would have settled it in one. Resolve with nm/addr2line on the ELF.
+         *
+         * Also prints the whole held-rank stack, because with more than two
+         * locks involved "while holding rank 9" does not say what else is held
+         * underneath it — and a rank INVERSION (taking rank 1 under rank 9) is a
+         * different bug from re-entrancy on the same lock. */
+        kprintf("[klock  ] RANK VIOLATION: acquiring '%s' (rank %d) while holding rank %d "
+                "| caller=%X cpu=%u depth=%u held=[%d %d %d %d %d %d %d %d]\n",
+                l->name, (uint64_t)l->rank, (uint64_t)st[*sp - 1],
+                (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx(), (uint64_t)*sp,
+                (uint64_t)(int64_t)st[0], (uint64_t)(int64_t)st[1],
+                (uint64_t)(int64_t)st[2], (uint64_t)(int64_t)st[3],
+                (uint64_t)(int64_t)st[4], (uint64_t)(int64_t)st[5],
+                (uint64_t)(int64_t)st[6], (uint64_t)(int64_t)st[7]);
     }                                                  /* resumes THIS thread   */
+    klock_irq_restore(rf);                             /* check done: reopen IF */
     if (__sync_lock_test_and_set(&l->v, 1)) {
         __sync_fetch_and_add(&l->contended, 1);
         do { krelax(); } while (l->v || __sync_lock_test_and_set(&l->v, 1));
     }
     l->acq++;                                          /* under the lock        */
-    if (*sp < 8) st[(*sp)++] = l->rank;
+    rf = klock_irq_save();                             /* v0.75: atomic push    */
+    /* v0.75: bind the slot to the LOCK. Everything below runs with the lock
+     * held, so these three fields have exactly one writer. `st`/`sp` are the
+     * ones resolved on THIS side; release will not resolve them again. A depth
+     * already at the 8-entry ceiling records no slot (rank_spp = 0) and release
+     * correspondingly pops nothing — the old code pushed nothing but popped
+     * anyway, which drifted the depth down and hid later violations. */
+    if (*sp < 8) {
+        l->rank_st  = st;
+        l->rank_spp = sp;
+        l->rank_idx = *sp;
+        st[(*sp)++] = l->rank;
+    } else {
+        l->rank_st  = 0;
+        l->rank_spp = 0;
+    }
+    klock_irq_restore(rf);
 }
 
+/* v0.75: catch the imbalance AT THE RELEASE, which is the only place that can
+ * see it. The acquire-side warning says "rank 9 is already held" long after the
+ * fact and names whoever noticed, not whoever left it — 887 of 927 violations
+ * pointed at tcp_timer_scan for that reason, and it is merely the most frequent
+ * acquirer on the BSP.
+ *
+ * Two distinct faults are reported here, because they have different causes:
+ *   UNDERFLOW — a release with nothing recorded as held. The push and the pop
+ *               went to different stacks (rank_ctx picks per-thread storage on
+ *               cpu 0 and per-CPU elsewhere), or the lock was released twice.
+ *   MISMATCH  — the top of the stack is not this lock's rank, i.e. releases are
+ *               not LIFO. That leaves the deeper entry stranded, which is
+ *               exactly the phantom hold the acquire side keeps tripping over.
+ * Both print the caller so the offending path names itself. */
+/* v0.75: pop EXACTLY the slot acquire pushed. rank_ctx() is deliberately not
+ * called here — re-deriving the context is the entire defect this replaces.
+ *
+ * The checks that remain are real invariants rather than the old guesswork:
+ * a lock whose recorded depth is not one below the current top is being
+ * released out of LIFO order, which is worth saying out loud. Truncating to our
+ * own index in that case is the conservative choice: it guarantees this lock's
+ * entry can never be stranded, which is the failure that produced hundreds of
+ * phantom violations from two underflows. */
 static void klock_release(struct klock *l) {
-    uint8_t *sp; rank_ctx(&sp);
-    if (*sp > 0) (*sp)--;                              /* LIFO release          */
+    uint64_t rf  = klock_irq_save();                   /* v0.75: atomic pop     */
+    uint8_t *st  = l->rank_st;
+    uint8_t *spp = l->rank_spp;
+    uint8_t  idx = l->rank_idx;
+    l->rank_st = 0; l->rank_spp = 0;                   /* consumed              */
+
+    if (spp) {
+        if (st[idx] != l->rank) {
+            __sync_fetch_and_add(&g_rank_mismatch, 1);
+            kprintf("[klock  ] RANK MISMATCH: releasing '%s' (rank %d); its recorded slot %u "
+                    "holds rank %d | caller=%X cpu=%u\n",
+                    l->name, (uint64_t)l->rank, (uint64_t)idx, (uint64_t)(int64_t)st[idx],
+                    (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx());
+        } else if (*spp != (uint8_t)(idx + 1)) {
+            __sync_fetch_and_add(&g_rank_mismatch, 1);
+            kprintf("[klock  ] OUT-OF-ORDER RELEASE: '%s' (rank %d) sits at slot %u but the "
+                    "held depth is %u | caller=%X cpu=%u\n",
+                    l->name, (uint64_t)l->rank, (uint64_t)idx, (uint64_t)*spp,
+                    (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx());
+        }
+        if (*spp > idx) *spp = idx;                    /* never strand our entry */
+    }
+    klock_irq_restore(rf);
     __sync_lock_release(&l->v);
 }
 
@@ -3184,6 +3396,18 @@ static void sched_init(void) {
     g_threads[0].cr3 = kernel_cr3; g_threads[0].stack = 0;
     g_threads[0].proc = 0; g_threads[0].uthread = 0;
     g_threads[0].rsp0 = 0; g_threads[0].ksrsp = 0;   /* boot-default trap stacks */
+    /* v0.75: HAND THE RANK BOOKKEEPING OVER, do not restart it. The line below
+     * sets g_sched_on, and that single assignment silently moves cpu 0 from the
+     * per-CPU rank stack to this thread's (see rank_ctx). Anything the boot
+     * context holds at this instant was recorded in the per-CPU stack and will
+     * be RELEASED against the per-thread one, so the depth has to come across or
+     * the release underflows and the acquire is remembered forever on a stack
+     * nothing reads again. Nothing is held here today — sched_init runs from
+     * kernel_main with no lock taken — which is exactly why copying costs
+     * nothing and stops the handover being a latent trap for whoever does take
+     * one before this point. */
+    g_threads[0].rank_sp = g_cpu[0].rank_sp;
+    for (int r = 0; r < 8; r++) g_threads[0].rank_stack[r] = g_cpu[0].rank_stack[r];
     g_cur = 0;
     g_idle_id = thread_create("idle", idle_fn, 0);
     g_sched_on = 1;                           /* cooperative switching live      */
@@ -5251,7 +5475,7 @@ static struct udbent g_udb[UDB_MAX];
  * complaint through a null pointer. It never fired, because every acquisition
  * here happens with no other lock held — which is exactly the kind of latent
  * fault that surfaces years later when someone adds the first caller that does. */
-static struct klock  g_udb_lock = { 0, "udb", 13, 0, 0 };
+static struct klock  g_udb_lock = { 0, "udb", 13, 0, 0, 0, 0, 0 };
 static volatile uint64_t g_auth_ok = 0, g_auth_bad = 0, g_auth_lockouts = 0;
 
 /* Salt source. Not a CSPRNG and not claimed to be one: it is rdtsc (which no
@@ -6677,7 +6901,7 @@ static struct ipc_shmem g_ipc_shm[MAX_IPC_SHMEM];
  * unrelated raw spinlock, not part of this ranked array — no actual
  * collision, just two independent numbering schemes that happen to reuse
  * the same next integer.) */
-static struct klock g_ipc_lock = { 0, "ipc", 6, 0, 0 };
+static struct klock g_ipc_lock = { 0, "ipc", 6, 0, 0, 0, 0, 0 };
 
 static void ipc_queue_clear(int idx) {
     struct ipc_queue *q = &g_ipc_q[idx];
@@ -6970,7 +7194,7 @@ struct vgpu_resource_unref {
     uint32_t resource_id, padding;
 } __attribute__((packed));
 
-static struct klock g_gpu_lock = { 0, "gpu", 7, 0, 0 };
+static struct klock g_gpu_lock = { 0, "gpu", 7, 0, 0, 0, 0, 0 };
 static volatile uint8_t *g_gpu_common = 0, *g_gpu_notify = 0;
 static uint32_t          g_gpu_notify_mul = 0;
 static struct vq         g_gpu_ctrl;
@@ -7647,7 +7871,7 @@ struct virtio_snd_pcm_set_params {
 struct virtio_snd_pcm_status { uint32_t status, latency_bytes; } __attribute__((packed));
 struct virtio_snd_pcm_xfer   { uint32_t stream_id; } __attribute__((packed));
 
-static struct klock g_audio_lock = { 0, "audio", 8, 0, 0 };
+static struct klock g_audio_lock = { 0, "audio", 8, 0, 0, 0, 0, 0 };
 static volatile uint8_t *g_snd_common = 0, *g_snd_notify = 0;
 static uint32_t g_snd_notify_mul = 0;
 /* g_snd_isr / snd_isr_drain() are forward-declared above, right before
@@ -8074,7 +8298,7 @@ struct nsock {
 };
 static struct nsock g_sock[NSOCK];
 static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len); /* fwd: v0.67 */
-static struct klock g_net_lock = { 0, "net", 9, 0, 0 };
+static struct klock g_net_lock = { 0, "net", 9, 0, 0, 0, 0, 0 };
 static volatile uint64_t g_net_tx_frames = 0;
 static volatile uint64_t g_net_loop_deliveries = 0;
 /* v0.65: the numbers the suite cannot see from ring 3. An EAGAIN count that
@@ -8982,7 +9206,7 @@ static int wg_focused(int wi) {
     return k;
 }
 static uint64_t g_wm_pagetab[NWMWIN][WIN_SURF_MAXPG];   /* phys of each window's surface pages */
-static struct klock g_wm_lock = { 0, "wm", 10, 0, 0 };
+static struct klock g_wm_lock = { 0, "wm", 10, 0, 0, 0, 0, 0 };
 static int g_wm_focus = -1;              /* window index with keyboard focus, or -1     */
 static int g_wm_znext = 1;               /* monotonically increasing z stamp            */
 static int g_wm_drag = -1, g_wm_drag_dx = 0, g_wm_drag_dy = 0;   /* window being dragged */
@@ -12320,7 +12544,7 @@ static void posix_sigcheck_on_return(struct sysframe *sf, uint64_t rv) {
  * could not fully read. */
 #define REDIR_STAGE_MAX 32768
 static uint8_t g_redir_stage[REDIR_STAGE_MAX];
-static struct klock g_redir_lock = { 0, "redir", 0, 0, 0 };
+static struct klock g_redir_lock = { 0, "redir", 0, 0, 0, 0, 0, 0 };
 
 static int64_t redirect_write_bytes(int fd, const void *data, uint32_t len) {
     int vol = VOL_ROOT;
@@ -13242,8 +13466,36 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                      * enabled underneath it; sched_yield gives the rest of the
                      * system a turn and cannot wedge if that bet is wrong. */
                     for (int t = 0; t < 64 && c->state == TCPS_SYN_SENT; t++) {
+                        /* v0.75 INSTRUMENTATION: this release/yield/re-acquire
+                         * window is where the last residual rank violation is
+                         * reported (klock_acquire below, kernel64.c:13412). The
+                         * acquire finds rank 9 still on THIS thread's stack even
+                         * though the release two lines up should have popped it,
+                         * and no amount of reading has explained how. So measure
+                         * it: the depth on each side of both operations, and the
+                         * thread identity across the yield. Prints only on an
+                         * anomaly, so a clean boot stays silent.
+                         *
+                         *   d0 -> d1  should differ by exactly 1 (the pop)
+                         *   d1 -> d2  should not change (nothing else is ours)
+                         *   tid0 == tid1, or we came back as a different thread
+                         *     and the stack we are about to check is not the one
+                         *     we released against. */
+                        uint8_t *dsp; (void)rank_ctx(&dsp);
+                        uint8_t d0 = *dsp;
+                        int tid0 = g_cur;
                         klock_release(&g_net_lock);
+                        uint8_t d1 = *dsp;
                         sched_yield();
+                        uint8_t *dsp2; (void)rank_ctx(&dsp2);
+                        uint8_t d2 = *dsp2;
+                        int tid1 = g_cur;
+                        if (d1 != (uint8_t)(d0 - 1) || d2 != d1 || tid0 != tid1 || dsp != dsp2)
+                            kprintf("[connwin] t=%d depth %u->%u (release) ->%u (after yield) "
+                                    "| tid %d->%d | stack %s | cpu=%u\n",
+                                    (uint64_t)(int64_t)t, (uint64_t)d0, (uint64_t)d1, (uint64_t)d2,
+                                    (uint64_t)(int64_t)tid0, (uint64_t)(int64_t)tid1,
+                                    dsp == dsp2 ? "same" : "CHANGED", (uint64_t)cpu_idx());
                         klock_acquire(&g_net_lock);
                         if (c->state != TCPS_SYN_SENT) break;
                         c->snd_nxt = c->iss;
@@ -24050,6 +24302,11 @@ static void shell_run(void) {
      * every log rather than something a future reader has to re-derive. */
     kprintf("[excur  ] BSP thread switches during a live ring-3 excursion: %u\n",
             g_excur_switch);
+    /* v0.75: the three rank-bookkeeping counters, printed every boot so a
+     * verification run reads them straight out of the log instead of inferring
+     * them from the absence of warnings. All three must be 0. */
+    kprintf("[klock  ] rank violations=%u underflow=%u mismatch=%u\n",
+            g_rank_violations, g_rank_underflow, g_rank_mismatch);
     kputs("\nType 'help' for commands, 'demo' for the capability walk-through.\n");
     kputs("outrun> ");
     for (;;) {
