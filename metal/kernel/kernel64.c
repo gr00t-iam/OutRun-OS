@@ -2013,6 +2013,18 @@ struct kproc {
      * critical section rather than an implicit invariant, and is the seam a
      * future multi-threaded-per-process model would actually need. */
     volatile int      vma_lock;
+    /* v0.75: lock ranks held by THIS TASK. The rank stack has to live on the
+     * thing that MIGRATES, and a ring-3 task is it: a syscall can drop a lock,
+     * yield, and resume on a DIFFERENT core, at which point per-CPU storage
+     * belongs to the wrong core and curthr is the BSP's kernel thread rather
+     * than this task. Measured, not argued — the [connwin] trace showed the same
+     * tid and correct depth arithmetic either side of one sched_yield() with a
+     * DIFFERENT stack pointer, which is the migration.
+     *
+     * Resolved through tg_of() so a thread answers with its process's stack, the
+     * same rule every other identity in this kernel follows since defect C. */
+    uint8_t  rank_stack[8];
+    uint8_t  rank_sp;
 };
 #define MAX_KPROC 64                  /* v0.41: +6 cio workers; v0.43: +10 smp_stress workers */
 static struct kproc kprocs[MAX_KPROC];
@@ -2280,6 +2292,10 @@ static void kproc_reset(struct kproc *p) {
     for (int sg = 0; sg < NSIG; sg++) p->sig_handler[sg] = 0;
     p->sig_pending = 0; p->sig_mask = 0; p->sigframe_sp = 0;
     p->alarm_deadline = 0; p->ppid_slot = -1; p->ppid_gen = 0; p->pgid = 0;
+    /* v0.75: a recycled slot must not inherit the dead task's held ranks — the
+     * same lesson thread_create_ex learned for PCBs, one struct over. */
+    p->rank_sp = 0;
+    for (int rr = 0; rr < 8; rr++) p->rank_stack[rr] = 0;
     /* v0.75 defect B: this slot is about to hold a DIFFERENT process, so anyone
      * still pointing at it as a parent must stop resolving. Incremented, never
      * blanked — the counter's value is the whole point, and a memset here would
@@ -3195,9 +3211,53 @@ static inline void execbuf_release(void) { __sync_lock_release(&g_execbuf_lock);
 static volatile uint64_t g_rank_underflow = 0, g_rank_mismatch = 0;
 
 /* Rank bookkeeping storage for the CURRENT context (see the pcb comment).    */
+/* v0.75: THE STORAGE MUST BELONG TO WHATEVER CAN HOLD A LOCK ACROSS A YIELD.
+ *
+ * This used to be `cpu_idx()==0 && g_sched_on ? curthr : per-CPU`, which picks
+ * by CORE. A ring-3 task's syscall can drop a lock, yield, and resume on a
+ * different core — so the two halves of one hold resolved to two different
+ * stacks, the push was never popped from the one it landed on, and the leftover
+ * rank was what every later acquire tripped over. That is measured, not
+ * inferred: the [connwin] trace showed identical tid and correct depth
+ * arithmetic on both sides of a single sched_yield(), with the stack POINTER
+ * changed.
+ *
+ * Three contexts, in the order they must be tested:
+ *
+ *   SERVICING A RING-3 TASK — excur_depth is non-zero exactly when this core is
+ *     inside a ring-3 excursion, so the syscall running now belongs to
+ *     cur_proc. That task is the entity that migrates, so the ranks live on it,
+ *     resolved through tg_of() so threads of one process share one stack the
+ *     way they share every other identity. Correct on the BSP and on APs alike,
+ *     and correct across a migration because the task is the key, not the core.
+ *
+ *   BSP KERNEL THREAD — no excursion, so this is the BSP's own scheduler thread
+ *     doing its own work. It can park holding a lock while another BSP thread
+ *     runs, which is why this was per-thread to begin with; that reasoning is
+ *     unchanged and so is the storage.
+ *
+ *   PRE-SCHEDULER, or an AP with no task — per-CPU. Nothing else exists yet, and
+ *     nothing in these contexts survives a yield.
+ *
+ * Deliberately NOT keyed on curthr for APs: g_threads/g_cur are the BSP
+ * scheduler's, and an AP touching them would race the BSP on its own thread's
+ * state — the kernel's cpu_local comment says as much ("APs only; the BSP
+ * tracks per-THREAD in the PCB"). */
 static inline uint8_t *rank_ctx(uint8_t **sp) {
-    if (cpu_idx() == 0 && g_sched_on) { *sp = &curthr->rank_sp;         return curthr->rank_stack; }
-    struct cpu_local *me = &g_cpu[cpu_idx()]; *sp = &me->rank_sp;       return me->rank_stack;
+    struct cpu_local *me = &g_cpu[cpu_idx()];
+    if (g_sched_on) {
+        if (me->excur_depth) {                        /* a ring-3 task's kernel side */
+            uint64_t p = me->cur_proc;
+            if (p < (uint64_t)n_kproc && kprocs[p].used) {
+                int L = tg_of((int)p);
+                *sp = &kprocs[L].rank_sp;
+                return kprocs[L].rank_stack;
+            }
+        }
+        if (cpu_idx() == 0) { *sp = &curthr->rank_sp; return curthr->rank_stack; }
+    }
+    *sp = &me->rank_sp;
+    return me->rank_stack;
 }
 
 /* v0.75: the rank stack is shared with INTERRUPT CONTEXT and must be touched
