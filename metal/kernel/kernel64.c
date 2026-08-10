@@ -281,6 +281,10 @@ struct cpu_local {
     uint8_t  rank_stack[8];                  /* klock ranks held by the context      */
     uint8_t  rank_sp;                        /* running on this CPU (APs only; the   */
     volatile int dbg_was_idle;               /* v0.43: DEBUG_SMP_SCHED idle-edge latch */
+    /* v0.75: how many ring-3 excursions this CPU is nested inside. Appended at
+     * the END of the struct on purpose — the asm contract pins offsets 8/16/24
+     * and the compiler pins 80, and all four are _Static_assert-ed below. */
+    volatile uint32_t excur_depth;
 };                                           /* BSP tracks per-THREAD in the PCB)    */
 #define CPUL_SYSCALL_RSP 8                   /* asm contract (boot/usermode.asm) */
 #define CPUL_USER_RSP    16
@@ -296,6 +300,14 @@ _Static_assert(__builtin_offsetof(struct cpu_local, canary) == CPUL_CANARY,
                "compiler contract: stack guard at %gs:80");
 static struct cpu_local g_cpu[MAX_CPUS];
 static volatile int g_gs_ready;              /* set once per-CPU GS bases are armed */
+/* v0.75: BSP thread switches taken while this core was inside a ring-3
+ * excursion — i.e. the exact event that used to overwrite one thread's kernel
+ * resume point with another's. Diagnostic only now that sched_switch_to saves
+ * and restores that context; a NON-ZERO value here is the bug's precondition
+ * occurring, and smpstrs reports it so the number is visible rather than
+ * inferred. The depth it keys off is per-CPU and therefore approximate across a
+ * switch, which is fine for counting events and is why nothing depends on it. */
+static volatile uint64_t g_excur_switch;
 static uint32_t cpu_idx(void);               /* fwd: %gs:0, or 0 before arming */
 
 /* Who is 'running' for every capability check in syscall_dispatch. Since
@@ -581,6 +593,7 @@ static volatile int g_debug_posix = 0;          /* DEBUG_POSIX: fork/exec/signal
 #define UARG_LEN   48                                      /* max bytes per string    */
 
 static void handle_cpl3_fault(struct isr_frame *f);      /* defined after process globals */
+static void panic_dump(struct isr_frame *f);             /* v0.75: fatal-fault diagnostics */
 static int  posix_try_fault_signal(struct isr_frame *f);  /* v0.55: catchable SIGSEGV (signal core) */
 static int  vm_fault_handle(struct isr_frame *f);        /* v0.63: demand-zero / copy-on-write     */
 static void tcp_timer_scan(void);                        /* v0.67: retransmit, driven from idle    */
@@ -645,9 +658,7 @@ void isr_dispatch(struct isr_frame *f) {
         /* offending task (guard-page hit = stack overflow).                      */
         if ((f->cs & 3) == 3) handle_cpl3_fault(f);      /* noreturn: unwinds to kernel */
         g_conlock = 0;                       /* terminal path: bust the console  */
-        kprintf("\n[panic ] CPU EXCEPTION %u: %s (err=%x) at rip=%X\n",
-                f->vector, exc_names[f->vector], f->error, f->rip);
-        kprintf("[panic ] system halted — the fault was contained to this core\n");
+        panic_dump(f);                       /* v0.75: see its definition        */
         for (;;) __asm__ volatile("cli; hlt");
     }
     if (f->vector == 32) {
@@ -853,6 +864,24 @@ extern uint64_t cpp_ring_depth(void);
 /* reach them directly.                                                         */
 static uint64_t g_next_frame = 0x01000000; /* 16 MiB: clear of kernel + stack */
 
+/* v0.75: the ceiling this allocator has always ASSUMED and never enforced.
+ *
+ * boot.asm identity-maps exactly the first 1 GiB with 2 MiB pages, and the
+ * comment above says page tables and scratch "all live below 1 GiB so BOTH the
+ * kernel CR3 and every process CR3 can reach them directly". That was a
+ * statement of intent with nothing behind it: g_next_frame starts at 16 MiB and
+ * grows monotonically with no upper bound, so a boot that allocates enough
+ * frames walks the bump pointer straight off the end of the mapped window. The
+ * first address past it is 0x40000000 EXACTLY, and every access to a frame at
+ * or beyond that point faults not-present — the allocator's own zeroing loop
+ * writes there before any caller ever sees the pointer.
+ *
+ * Strictly `<`: an allocation is legal only if every byte it hands out lies
+ * below the limit, so a frame based at 0x3FFFF000 is the last valid one and an
+ * extent ENDING at 0x40000000 is fine (the end is exclusive), while one ending
+ * at 0x40001000 is not. */
+#define IDENT_MAP_LIMIT 0x40000000ull      /* 1 GiB — see boot.asm's page tables */
+
 /* v0.41: the bump pointer is claimed with LOCK XADD, so any core may allocate
  * concurrently — two cores can no longer be handed the same frame, and a
  * multi-frame claim stays contiguous because the whole extent is reserved in
@@ -860,6 +889,23 @@ static uint64_t g_next_frame = 0x01000000; /* 16 MiB: clear of kernel + stack */
  * happens outside any lock: the frames are exclusively ours once claimed.    */
 static uint64_t alloc_frames(uint64_t n) {
     uint64_t base = __sync_fetch_and_add(&g_next_frame, n * 0x1000);
+    uint64_t end  = base + n * 0x1000;      /* exclusive                        */
+    /* v0.75: enforce the identity-map ceiling BEFORE the zeroing loop below,
+     * because that loop is itself the first thing to touch the frames — an
+     * unbounded bump pointer does not fail at the caller, it faults inside the
+     * allocator, writing to the first unmapped address. Halting here converts a
+     * silent walk off the end of the mapped window into one line naming the
+     * exact request that exhausted it.
+     *
+     * `end > IDENT_MAP_LIMIT` rather than `>=`: the end is exclusive, so an
+     * extent finishing exactly at 0x40000000 touched nothing at or past it.
+     * The overflow test catches an absurd `n` wrapping the addition. */
+    if (end < base || end > IDENT_MAP_LIMIT) {
+        kprintf("\n[frame  ] OUT OF IDENTITY-MAPPED RAM: request for %u frame(s) at %X would end "
+                "at %X, past the 1 GiB limit %X -- halting\n",
+                n, base, end, (uint64_t)IDENT_MAP_LIMIT);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
     uint64_t *p = (uint64_t *)base;         /* identity mapped -> phys == virt  */
     for (uint64_t i = 0; i < n * 512; i++) p[i] = 0;
     return base;
@@ -2037,6 +2083,154 @@ static uint64_t dbg_pid_of(uint64_t proc_idx) {
     return kprocs[proc_idx].pid;
 }
 
+/* v0.75: is `pa` a physical address this kernel can actually dereference right
+ * now, from a fault handler, without risking a second fault?
+ *
+ * Three conditions, and all three are things a corrupted CR3 or page-table entry
+ * routinely violates:
+ *   - non-zero. A zeroed CR3 or a cleared entry reads as 0, and 0 is never a
+ *     page-table root here (the pool starts at 16 MiB and the kernel's own
+ *     tables sit in .bss).
+ *   - 4 KiB aligned. Every table this kernel builds comes from the frame
+ *     allocator, so a low-bit-dirty value is garbage rather than an address —
+ *     and it is exactly what a partially-overwritten entry looks like.
+ *   - below the 1 GiB identity map. Page tables are reached as phys == virt, so
+ *     anything at or beyond IDENT_MAP_LIMIT is not addressable at all: reading
+ *     it is the very fault we are trying to report on.
+ *
+ * Deliberately conservative. A false negative costs one skipped diagnostic line;
+ * a false positive costs the whole dump. */
+static int panic_phys_ok(uint64_t pa) {
+    if (!pa)                     return 0;
+    if (pa & 0xFFFull)           return 0;
+    if (pa >= IDENT_MAP_LIMIT)   return 0;
+    return 1;
+}
+
+/* Which of the three it failed, so the log says why rather than just "bad". */
+static const char *panic_phys_why(uint64_t pa) {
+    if (!pa)                   return "null";
+    if (pa & 0xFFFull)         return "not 4 KiB aligned";
+    if (pa >= IDENT_MAP_LIMIT) return "at or beyond the 1 GiB identity map";
+    return "ok";
+}
+
+/* v0.75: what a fatal fault prints. This used to be vector, error code and rip,
+ * and that is not enough to act on — "page fault in posix_drain" does not
+ * distinguish a bug in posix_drain from posix_drain merely being the code that
+ * ran next after the address space underneath it went away. An intermittent #14
+ * in a kernel where every process ALIASES PML4 entry 0 (the low 1 GiB identity
+ * map: kernel code, kernel stacks, the IDT) needs the faulting address and the
+ * CR3 it was resolved through, or it cannot be told apart from ordinary memory
+ * corruption.
+ *
+ * Terminal path only: nothing here runs until the machine is already dead, so
+ * it costs nothing in the normal case and there is no reason to be frugal. */
+static void panic_dump(struct isr_frame *f) {
+    uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    uint64_t cr3_now = read_cr3();
+
+    kprintf("\n[panic ] CPU EXCEPTION %u: %s (err=%x) at rip=%X\n",
+            f->vector, exc_names[f->vector], f->error, f->rip);
+    kprintf("[panic ] cpu=%u pid=%u cr2=%X cr3=%X kernel_cr3=%X\n",
+            (uint64_t)cpu_idx(), dbg_pid_of(current_proc_idx), cr2, cr3_now, kernel_cr3);
+    kprintf("[panic ] rsp=%X rbp=%X cs=%X cpl=%u rflags=%X\n",
+            f->rsp, f->rbp, f->cs, (uint64_t)(f->cs & 3), f->rflags);
+    if (f->vector == 14)
+        kprintf("[panic ] pf: %s | %s | %s%s%s\n",
+                (f->error & 1)  ? "protection-violation" : "NOT-PRESENT",
+                (f->error & 2)  ? "write" : "read",
+                (f->error & 4)  ? "user"  : "kernel",
+                (f->error & 8)  ? " | reserved-bit"      : "",
+                (f->error & 16) ? " | instruction-fetch" : "");
+
+    /* Is the address space we faulted in still a KERNEL-shaped one? Entry 0 is
+     * aliased into every process by create_address_space(), so it is present in
+     * every legitimate CR3 this kernel installs. If it is absent, the CR3 in use
+     * is not an address space at all — it is a freed frame something else has
+     * already written over, and THAT is the bug rather than whatever instruction
+     * happened to touch memory next.
+     *
+     * v0.75: EVERY pointer below is validated before it is dereferenced. This
+     * code runs when the machine is already broken, and the most likely thing to
+     * be broken is exactly the state it wants to read — a corrupt CR3 is one of
+     * the failures it exists to diagnose. Dereferencing it unchecked faults
+     * INSIDE the fault handler, and the second fault arrives with the console
+     * half-written: the dump truncates and takes its own evidence with it.
+     * (Observed: a run whose output stopped dead after the first line, which is
+     * what prompted this.) A rejected pointer prints its raw value and skips the
+     * walk, so the log still says what CR3 was. */
+    if (!panic_phys_ok(cr3_now & ADDR_MASK)) {
+        kprintf("[panic ] CR3 %X is not a usable page-table root (raw frame %X): "
+                "%s — skipping the page-table walk\n",
+                cr3_now, cr3_now & ADDR_MASK, panic_phys_why(cr3_now & ADDR_MASK));
+    } else {
+        uint64_t *pml4 = (uint64_t *)(cr3_now & ADDR_MASK);
+        uint64_t kp0 = 0, kpc0 = 0;
+        int kok = panic_phys_ok(kernel_cr3 & ADDR_MASK);
+        if (kok) {
+            uint64_t *kp = (uint64_t *)(kernel_cr3 & ADDR_MASK);
+            kp0 = kp[0]; kpc0 = kp[0xC0];
+        }
+        kprintf("[panic ] pml4[0]=%X (kernel %X)  pml4[0xC0]=%X (kernel %X)%s\n",
+                pml4[0], kp0, pml4[0xC0], kpc0, kok ? "" : "  [kernel_cr3 unreadable]");
+        if (!(pml4[0] & PTE_PRESENT))
+            kprintf("[panic ] *** PML4 ENTRY 0 NOT PRESENT: the live CR3 has lost the kernel\n"
+                    "[panic ] *** identity map. This address space was torn down or recycled\n"
+                    "[panic ] *** while this core was still running in it.\n");
+        else if (kok && cr3_now != kernel_cr3 && pml4[0] != kp0)
+            kprintf("[panic ] *** PML4[0] DISAGREES with the kernel's: this CR3's entry 0 is\n"
+                    "[panic ] *** stale or overwritten.\n");
+
+        /* Walk CR2 and say WHERE translation died. On a #14 this turns "not
+         * present" into the specific level that was missing, which is the
+         * difference between "some pointer was wrong" and "the PDPT covering
+         * this range was never installed". Each table pointer is validated
+         * before the step that would dereference it. */
+        if (f->vector == 14) {
+            uint64_t va = cr2;
+            uint64_t idx[4] = { (va >> 39) & 0x1FF, (va >> 30) & 0x1FF,
+                                (va >> 21) & 0x1FF, (va >> 12) & 0x1FF };
+            const char *lvl[4] = { "PML4", "PDPT", "PD", "PT" };
+            uint64_t tbl = cr3_now & ADDR_MASK;
+            kprintf("[panic ] walk of cr2=%X: pml4[%u] pdpt[%u] pd[%u] pt[%u]\n",
+                    va, idx[0], idx[1], idx[2], idx[3]);
+            for (int L = 0; L < 4; L++) {
+                if (!panic_phys_ok(tbl)) {
+                    kprintf("[panic ]   %s table at %X unusable (%s) — walk stops\n",
+                            lvl[L], tbl, panic_phys_why(tbl));
+                    break;
+                }
+                uint64_t e = ((uint64_t *)tbl)[idx[L]];
+                kprintf("[panic ]   %s[%u] = %X%s%s\n", lvl[L], idx[L], e,
+                        (e & PTE_PRESENT) ? "" : "  <-- NOT PRESENT, translation dies here",
+                        (e & PTE_HUGE)    ? "  (huge leaf)" : "");
+                if (!(e & PTE_PRESENT) || (e & PTE_HUGE)) break;
+                tbl = e & ADDR_MASK;
+            }
+        }
+    }
+
+    /* Poor-man's backtrace: -O2 without frame pointers makes an rbp chain
+     * unreliable, so scan the stack for values inside .text instead. Every real
+     * return address is one; a few stale ones are a small price for having a
+     * call chain at all. Resolve them with `nm`/`addr2line` against the ELF. */
+    {
+        uint64_t lo = (uint64_t)_stext, hi = (uint64_t)_etext;
+        uint64_t *sp = (uint64_t *)(f->rsp & ~7ull);
+        kprintf("[panic ] stack scan (text %X..%X):\n", lo, hi);
+        int shown = 0;
+        for (int i = 0; i < 256 && shown < 12; i++) {
+            uint64_t v = sp[i];
+            if (v >= lo && v < hi) {
+                kprintf("[panic ]   +%d: %X\n", (uint64_t)(int64_t)(i * 8), v);
+                shown++;
+            }
+        }
+    }
+    kprintf("[panic ] system halted — the fault was contained to this core\n");
+}
+
 /* v0.45: clears every field of a kproc slot's PER-PROCESS lifetime state —
  * identity, address-space handle, scheduling state, and the v0.44 DMA grant
  * table — so the slot is indistinguishable from a never-used one before its
@@ -2657,6 +2851,18 @@ struct pcb {
      * — a per-CPU stack would see the parked holder's ranks as its own.      */
     uint8_t  rank_stack[8];
     uint8_t  rank_sp;
+    /* v0.75: THIS THREAD's ring-3 kernel resume point. See sched_switch_to for
+     * why it cannot stay per-CPU: the identical argument as rank_stack above,
+     * one field further on. enter_user_mode saves the resume context into
+     * %gs:24..72 — this CPU's cpu_local — and resume_kernel restores from there,
+     * so the slot is single-occupancy per CORE. On the BSP it is not: a ring-3
+     * task can SYSCALL into a path that parks (vblk wait), the BSP runs another
+     * kernel thread meanwhile, and if THAT thread also enters ring 3 it
+     * overwrites the first thread's resume point. The first task then exits,
+     * resume_kernel restores the second thread's rsp/rbx/rbp/r12-r15, and the
+     * first excursion returns onto a stack that is not its own — a #13 with a
+     * non-canonical RIP and another thread's registers still loaded. */
+    uint64_t krsp, krbx, krbp, kr12, kr13, kr14, kr15;
 };
 
 #define MAX_THREADS 16
@@ -2697,6 +2903,23 @@ static void __attribute__((no_stack_protector)) sched_switch_to(int nextid) {
     struct cpu_local *cl = &g_cpu[cpu_idx()];/* this CPU's guard word (%gs:80):   */
     prev->canary = cl->canary;               /* save this thread's guard          */
     cl->canary   = next->canary;             /* load the next thread's guard      */
+    /* v0.75: the ring-3 kernel resume point is per-CPU state that the BSP
+     * multiplexes between threads, exactly like the guard word above and for
+     * exactly the same reason — so it is saved and restored in exactly the same
+     * place. Without this, a thread that is INSIDE a ring-3 excursion and parks
+     * in a syscall has its resume point overwritten by the next BSP thread to
+     * enter ring 3, and unwinds onto that thread's stack when its task exits.
+     * (Found live: an intermittent #13 General Protection at a non-canonical RIP
+     * on cpu 0, ~1 boot in 4 under -smp 4, with the kernel CR3 and PML4 entirely
+     * intact — see the panic_dump output that ruled the address space out.)
+     * g_excur_switch counts the switches that would have corrupted it. */
+    if (cl->excur_depth) __sync_fetch_and_add(&g_excur_switch, 1);
+    prev->krsp = cl->krsp; prev->krbx = cl->krbx; prev->krbp = cl->krbp;
+    prev->kr12 = cl->kr12; prev->kr13 = cl->kr13;
+    prev->kr14 = cl->kr14; prev->kr15 = cl->kr15;
+    cl->krsp = next->krsp; cl->krbx = next->krbx; cl->krbp = next->krbp;
+    cl->kr12 = next->kr12; cl->kr13 = next->kr13;
+    cl->kr14 = next->kr14; cl->kr15 = next->kr15;
     prev->proc = current_proc_idx;           /* per-thread process identity: the  */
     current_proc_idx = next->proc;           /* capability gate reads this        */
     prev->cr3 = read_cr3();                  /* save the LIVE address space (the  */
@@ -10309,9 +10532,15 @@ static void cpu_exec_proc(int c, int p) {
             kprintf("[dbgposix] pid %u killed by signal %d\n",
                     kprocs[p].pid, (uint64_t)fatal_sig);
     } else {
+        /* v0.75: mark the excursion so sched_switch_to can see that a switch
+         * away from here would have clobbered this thread's resume point. Both
+         * entries below save that point into %gs:24..72; the decrement runs on
+         * the unwind, whichever way the excursion ends. */
+        __sync_fetch_and_add(&me->excur_depth, 1);
         code = kprocs[p].pstate
              ? enter_user_resume(&kprocs[p].uctx)
              : enter_user_mode(kprocs[p].entry, USTK_INIT);
+        __sync_fetch_and_sub(&me->excur_depth, 1);
     }
     write_cr3(kernel_cr3);
     __sync_fetch_and_sub(&g_inr3, 1);
@@ -23813,6 +24042,14 @@ static void shell_exec(char *line) {
 static void shell_run(void) {
     char line[80];
     uint32_t len = 0;
+    /* v0.75: the precondition of the resume-point race, counted for the whole
+     * boot. Non-zero means BSP thread switches DID happen with a ring-3
+     * excursion live on this core — which before sched_switch_to saved the
+     * resume context was the corruption that produced an intermittent #13 at a
+     * non-canonical RIP. Printed unconditionally so the number is evidence in
+     * every log rather than something a future reader has to re-derive. */
+    kprintf("[excur  ] BSP thread switches during a live ring-3 excursion: %u\n",
+            g_excur_switch);
     kputs("\nType 'help' for commands, 'demo' for the capability walk-through.\n");
     kputs("outrun> ");
     for (;;) {
