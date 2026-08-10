@@ -3200,8 +3200,36 @@ static inline uint8_t *rank_ctx(uint8_t **sp) {
     struct cpu_local *me = &g_cpu[cpu_idx()]; *sp = &me->rank_sp;       return me->rank_stack;
 }
 
+/* v0.75: the rank stack is shared with INTERRUPT CONTEXT and must be touched
+ * atomically with respect to it.
+ *
+ * On cpu 0 rank_ctx() resolves to curthr->rank_stack, and an ISR on that core
+ * runs on whatever thread it interrupted — so a softirq taking a klock pushes
+ * and pops the INTERRUPTED THREAD's stack while that thread is mid-update. The
+ * push/pop pairs are individually balanced, so the damage is not corruption of
+ * the depth but a torn READ: the last verification caught the acquire-side
+ * check firing and then printing `depth=0`, which the guard `*sp > 0` cannot
+ * produce. The stack had changed underneath between the test and the report.
+ *
+ * Masking local interrupts across each read-modify-write is enough, and is
+ * cheaper than a second per-CPU ISR stack: the sections are a compare and an
+ * increment, the ISR cannot then land inside one, and every push still pairs
+ * with its own pop on the same stack. Callers already in interrupt context
+ * (IF off) are unaffected — the flags are saved and restored, never forced on.
+ * Deliberately NOT held across the spin below, which must keep interrupts in
+ * whatever state the caller had or a contended lock would stall the timer. */
+static inline uint64_t klock_irq_save(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void klock_irq_restore(uint64_t f) {
+    if (f & 0x200ull) __asm__ volatile("sti" ::: "memory");
+}
+
 static void klock_acquire(struct klock *l) {
     uint8_t *sp, *st = rank_ctx(&sp);                  /* our context's stack;  */
+    uint64_t rf = klock_irq_save();                    /* v0.75: vs ISR on cpu 0 */
     if (*sp > 0 && st[*sp - 1] >= l->rank) {           /* still ours after any  */
         __sync_fetch_and_add(&g_rank_violations, 1);   /* yield below — a yield */
         /* v0.75: the CALLER. "acquiring net while holding net" names the lock
@@ -3224,11 +3252,13 @@ static void klock_acquire(struct klock *l) {
                 (uint64_t)(int64_t)st[4], (uint64_t)(int64_t)st[5],
                 (uint64_t)(int64_t)st[6], (uint64_t)(int64_t)st[7]);
     }                                                  /* resumes THIS thread   */
+    klock_irq_restore(rf);                             /* check done: reopen IF */
     if (__sync_lock_test_and_set(&l->v, 1)) {
         __sync_fetch_and_add(&l->contended, 1);
         do { krelax(); } while (l->v || __sync_lock_test_and_set(&l->v, 1));
     }
     l->acq++;                                          /* under the lock        */
+    rf = klock_irq_save();                             /* v0.75: atomic push    */
     /* v0.75: bind the slot to the LOCK. Everything below runs with the lock
      * held, so these three fields have exactly one writer. `st`/`sp` are the
      * ones resolved on THIS side; release will not resolve them again. A depth
@@ -3244,6 +3274,7 @@ static void klock_acquire(struct klock *l) {
         l->rank_st  = 0;
         l->rank_spp = 0;
     }
+    klock_irq_restore(rf);
 }
 
 /* v0.75: catch the imbalance AT THE RELEASE, which is the only place that can
@@ -3270,6 +3301,7 @@ static void klock_acquire(struct klock *l) {
  * entry can never be stranded, which is the failure that produced hundreds of
  * phantom violations from two underflows. */
 static void klock_release(struct klock *l) {
+    uint64_t rf  = klock_irq_save();                   /* v0.75: atomic pop     */
     uint8_t *st  = l->rank_st;
     uint8_t *spp = l->rank_spp;
     uint8_t  idx = l->rank_idx;
@@ -3291,6 +3323,7 @@ static void klock_release(struct klock *l) {
         }
         if (*spp > idx) *spp = idx;                    /* never strand our entry */
     }
+    klock_irq_restore(rf);
     __sync_lock_release(&l->v);
 }
 
