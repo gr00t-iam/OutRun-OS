@@ -281,6 +281,10 @@ struct cpu_local {
     uint8_t  rank_stack[8];                  /* klock ranks held by the context      */
     uint8_t  rank_sp;                        /* running on this CPU (APs only; the   */
     volatile int dbg_was_idle;               /* v0.43: DEBUG_SMP_SCHED idle-edge latch */
+    /* v0.75: how many ring-3 excursions this CPU is nested inside. Appended at
+     * the END of the struct on purpose — the asm contract pins offsets 8/16/24
+     * and the compiler pins 80, and all four are _Static_assert-ed below. */
+    volatile uint32_t excur_depth;
 };                                           /* BSP tracks per-THREAD in the PCB)    */
 #define CPUL_SYSCALL_RSP 8                   /* asm contract (boot/usermode.asm) */
 #define CPUL_USER_RSP    16
@@ -296,6 +300,14 @@ _Static_assert(__builtin_offsetof(struct cpu_local, canary) == CPUL_CANARY,
                "compiler contract: stack guard at %gs:80");
 static struct cpu_local g_cpu[MAX_CPUS];
 static volatile int g_gs_ready;              /* set once per-CPU GS bases are armed */
+/* v0.75: BSP thread switches taken while this core was inside a ring-3
+ * excursion — i.e. the exact event that used to overwrite one thread's kernel
+ * resume point with another's. Diagnostic only now that sched_switch_to saves
+ * and restores that context; a NON-ZERO value here is the bug's precondition
+ * occurring, and smpstrs reports it so the number is visible rather than
+ * inferred. The depth it keys off is per-CPU and therefore approximate across a
+ * switch, which is fine for counting events and is why nothing depends on it. */
+static volatile uint64_t g_excur_switch;
 static uint32_t cpu_idx(void);               /* fwd: %gs:0, or 0 before arming */
 
 /* Who is 'running' for every capability check in syscall_dispatch. Since
@@ -581,6 +593,7 @@ static volatile int g_debug_posix = 0;          /* DEBUG_POSIX: fork/exec/signal
 #define UARG_LEN   48                                      /* max bytes per string    */
 
 static void handle_cpl3_fault(struct isr_frame *f);      /* defined after process globals */
+static void panic_dump(struct isr_frame *f);             /* v0.75: fatal-fault diagnostics */
 static int  posix_try_fault_signal(struct isr_frame *f);  /* v0.55: catchable SIGSEGV (signal core) */
 static int  vm_fault_handle(struct isr_frame *f);        /* v0.63: demand-zero / copy-on-write     */
 static void tcp_timer_scan(void);                        /* v0.67: retransmit, driven from idle    */
@@ -645,9 +658,7 @@ void isr_dispatch(struct isr_frame *f) {
         /* offending task (guard-page hit = stack overflow).                      */
         if ((f->cs & 3) == 3) handle_cpl3_fault(f);      /* noreturn: unwinds to kernel */
         g_conlock = 0;                       /* terminal path: bust the console  */
-        kprintf("\n[panic ] CPU EXCEPTION %u: %s (err=%x) at rip=%X\n",
-                f->vector, exc_names[f->vector], f->error, f->rip);
-        kprintf("[panic ] system halted — the fault was contained to this core\n");
+        panic_dump(f);                       /* v0.75: see its definition        */
         for (;;) __asm__ volatile("cli; hlt");
     }
     if (f->vector == 32) {
@@ -853,6 +864,24 @@ extern uint64_t cpp_ring_depth(void);
 /* reach them directly.                                                         */
 static uint64_t g_next_frame = 0x01000000; /* 16 MiB: clear of kernel + stack */
 
+/* v0.75: the ceiling this allocator has always ASSUMED and never enforced.
+ *
+ * boot.asm identity-maps exactly the first 1 GiB with 2 MiB pages, and the
+ * comment above says page tables and scratch "all live below 1 GiB so BOTH the
+ * kernel CR3 and every process CR3 can reach them directly". That was a
+ * statement of intent with nothing behind it: g_next_frame starts at 16 MiB and
+ * grows monotonically with no upper bound, so a boot that allocates enough
+ * frames walks the bump pointer straight off the end of the mapped window. The
+ * first address past it is 0x40000000 EXACTLY, and every access to a frame at
+ * or beyond that point faults not-present — the allocator's own zeroing loop
+ * writes there before any caller ever sees the pointer.
+ *
+ * Strictly `<`: an allocation is legal only if every byte it hands out lies
+ * below the limit, so a frame based at 0x3FFFF000 is the last valid one and an
+ * extent ENDING at 0x40000000 is fine (the end is exclusive), while one ending
+ * at 0x40001000 is not. */
+#define IDENT_MAP_LIMIT 0x40000000ull      /* 1 GiB — see boot.asm's page tables */
+
 /* v0.41: the bump pointer is claimed with LOCK XADD, so any core may allocate
  * concurrently — two cores can no longer be handed the same frame, and a
  * multi-frame claim stays contiguous because the whole extent is reserved in
@@ -860,6 +889,23 @@ static uint64_t g_next_frame = 0x01000000; /* 16 MiB: clear of kernel + stack */
  * happens outside any lock: the frames are exclusively ours once claimed.    */
 static uint64_t alloc_frames(uint64_t n) {
     uint64_t base = __sync_fetch_and_add(&g_next_frame, n * 0x1000);
+    uint64_t end  = base + n * 0x1000;      /* exclusive                        */
+    /* v0.75: enforce the identity-map ceiling BEFORE the zeroing loop below,
+     * because that loop is itself the first thing to touch the frames — an
+     * unbounded bump pointer does not fail at the caller, it faults inside the
+     * allocator, writing to the first unmapped address. Halting here converts a
+     * silent walk off the end of the mapped window into one line naming the
+     * exact request that exhausted it.
+     *
+     * `end > IDENT_MAP_LIMIT` rather than `>=`: the end is exclusive, so an
+     * extent finishing exactly at 0x40000000 touched nothing at or past it.
+     * The overflow test catches an absurd `n` wrapping the addition. */
+    if (end < base || end > IDENT_MAP_LIMIT) {
+        kprintf("\n[frame  ] OUT OF IDENTITY-MAPPED RAM: request for %u frame(s) at %X would end "
+                "at %X, past the 1 GiB limit %X -- halting\n",
+                n, base, end, (uint64_t)IDENT_MAP_LIMIT);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
     uint64_t *p = (uint64_t *)base;         /* identity mapped -> phys == virt  */
     for (uint64_t i = 0; i < n * 512; i++) p[i] = 0;
     return base;
@@ -1967,6 +2013,18 @@ struct kproc {
      * critical section rather than an implicit invariant, and is the seam a
      * future multi-threaded-per-process model would actually need. */
     volatile int      vma_lock;
+    /* v0.75: lock ranks held by THIS TASK. The rank stack has to live on the
+     * thing that MIGRATES, and a ring-3 task is it: a syscall can drop a lock,
+     * yield, and resume on a DIFFERENT core, at which point per-CPU storage
+     * belongs to the wrong core and curthr is the BSP's kernel thread rather
+     * than this task. Measured, not argued — the [connwin] trace showed the same
+     * tid and correct depth arithmetic either side of one sched_yield() with a
+     * DIFFERENT stack pointer, which is the migration.
+     *
+     * Resolved through tg_of() so a thread answers with its process's stack, the
+     * same rule every other identity in this kernel follows since defect C. */
+    uint8_t  rank_stack[8];
+    uint8_t  rank_sp;
 };
 #define MAX_KPROC 64                  /* v0.41: +6 cio workers; v0.43: +10 smp_stress workers */
 static struct kproc kprocs[MAX_KPROC];
@@ -2037,6 +2095,154 @@ static uint64_t dbg_pid_of(uint64_t proc_idx) {
     return kprocs[proc_idx].pid;
 }
 
+/* v0.75: is `pa` a physical address this kernel can actually dereference right
+ * now, from a fault handler, without risking a second fault?
+ *
+ * Three conditions, and all three are things a corrupted CR3 or page-table entry
+ * routinely violates:
+ *   - non-zero. A zeroed CR3 or a cleared entry reads as 0, and 0 is never a
+ *     page-table root here (the pool starts at 16 MiB and the kernel's own
+ *     tables sit in .bss).
+ *   - 4 KiB aligned. Every table this kernel builds comes from the frame
+ *     allocator, so a low-bit-dirty value is garbage rather than an address —
+ *     and it is exactly what a partially-overwritten entry looks like.
+ *   - below the 1 GiB identity map. Page tables are reached as phys == virt, so
+ *     anything at or beyond IDENT_MAP_LIMIT is not addressable at all: reading
+ *     it is the very fault we are trying to report on.
+ *
+ * Deliberately conservative. A false negative costs one skipped diagnostic line;
+ * a false positive costs the whole dump. */
+static int panic_phys_ok(uint64_t pa) {
+    if (!pa)                     return 0;
+    if (pa & 0xFFFull)           return 0;
+    if (pa >= IDENT_MAP_LIMIT)   return 0;
+    return 1;
+}
+
+/* Which of the three it failed, so the log says why rather than just "bad". */
+static const char *panic_phys_why(uint64_t pa) {
+    if (!pa)                   return "null";
+    if (pa & 0xFFFull)         return "not 4 KiB aligned";
+    if (pa >= IDENT_MAP_LIMIT) return "at or beyond the 1 GiB identity map";
+    return "ok";
+}
+
+/* v0.75: what a fatal fault prints. This used to be vector, error code and rip,
+ * and that is not enough to act on — "page fault in posix_drain" does not
+ * distinguish a bug in posix_drain from posix_drain merely being the code that
+ * ran next after the address space underneath it went away. An intermittent #14
+ * in a kernel where every process ALIASES PML4 entry 0 (the low 1 GiB identity
+ * map: kernel code, kernel stacks, the IDT) needs the faulting address and the
+ * CR3 it was resolved through, or it cannot be told apart from ordinary memory
+ * corruption.
+ *
+ * Terminal path only: nothing here runs until the machine is already dead, so
+ * it costs nothing in the normal case and there is no reason to be frugal. */
+static void panic_dump(struct isr_frame *f) {
+    uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    uint64_t cr3_now = read_cr3();
+
+    kprintf("\n[panic ] CPU EXCEPTION %u: %s (err=%x) at rip=%X\n",
+            f->vector, exc_names[f->vector], f->error, f->rip);
+    kprintf("[panic ] cpu=%u pid=%u cr2=%X cr3=%X kernel_cr3=%X\n",
+            (uint64_t)cpu_idx(), dbg_pid_of(current_proc_idx), cr2, cr3_now, kernel_cr3);
+    kprintf("[panic ] rsp=%X rbp=%X cs=%X cpl=%u rflags=%X\n",
+            f->rsp, f->rbp, f->cs, (uint64_t)(f->cs & 3), f->rflags);
+    if (f->vector == 14)
+        kprintf("[panic ] pf: %s | %s | %s%s%s\n",
+                (f->error & 1)  ? "protection-violation" : "NOT-PRESENT",
+                (f->error & 2)  ? "write" : "read",
+                (f->error & 4)  ? "user"  : "kernel",
+                (f->error & 8)  ? " | reserved-bit"      : "",
+                (f->error & 16) ? " | instruction-fetch" : "");
+
+    /* Is the address space we faulted in still a KERNEL-shaped one? Entry 0 is
+     * aliased into every process by create_address_space(), so it is present in
+     * every legitimate CR3 this kernel installs. If it is absent, the CR3 in use
+     * is not an address space at all — it is a freed frame something else has
+     * already written over, and THAT is the bug rather than whatever instruction
+     * happened to touch memory next.
+     *
+     * v0.75: EVERY pointer below is validated before it is dereferenced. This
+     * code runs when the machine is already broken, and the most likely thing to
+     * be broken is exactly the state it wants to read — a corrupt CR3 is one of
+     * the failures it exists to diagnose. Dereferencing it unchecked faults
+     * INSIDE the fault handler, and the second fault arrives with the console
+     * half-written: the dump truncates and takes its own evidence with it.
+     * (Observed: a run whose output stopped dead after the first line, which is
+     * what prompted this.) A rejected pointer prints its raw value and skips the
+     * walk, so the log still says what CR3 was. */
+    if (!panic_phys_ok(cr3_now & ADDR_MASK)) {
+        kprintf("[panic ] CR3 %X is not a usable page-table root (raw frame %X): "
+                "%s — skipping the page-table walk\n",
+                cr3_now, cr3_now & ADDR_MASK, panic_phys_why(cr3_now & ADDR_MASK));
+    } else {
+        uint64_t *pml4 = (uint64_t *)(cr3_now & ADDR_MASK);
+        uint64_t kp0 = 0, kpc0 = 0;
+        int kok = panic_phys_ok(kernel_cr3 & ADDR_MASK);
+        if (kok) {
+            uint64_t *kp = (uint64_t *)(kernel_cr3 & ADDR_MASK);
+            kp0 = kp[0]; kpc0 = kp[0xC0];
+        }
+        kprintf("[panic ] pml4[0]=%X (kernel %X)  pml4[0xC0]=%X (kernel %X)%s\n",
+                pml4[0], kp0, pml4[0xC0], kpc0, kok ? "" : "  [kernel_cr3 unreadable]");
+        if (!(pml4[0] & PTE_PRESENT))
+            kprintf("[panic ] *** PML4 ENTRY 0 NOT PRESENT: the live CR3 has lost the kernel\n"
+                    "[panic ] *** identity map. This address space was torn down or recycled\n"
+                    "[panic ] *** while this core was still running in it.\n");
+        else if (kok && cr3_now != kernel_cr3 && pml4[0] != kp0)
+            kprintf("[panic ] *** PML4[0] DISAGREES with the kernel's: this CR3's entry 0 is\n"
+                    "[panic ] *** stale or overwritten.\n");
+
+        /* Walk CR2 and say WHERE translation died. On a #14 this turns "not
+         * present" into the specific level that was missing, which is the
+         * difference between "some pointer was wrong" and "the PDPT covering
+         * this range was never installed". Each table pointer is validated
+         * before the step that would dereference it. */
+        if (f->vector == 14) {
+            uint64_t va = cr2;
+            uint64_t idx[4] = { (va >> 39) & 0x1FF, (va >> 30) & 0x1FF,
+                                (va >> 21) & 0x1FF, (va >> 12) & 0x1FF };
+            const char *lvl[4] = { "PML4", "PDPT", "PD", "PT" };
+            uint64_t tbl = cr3_now & ADDR_MASK;
+            kprintf("[panic ] walk of cr2=%X: pml4[%u] pdpt[%u] pd[%u] pt[%u]\n",
+                    va, idx[0], idx[1], idx[2], idx[3]);
+            for (int L = 0; L < 4; L++) {
+                if (!panic_phys_ok(tbl)) {
+                    kprintf("[panic ]   %s table at %X unusable (%s) — walk stops\n",
+                            lvl[L], tbl, panic_phys_why(tbl));
+                    break;
+                }
+                uint64_t e = ((uint64_t *)tbl)[idx[L]];
+                kprintf("[panic ]   %s[%u] = %X%s%s\n", lvl[L], idx[L], e,
+                        (e & PTE_PRESENT) ? "" : "  <-- NOT PRESENT, translation dies here",
+                        (e & PTE_HUGE)    ? "  (huge leaf)" : "");
+                if (!(e & PTE_PRESENT) || (e & PTE_HUGE)) break;
+                tbl = e & ADDR_MASK;
+            }
+        }
+    }
+
+    /* Poor-man's backtrace: -O2 without frame pointers makes an rbp chain
+     * unreliable, so scan the stack for values inside .text instead. Every real
+     * return address is one; a few stale ones are a small price for having a
+     * call chain at all. Resolve them with `nm`/`addr2line` against the ELF. */
+    {
+        uint64_t lo = (uint64_t)_stext, hi = (uint64_t)_etext;
+        uint64_t *sp = (uint64_t *)(f->rsp & ~7ull);
+        kprintf("[panic ] stack scan (text %X..%X):\n", lo, hi);
+        int shown = 0;
+        for (int i = 0; i < 256 && shown < 12; i++) {
+            uint64_t v = sp[i];
+            if (v >= lo && v < hi) {
+                kprintf("[panic ]   +%d: %X\n", (uint64_t)(int64_t)(i * 8), v);
+                shown++;
+            }
+        }
+    }
+    kprintf("[panic ] system halted — the fault was contained to this core\n");
+}
+
 /* v0.45: clears every field of a kproc slot's PER-PROCESS lifetime state —
  * identity, address-space handle, scheduling state, and the v0.44 DMA grant
  * table — so the slot is indistinguishable from a never-used one before its
@@ -2086,6 +2292,10 @@ static void kproc_reset(struct kproc *p) {
     for (int sg = 0; sg < NSIG; sg++) p->sig_handler[sg] = 0;
     p->sig_pending = 0; p->sig_mask = 0; p->sigframe_sp = 0;
     p->alarm_deadline = 0; p->ppid_slot = -1; p->ppid_gen = 0; p->pgid = 0;
+    /* v0.75: a recycled slot must not inherit the dead task's held ranks — the
+     * same lesson thread_create_ex learned for PCBs, one struct over. */
+    p->rank_sp = 0;
+    for (int rr = 0; rr < 8; rr++) p->rank_stack[rr] = 0;
     /* v0.75 defect B: this slot is about to hold a DIFFERENT process, so anyone
      * still pointing at it as a parent must stop resolving. Incremented, never
      * blanked — the counter's value is the whole point, and a memset here would
@@ -2657,6 +2867,18 @@ struct pcb {
      * — a per-CPU stack would see the parked holder's ranks as its own.      */
     uint8_t  rank_stack[8];
     uint8_t  rank_sp;
+    /* v0.75: THIS THREAD's ring-3 kernel resume point. See sched_switch_to for
+     * why it cannot stay per-CPU: the identical argument as rank_stack above,
+     * one field further on. enter_user_mode saves the resume context into
+     * %gs:24..72 — this CPU's cpu_local — and resume_kernel restores from there,
+     * so the slot is single-occupancy per CORE. On the BSP it is not: a ring-3
+     * task can SYSCALL into a path that parks (vblk wait), the BSP runs another
+     * kernel thread meanwhile, and if THAT thread also enters ring 3 it
+     * overwrites the first thread's resume point. The first task then exits,
+     * resume_kernel restores the second thread's rsp/rbx/rbp/r12-r15, and the
+     * first excursion returns onto a stack that is not its own — a #13 with a
+     * non-canonical RIP and another thread's registers still loaded. */
+    uint64_t krsp, krbx, krbp, kr12, kr13, kr14, kr15;
 };
 
 #define MAX_THREADS 16
@@ -2697,6 +2919,23 @@ static void __attribute__((no_stack_protector)) sched_switch_to(int nextid) {
     struct cpu_local *cl = &g_cpu[cpu_idx()];/* this CPU's guard word (%gs:80):   */
     prev->canary = cl->canary;               /* save this thread's guard          */
     cl->canary   = next->canary;             /* load the next thread's guard      */
+    /* v0.75: the ring-3 kernel resume point is per-CPU state that the BSP
+     * multiplexes between threads, exactly like the guard word above and for
+     * exactly the same reason — so it is saved and restored in exactly the same
+     * place. Without this, a thread that is INSIDE a ring-3 excursion and parks
+     * in a syscall has its resume point overwritten by the next BSP thread to
+     * enter ring 3, and unwinds onto that thread's stack when its task exits.
+     * (Found live: an intermittent #13 General Protection at a non-canonical RIP
+     * on cpu 0, ~1 boot in 4 under -smp 4, with the kernel CR3 and PML4 entirely
+     * intact — see the panic_dump output that ruled the address space out.)
+     * g_excur_switch counts the switches that would have corrupted it. */
+    if (cl->excur_depth) __sync_fetch_and_add(&g_excur_switch, 1);
+    prev->krsp = cl->krsp; prev->krbx = cl->krbx; prev->krbp = cl->krbp;
+    prev->kr12 = cl->kr12; prev->kr13 = cl->kr13;
+    prev->kr14 = cl->kr14; prev->kr15 = cl->kr15;
+    cl->krsp = next->krsp; cl->krbx = next->krbx; cl->krbp = next->krbp;
+    cl->kr12 = next->kr12; cl->kr13 = next->kr13;
+    cl->kr14 = next->kr14; cl->kr15 = next->kr15;
     prev->proc = current_proc_idx;           /* per-thread process identity: the  */
     current_proc_idx = next->proc;           /* capability gate reads this        */
     prev->cr3 = read_cr3();                  /* save the LIVE address space (the  */
@@ -2765,6 +3004,28 @@ static int thread_create_ex(const char *name, void (*entry)(void *), void *arg,
         t->id = i; t->name = name; t->entry = entry; t->arg = arg;
         t->cr3 = kernel_cr3; t->stack = g_tstacks[i]; t->wait_tag = 0;
         t->proc = 0; t->uthread = 0; t->rsp0 = 0; t->ksrsp = 0;
+        /* v0.75: RESET THE LOCK-RANK BOOKKEEPING. rank_sp was assigned nowhere
+         * in the tree — not here, not in sched_init, nowhere — so it was correct
+         * only by virtue of g_threads[] being zero-initialised at boot. PCB
+         * slots are RECYCLED (thread_trampoline marks T_FREE, the CAS above
+         * reclaims), so any depth the previous occupant left behind became the
+         * new thread's starting depth, and the ranks under it became ranks the
+         * new thread was considered to be holding.
+         *
+         * A thread that leaves a non-zero depth behind hands its successor a
+         * permanent phantom hold: every acquire that thread ever makes compares
+         * against a rank nothing owns, and reports a violation for a lock that
+         * is demonstrably free. That is the shape of the data in PR #64 — 854 of
+         * 937 violations from one site, all on cpu 0, none of them deadlocking,
+         * and the teardown "inversions" (ipc/gpu/audio/descriptor/net_teardown)
+         * all reported under the same phantom rank 9 because cpu_exec_proc's
+         * exit path calls them one after another on that same thread.
+         *
+         * Zeroing the stack as well as the depth is deliberate: the depth alone
+         * would be enough for correctness, but a stale rank sitting above sp is
+         * exactly what makes a future off-by-one unreadable in a log. */
+        t->rank_sp = 0;
+        for (int r = 0; r < 8; r++) t->rank_stack[r] = 0;
         uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
         t->canary = ((((uint64_t)hi << 32) | lo) * 0x9E3779B97F4A7C15ull)
                     ^ (0xC0FFEE0000ull + (uint64_t)i * 0x100000001B3ull);   /* per-thread entropy */
@@ -2858,18 +3119,39 @@ struct klock {
     uint8_t           rank;
     volatile uint32_t acq;                   /* successful acquisitions        */
     volatile uint32_t contended;             /* acquisitions that had to wait  */
+    /* v0.75: WHERE THIS LOCK'S RANK ENTRY LIVES, recorded at acquire.
+     *
+     * rank_ctx() chooses per-thread or per-CPU storage by evaluating
+     * (cpu_idx()==0 && g_sched_on) at the moment it is called. Acquire and
+     * release call it separately, so a lock held across anything that changes
+     * that predicate — a scheduler transition, work that reaches a context
+     * switch — pushed onto one stack and popped from another: the pop
+     * underflowed and the push was stranded permanently. That stranded rank is
+     * what every later acquire on the thread tripped over, and it is why the
+     * acquire-side warning always accused whoever NOTICED rather than whoever
+     * left it (measured: tcp_timer_scan + 268 and gpu_teardown_kproc + 56).
+     *
+     * A klock is held by exactly one context at a time, so the lock itself is
+     * the one place that can remember the answer. These are written under the
+     * lock, after it is acquired, and read before it is released — so release
+     * pops the exact slot acquire pushed, whatever the context has become since.
+     * Appended to the struct so the 13 five-field initialisers below still
+     * zero-fill them. */
+    uint8_t          *rank_st;               /* the stack it was pushed on     */
+    uint8_t          *rank_spp;              /* that stack's depth cursor      */
+    uint8_t           rank_idx;              /* the index it was pushed at     */
 };
-static struct klock g_ofile_lock = { 0, "ofile", 1, 0, 0 };
-static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0 };
-static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0 };
-static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0 };
-static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0 };
+static struct klock g_ofile_lock = { 0, "ofile", 1, 0, 0, 0, 0, 0 };
+static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0, 0, 0, 0 };
+static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0, 0, 0, 0 };
+static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0, 0, 0, 0 };
+static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0, 0, 0, 0 };
 /* v0.66. Rank 12: ABOVE every lock this ever needs, because it is never held
  * across one. Filling a page reads the VFS and flushing one writes it, and
  * both happen with this released — collect under the lock, do the I/O outside
  * it, re-check on the way back in. Holding it across g_vfs_lock (rank 2) would
  * be a real inversion, not a bookkeeping nicety. */
-static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0 };
+static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0, 0, 0, 0 };
 static volatile uint32_t g_rank_violations = 0;
 
 /* Back off without monopolizing the core that must make our progress: the BSP
@@ -2925,30 +3207,193 @@ static inline void execbuf_acquire(void) {
 }
 static inline void execbuf_release(void) { __sync_lock_release(&g_execbuf_lock); }
 
+/* v0.75: imbalance counters, reported by klock_release below. */
+static volatile uint64_t g_rank_underflow = 0, g_rank_mismatch = 0;
+/* v0.75: times sys_connect's retransmit loop was entered from an AP. This
+ * counts ARRIVALS, not faults — the ring-3 client runs on whichever core holds
+ * it, so a healthy -smp 4 boot is expected to be non-zero. It earns its keep as
+ * a measure of how often the AP path is exercised at all: a run reporting zero
+ * has not tested the thing we changed. */
+static volatile uint64_t g_connect_ap_yield = 0;
+/* v0.75: times sys_connect found its socket slot reissued underneath it across
+ * the retransmit loop's lock release. This one IS a fault counter — non-zero
+ * means a stale-handle window was hit and refused rather than acted on. */
+static volatile uint64_t g_connect_stale = 0;
+
 /* Rank bookkeeping storage for the CURRENT context (see the pcb comment).    */
+/* v0.75: THE STORAGE MUST BELONG TO WHATEVER CAN HOLD A LOCK ACROSS A YIELD.
+ *
+ * This used to be `cpu_idx()==0 && g_sched_on ? curthr : per-CPU`, which picks
+ * by CORE. A ring-3 task's syscall can drop a lock, yield, and resume on a
+ * different core — so the two halves of one hold resolved to two different
+ * stacks, the push was never popped from the one it landed on, and the leftover
+ * rank was what every later acquire tripped over. That is measured, not
+ * inferred: the [connwin] trace showed identical tid and correct depth
+ * arithmetic on both sides of a single sched_yield(), with the stack POINTER
+ * changed.
+ *
+ * Three contexts, in the order they must be tested:
+ *
+ *   SERVICING A RING-3 TASK — excur_depth is non-zero exactly when this core is
+ *     inside a ring-3 excursion, so the syscall running now belongs to
+ *     cur_proc. That task is the entity that migrates, so the ranks live on it,
+ *     resolved through tg_of() so threads of one process share one stack the
+ *     way they share every other identity. Correct on the BSP and on APs alike,
+ *     and correct across a migration because the task is the key, not the core.
+ *
+ *   BSP KERNEL THREAD — no excursion, so this is the BSP's own scheduler thread
+ *     doing its own work. It can park holding a lock while another BSP thread
+ *     runs, which is why this was per-thread to begin with; that reasoning is
+ *     unchanged and so is the storage.
+ *
+ *   PRE-SCHEDULER, or an AP with no task — per-CPU. Nothing else exists yet, and
+ *     nothing in these contexts survives a yield.
+ *
+ * Deliberately NOT keyed on curthr for APs: g_threads/g_cur are the BSP
+ * scheduler's, and an AP touching them would race the BSP on its own thread's
+ * state — the kernel's cpu_local comment says as much ("APs only; the BSP
+ * tracks per-THREAD in the PCB"). */
 static inline uint8_t *rank_ctx(uint8_t **sp) {
-    if (cpu_idx() == 0 && g_sched_on) { *sp = &curthr->rank_sp;         return curthr->rank_stack; }
-    struct cpu_local *me = &g_cpu[cpu_idx()]; *sp = &me->rank_sp;       return me->rank_stack;
+    struct cpu_local *me = &g_cpu[cpu_idx()];
+    if (g_sched_on) {
+        if (me->excur_depth) {                        /* a ring-3 task's kernel side */
+            uint64_t p = me->cur_proc;
+            if (p < (uint64_t)n_kproc && kprocs[p].used) {
+                int L = tg_of((int)p);
+                *sp = &kprocs[L].rank_sp;
+                return kprocs[L].rank_stack;
+            }
+        }
+        if (cpu_idx() == 0) { *sp = &curthr->rank_sp; return curthr->rank_stack; }
+    }
+    *sp = &me->rank_sp;
+    return me->rank_stack;
+}
+
+/* v0.75: the rank stack is shared with INTERRUPT CONTEXT and must be touched
+ * atomically with respect to it.
+ *
+ * On cpu 0 rank_ctx() resolves to curthr->rank_stack, and an ISR on that core
+ * runs on whatever thread it interrupted — so a softirq taking a klock pushes
+ * and pops the INTERRUPTED THREAD's stack while that thread is mid-update. The
+ * push/pop pairs are individually balanced, so the damage is not corruption of
+ * the depth but a torn READ: the last verification caught the acquire-side
+ * check firing and then printing `depth=0`, which the guard `*sp > 0` cannot
+ * produce. The stack had changed underneath between the test and the report.
+ *
+ * Masking local interrupts across each read-modify-write is enough, and is
+ * cheaper than a second per-CPU ISR stack: the sections are a compare and an
+ * increment, the ISR cannot then land inside one, and every push still pairs
+ * with its own pop on the same stack. Callers already in interrupt context
+ * (IF off) are unaffected — the flags are saved and restored, never forced on.
+ * Deliberately NOT held across the spin below, which must keep interrupts in
+ * whatever state the caller had or a contended lock would stall the timer. */
+static inline uint64_t klock_irq_save(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void klock_irq_restore(uint64_t f) {
+    if (f & 0x200ull) __asm__ volatile("sti" ::: "memory");
 }
 
 static void klock_acquire(struct klock *l) {
     uint8_t *sp, *st = rank_ctx(&sp);                  /* our context's stack;  */
+    uint64_t rf = klock_irq_save();                    /* v0.75: vs ISR on cpu 0 */
     if (*sp > 0 && st[*sp - 1] >= l->rank) {           /* still ours after any  */
         __sync_fetch_and_add(&g_rank_violations, 1);   /* yield below — a yield */
-        kprintf("[klock  ] RANK VIOLATION: acquiring '%s' (rank %d) while holding rank %d\n",
-                l->name, (uint64_t)l->rank, (uint64_t)st[*sp - 1]);
+        /* v0.75: the CALLER. "acquiring net while holding net" names the lock
+         * and not the path, and the path is the whole question when one lock is
+         * reachable from the timer scan, the receive path, several syscalls and
+         * the suite itself. A previous attempt at this bug guessed the path from
+         * reading and was disproven by a 20-boot run; this is the datum that
+         * would have settled it in one. Resolve with nm/addr2line on the ELF.
+         *
+         * Also prints the whole held-rank stack, because with more than two
+         * locks involved "while holding rank 9" does not say what else is held
+         * underneath it — and a rank INVERSION (taking rank 1 under rank 9) is a
+         * different bug from re-entrancy on the same lock. */
+        kprintf("[klock  ] RANK VIOLATION: acquiring '%s' (rank %d) while holding rank %d "
+                "| caller=%X cpu=%u depth=%u held=[%d %d %d %d %d %d %d %d]\n",
+                l->name, (uint64_t)l->rank, (uint64_t)st[*sp - 1],
+                (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx(), (uint64_t)*sp,
+                (uint64_t)(int64_t)st[0], (uint64_t)(int64_t)st[1],
+                (uint64_t)(int64_t)st[2], (uint64_t)(int64_t)st[3],
+                (uint64_t)(int64_t)st[4], (uint64_t)(int64_t)st[5],
+                (uint64_t)(int64_t)st[6], (uint64_t)(int64_t)st[7]);
     }                                                  /* resumes THIS thread   */
+    klock_irq_restore(rf);                             /* check done: reopen IF */
     if (__sync_lock_test_and_set(&l->v, 1)) {
         __sync_fetch_and_add(&l->contended, 1);
         do { krelax(); } while (l->v || __sync_lock_test_and_set(&l->v, 1));
     }
     l->acq++;                                          /* under the lock        */
-    if (*sp < 8) st[(*sp)++] = l->rank;
+    rf = klock_irq_save();                             /* v0.75: atomic push    */
+    /* v0.75: bind the slot to the LOCK. Everything below runs with the lock
+     * held, so these three fields have exactly one writer. `st`/`sp` are the
+     * ones resolved on THIS side; release will not resolve them again. A depth
+     * already at the 8-entry ceiling records no slot (rank_spp = 0) and release
+     * correspondingly pops nothing — the old code pushed nothing but popped
+     * anyway, which drifted the depth down and hid later violations. */
+    if (*sp < 8) {
+        l->rank_st  = st;
+        l->rank_spp = sp;
+        l->rank_idx = *sp;
+        st[(*sp)++] = l->rank;
+    } else {
+        l->rank_st  = 0;
+        l->rank_spp = 0;
+    }
+    klock_irq_restore(rf);
 }
 
+/* v0.75: catch the imbalance AT THE RELEASE, which is the only place that can
+ * see it. The acquire-side warning says "rank 9 is already held" long after the
+ * fact and names whoever noticed, not whoever left it — 887 of 927 violations
+ * pointed at tcp_timer_scan for that reason, and it is merely the most frequent
+ * acquirer on the BSP.
+ *
+ * Two distinct faults are reported here, because they have different causes:
+ *   UNDERFLOW — a release with nothing recorded as held. The push and the pop
+ *               went to different stacks (rank_ctx picks per-thread storage on
+ *               cpu 0 and per-CPU elsewhere), or the lock was released twice.
+ *   MISMATCH  — the top of the stack is not this lock's rank, i.e. releases are
+ *               not LIFO. That leaves the deeper entry stranded, which is
+ *               exactly the phantom hold the acquire side keeps tripping over.
+ * Both print the caller so the offending path names itself. */
+/* v0.75: pop EXACTLY the slot acquire pushed. rank_ctx() is deliberately not
+ * called here — re-deriving the context is the entire defect this replaces.
+ *
+ * The checks that remain are real invariants rather than the old guesswork:
+ * a lock whose recorded depth is not one below the current top is being
+ * released out of LIFO order, which is worth saying out loud. Truncating to our
+ * own index in that case is the conservative choice: it guarantees this lock's
+ * entry can never be stranded, which is the failure that produced hundreds of
+ * phantom violations from two underflows. */
 static void klock_release(struct klock *l) {
-    uint8_t *sp; rank_ctx(&sp);
-    if (*sp > 0) (*sp)--;                              /* LIFO release          */
+    uint64_t rf  = klock_irq_save();                   /* v0.75: atomic pop     */
+    uint8_t *st  = l->rank_st;
+    uint8_t *spp = l->rank_spp;
+    uint8_t  idx = l->rank_idx;
+    l->rank_st = 0; l->rank_spp = 0;                   /* consumed              */
+
+    if (spp) {
+        if (st[idx] != l->rank) {
+            __sync_fetch_and_add(&g_rank_mismatch, 1);
+            kprintf("[klock  ] RANK MISMATCH: releasing '%s' (rank %d); its recorded slot %u "
+                    "holds rank %d | caller=%X cpu=%u\n",
+                    l->name, (uint64_t)l->rank, (uint64_t)idx, (uint64_t)(int64_t)st[idx],
+                    (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx());
+        } else if (*spp != (uint8_t)(idx + 1)) {
+            __sync_fetch_and_add(&g_rank_mismatch, 1);
+            kprintf("[klock  ] OUT-OF-ORDER RELEASE: '%s' (rank %d) sits at slot %u but the "
+                    "held depth is %u | caller=%X cpu=%u\n",
+                    l->name, (uint64_t)l->rank, (uint64_t)idx, (uint64_t)*spp,
+                    (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx());
+        }
+        if (*spp > idx) *spp = idx;                    /* never strand our entry */
+    }
+    klock_irq_restore(rf);
     __sync_lock_release(&l->v);
 }
 
@@ -2961,6 +3406,18 @@ static void sched_init(void) {
     g_threads[0].cr3 = kernel_cr3; g_threads[0].stack = 0;
     g_threads[0].proc = 0; g_threads[0].uthread = 0;
     g_threads[0].rsp0 = 0; g_threads[0].ksrsp = 0;   /* boot-default trap stacks */
+    /* v0.75: HAND THE RANK BOOKKEEPING OVER, do not restart it. The line below
+     * sets g_sched_on, and that single assignment silently moves cpu 0 from the
+     * per-CPU rank stack to this thread's (see rank_ctx). Anything the boot
+     * context holds at this instant was recorded in the per-CPU stack and will
+     * be RELEASED against the per-thread one, so the depth has to come across or
+     * the release underflows and the acquire is remembered forever on a stack
+     * nothing reads again. Nothing is held here today — sched_init runs from
+     * kernel_main with no lock taken — which is exactly why copying costs
+     * nothing and stops the handover being a latent trap for whoever does take
+     * one before this point. */
+    g_threads[0].rank_sp = g_cpu[0].rank_sp;
+    for (int r = 0; r < 8; r++) g_threads[0].rank_stack[r] = g_cpu[0].rank_stack[r];
     g_cur = 0;
     g_idle_id = thread_create("idle", idle_fn, 0);
     g_sched_on = 1;                           /* cooperative switching live      */
@@ -5272,7 +5729,7 @@ static struct udbent g_udb[UDB_MAX];
  * complaint through a null pointer. It never fired, because every acquisition
  * here happens with no other lock held — which is exactly the kind of latent
  * fault that surfaces years later when someone adds the first caller that does. */
-static struct klock  g_udb_lock = { 0, "udb", 13, 0, 0 };
+static struct klock  g_udb_lock = { 0, "udb", 13, 0, 0, 0, 0, 0 };
 static volatile uint64_t g_auth_ok = 0, g_auth_bad = 0, g_auth_lockouts = 0;
 
 /* Salt source. Not a CSPRNG and not claimed to be one: it is rdtsc (which no
@@ -6708,7 +7165,7 @@ static struct ipc_shmem g_ipc_shm[MAX_IPC_SHMEM];
  * unrelated raw spinlock, not part of this ranked array — no actual
  * collision, just two independent numbering schemes that happen to reuse
  * the same next integer.) */
-static struct klock g_ipc_lock = { 0, "ipc", 6, 0, 0 };
+static struct klock g_ipc_lock = { 0, "ipc", 6, 0, 0, 0, 0, 0 };
 
 static void ipc_queue_clear(int idx) {
     struct ipc_queue *q = &g_ipc_q[idx];
@@ -7001,7 +7458,7 @@ struct vgpu_resource_unref {
     uint32_t resource_id, padding;
 } __attribute__((packed));
 
-static struct klock g_gpu_lock = { 0, "gpu", 7, 0, 0 };
+static struct klock g_gpu_lock = { 0, "gpu", 7, 0, 0, 0, 0, 0 };
 static volatile uint8_t *g_gpu_common = 0, *g_gpu_notify = 0;
 static uint32_t          g_gpu_notify_mul = 0;
 static struct vq         g_gpu_ctrl;
@@ -7678,7 +8135,7 @@ struct virtio_snd_pcm_set_params {
 struct virtio_snd_pcm_status { uint32_t status, latency_bytes; } __attribute__((packed));
 struct virtio_snd_pcm_xfer   { uint32_t stream_id; } __attribute__((packed));
 
-static struct klock g_audio_lock = { 0, "audio", 8, 0, 0 };
+static struct klock g_audio_lock = { 0, "audio", 8, 0, 0, 0, 0, 0 };
 static volatile uint8_t *g_snd_common = 0, *g_snd_notify = 0;
 static uint32_t g_snd_notify_mul = 0;
 /* g_snd_isr / snd_isr_drain() are forward-declared above, right before
@@ -8102,10 +8559,28 @@ struct nsock {
     int      acceptq[SOCK_BACKLOG];          /* listener: COMPLETED connections    */
     int      aq_head, aq_tail, aq_count;
     int      parent;                         /* child: its listener, or -1         */
+    /* v0.75: which OCCUPANT of this slot, not which slot. A socket index is an
+     * address, and an address is not an identity — sys_connect releases
+     * g_net_lock inside its SYN-retransmit loop while still holding a raw
+     * `struct nsock *`, so a close and reopen inside that window hands it back
+     * a DIFFERENT socket living at the same address. Bumped on every transition
+     * in or out of the slot, so a reference captured before one compares
+     * unequal after it. The same shape as kproc::gen, for the same reason. */
+    uint32_t gen;
 };
 static struct nsock g_sock[NSOCK];
+
+/* v0.75: recycle a socket slot, carrying its generation across the wipe. `gen`
+ * is the one field a wipe must NOT clear: zeroing it would restart the counter
+ * and let a stale reference match again, which is precisely the case it exists
+ * to catch. Every cmemset of a g_sock[] entry goes through here. */
+static void sock_slot_wipe(int si) {
+    uint32_t g = g_sock[si].gen;
+    cmemset(&g_sock[si], 0, sizeof g_sock[si]);
+    g_sock[si].gen = g + 1;
+}
 static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len); /* fwd: v0.67 */
-static struct klock g_net_lock = { 0, "net", 9, 0, 0 };
+static struct klock g_net_lock = { 0, "net", 9, 0, 0, 0, 0, 0 };
 static volatile uint64_t g_net_tx_frames = 0;
 static volatile uint64_t g_net_loop_deliveries = 0;
 /* v0.65: the numbers the suite cannot see from ring 3. An EAGAIN count that
@@ -8151,7 +8626,7 @@ static void net_sock_release_locked(int si) {
             if (g_sock[i].used && !g_sock[i].listening && g_sock[i].bound &&
                 g_sock[i].lport == g_sock[si].lport && i != si)
                 g_sock[i].hup = 1;
-    cmemset(&g_sock[si], 0, sizeof g_sock[si]);
+    sock_slot_wipe(si);
     g_sock[si].waiter_tid = -1;
     g_sock[si].fd = -1;
 }
@@ -8181,6 +8656,27 @@ static int sock_of_fd(int fd, int *flags_out) {
     }
     klock_release(&g_ofile_lock);
     return si;
+}
+
+/* v0.75: does slot `si` STILL belong to descriptor `fd`? Caller holds
+ * g_net_lock and must NOT hold g_ofile_lock.
+ *
+ * sock_of_fd() resolves under the ofile lock (rank 1) and releases it; a caller
+ * then climbs to the net lock (rank 9). The descriptor can be closed and
+ * reissued in that gap, leaving a slot index that names a socket the caller no
+ * longer owns.
+ *
+ * This checks the socket's own back-pointer to its descriptor, which the net
+ * lock already protects. Deliberately NOT a second sock_of_fd() call: that
+ * would take rank 1 while holding rank 9 — a rank INVERSION, and the exact
+ * shape of the violation the v0.75 rank work exists to prevent. Validating
+ * against state the held lock covers needs no second acquisition and cannot
+ * invert anything.
+ *
+ * A close frees the slot (used=0, fd=-1); a reissue repoints it at a different
+ * descriptor. Either way this compares unequal. */
+static inline int sock_fd_still_ours(int si, int fd) {
+    return si >= 0 && si < NSOCK && g_sock[si].used && g_sock[si].fd == fd;
 }
 
 /* Enqueue a datagram into a socket's RX ring and wake any parked receiver.
@@ -8429,7 +8925,7 @@ static void tcp_input(int si, struct tseg *g) {
         int ci = -1;
         for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) { ci = i; break; }
         if (ci < 0) return;
-        cmemset(&g_sock[ci], 0, sizeof g_sock[ci]);
+        sock_slot_wipe(ci);
         struct nsock *c = &g_sock[ci];
         c->used = 1; c->owner = s->owner; c->waiter_tid = -1; c->fd = -1;
         c->stream = 1; c->bound = 1; c->lport = s->lport;
@@ -9013,7 +9509,7 @@ static int wg_focused(int wi) {
     return k;
 }
 static uint64_t g_wm_pagetab[NWMWIN][WIN_SURF_MAXPG];   /* phys of each window's surface pages */
-static struct klock g_wm_lock = { 0, "wm", 10, 0, 0 };
+static struct klock g_wm_lock = { 0, "wm", 10, 0, 0, 0, 0, 0 };
 static int g_wm_focus = -1;              /* window index with keyboard focus, or -1     */
 static int g_wm_znext = 1;               /* monotonically increasing z stamp            */
 static int g_wm_drag = -1, g_wm_drag_dx = 0, g_wm_drag_dy = 0;   /* window being dragged */
@@ -10563,9 +11059,15 @@ static void cpu_exec_proc(int c, int p) {
             kprintf("[dbgposix] pid %u killed by signal %d\n",
                     kprocs[p].pid, (uint64_t)fatal_sig);
     } else {
+        /* v0.75: mark the excursion so sched_switch_to can see that a switch
+         * away from here would have clobbered this thread's resume point. Both
+         * entries below save that point into %gs:24..72; the decrement runs on
+         * the unwind, whichever way the excursion ends. */
+        __sync_fetch_and_add(&me->excur_depth, 1);
         code = kprocs[p].pstate
              ? enter_user_resume(&kprocs[p].uctx)
              : enter_user_mode(kprocs[p].entry, USTK_INIT);
+        __sync_fetch_and_sub(&me->excur_depth, 1);
     }
     write_cr3(kernel_cr3);
     __sync_fetch_and_sub(&g_inr3, 1);
@@ -12085,7 +12587,7 @@ static uint64_t sys_futex_wait(struct sysframe *sf, uint64_t uaddr, uint64_t val
         uint64_t dl = g_ticks + timeout;
         while (*(volatile uint64_t *)uaddr == val) {
             if (g_ticks >= dl) return WAIT_RV_TIMEDOUT;
-            sched_yield();
+            krelax();  /* v0.75: BSP-only yield; AP must PAUSE */
         }
         return WAIT_RV_OK;
     }
@@ -12184,7 +12686,7 @@ static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, ui
      * than spinning — which on a uniprocessor is the difference between
      * waiting and preventing the event from ever happening. */
     if (!sf || !can_park()) {
-        while (g_ticks < dl) { sched_yield(); }
+        while (g_ticks < dl) { krelax();  /* v0.75 */ }
         kprocs[me].ep_deadline = 0;
         return 0;
     }
@@ -12193,7 +12695,7 @@ static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, ui
     /* Only reached if the caller did not arrive through a `syscall` we can
      * rewind onto; fall back to the bounded yield rather than parking with no
      * way to re-run the scan. */
-    while (g_ticks < dl) { sched_yield(); }
+    while (g_ticks < dl) { krelax();  /* v0.75 */ }
     kprocs[me].ep_deadline = 0;
     return 0;
 }
@@ -12244,7 +12746,7 @@ static uint64_t sys_thread_join(struct sysframe *sf, uint64_t tid, uint64_t out)
         uint64_t dl = g_ticks + FUTEX_DEFAULT_TICKS;
         while (!(kprocs[L].thr_done & (1u << tid))) {
             if (g_ticks >= dl) return WAIT_RV_TIMEDOUT;
-            sched_yield();
+            krelax();  /* v0.75 */
         }
         if (out) *(volatile uint64_t *)out = kprocs[L].thr_exit[tid];
         return WAIT_RV_OK;
@@ -12345,7 +12847,7 @@ static void posix_sigcheck_on_return(struct sysframe *sf, uint64_t rv) {
  * could not fully read. */
 #define REDIR_STAGE_MAX 32768
 static uint8_t g_redir_stage[REDIR_STAGE_MAX];
-static struct klock g_redir_lock = { 0, "redir", 0, 0, 0 };
+static struct klock g_redir_lock = { 0, "redir", 0, 0, 0, 0, 0, 0 };
 
 static int64_t redirect_write_bytes(int fd, const void *data, uint32_t len) {
     int vol = VOL_ROOT;
@@ -13174,7 +13676,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         klock_acquire(&g_net_lock);
         int si = -1;
         for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) {
-            cmemset(&g_sock[i], 0, sizeof g_sock[i]);
+            sock_slot_wipe(i);
             g_sock[i].used = 1; g_sock[i].owner = owner;
             g_sock[i].waiter_tid = -1; g_sock[i].fd = -1;
             g_sock[i].stream = want_stream; g_sock[i].parent = -1;
@@ -13199,9 +13701,13 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     }
     case 36: {   /* SYS_BIND(fd, port) -> 0 ok, negative error */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        int si = sock_of_fd((int)(int64_t)a0, 0); uint16_t port = (uint16_t)a1;
+        int sfd = (int)(int64_t)a0;
+        int si = sock_of_fd(sfd, 0); uint16_t port = (uint16_t)a1;
         if (si < 0 || port == 0) return (uint64_t)-9;                  /* EBADF/EINVAL */
         klock_acquire(&g_net_lock);
+        /* v0.75: `si` was resolved under the ofile lock, which is now released.
+         * Re-establish that the slot is still ours before writing to it. */
+        if (!sock_fd_still_ours(si, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
         int rc = -1;
         int taken = net_find_bound(port);
         if (taken < 0 || taken == si) { g_sock[si].lport = port; g_sock[si].bound = 1; rc = 0; }
@@ -13218,11 +13724,26 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * for an operation that already completed would be a lie a
                   * caller would then wait on. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        int si = sock_of_fd((int)(int64_t)a0, 0);
+        int sfd = (int)(int64_t)a0;
         uint32_t addr = (uint32_t)a1; uint16_t port = (uint16_t)a2;
-        if (si < 0) return (uint64_t)-9;
-        int fl = 0; (void)sock_of_fd((int)(int64_t)a0, &fl);
+        /* v0.75: ONE resolution, not two. This used to call sock_of_fd() twice
+         * — once for the slot, again for the flags — which is two independent
+         * lookups of a descriptor that can change between them, with the second
+         * discarding the slot it had just resolved. A single call cannot
+         * disagree with itself. */
+        int fl = 0;
+        int si = sock_of_fd(sfd, &fl);
+        if (si < 0) return (uint64_t)-9;                    /* EBADF */
         klock_acquire(&g_net_lock);
+        /* v0.75: close the resolve->acquire window. `si` was read under the
+         * ofile lock, which is now released; re-establish that this slot is
+         * still the socket `sfd` names before touching it. See
+         * sock_fd_still_ours() for why this is not a second sock_of_fd(). */
+        if (!sock_fd_still_ours(si, sfd)) {
+            __sync_fetch_and_add(&g_connect_stale, 1);
+            klock_release(&g_net_lock);
+            return (uint64_t)-9;                            /* EBADF */
+        }
         int rc = -1;
         if (g_sock[si].listening) rc = -22;                 /* EINVAL: a listener */
         else if (g_sock[si].stream) {
@@ -13266,10 +13787,104 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                      * spins on the tick counter is betting that interrupts are
                      * enabled underneath it; sched_yield gives the rest of the
                      * system a turn and cannot wedge if that bet is wrong. */
+                    /* v0.75: the occupant we are retransmitting FOR. Captured
+                     * under the lock, before the first release. Everything the
+                     * loop does to `c` is only valid while the slot still holds
+                     * this socket. */
+                    uint32_t expected_gen = c->gen;
                     for (int t = 0; t < 64 && c->state == TCPS_SYN_SENT; t++) {
+                        /* v0.75 INSTRUMENTATION: this release/yield/re-acquire
+                         * window is where the last residual rank violation is
+                         * reported (klock_acquire below, kernel64.c:13412). The
+                         * acquire finds rank 9 still on THIS thread's stack even
+                         * though the release two lines up should have popped it,
+                         * and no amount of reading has explained how. So measure
+                         * it: the depth on each side of both operations, and the
+                         * thread identity across the yield. Prints only on an
+                         * anomaly, so a clean boot stays silent.
+                         *
+                         *   d0 -> d1  should differ by exactly 1 (the pop)
+                         *   d1 -> d2  should not change (nothing else is ours)
+                         *   tid0 == tid1, or we came back as a different thread
+                         *     and the stack we are about to check is not the one
+                         *     we released against. */
+                        uint8_t *dsp; (void)rank_ctx(&dsp);
+                        uint8_t d0 = *dsp;
+                        int tid0 = g_cur;
                         klock_release(&g_net_lock);
-                        sched_yield();
+                        uint8_t d1 = *dsp;
+                        /* v0.75 HYPOTHESIS TEST, one branch. sched_yield()
+                         * operates on g_cur/g_threads[] — the BSP scheduler's
+                         * tables — and has NO cpu_idx() guard of its own; krelax
+                         * guards its own call with `cpu_idx()==0 && g_sched_on`,
+                         * so the BSP-only constraint is known and enforced
+                         * elsewhere. This syscall runs on whichever core the
+                         * ring-3 task occupies and calls it unguarded.
+                         *
+                         * If an AP ever reaches here it is switching itself onto
+                         * a BSP kernel thread's stack, which would explain the
+                         * suite-39 hang outright. Counted AND printed, because a
+                         * hung boot never reaches the end-of-boot summary — the
+                         * line has to be in the log at the moment it happens. If
+                         * this never fires across a hanging run, the hypothesis
+                         * is dead and the cross-core dump becomes the next step. */
+                        /* v0.75 FIX. This was a bare sched_yield(), which
+                         * operates on g_cur/g_threads[] — the BSP scheduler's
+                         * tables — and carries no core guard of its own. This
+                         * syscall runs on whichever core the ring-3 task
+                         * occupies, so an AP reaching here selected a BSP kernel
+                         * thread and switched ITSELF onto that thread's stack,
+                         * while the BSP might be running the very same thread.
+                         *
+                         * Not theoretical: the counter below fired in every
+                         * -smp 4 boot measured, always the same shape —
+                         * "sys_connect sched_yield() on AP cpu=2 pid=709" (the
+                         * tcpstr client) on the first retransmit iteration. It
+                         * fired on boots that hung AND on boots that completed,
+                         * which is what an intermittent corruption looks like:
+                         * the illegal call always happens, and whether it wedges
+                         * depends on what the BSP's scheduler state is at that
+                         * instant.
+                         *
+                         * krelax() is exactly the guarded form and already
+                         * exists for this reason — it yields on the BSP and
+                         * PAUSE-spins on an AP, which is the correct backoff
+                         * where there is no kernel scheduler to yield to.
+                         *
+                         * The counter counts AP ARRIVALS at this site, not
+                         * faults. An AP reaching here is normal and expected —
+                         * the ring-3 client runs wherever it is scheduled — and
+                         * a healthy -smp 4 boot shows a non-zero count. What
+                         * changed is what it DOES on arrival: krelax(), never
+                         * sched_yield(). Read it as "how often the AP path was
+                         * exercised", which is what makes it useful.
+                         */
+                        if (cpu_idx() != 0) __sync_fetch_and_add(&g_connect_ap_yield, 1);
+                        krelax();
+                        uint8_t *dsp2; (void)rank_ctx(&dsp2);
+                        uint8_t d2 = *dsp2;
+                        int tid1 = g_cur;
+                        if (d1 != (uint8_t)(d0 - 1) || d2 != d1 || tid0 != tid1 || dsp != dsp2)
+                            kprintf("[connwin] t=%d depth %u->%u (release) ->%u (after yield) "
+                                    "| tid %d->%d | stack %s | cpu=%u\n",
+                                    (uint64_t)(int64_t)t, (uint64_t)d0, (uint64_t)d1, (uint64_t)d2,
+                                    (uint64_t)(int64_t)tid0, (uint64_t)(int64_t)tid1,
+                                    dsp == dsp2 ? "same" : "CHANGED", (uint64_t)cpu_idx());
                         klock_acquire(&g_net_lock);
+                        /* v0.75: the slot may have been closed and reissued
+                         * while the lock was down. `c` still points at valid
+                         * memory — g_sock[] is static — so nothing faults; it
+                         * just addresses SOMEONE ELSE'S socket, and the SYN we
+                         * are about to retransmit would be sent on their
+                         * connection with our sequence numbers. Check identity,
+                         * not liveness: `used` alone cannot tell a slot that
+                         * was never freed from one freed and immediately
+                         * reallocated, which is the common case under load. */
+                        if (!sock_fd_still_ours(si, sfd) || c->gen != expected_gen) {
+                            __sync_fetch_and_add(&g_connect_stale, 1);
+                            klock_release(&g_net_lock);
+                            return (uint64_t)(int64_t)-104;     /* ECONNRESET */
+                        }
                         if (c->state != TCPS_SYN_SENT) break;
                         c->snd_nxt = c->iss;
                         tcp_output(si, TH_SYN, 0, 0);
@@ -13291,7 +13906,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     case 38: {   /* SYS_SEND(fd, buf, len) -> bytes sent, or negative */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
         int fl = 0;
-        int si = sock_of_fd((int)(int64_t)a0, &fl);
+        int sfd = (int)(int64_t)a0;
+        int si = sock_of_fd(sfd, &fl);
         uint64_t ubuf = a1; uint32_t len = (uint32_t)a2;
         if (si < 0) return (uint64_t)-9;
         if (len > SOCK_DGRAM_MAX) len = SOCK_DGRAM_MAX;
@@ -13299,6 +13915,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         uint8_t stage[SOCK_DGRAM_MAX];
         cmemcpy(stage, (const void *)ubuf, len);
         klock_acquire(&g_net_lock);
+        /* v0.75: the descriptor may have been closed and reissued since it was
+         * resolved. Checked BEFORE the ENOTCONN test below so a stale handle
+         * reports EBADF rather than being described as a live-but-unconnected
+         * socket — the caller's fd is the thing that went away. */
+        if (!sock_fd_still_ours(si, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
         if (!g_sock[si].used || !g_sock[si].connected || g_sock[si].listening) {
             klock_release(&g_net_lock); return (uint64_t)-107;         /* ENOTCONN */
         }
@@ -13354,14 +13975,19 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   *             caller are written against it. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
         int fl = 0;
-        int si = sock_of_fd((int)(int64_t)a0, &fl);
+        int sfd = (int)(int64_t)a0;
+        int si = sock_of_fd(sfd, &fl);
         uint64_t ubuf = a1; uint32_t maxlen = (uint32_t)a2;
         if (si < 0) return (uint64_t)-9;
         if (!access_ok(kprocs[tg_of((int)current_proc_idx)].cr3, ubuf, maxlen, 1)) return (uint64_t)-14;
         uint64_t t0 = g_ticks;
         for (;;) {
             klock_acquire(&g_net_lock);
-            if (!g_sock[si].used) { klock_release(&g_net_lock); return (uint64_t)-9; }
+            /* v0.75: was `!g_sock[si].used`, which cannot tell a slot that was
+             * never freed from one freed and immediately reallocated. This is a
+             * BLOCKING poll, so the window is not the resolve->acquire gap
+             * alone — it reopens on every iteration of this loop. */
+            if (!sock_fd_still_ours(si, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
             if (g_sock[si].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
             if (g_sock[si].stream) {
                 struct nsock *c = &g_sock[si];
@@ -14302,10 +14928,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * pretending to size it per socket would be a parameter with
                   * no effect. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        int si = sock_of_fd((int)(int64_t)a0, 0);
+        int sfd = (int)(int64_t)a0;
+        int si = sock_of_fd(sfd, 0);
         if (si < 0) return (uint64_t)-9;
         int64_t rc;
         klock_acquire(&g_net_lock);
+        /* v0.75: see sock_fd_still_ours() — the descriptor may have been closed
+         * and reissued between the ofile lock and this one. */
+        if (!sock_fd_still_ours(si, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
         if (!g_sock[si].bound)         rc = -22;    /* EINVAL: nothing to listen on */
         else if (g_sock[si].connected) rc = -22;    /* EINVAL: already a peer socket */
         else { g_sock[si].listening = 1;
@@ -14331,7 +14961,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * truncated. `flags` may carry SOCK_NONBLOCK for the new
                   * descriptor. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        int li = sock_of_fd((int)(int64_t)a0, 0);
+        int sfd = (int)(int64_t)a0;
+        int li = sock_of_fd(sfd, 0);
         if (li < 0) return (uint64_t)-9;
         uint64_t upeer = a1;
         int owner = fd_owner();
@@ -14340,12 +14971,22 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         /* Claim the child's socket slot BEFORE dequeuing the peer: if the table
          * is full we must leave the request queued for a later accept, not
          * consume and discard a client's first datagram. */
+        /* v0.75: this reads g_sock[li].stream WITHOUT the net lock, which is
+         * safe only because of what `stream` is: it is set when the slot is
+         * allocated and cleared only by the wipe that frees it, so it never
+         * changes under a live socket. A stale `li` can therefore steer us into
+         * the wrong branch, and nothing worse — BOTH branches revalidate under
+         * the lock below and return EBADF, so a wrong branch costs an error
+         * code path, not a wrong action. */
         if (g_sock[li].stream) {
             /* v0.67: a real accept. The connection is already ESTABLISHED —
              * the handshake completed in tcp_input without waiting for the
              * application, which is what stops a busy server from timing its
              * peers out. accept() only transfers ownership. */
             klock_acquire(&g_net_lock);
+            /* v0.75: the listener's descriptor may have been closed and
+             * reissued since it was resolved. */
+            if (!sock_fd_still_ours(li, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
             if (g_sock[li].state != TCPS_LISTEN) { klock_release(&g_net_lock); return (uint64_t)-22; }
             if (g_sock[li].aq_count == 0) {
                 klock_release(&g_net_lock);
@@ -14372,13 +15013,17 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             return (uint64_t)(int64_t)nfd2;
         }
         klock_acquire(&g_net_lock);
-        if (!g_sock[li].used || !g_sock[li].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
+        /* v0.75: EBADF for a descriptor that went away, EINVAL only for a live
+         * socket that is not a listener. The old test collapsed both into
+         * EINVAL, which describes the wrong fault to the caller. */
+        if (!sock_fd_still_ours(li, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
+        if (!g_sock[li].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
         if (g_sock[li].pcount == 0) { klock_release(&g_net_lock);
                                       __sync_fetch_and_add(&g_net_eagain, 1);
                                       return (uint64_t)-11; }                    /* EAGAIN */
         int ci = -1;
         for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) {
-            cmemset(&g_sock[i], 0, sizeof g_sock[i]);
+            sock_slot_wipe(i);
             g_sock[i].used = 1; g_sock[i].waiter_tid = -1; g_sock[i].fd = -1;
             ci = i; break;
         }
@@ -21346,7 +21991,7 @@ static int tcpstrs_grab_sock(void) {
     klock_acquire(&g_net_lock);
     for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) { si = i; break; }
     if (si >= 0) {
-        cmemset(&g_sock[si], 0, sizeof g_sock[si]);
+        sock_slot_wipe(si);
         struct nsock *t = &g_sock[si];
         t->used = 1; t->stream = 1; t->waiter_tid = -1; t->fd = -1;
         t->connected = 1; t->bound = 1;
@@ -24290,6 +24935,32 @@ static void shell_exec(char *line) {
 static void shell_run(void) {
     char line[80];
     uint32_t len = 0;
+    /* v0.75: the precondition of the resume-point race, counted for the whole
+     * boot. Non-zero means BSP thread switches DID happen with a ring-3
+     * excursion live on this core — which before sched_switch_to saved the
+     * resume context was the corruption that produced an intermittent #13 at a
+     * non-canonical RIP. Printed unconditionally so the number is evidence in
+     * every log rather than something a future reader has to re-derive. */
+    kprintf("[excur  ] BSP thread switches during a live ring-3 excursion: %u\n",
+            g_excur_switch);
+    /* v0.75: the three rank-bookkeeping counters, printed every boot so a
+     * verification run reads them straight out of the log instead of inferring
+     * them from the absence of warnings. All three must be 0. */
+    kprintf("[klock  ] rank violations=%u underflow=%u mismatch=%u\n",
+            g_rank_violations, g_rank_underflow, g_rank_mismatch);
+    /* v0.75: the sys_connect counters. apyield is COVERAGE — how often an AP
+     * actually entered the retransmit loop, so a run reporting 0 has not
+     * exercised the AP path and its clean result says nothing about it. stale
+     * is a FAULT count: slots reissued underneath the loop and refused.
+     *
+     * Printed here rather than left as a variable only a debugger could read.
+     * A counter nothing prints is not instrumentation — the first -smp 4 matrix
+     * of this fix grepped its logs for a stale count that no code could ever
+     * emit, and read the resulting zeroes as evidence.
+     *
+     * Caveat this cannot fix: a HUNG boot never reaches this line, so these
+     * numbers describe surviving boots only. */
+    kprintf("[connect] apyield=%u stale=%u\n", g_connect_ap_yield, g_connect_stale);
     kputs("\nType 'help' for commands, 'demo' for the capability walk-through.\n");
     kputs("outrun> ");
     for (;;) {

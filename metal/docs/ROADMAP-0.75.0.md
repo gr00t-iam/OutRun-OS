@@ -549,3 +549,204 @@ a login program; lockout expiry and administrative unlock. The queued TCP
 hardening work (congestion window, slow start, fast retransmit, Karn/Jacobson
 RTO, segment coalescing) is independent of all of the above and unaffected by
 this milestone's ordering.
+
+---
+
+## SUITE 39 (`tcpstrs`) `-smp 4` HANG — RESOLVED
+
+The intermittent hang that stalled every `-smp 4` boot at `[tcpstrs]` is fixed.
+Two defects, both on the `sys_connect` SYN-retransmit path, both of the same
+family: **something treated a transient handle as a stable identity.**
+
+### 1. An AP called the BSP's scheduler (the cause)
+
+`sched_yield()` operates on `g_cur` / `g_threads[]` — the BSP scheduler's
+tables — and carries no core guard. Five syscall paths called it unguarded, so
+an AP reaching any of them picked a BSP kernel thread and switched *itself*
+onto that thread's stack while the BSP might be running the very same thread:
+`sys_connect`, `sys_futex_wait`, `sys_epoll_wait` (x2), `sys_thread_join`.
+
+All five now call `krelax()`, which already existed for exactly this case: it
+yields on the BSP and `PAUSE`-spins on an AP, where there is no kernel
+scheduler to yield to. BSP behaviour is unchanged by construction.
+
+### 2. A socket index is not a socket identity (latent, unproven)
+
+`sys_connect` released `g_net_lock` inside its retransmit loop while holding a
+raw `struct nsock *`. `g_sock[]` is static, so the pointer never dangles — it
+just addresses whoever occupies that slot when the lock returns, and the loop
+would retransmit our SYN with our sequence numbers onto their session.
+
+`struct nsock` now carries a generation, every slot wipe goes through
+`sock_slot_wipe()` (which carries the counter across the `cmemset` and bumps
+it), and the loop revalidates after each re-acquire, returning `-ECONNRESET` on
+mismatch. Same shape as defect B's `ppid_slot` fix, for the same reason.
+
+**This one is committed on its argument, not on evidence: it never fired.**
+`stale=0` across all 20 verification boots. It is correct and, on this
+workload, inert.
+
+### Evidence
+
+3-arm interleaved matrix, 8 rounds, round-robin so host drift hits all arms:
+
+| arm | build | OK | HANG |
+|-----|-------|----|------|
+| `ap`  | neither fix    | 4 | 4 |
+| `fix` | AP-yield only  | 7 | 1 |
+| `sg`  | both fixes     | 8 | 0 |
+
+Final binary, 20 boots at `-smp 4`: **20 OK / 0 HANG / 0 PANIC**, 44 suites and
+0 failures every boot, rank violations/underflow/mismatch all 0. An AP entered
+the retransmit loop in 14 of the 20, so the fixed path was genuinely exercised
+rather than merely not taken.
+
+Pooling the baseline arm with ten earlier boots of the same `ap.iso`: the
+unfixed kernel hangs **11 times in 18 boots** against **1 in 16** for the arms
+carrying the AP-yield fix.
+
+### Two process notes, because both cost real time
+
+- **A run that boots the wrong image is worse than no run.** The first
+  verification of the AP-yield fix booted the *detector* ISO while writing to a
+  directory named for the fixed one, and its result was reported as evidence
+  that the fix did not work. It was evidence about the unfixed kernel. Every
+  harness now stamps the md5 of the image it boots into every log it writes.
+- **A counter nothing prints is not instrumentation.** `g_connect_stale` was
+  incremented but never emitted; the first matrix grepped for a string no code
+  could produce and got zeroes from all three arms. Both `sys_connect` counters
+  now print in the end-of-boot summary. Note they are readable only on boots
+  that survive to reach it.
+
+`g_connect_ap_yield` counts AP **arrivals** at the yield site, before the
+backoff runs. Non-zero is expected and healthy on `-smp 4` — it measures
+coverage of the AP path, not faults. `g_connect_stale` is the fault counter.
+
+### Still open on the socket paths
+
+`sock_of_fd()` resolves the fd outside `g_net_lock` and the index is used after
+the lock is taken, so the fd->slot mapping is still a TOCTOU window. The
+generation counter now makes that window *detectable* wherever a caller cares
+to check it, but only `sys_connect` checks today.
+
+---
+
+## `sock_of_fd()` TOCTOU IN `sys_connect()` — CLOSED
+
+`sock_of_fd()` resolves a descriptor under `g_ofile_lock` (**rank 1**) and
+releases it; the caller then climbs to `g_net_lock` (**rank 9**) and indexes
+`g_sock[si]`. The descriptor can be closed and reissued in that gap, leaving a
+slot index that names a socket the caller no longer owns.
+
+Two changes in `sys_connect()`:
+
+1. **One resolution, not two.** It called `sock_of_fd()` twice — once for the
+   slot, again for the flags — and discarded the slot the second call resolved.
+   Two independent lookups of a descriptor that can change between them, with
+   nothing checking they agreed.
+2. **Revalidate after taking the net lock**, via `sock_fd_still_ours()`: the
+   slot is ours iff it is in use and its own back-pointer still names our
+   descriptor. The retransmit loop's post-yield check uses it too, on top of the
+   generation compare.
+
+### Why NOT "move sock_of_fd() inside g_net_lock"
+
+That is the obvious-looking fix and it is wrong. `sock_of_fd()` takes rank 1;
+inside `g_net_lock` we hold rank 9. Acquiring 1 under 9 is a rank **inversion**
+— and specifically the one this document already records above as a
+pre-existing defect ("`ofile` rank 1 taken while holding rank 9, consistent with
+re-entering an fd path from inside the net lock"). v0.75 spent its whole
+rank-tracking effort driving those to zero. Trading a narrow race for a
+deadlock class is not a fix.
+
+`g_sock[].fd` is the right authority precisely because `g_net_lock` already
+protects it: validating against state the held lock covers needs no second
+acquisition and cannot invert anything. There is no `dup()`/`dup2()` for
+sockets in this tree, so the back-pointer is unambiguous — one descriptor per
+slot.
+
+**Residual, and deliberate:** if a descriptor is closed and a new socket lands
+on *both* the same slot and the same fd number, this compares equal. That is a
+socket the descriptor legitimately names now, and an application racing
+`close()` against `connect()` on one descriptor has no defined answer to be
+denied.
+
+### Verification
+
+Uniprocessor 44 suites / 0 failed, `[tcpstrs] 28 passed`. Ten `-smp 4` boots:
+**10 OK / 0 HANG / 0 PANIC**, 44 suites and 0 failures every boot, and **0 rank
+violations, underflow or mismatch in any boot** — which is the check that
+matters here, since the rejected alternative would have produced them. An AP
+entered the connect retransmit loop in 8 of the 10, so the path was exercised.
+Build 0 errors, 35 warnings (unchanged baseline).
+
+Like the generation counter, the new check **never fired** (`stale=0`
+throughout). It is committed on its argument, not on evidence of the race
+occurring.
+
+### The five sibling syscalls — now also closed
+
+`sys_connect()` was fixed first; the identical resolve-then-climb gap existed in
+every other `sock_of_fd()` caller. All five now revalidate with
+`sock_fd_still_ours()` immediately after acquiring the net lock, returning
+`-EBADF` and releasing the lock.
+
+| syscall | before | after |
+|---------|--------|-------|
+| `bind`   | no check          | `sock_fd_still_ours()` |
+| `send`   | `used` only       | `sock_fd_still_ours()`, before the ENOTCONN test |
+| `recv`   | `used` only       | `sock_fd_still_ours()`, **inside** the blocking poll loop |
+| `listen` | no check          | `sock_fd_still_ours()` |
+| `accept` | no check          | `sock_fd_still_ours()` in both branches |
+
+Checking `used` was not the same question: a slot freed and immediately
+reallocated is `used` again, and that is the common case under load.
+
+Three of these are not mechanical copies of the `sys_connect` change:
+
+- **`recv`** puts the check inside its blocking poll loop rather than before
+  it. The window there is not the resolve->acquire gap alone — it reopens on
+  every iteration, which makes it the longest exposure of the five.
+- **`send`** checks before the ENOTCONN test, so a stale handle reports EBADF
+  instead of being described as a live-but-unconnected socket. The caller's
+  descriptor is the thing that went away.
+- **`accept`** now distinguishes EBADF (descriptor gone) from EINVAL (live
+  socket that is not a listener); the old test collapsed both into EINVAL. Its
+  unlocked read of `g_sock[li].stream` is deliberately left alone: `stream` is
+  set at allocation and cleared only by the wipe that frees the slot, so it
+  never changes under a live socket. A stale index can steer the wrong branch
+  and nothing worse, because both branches revalidate under the lock — a wrong
+  branch costs an error path, not a wrong action.
+
+Verified: uniprocessor 44 suites / 0 failed, `[tcpstrs] 28 passed`; ten `-smp 4`
+boots **10 OK / 0 HANG / 0 PANIC**, 0 suite failures and **0 rank violations,
+underflow or mismatch in any boot**. Build 0 errors, 35 warnings.
+
+As with `sys_connect`, **none of these checks fired** (`stale=0` throughout).
+They are committed on their argument, not on evidence of the race occurring.
+
+### Phase 5 (network stack hardening) — CLOSED
+
+Every `sock_of_fd()` caller now validates its descriptor under the lock that
+protects the answer. The v0.75 network work is: the AP-yield fix, the socket
+generation counter, and this descriptor revalidation across all six syscalls.
+
+## TIER 2 HANDOFF STATE (next milestone)
+
+The crypto half of "Persistent User Database Storage & Tier-2 Crypto Engine" is
+largely **already written and unmerged**, which is the first thing to know
+before starting it:
+
+- **PR #61** — SHA-256 (FIPS 180-4) as its own verified unit, against NIST
+  vectors. Open.
+- **PR #62** — `udb_kdf()` is PBKDF2-HMAC-SHA-256. Open, stacked on #61.
+
+Both branch from `#60` and are 8 commits behind `main`, but `git merge-tree`
+reports **0 conflicts** against current `main`, so they rebase cleanly. Step 5
+of the milestone plan above is therefore mostly a review-and-merge task, not an
+implementation task.
+
+That leaves **step 6 (persist the user database)** as the real remaining work,
+with the open design question unchanged: the volume is content-addressed with
+no timestamps, so a password change must not be inferable from dedup
+behaviour.
