@@ -254,3 +254,106 @@ directory permissions, supplementary groups, a login program, lockout expiry and
 administrative unlock. The queued TCP hardening work (congestion window, slow
 start, fast retransmit, Karn/Jacobson RTO, segment coalescing) remains
 independent of all of the above.
+
+---
+
+## STEP 1 RESULT — DIRTY-VOLUME CHARACTERISATION
+
+Run before any fix, as the plan requires. Harness: `dirty3.sh` — one 4 MB image
+created once and **reused** across three consecutive boots, uniprocessor for
+determinism, capturing every `FAIL` assertion and every `RESULT` line per boot
+and diffing consecutive boots in both directions. ISO `rel.iso`
+(md5 `c5fd5fdf8021223b7701470d8ab4c5d1`); confirmed to be the current `main`
+kernel by checking that no source under `metal/{kernel,user,rust,cpp,boot}`
+changed since it was built.
+
+### The complete list
+
+```
+boot 1  OK  suites=45  failing-suites=0  failing-assertions=0   (205s)
+boot 2  OK  suites=45  failing-suites=2  failing-assertions=3   (190s)
+boot 3  OK  suites=45  failing-suites=2  failing-assertions=3   (185s)
+```
+
+Exactly **three** failing assertions across **two** suites, and they are the same
+three on boot 2 and boot 3:
+
+| # | suite | assertion |
+|---|-------|-----------|
+| 1 | `usersstrs` | a newly created file gets the default mode |
+| 2 | `usersstrs` | a stranger CAN open another user's 0644 file for reading |
+| 3 | `vfsstrs`   | VFS journal commit is genuinely DEFERRED (on-disk dir region is stale before apply) |
+
+```
+[usersstrs] RESULT: 18 passed, 0 failed   ->  16 passed, 2 failed
+[vfsstrs]   RESULT: 19 passed, 0 failed   ->  18 passed, 1 failed
+```
+
+### The finding that mattered: it converges after one boot
+
+The `boot 2 -> boot 3` diff is **empty in both directions** — no new failures, no
+failures that disappeared, no RESULT line changed. The volume reaches a fixed
+point after the first dirty boot.
+
+This is the question step 1 existed to answer. The plan warned not to assume the
+count was three, because the known three came from a two-boot run and a suite
+failing on boot 2 could mask a different failure on boot 3. **It does not.** The
+work list is closed at three, and a fix for these three can be verified without
+worrying that it merely uncovers a fourth.
+
+It also means the defect is **deterministic, not accumulative**: prior state
+either exists or it does not, and a second application of it changes nothing.
+That is consistent with both root causes being "a fixture already exists"
+rather than anything that grows per boot.
+
+### Root causes (located before the run, confirmed by it)
+
+Both are **test defects, not kernel defects**.
+
+1 & 2 — `usersstrs`, kernel64.c ~19604. `vfs_open_for("m72own", alice, 1)` with
+`creat=1`, then asserts `vfs_mode_of(...) == VFS_MODE_DEFAULT` and that a
+stranger can open it at 0644. On a re-used volume `m72own` already exists,
+carrying the mode **this same suite's later assertions changed it to**, so
+"newly created" is false and the mode is no longer the default. Two assertions
+fall out of one stale fixture.
+
+3 — `vfsstrs`, kernel64.c ~17713.
+`deferred_ok = (praw->used == 0 || praw->file_hash != DENTS[idx].file_hash)`.
+On a re-used volume the on-disk dirent for `vfs-crash-test` already exists from
+the previous boot with the same content and therefore **the same hash** —
+content addressing makes this deterministic, not lucky — so the "on-disk is
+stale" precondition cannot hold and the assertion is defeated by its own
+fixture.
+
+### A gap in this run, stated rather than glossed
+
+The harness reports the two deliberately durable artefacts as absent in all
+three boots:
+
+```
+boot 1: udb=0 vfs-reboot-test=0
+boot 2: udb=0 vfs-reboot-test=0
+boot 3: udb=0 vfs-reboot-test=0
+```
+
+That is **not** evidence that they survive. It means they were never created:
+both require a manual command at the prompt (`udbpersist`, `vfscrashwrite`) and
+this harness types nothing. So the constraint the plan flagged — that a fixture
+reset must not destroy the only cross-boot evidence in the tree — is **still
+untested**.
+
+Establishing that baseline is a prerequisite for step 2, not an afterthought: a
+fixture-reset policy could delete `vfs-reboot-test` and `udbreboot` and every
+run above would still look identical, because neither was present to lose. The
+next run must create both in boot 1 and assert they are still there in boots 2
+and 3, **before** any reset policy is written.
+
+### Not yet characterised
+
+- **`-smp 4` on a dirty volume.** This pass was uniprocessor on purpose, to keep
+  the answer deterministic. The SMP dirty-volume failure set may be a superset;
+  it has not been measured, and the dirty-volume gate configuration should
+  eventually cover both.
+- **More than three boots.** Convergence is established between boots 2 and 3;
+  a longer run has not been done and is probably unnecessary given the fixed
+  point, but it is not proven beyond three.
