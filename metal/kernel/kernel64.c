@@ -3209,6 +3209,9 @@ static inline void execbuf_release(void) { __sync_lock_release(&g_execbuf_lock);
 
 /* v0.75: imbalance counters, reported by klock_release below. */
 static volatile uint64_t g_rank_underflow = 0, g_rank_mismatch = 0;
+/* v0.75: times sys_connect's retransmit loop called the BSP-only sched_yield()
+ * from an AP. Non-zero proves the suite-39 hang hypothesis; zero kills it. */
+static volatile uint64_t g_connect_ap_yield = 0;
 
 /* Rank bookkeeping storage for the CURRENT context (see the pcb comment).    */
 /* v0.75: THE STORAGE MUST BELONG TO WHATEVER CAN HOLD A LOCK ACROSS A YIELD.
@@ -12284,7 +12287,7 @@ static uint64_t sys_futex_wait(struct sysframe *sf, uint64_t uaddr, uint64_t val
         uint64_t dl = g_ticks + timeout;
         while (*(volatile uint64_t *)uaddr == val) {
             if (g_ticks >= dl) return WAIT_RV_TIMEDOUT;
-            sched_yield();
+            krelax();  /* v0.75: BSP-only yield; AP must PAUSE */
         }
         return WAIT_RV_OK;
     }
@@ -12383,7 +12386,7 @@ static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, ui
      * than spinning — which on a uniprocessor is the difference between
      * waiting and preventing the event from ever happening. */
     if (!sf || !can_park()) {
-        while (g_ticks < dl) { sched_yield(); }
+        while (g_ticks < dl) { krelax();  /* v0.75 */ }
         kprocs[me].ep_deadline = 0;
         return 0;
     }
@@ -12392,7 +12395,7 @@ static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, ui
     /* Only reached if the caller did not arrive through a `syscall` we can
      * rewind onto; fall back to the bounded yield rather than parking with no
      * way to re-run the scan. */
-    while (g_ticks < dl) { sched_yield(); }
+    while (g_ticks < dl) { krelax();  /* v0.75 */ }
     kprocs[me].ep_deadline = 0;
     return 0;
 }
@@ -12443,7 +12446,7 @@ static uint64_t sys_thread_join(struct sysframe *sf, uint64_t tid, uint64_t out)
         uint64_t dl = g_ticks + FUTEX_DEFAULT_TICKS;
         while (!(kprocs[L].thr_done & (1u << tid))) {
             if (g_ticks >= dl) return WAIT_RV_TIMEDOUT;
-            sched_yield();
+            krelax();  /* v0.75 */
         }
         if (out) *(volatile uint64_t *)out = kprocs[L].thr_exit[tid];
         return WAIT_RV_OK;
@@ -13486,7 +13489,47 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                         int tid0 = g_cur;
                         klock_release(&g_net_lock);
                         uint8_t d1 = *dsp;
-                        sched_yield();
+                        /* v0.75 HYPOTHESIS TEST, one branch. sched_yield()
+                         * operates on g_cur/g_threads[] — the BSP scheduler's
+                         * tables — and has NO cpu_idx() guard of its own; krelax
+                         * guards its own call with `cpu_idx()==0 && g_sched_on`,
+                         * so the BSP-only constraint is known and enforced
+                         * elsewhere. This syscall runs on whichever core the
+                         * ring-3 task occupies and calls it unguarded.
+                         *
+                         * If an AP ever reaches here it is switching itself onto
+                         * a BSP kernel thread's stack, which would explain the
+                         * suite-39 hang outright. Counted AND printed, because a
+                         * hung boot never reaches the end-of-boot summary — the
+                         * line has to be in the log at the moment it happens. If
+                         * this never fires across a hanging run, the hypothesis
+                         * is dead and the cross-core dump becomes the next step. */
+                        /* v0.75 FIX. This was a bare sched_yield(), which
+                         * operates on g_cur/g_threads[] — the BSP scheduler's
+                         * tables — and carries no core guard of its own. This
+                         * syscall runs on whichever core the ring-3 task
+                         * occupies, so an AP reaching here selected a BSP kernel
+                         * thread and switched ITSELF onto that thread's stack,
+                         * while the BSP might be running the very same thread.
+                         *
+                         * Not theoretical: the counter below fired in every
+                         * -smp 4 boot measured, always the same shape —
+                         * "sys_connect sched_yield() on AP cpu=2 pid=709" (the
+                         * tcpstr client) on the first retransmit iteration. It
+                         * fired on boots that hung AND on boots that completed,
+                         * which is what an intermittent corruption looks like:
+                         * the illegal call always happens, and whether it wedges
+                         * depends on what the BSP's scheduler state is at that
+                         * instant.
+                         *
+                         * krelax() is exactly the guarded form and already
+                         * exists for this reason — it yields on the BSP and
+                         * PAUSE-spins on an AP, which is the correct backoff
+                         * where there is no kernel scheduler to yield to. The
+                         * counter is kept as a regression guard: it must stay 0.
+                         */
+                        if (cpu_idx() != 0) __sync_fetch_and_add(&g_connect_ap_yield, 1);
+                        krelax();
                         uint8_t *dsp2; (void)rank_ctx(&dsp2);
                         uint8_t d2 = *dsp2;
                         int tid1 = g_cur;
