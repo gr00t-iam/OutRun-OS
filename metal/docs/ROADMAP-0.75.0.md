@@ -514,6 +514,13 @@ fork fix, and none of the three is fixed here.
    already produce different digests (per-user salts), which helps, but the file
    as a whole wants thought before it is written.
 
+   > **Status: DONE.** Fixed-size A/B image, a fresh nonce in every 512-byte
+   > segment so nothing ever dedups, generation + root flip, SHA-256 integrity,
+   > fail-closed load, lockout state deliberately not stored. Proven by booting
+   > twice on one disk, which is the only test that can see it. See the STEP 6
+   > section at the end of this document — including the two defects that run
+   > caught and the pre-existing volume-reuse failures it surfaced.
+
 ### WHERE v0.75 STANDS
 
 | item | state |
@@ -524,21 +531,33 @@ fork fix, and none of the three is fixed here.
 | Tier 1 · the fork enqueue funnel | **fixed**, causality NOT reproduced uninstrumented |
 | Tier 1 · step 3, three clean smp4-bios runs | **NOT satisfied** — see PHASE 1 RESULT |
 | Tier 2 · item 5, SHA-256 + KDF | **done** — primitive and KDF, both vector-verified |
-| Tier 2 · item 6, persist the user database | **not started** |
+| Tier 2 · item 6, persist the user database | **done** — see STEP 6 below |
+| Network stack hardening (phase 5) | **done** — AP yields, socket generation, fd revalidation |
 
-Open defects found along the way, none of them fixed, in the order they should
-be taken seriously:
+**This table was stale for most of the milestone and is corrected here.** The
+three "open defects, none of them fixed" recorded below it were written before
+the SMP work; two of them have since been fixed, and leaving the list as it was
+would have had this document arguing against its own later sections.
 
-1. **The intermittent `-smp 4` page-fault panic.** It stops the machine and
-   produces no matrix at all. Present in `main` independent of any Tier 2 work.
-2. **`g_net_lock` re-entrancy**, now reproducing uncontended on smp4-bios 3 runs
-   in 5 — which is why `main` does not currently meet the release gate there.
-3. **Toolchain suites' wall-clock budgets** on a loaded host.
+1. ~~**The intermittent `-smp 4` page-fault panic.**~~ **FIXED.** The BSP's
+   ring-3 kernel resume point was per-CPU where it had to be per-THREAD (#63).
+2. ~~**`g_net_lock` re-entrancy.**~~ **FIXED.** Lock-rank storage is now keyed
+   to the task, which is the thing that migrates (#64), and the residual
+   suite-39 hang was an AP calling the BSP-only `sched_yield()` (#65). Twenty
+   consecutive `-smp 4` boots at 0 violations, 0 underflow, 0 mismatch.
+3. **Toolchain suites' wall-clock budgets** on a loaded host. **Still open** —
+   not a correctness failure, but it is what breaks a regression run on a busy
+   machine.
+4. **The suite set is not idempotent across boots on a re-used volume.**
+   **NEW, still open.** Booting twice on one disk fails `[vfsstrs]` (1) and
+   `[usersstrs]` (2). Surfaced by the step 6 cross-boot test and confirmed
+   pre-existing by negative control against the `main` kernel from before that
+   branch. Every regression run to date has used a fresh image, so this has
+   never been exercised — which is exactly why it survived this long.
 
-The next milestone-shaped piece of work is Tier 2 item 6 (persistence). The next
-CORRECTNESS-shaped piece is (1) above, and it should probably come first: a
-release gate cannot mean anything while one configuration in three intermittently
-halts before reaching the prompt.
+With (1) and (2) closed, the release gate is meaningful again: all three
+configurations reach the prompt. What remains for a v0.75.0 tag is the gate
+itself, run as the gate — see the closing section.
 
 ### Explicitly deferred past v0.75
 
@@ -777,11 +796,13 @@ the child and expect conflicts proportional to the parent's size. They are
 mechanical, but they are not automatic, and a whole-file "take ours" is the
 wrong reflex.
 
-### What remains: step 6, persist the user database
+### Step 6 — also done
 
-Now the only open item in Tier 2. The design question is unchanged: the volume
-is content-addressed with no timestamps, so a password change must not be
-inferable from dedup behaviour. See the plan section below.
+Persistence landed (#68). The design question it was blocked on — the volume is
+content-addressed with no timestamps, so a password change must not be inferable
+from dedup behaviour — is answered by a fresh nonce in every 512-byte segment,
+so no write ever dedups and dedup behaviour carries no signal. Tier 2 is
+complete. See the plan and the STEP 6 result section below.
 
 ### Not done, and honest about it
 
