@@ -5566,6 +5566,75 @@ static void sha256(const void *data, uint64_t len, uint8_t out[SHA256_DIGEST]) {
     sha256_final(&c, out);
 }
 
+/* HMAC-SHA-256, RFC 2104. Not a hash of key||message — that construction is
+ * length-extendable and the reason HMAC exists. The key is zero-padded to the
+ * block size (or hashed first if it is longer than one), and the message is run
+ * through two nested hashes with two different pads.
+ *
+ * Needed here only because PBKDF2 is defined over a PRF and HMAC is the PRF
+ * every published PBKDF2 vector uses; a KDF built on a non-standard PRF could
+ * not be checked against anything. RFC 4231's test cases are asserted in
+ * shastrs, including the longer-than-block-size key that exercises the hash-the-
+ * key branch — the branch a wrong implementation usually gets away with. */
+static void hmac_sha256(const uint8_t *key, uint32_t keylen,
+                        const uint8_t *msg, uint64_t msglen,
+                        uint8_t out[SHA256_DIGEST]) {
+    uint8_t k[SHA256_BLOCK], ipad[SHA256_BLOCK], opad[SHA256_BLOCK];
+    uint8_t inner[SHA256_DIGEST];
+    struct sha256_ctx c;
+
+    for (uint32_t i = 0; i < SHA256_BLOCK; i++) k[i] = 0;
+    if (keylen > SHA256_BLOCK) sha256(key, keylen, k);      /* long key: hash, then pad */
+    else for (uint32_t i = 0; i < keylen; i++) k[i] = key[i];
+    for (uint32_t i = 0; i < SHA256_BLOCK; i++) {
+        ipad[i] = (uint8_t)(k[i] ^ 0x36);
+        opad[i] = (uint8_t)(k[i] ^ 0x5c);
+    }
+    sha256_init(&c);
+    sha256_update(&c, ipad, SHA256_BLOCK);
+    sha256_update(&c, msg, msglen);
+    sha256_final(&c, inner);
+
+    sha256_init(&c);
+    sha256_update(&c, opad, SHA256_BLOCK);
+    sha256_update(&c, inner, SHA256_DIGEST);
+    sha256_final(&c, out);
+}
+
+/* PBKDF2 (RFC 2898 / RFC 8018) with HMAC-SHA-256, producing exactly one block —
+ * dkLen == the digest size, which is what UDB_HASH_LEN is, so there is no
+ * multi-block loop and no truncation. That is worth stating plainly because
+ * truncating a KDF is where implementations quietly diverge from the standard;
+ * here the derived key IS one full PRF output and nothing is discarded.
+ *
+ *   U1 = HMAC(pw, salt || INT_32_BE(1)),  Ui = HMAC(pw, U(i-1)),  DK = U1 ^ ... ^ Uc
+ *
+ * The chain is inherently serial — Ui needs U(i-1) — so the work factor cannot
+ * be parallelised away within one candidate password, which is the property the
+ * v0.74 KDF was reaching for with its cross-lane fold. And the password is the
+ * HMAC KEY on every one of the c iterations, so an attacker cannot precompute
+ * past the input and pay for the rounds once across many candidates: the concern
+ * the v0.74 comment raised about folding the input in only at the start. */
+static void pbkdf2_hmac_sha256(const uint8_t *pw, uint32_t pwlen,
+                               const uint8_t *salt, uint32_t saltlen,
+                               uint32_t rounds, uint8_t out[SHA256_DIGEST]) {
+    uint8_t s1[64 + 4];
+    uint8_t u[SHA256_DIGEST], t[SHA256_DIGEST], next[SHA256_DIGEST];
+
+    if (saltlen > 64) saltlen = 64;             /* bounded; UDB salts are 16 bytes */
+    for (uint32_t i = 0; i < saltlen; i++) s1[i] = salt[i];
+    s1[saltlen + 0] = 0; s1[saltlen + 1] = 0;   /* INT_32_BE(1): the one and only block */
+    s1[saltlen + 2] = 0; s1[saltlen + 3] = 1;
+
+    hmac_sha256(pw, pwlen, s1, (uint64_t)saltlen + 4, u);
+    for (int i = 0; i < SHA256_DIGEST; i++) t[i] = u[i];
+    for (uint32_t r = 1; r < rounds; r++) {
+        hmac_sha256(pw, pwlen, u, SHA256_DIGEST, next);
+        for (int i = 0; i < SHA256_DIGEST; i++) { u[i] = next[i]; t[i] ^= next[i]; }
+    }
+    for (int i = 0; i < SHA256_DIGEST; i++) out[i] = t[i];
+}
+
 /* ===========================================================================
  * v0.74: USER DATABASE — salts, a deliberately slow KDF, and account lockout
  * ===========================================================================
@@ -5577,13 +5646,26 @@ static void sha256(const void *data, uint64_t len, uint8_t out[SHA256_DIGEST]) {
  * WHAT THIS IS NOT, stated first and plainly, because a security mechanism
  * that oversells itself is worse than none:
  *
- *   The mixing primitive is FNV-1a — the same hash CAS uses for content
- *   addressing — and FNV-1a is NOT a cryptographic hash. It is not collision
- *   resistant and it is not preimage resistant. A stored digest here would not
- *   survive an attacker with the database and a serious offline budget, and no
- *   comment can change that; only a real primitive (SHA-256, then Argon2 or
- *   scrypt over it) would, and writing one belongs in its own milestone with
- *   its own test vectors rather than being improvised inside this one.
+ *   v0.75 UPDATE — the first paragraph of this warning is now OUT OF DATE, and
+ *   is kept because what it promised is exactly what happened. It read: "The
+ *   mixing primitive is FNV-1a — the same hash CAS uses for content addressing —
+ *   and FNV-1a is NOT a cryptographic hash... only a real primitive (SHA-256,
+ *   then Argon2 or scrypt over it) would [fix it], and writing one belongs in
+ *   its own milestone with its own test vectors rather than being improvised
+ *   inside this one."
+ *
+ *   That milestone is v0.75. udb_kdf() is now PBKDF2-HMAC-SHA-256 (RFC 8018)
+ *   over a SHA-256 verified against FIPS 180-4 vectors, and the KDF itself is
+ *   verified against published PBKDF2 vectors. See shastrs.
+ *
+ *   WHAT IS STILL NOT TRUE: PBKDF2 is not memory-hard. It buys a serial CPU work
+ *   factor and nothing more, so an attacker with GPUs or an ASIC still gets a far
+ *   better rate than a defender does, and 4096 iterations is a modest count by
+ *   modern standards. The "then Argon2 or scrypt over it" half of that sentence
+ *   is NOT done and remains the honest next step. What has changed is that the
+ *   digest is now built from a primitive that is collision and preimage
+ *   resistant, so the database no longer falls to anyone who simply inverts the
+ *   hash — it falls only to someone willing to pay the iteration cost per guess.
  *
  * WHAT IT IS: the correct STRUCTURE around whatever primitive sits inside, and
  * every part of that structure is independently worth having, because each one
@@ -5594,10 +5676,12 @@ static void sha256(const void *data, uint64_t len, uint8_t out[SHA256_DIGEST]) {
  *                        accounts share a password, and one cracked entry
  *                        breaks every account that shares it. This is a
  *                        property of the schema, not of the hash.
- *   4096 ROUNDS        — a work factor. Each lane's round depends on the
- *                        previous round AND on a neighbouring lane, so the
- *                        chain is inherently serial and cannot be collapsed
- *                        into a closed form or parallelised per lane.
+ *   4096 ROUNDS        — a work factor. v0.75: these are now PBKDF2 iterations,
+ *                        Ui = HMAC(pw, U(i-1)), which is serial for the same
+ *                        reason the old four-lane chain was and by a standard
+ *                        construction rather than a hand-argued one. The
+ *                        password is the HMAC key on every iteration, so the
+ *                        cost cannot be amortised across guesses.
  *   CONSTANT-TIME CMP  — the verify never returns early on a mismatched byte,
  *                        so the time it takes carries no information about how
  *                        much of the digest matched. A byte-at-a-time compare
@@ -5609,7 +5693,17 @@ static void sha256(const void *data, uint64_t len, uint8_t out[SHA256_DIGEST]) {
  *
  * Swapping FNV-1a for a real primitive later changes udb_kdf() and nothing
  * else — the schema, the syscalls, the lockout and every test above stay as
- * they are. That is the point of building the structure first.                */
+ * they are. That is the point of building the structure first.
+ *
+ * v0.75: that claim was tested by doing it, and it held. udb_kdf() is the only
+ * function whose body changed; UDB_MAX, UDB_NAME_MAX, UDB_SALT_LEN,
+ * UDB_HASH_LEN, UDB_KDF_ROUNDS, UDB_MAX_FAILS, struct udbent, udb_make_salt(),
+ * udb_ct_eq(), udb_add(), udb_auth(), the lockout state machine and both
+ * syscalls are untouched, and all 35 authstrs assertions still pass unmodified.
+ * The digests those assertions compare are different values now, but not one of
+ * them asserted a VALUE — they assert relationships (same input same digest,
+ * different salt different digest, one character changes it), which is what made
+ * the primitive swappable in the first place.                                  */
 #define UDB_MAX        16
 #define UDB_NAME_MAX   24
 #define UDB_SALT_LEN   16
@@ -5657,33 +5751,43 @@ static void udb_make_salt(uint8_t *out) {
     }
 }
 
-/* The KDF. Four 64-bit lanes, UDB_KDF_ROUNDS rounds, salt and password folded
- * in on EVERY round rather than once at the start — folding once would let an
- * attacker precompute the state after the input and pay for the rounds a
- * single time across every candidate, which would make the work factor
- * decorative. The cross-lane fold on the last line of each lane is what keeps
- * the four lanes from being four independent (and independently parallelisable)
- * 64-bit hashes. */
+/* The KDF. v0.75: PBKDF2-HMAC-SHA-256, c = UDB_KDF_ROUNDS, dkLen = 32.
+ *
+ * This is the swap the v0.74 comment above promised and ROADMAP-0.75.0.md
+ * sequenced. What was here was four 64-bit FNV-1a lanes with a cross-lane fold —
+ * a sound SHAPE built on a primitive that is neither collision nor preimage
+ * resistant, which the section header said plainly and at length.
+ *
+ * Every property that comment claimed for the old construction is preserved, by
+ * a standard rather than by a bespoke argument:
+ *
+ *   SERIAL WORK FACTOR — PBKDF2's U-chain is Ui = HMAC(pw, U(i-1)), so iteration
+ *                        i cannot start before i-1 finishes. The cross-lane fold
+ *                        existed to stop four lanes being parallelised; here
+ *                        there is one chain and nothing to parallelise.
+ *   INPUT IN EVERY ROUND — the password is the HMAC key on all c iterations, so
+ *                        no attacker precomputes a state "after the input" and
+ *                        amortises the rounds across candidates. That was the
+ *                        stated reason the old code re-folded pw and salt every
+ *                        round, and it costs nothing here.
+ *   NO TRUNCATION      — dkLen equals the PRF output, 32 bytes, which is exactly
+ *                        UDB_HASH_LEN. The derived key is one whole HMAC output;
+ *                        nothing is cut off, and the one-block case means no
+ *                        multi-block concatenation to get wrong.
+ *
+ * The 128-byte password cap is carried over from the old implementation
+ * deliberately: it bounds the work an unauthenticated caller can ask for
+ * through SYS_AUTH, and dropping it while changing everything else would have
+ * buried a policy change inside a primitive change.
+ *
+ * UNCHANGED, and that is the point: the schema, both syscalls, the lockout, the
+ * salt generator and the constant-time compare. udb_kdf() is the only function
+ * that changed, so if authstrs goes red the KDF is the only new suspect — and
+ * shastrs proves the primitive underneath it independently. */
 static void udb_kdf(const char *pw, const uint8_t *salt, uint8_t *out) {
-    uint64_t st[4];
-    for (int l = 0; l < 4; l++)
-        st[l] = 0xcbf29ce484222325ull ^ (0x9e3779b97f4a7c15ull * (uint64_t)(l + 1));
     uint32_t pwlen = 0; while (pwlen < 128 && pw[pwlen]) pwlen++;
-
-    for (uint32_t r = 0; r < UDB_KDF_ROUNDS; r++) {
-        for (int l = 0; l < 4; l++) {
-            uint64_t h = st[l];
-            h = (h ^ (uint64_t)(r + 1)) * 0x100000001b3ull;
-            h = (h ^ (uint64_t)(unsigned)l) * 0x100000001b3ull;
-            for (uint32_t i = 0; i < UDB_SALT_LEN; i++) h = (h ^ salt[i]) * 0x100000001b3ull;
-            for (uint32_t i = 0; i < pwlen; i++)        h = (h ^ (uint8_t)pw[i]) * 0x100000001b3ull;
-            h = (h ^ st[(l + 1) & 3]) * 0x100000001b3ull;
-            h ^= h >> 29;
-            st[l] = h;
-        }
-    }
-    for (int l = 0; l < 4; l++)
-        for (int b = 0; b < 8; b++) out[l * 8 + b] = (uint8_t)(st[l] >> (b * 8));
+    pbkdf2_hmac_sha256((const uint8_t *)pw, pwlen, salt, UDB_SALT_LEN,
+                       UDB_KDF_ROUNDS, out);
 }
 
 /* Constant-time equality. The accumulate-then-test shape is the entire point:
@@ -19324,6 +19428,13 @@ static void sha_vector(const char *what, const char *msg, uint64_t len, const ch
     shacheck(what, sha_hexeq(d, want));
 }
 
+static void sha_hmac_vec(const char *what, const uint8_t *key, uint32_t keylen,
+                         const uint8_t *msg, uint64_t msglen, const char *want) {
+    uint8_t d[SHA256_DIGEST];
+    hmac_sha256(key, keylen, msg, msglen, d);
+    shacheck(what, sha_hexeq(d, want));
+}
+
 static void cmd_sha_stress(void) {
     kputs("-- SHASTRS: SHA-256 against FIPS 180-4 / NIST CAVP vectors --\n");
     g_shapass = g_shafail = 0;
@@ -19406,9 +19517,82 @@ static void cmd_sha_stress(void) {
         shacheck("the same input hashes to the same digest twice", same);
     }
 
-    /* The v0.74 database still uses FNV-1a. Stated as an assertion rather than a
-     * comment so the day someone wires this in, the suite says so out loud. */
-    shacheck("NOT yet wired into udb_kdf() — that is a separate, attributable step",
+    /* ---- HMAC-SHA-256, RFC 4231 ----------------------------------------- */
+    /* PBKDF2 is defined over a PRF, so the PRF gets its own vectors before the
+     * KDF built on it does. TC6's key is 131 bytes — longer than the 64-byte
+     * block — which is the only case that exercises the hash-the-key branch. */
+    {
+        uint8_t key[131], msg[50];
+
+        for (int i = 0; i < 20; i++) key[i] = 0x0b;
+        sha_hmac_vec("RFC 4231 TC1: 20-byte 0x0b key, \"Hi There\"",
+                     key, 20, (const uint8_t *)"Hi There", 8,
+                     "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+
+        sha_hmac_vec("RFC 4231 TC2: short ASCII key (\"Jefe\")",
+                     (const uint8_t *)"Jefe", 4,
+                     (const uint8_t *)"what do ya want for nothing?", 28,
+                     "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+
+        for (int i = 0; i < 20; i++) key[i] = 0xaa;
+        for (int i = 0; i < 50; i++) msg[i] = 0xdd;
+        sha_hmac_vec("RFC 4231 TC3: 20-byte 0xaa key, 50 bytes of 0xdd",
+                     key, 20, msg, 50,
+                     "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+
+        for (int i = 0; i < 131; i++) key[i] = 0xaa;
+        sha_hmac_vec("RFC 4231 TC6: 131-byte key (longer than the block: hashed first)",
+                     key, 131,
+                     (const uint8_t *)"Test Using Larger Than Block-Size Key - Hash Key First", 54,
+                     "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+    }
+
+    /* ---- PBKDF2-HMAC-SHA-256, published vectors -------------------------- */
+    /* The standard "password"/"salt" series. c=1 checks U1 alone (so, the salt
+     * and the INT_32_BE(1) block index); c=2 checks that the XOR accumulation
+     * happens at all — an implementation that returns Uc instead of U1^...^Uc
+     * passes c=1 and fails here; c=4096 is the iteration count UDB actually
+     * uses, so it checks the exact chain length in production. */
+    {
+        uint8_t d[SHA256_DIGEST];
+        pbkdf2_hmac_sha256((const uint8_t *)"password", 8, (const uint8_t *)"salt", 4, 1, d);
+        shacheck("PBKDF2-HMAC-SHA256 c=1  (\"password\",\"salt\",dkLen=32)",
+                 sha_hexeq(d, "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"));
+
+        pbkdf2_hmac_sha256((const uint8_t *)"password", 8, (const uint8_t *)"salt", 4, 2, d);
+        shacheck("PBKDF2-HMAC-SHA256 c=2  (proves U1^..^Uc, not just Uc)",
+                 sha_hexeq(d, "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"));
+
+        pbkdf2_hmac_sha256((const uint8_t *)"password", 8, (const uint8_t *)"salt", 4,
+                           UDB_KDF_ROUNDS, d);
+        shacheck("PBKDF2-HMAC-SHA256 c=4096 (the count UDB uses)",
+                 sha_hexeq(d, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"));
+    }
+
+    /* ---- udb_kdf() end to end ------------------------------------------- */
+    /* The KDF as the database actually calls it, against a digest computed by an
+     * independent implementation for the same inputs. This is the assertion that
+     * would catch a wiring mistake — a wrong salt length, a swapped argument, a
+     * truncation — that the primitive vectors above would all still pass. */
+    {
+        uint8_t salt[UDB_SALT_LEN], d[SHA256_DIGEST];
+        for (int i = 0; i < UDB_SALT_LEN; i++) salt[i] = (uint8_t)i;   /* 00..0f */
+        udb_kdf("correct horse", salt, d);
+        shacheck("udb_kdf(\"correct horse\", salt 00..0f) matches PBKDF2-HMAC-SHA256 c=4096",
+                 sha_hexeq(d, "8750ad7301ef1b2b80b2ce8deddc4b202af4decc15d43c39c9fcd2cb74dfb9ce"));
+
+        udb_kdf("correct horsf", salt, d);            /* one character later in the string */
+        shacheck("udb_kdf(\"correct horsf\", same salt) — the one-character neighbour",
+                 sha_hexeq(d, "cc524f3d8ae8b93f84185f93c9f42f211330fc47a6adb6a04ebb936b63469f83"));
+
+        udb_kdf("", salt, d);                         /* empty password: still a full derivation */
+        shacheck("udb_kdf(\"\", same salt) — the empty password derives normally",
+                 sha_hexeq(d, "fd6e0f668c6d464b76592a4ab0e8e62d41e4bc8fcc4a3d5a3241d9586e1e19d8"));
+    }
+
+    /* The schema constant and the digest size have to agree, or the KDF is
+     * silently truncated or overruns the stored hash. */
+    shacheck("UDB_HASH_LEN equals the SHA-256 digest size — no truncation",
              UDB_HASH_LEN == SHA256_DIGEST);
 
     kprintf("[shastrs] RESULT: %d passed, %d failed\n", (uint64_t)g_shapass, (uint64_t)g_shafail);
