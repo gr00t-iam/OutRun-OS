@@ -495,3 +495,125 @@ coverage of the AP path, not faults. `g_connect_stale` is the fault counter.
 the lock is taken, so the fd->slot mapping is still a TOCTOU window. The
 generation counter now makes that window *detectable* wherever a caller cares
 to check it, but only `sys_connect` checks today.
+
+---
+
+## `sock_of_fd()` TOCTOU IN `sys_connect()` — CLOSED
+
+`sock_of_fd()` resolves a descriptor under `g_ofile_lock` (**rank 1**) and
+releases it; the caller then climbs to `g_net_lock` (**rank 9**) and indexes
+`g_sock[si]`. The descriptor can be closed and reissued in that gap, leaving a
+slot index that names a socket the caller no longer owns.
+
+Two changes in `sys_connect()`:
+
+1. **One resolution, not two.** It called `sock_of_fd()` twice — once for the
+   slot, again for the flags — and discarded the slot the second call resolved.
+   Two independent lookups of a descriptor that can change between them, with
+   nothing checking they agreed.
+2. **Revalidate after taking the net lock**, via `sock_fd_still_ours()`: the
+   slot is ours iff it is in use and its own back-pointer still names our
+   descriptor. The retransmit loop's post-yield check uses it too, on top of the
+   generation compare.
+
+### Why NOT "move sock_of_fd() inside g_net_lock"
+
+That is the obvious-looking fix and it is wrong. `sock_of_fd()` takes rank 1;
+inside `g_net_lock` we hold rank 9. Acquiring 1 under 9 is a rank **inversion**
+— and specifically the one this document already records above as a
+pre-existing defect ("`ofile` rank 1 taken while holding rank 9, consistent with
+re-entering an fd path from inside the net lock"). v0.75 spent its whole
+rank-tracking effort driving those to zero. Trading a narrow race for a
+deadlock class is not a fix.
+
+`g_sock[].fd` is the right authority precisely because `g_net_lock` already
+protects it: validating against state the held lock covers needs no second
+acquisition and cannot invert anything. There is no `dup()`/`dup2()` for
+sockets in this tree, so the back-pointer is unambiguous — one descriptor per
+slot.
+
+**Residual, and deliberate:** if a descriptor is closed and a new socket lands
+on *both* the same slot and the same fd number, this compares equal. That is a
+socket the descriptor legitimately names now, and an application racing
+`close()` against `connect()` on one descriptor has no defined answer to be
+denied.
+
+### Verification
+
+Uniprocessor 44 suites / 0 failed, `[tcpstrs] 28 passed`. Ten `-smp 4` boots:
+**10 OK / 0 HANG / 0 PANIC**, 44 suites and 0 failures every boot, and **0 rank
+violations, underflow or mismatch in any boot** — which is the check that
+matters here, since the rejected alternative would have produced them. An AP
+entered the connect retransmit loop in 8 of the 10, so the path was exercised.
+Build 0 errors, 35 warnings (unchanged baseline).
+
+Like the generation counter, the new check **never fired** (`stale=0`
+throughout). It is committed on its argument, not on evidence of the race
+occurring.
+
+### The five sibling syscalls — now also closed
+
+`sys_connect()` was fixed first; the identical resolve-then-climb gap existed in
+every other `sock_of_fd()` caller. All five now revalidate with
+`sock_fd_still_ours()` immediately after acquiring the net lock, returning
+`-EBADF` and releasing the lock.
+
+| syscall | before | after |
+|---------|--------|-------|
+| `bind`   | no check          | `sock_fd_still_ours()` |
+| `send`   | `used` only       | `sock_fd_still_ours()`, before the ENOTCONN test |
+| `recv`   | `used` only       | `sock_fd_still_ours()`, **inside** the blocking poll loop |
+| `listen` | no check          | `sock_fd_still_ours()` |
+| `accept` | no check          | `sock_fd_still_ours()` in both branches |
+
+Checking `used` was not the same question: a slot freed and immediately
+reallocated is `used` again, and that is the common case under load.
+
+Three of these are not mechanical copies of the `sys_connect` change:
+
+- **`recv`** puts the check inside its blocking poll loop rather than before
+  it. The window there is not the resolve->acquire gap alone — it reopens on
+  every iteration, which makes it the longest exposure of the five.
+- **`send`** checks before the ENOTCONN test, so a stale handle reports EBADF
+  instead of being described as a live-but-unconnected socket. The caller's
+  descriptor is the thing that went away.
+- **`accept`** now distinguishes EBADF (descriptor gone) from EINVAL (live
+  socket that is not a listener); the old test collapsed both into EINVAL. Its
+  unlocked read of `g_sock[li].stream` is deliberately left alone: `stream` is
+  set at allocation and cleared only by the wipe that frees the slot, so it
+  never changes under a live socket. A stale index can steer the wrong branch
+  and nothing worse, because both branches revalidate under the lock — a wrong
+  branch costs an error path, not a wrong action.
+
+Verified: uniprocessor 44 suites / 0 failed, `[tcpstrs] 28 passed`; ten `-smp 4`
+boots **10 OK / 0 HANG / 0 PANIC**, 0 suite failures and **0 rank violations,
+underflow or mismatch in any boot**. Build 0 errors, 35 warnings.
+
+As with `sys_connect`, **none of these checks fired** (`stale=0` throughout).
+They are committed on their argument, not on evidence of the race occurring.
+
+### Phase 5 (network stack hardening) — CLOSED
+
+Every `sock_of_fd()` caller now validates its descriptor under the lock that
+protects the answer. The v0.75 network work is: the AP-yield fix, the socket
+generation counter, and this descriptor revalidation across all six syscalls.
+
+## TIER 2 HANDOFF STATE (next milestone)
+
+The crypto half of "Persistent User Database Storage & Tier-2 Crypto Engine" is
+largely **already written and unmerged**, which is the first thing to know
+before starting it:
+
+- **PR #61** — SHA-256 (FIPS 180-4) as its own verified unit, against NIST
+  vectors. Open.
+- **PR #62** — `udb_kdf()` is PBKDF2-HMAC-SHA-256. Open, stacked on #61.
+
+Both branch from `#60` and are 8 commits behind `main`, but `git merge-tree`
+reports **0 conflicts** against current `main`, so they rebase cleanly. Step 5
+of the milestone plan above is therefore mostly a review-and-merge task, not an
+implementation task.
+
+That leaves **step 6 (persist the user database)** as the real remaining work,
+with the open design question unchanged: the volume is content-addressed with
+no timestamps, so a password change must not be inferable from dedup
+behaviour.
