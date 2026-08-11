@@ -196,10 +196,38 @@ qemu-nvme: install-img
 # Boot on q35 with an emulated Intel VT-d IOMMU; virtio devices behind it.
 # (virtio-sound omitted here for the same reason as the main qemu target — it
 # breaks virtio-gpu's controlq under this QEMU; see qemu-audio + CHANGELOG.)
-QEMU_IOMMU := -machine q35,kernel-irqchip=split -device intel-iommu,intremap=off,caching-mode=on
-qemu-iommu: all
-	qemu-system-x86_64 $(QEMU_IOMMU) -cdrom build/outrun-os-$(VERSION).iso -m 512M -nographic -no-reboot $(QEMU_GPU) \
-	  -drive file=/tmp/cas.img,if=none,format=raw,id=vd0 \
-	  -device virtio-blk-pci,drive=vd0,disable-legacy=on,disable-modern=off,iommu_platform=on \
-	  -netdev user,id=n0 \
-	  -device virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,mac=52:54:00:ab:cd:ef,iommu_platform=on
+# v0.75: this is the THIRD release-gate configuration, and two things stopped it
+# from being that.
+#
+#   intremap=off  Interrupt remapping was disabled, so the one part of VT-d that
+#                 interacts with the APIC/MSI path this kernel actually drives
+#                 was never exercised. DMA translation was, which is why the
+#                 target still found real bugs — but "IOMMU" was doing half the
+#                 job the config name implies. Now `on`, which is also why
+#                 kernel-irqchip=split is required rather than incidental.
+#
+#   no -smp       The target passed no -smp at all, so it booted UNIPROCESSOR
+#                 while every log it produced is named "smp4-iommu". The gate's
+#                 third config is meant to be the SMP one under VT-d; without
+#                 -smp 4 it duplicates the uniprocessor config with an IOMMU
+#                 bolted on and cannot catch anything SMP-specific.
+#
+# Also: this target used to point -drive at a hardcoded /tmp/cas.img with no
+# rule to create it, unlike every other qemu target here, so it failed outright
+# on a clean machine and silently reused whatever a previous run had left behind
+# on a dirty one. It now uses $(QEMU_BLK)/$(QEMU_NET) with iommu_platform=on
+# appended, and depends on $(VBLK_IMG) like the rest.
+#
+# Verified as written: 5/5 clean boots, 47 suites, 0 failures, 0 lock-rank
+# faults. Note 47 rather than the 45 of the other configs — the VT-d
+# configuration runs two additional IOMMU-specific suites, and their absence is
+# how you can tell this target is not actually running with an IOMMU.
+QEMU_IOMMU := -smp 4 -machine q35,kernel-irqchip=split \
+              -device intel-iommu,intremap=on,caching-mode=on
+QEMU_BLK_IOMMU := -drive file=$(VBLK_IMG),if=none,format=raw,id=vd0 \
+  -device virtio-blk-pci,drive=vd0,disable-legacy=on,disable-modern=off,iommu_platform=on
+QEMU_NET_IOMMU := -netdev user,id=n0 \
+  -device virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,mac=52:54:00:ab:cd:ef,iommu_platform=on
+qemu-iommu: $(ISO) $(VBLK_IMG)
+	qemu-system-x86_64 $(QEMU_IOMMU) -cdrom $(ISO) -m 512M -nographic -no-reboot $(QEMU_GPU) \
+	  $(QEMU_BLK_IOMMU) $(QEMU_NET_IOMMU)

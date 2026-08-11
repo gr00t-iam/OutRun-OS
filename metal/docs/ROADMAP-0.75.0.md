@@ -1058,35 +1058,54 @@ this milestone can say so: the table earlier in this document recorded, until
 today, that `main` did not meet the gate because of the `-smp 4` panic and the
 `g_net_lock` re-entrancy. Both are closed.
 
-### A gate configuration that was not actually running
+### The third gate configuration was not what its name said — CORRECTED, then FIXED
 
-The third config had to be written out by hand, and that is worth recording.
-`make qemu-iommu` expands `$(QEMU_IOMMU)`:
+> **RETRACTION.** An earlier revision of this section claimed `QEMU_IOMMU` was
+> "not defined anywhere in the Makefile" and that every past `smp4-iommu` result
+> should therefore be distrusted. **That was wrong.** It was defined, at
+> Makefile line 199, and the claim came from a `grep ... | head -5` that
+> truncated before reaching it — the same truncated-search mistake this
+> milestone already made once, with the `g_sock[]` wipe sites. The retracted
+> paragraph is left described rather than silently deleted, because a wrong
+> claim that reached `main` is part of the record.
 
-```
-qemu-iommu: all
-	qemu-system-x86_64 $(QEMU_IOMMU) -cdrom ... 
-```
+What was actually wrong is narrower, and real. The definition was:
 
-**`QEMU_IOMMU` is not defined anywhere in the Makefile.** An undefined make
-variable expands to nothing, so that target has been booting with no
-`intel-iommu`, no `intremap`, and no q35 machine type — silently degrading into
-roughly the plain SMP configuration beside it. A gate configuration that
-collapses into the one next to it is not a third data point, and every
-"smp4-iommu" result recorded from that target since the variable went missing
-should be read with that in mind.
-
-The runs in the table above use the configuration spelled out explicitly:
-
-```
--smp 4 -machine q35,kernel-irqchip=split -device intel-iommu,intremap=on
-       ... virtio-blk-pci,...,iommu_platform=on
-       ... virtio-net-pci,...,iommu_platform=on
+```make
+QEMU_IOMMU := -machine q35,kernel-irqchip=split -device intel-iommu,intremap=off,caching-mode=on
 ```
 
-The Makefile is **not** repaired here — the flags a gate target should carry are
-a deliberate choice, not something to infer from old logs and quietly commit
-under a documentation change. It is left as an explicit open item.
+Two defects, neither of which stops a boot, which is why they lasted:
+
+1. **`intremap=off`.** DMA translation was exercised; interrupt remapping — the
+   half of VT-d that touches the APIC/MSI path this kernel drives — was not. The
+   target found real bugs, so it was never suspect, but it was doing half the
+   job its name implies.
+2. **No `-smp` at all.** The target booted UNIPROCESSOR while every log it
+   produced is named `smp4-iommu`. As the gate's third configuration it was
+   duplicating the uniprocessor config with an IOMMU attached, and could not
+   catch anything SMP-specific — which is precisely the class of bug this
+   milestone spent its length on.
+
+A third, unrelated: it pointed `-drive` at a hardcoded `/tmp/cas.img` with no
+rule to create it, unlike every other qemu target, so it failed outright on a
+clean machine and silently reused stale state on a dirty one.
+
+**Fixed** — `intremap=on`, `-smp 4`, and `$(VBLK_IMG)` with a proper
+prerequisite, verified by running the target itself rather than a hand-written
+qemu line resembling it:
+
+```
+$ make qemu-iommu
+[iommu  ] DMAR found: host address width 39 bits, flags 1
+[iommu  ] VT-d version 1.0  cap 00d2008c22260286  ecap 0000000000f00f4a
+[iommu  ] domains 65536  MGAW 39-bit  SAGAW 2  superpages 3  IR-capable
+[smp    ] MADT: 4 enabled cpu(s): apic0 apic1 apic2 apic3
+47 suites, 0 failures, rank violations=0 underflow=0 mismatch=0
+```
+
+The gate table above still stands: those runs used the same flags, spelled out
+by hand before the Makefile carried them.
 
 ### What a v0.75.0 tag would and would not be claiming
 
@@ -1114,4 +1133,6 @@ NOT claimed:
 - The suite set is not idempotent across boots on a re-used volume — two suites
   fail on a second boot, pre-existing and confirmed by negative control.
 - The toolchain suites' wall-clock budgets still break on a loaded host.
-- `make qemu-iommu` is still broken, per above.
+- ~~`make qemu-iommu` is still broken, per above.~~ **FIXED** — `intremap=on`,
+  `-smp 4`, and a real `$(VBLK_IMG)` prerequisite; verified by running the
+  target. The claim that `QEMU_IOMMU` was undefined is retracted above.
