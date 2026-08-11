@@ -5732,6 +5732,86 @@ static struct udbent g_udb[UDB_MAX];
 static struct klock  g_udb_lock = { 0, "udb", 13, 0, 0, 0, 0, 0 };
 static volatile uint64_t g_auth_ok = 0, g_auth_bad = 0, g_auth_lockouts = 0;
 
+/* ---------------------------------------------------------------------------
+ * v0.75 step 6: PERSISTENCE.
+ *
+ * The volume is content-addressed with no timestamps, and a VFS file is stored
+ * as per-512-byte-block CAS chunks (`chunk_hash[i]`). That means DEDUP IS
+ * OBSERVABLE PER CHUNK: an observer who can see which blocks exist learns
+ * things without reading any content.
+ *
+ * The case that matters is one account over time. Per-user salts already handle
+ * two accounts sharing a password — different salts, different digests,
+ * different bytes. But a salt is stable across a password CHANGE, so a user
+ * reverting to an earlier password re-derives the identical digest, the image
+ * becomes byte-identical to an earlier one, the store dedups, and no new block
+ * appears. That absence is the signal: "went back to a password used before."
+ *
+ * So the image is built as UDB_IMG_SEGS fixed 512-byte segments, each carrying
+ * its own freshly drawn nonce. Every segment therefore differs on every write,
+ * nothing ever dedups, and dedup behaviour carries no information at all. The
+ * nonce is per SEGMENT rather than one per image on purpose: a single header
+ * nonce would leave the other chunks byte-identical when they had not changed,
+ * which is exactly the per-chunk leak, only quieter.
+ *
+ * This costs one block per segment per write with no dedup savings. That is the
+ * point — the savings ARE the leak.
+ *
+ * Fixed size regardless of population: a file whose length grew with each
+ * account would publish how many accounts exist without anyone reading it.
+ * Unused slots are filled with random bytes rather than zeroes.
+ *
+ * Two files, written alternately, each carrying a generation: the reader takes
+ * the highest generation that VERIFIES. A torn or interrupted write damages at
+ * most the older slot, so the previous good image always survives. That is the
+ * root flip; it does not depend on the dirent rewrite being atomic.
+ *
+ * NOT persisted: the lockout counters. See udb_serialize().
+ * NOT provided: confidentiality. Salts and digests are readable by anyone who
+ * can read the volume. What protects a password is the KDF, not the storage —
+ * there is no key store and nothing to encrypt this with that does not itself
+ * live on the same volume. */
+#define UDB_SEG_BYTES  512
+#define UDB_SEG_NONCE  16
+#define UDB_SEG_DATA   (UDB_SEG_BYTES - UDB_SEG_NONCE)      /* 496            */
+#define UDB_IMG_SEGS   3
+#define UDB_IMG_BYTES  (UDB_IMG_SEGS * UDB_SEG_BYTES)       /* 1536 on disk   */
+#define UDB_PAY_BYTES  (UDB_IMG_SEGS * UDB_SEG_DATA)        /* 1488 logical   */
+#define UDB_REC_BYTES  84
+#define UDB_PAY_HDR    56          /* magic8 ver4 rsv4 gen8 sha32             */
+#define UDB_PATH_A     "/etc/udb.a"
+#define UDB_PATH_B     "/etc/udb.b"
+
+/* The records must fit the payload with room left for the random tail. */
+_Static_assert(UDB_PAY_HDR + UDB_MAX * UDB_REC_BYTES <= UDB_PAY_BYTES,
+               "UDB image payload cannot hold UDB_MAX records");
+
+static uint64_t g_udb_gen = 0;          /* generation of the loaded/last image */
+/* Fail-closed flag. Set when a stored image exists but does not verify. An
+ * unreadable database must NOT quietly become an empty one: an empty UDB is a
+ * system where the next caller creates the first account. */
+static int      g_udb_unavailable = 0;
+static int      g_udb_persist = 0;      /* set once the volume is mountable    */
+static volatile uint64_t g_udb_saves = 0, g_udb_load_fail = 0;
+static void udb_save(void);             /* fwd: defined after the VFS section  */
+
+/* Random filler. Same splitmix64-over-rdtsc source as the salt generator, and
+ * carrying the same caveat: this is not a CSPRNG. It does not need to be — its
+ * only job is to make every write byte-unique so nothing dedups, and for that
+ * non-repetition is the property that matters, not unpredictability. */
+static uint64_t g_udb_rndseq = 0;
+static void udb_rand_fill(uint8_t *out, uint32_t n) {
+    uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t s = ((uint64_t)hi << 32 | lo) ^ (g_ticks * 0x9e3779b97f4a7c15ull)
+                 ^ (__sync_fetch_and_add(&g_udb_rndseq, 1) * 0xbf58476d1ce4e5b9ull);
+    for (uint32_t i = 0; i < n; i++) {
+        s ^= s >> 30; s *= 0xbf58476d1ce4e5b9ull;
+        s ^= s >> 27; s *= 0x94d049bb133111ebull;
+        s ^= s >> 31;
+        out[i] = (uint8_t)(s & 0xff);
+    }
+}
+
 /* Salt source. Not a CSPRNG and not claimed to be one: it is rdtsc (which no
  * two calls observe alike on real silicon or under TCG) folded with the tick
  * counter and a monotonic sequence, so two accounts created in the same boot
@@ -5827,6 +5907,13 @@ static int udb_add(const char *name, const char *pw, uint32_t uid, uint32_t gid)
     udb_kdf(pw, g_udb[s].salt, g_udb[s].hash);
     g_udb[s].fails = 0; g_udb[s].locked = 0; g_udb[s].used = 1;
     klock_release(&g_udb_lock);
+    /* v0.75: persist OUTSIDE the lock, and it has to be outside. g_udb_lock is
+     * rank 13; the write path descends through vfs (rank 2) and cas (rank 3),
+     * so saving with the udb lock held would acquire 2 and 3 underneath 13 —
+     * a rank inversion of exactly the kind v0.75 spent this milestone removing.
+     * udb_save() re-acquires the lock itself, briefly, only to copy the table
+     * out. */
+    udb_save();
     return 0;
 }
 
@@ -5845,6 +5932,12 @@ static int udb_add(const char *name, const char *pw, uint32_t uid, uint32_t gid)
  * correct guess as to a wrong one. */
 static int64_t udb_auth(const char *name, const char *pw) {
     uint8_t cand[UDB_HASH_LEN];
+    /* v0.75: FAIL CLOSED. A stored image existed and did not verify, so the
+     * table in memory is not known to be the real one. Denying everything is
+     * the only safe answer — the tempting alternative, carrying on with an
+     * empty table, is a system where the next caller creates the first account
+     * and owns the machine. */
+    if (g_udb_unavailable) { __sync_fetch_and_add(&g_auth_bad, 1); return -11; }
     klock_acquire(&g_udb_lock);
     int i = udb_find_locked(name);
     if (i < 0) {
@@ -6308,6 +6401,238 @@ static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
     klock_release(&g_vfs_lock);
     return got;
 }
+
+/* ===========================================================================
+ * v0.75 step 6: USER DATABASE PERSISTENCE
+ * ===========================================================================
+ * Placed here rather than beside the rest of the UDB because it is the first
+ * UDB code that needs the VFS, and the VFS needs the CAS. The declarations and
+ * the design argument live up in the UDB section; this is the mechanism.
+ *
+ * On-disk payload, UDB_PAY_BYTES fixed:
+ *
+ *   0   magic[8]    "ORUNUDB1"
+ *   8   u32         version
+ *   12  u32         reserved
+ *   16  u64         generation
+ *   24  u8[32]      sha256 over everything from UDB_PAY_HDR to the end
+ *   56  records     UDB_MAX * UDB_REC_BYTES
+ *   ..  random tail padding out to UDB_PAY_BYTES
+ *
+ * Record, UDB_REC_BYTES:
+ *
+ *   0  name[24]  24 uid  28 gid  32 salt[16]  48 hash[32]  80 used  81 pad[3]
+ *
+ * The payload is then cut into UDB_IMG_SEGS segments, each written as
+ * [16-byte fresh nonce][UDB_SEG_DATA payload bytes], so the file is exactly
+ * UDB_IMG_BYTES and every 512-byte CAS chunk is unique on every write. */
+#define UDB_MAGIC0 'O'
+static const char g_udb_magic[8] = { 'O','R','U','N','U','D','B','1' };
+
+static inline void udb_put32(uint8_t *p, uint32_t v) {
+    p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24);
+}
+static inline void udb_put64(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8*i));
+}
+static inline uint32_t udb_get32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+}
+static inline uint64_t udb_get64(const uint8_t *p) {
+    uint64_t v = 0; for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8*i); return v;
+}
+
+/* Serialise the live table into `pay`. Takes g_udb_lock only for the copy, and
+ * holds NOTHING while doing I/O — see the note in udb_add().
+ *
+ * `fails` and `locked` are deliberately absent from the record layout. They
+ * change on every FAILED authentication, so persisting them would make every
+ * failed login write a block, and an observer counting writes would be counting
+ * failed logins — a fresh side channel introduced by closing another one. The
+ * cost is that lockout state resets across a reboot, which is a real weakness
+ * against an attacker who can force reboots, and it is recorded rather than
+ * hidden. */
+static void udb_serialize(uint8_t *pay, uint64_t gen) {
+    /* Random first: every byte not subsequently overwritten is then random
+     * rather than zero, which covers the tail padding and every unused slot in
+     * one step. */
+    udb_rand_fill(pay, UDB_PAY_BYTES);
+
+    for (int i = 0; i < 8; i++) pay[i] = (uint8_t)g_udb_magic[i];
+    udb_put32(pay + 8, 1);                       /* version                    */
+    udb_put32(pay + 12, 0);                      /* reserved                   */
+    udb_put64(pay + 16, gen);
+    /* pay[24..56) is the digest, filled after the body is complete.           */
+
+    klock_acquire(&g_udb_lock);
+    for (int i = 0; i < UDB_MAX; i++) {
+        uint8_t *r = pay + UDB_PAY_HDR + i * UDB_REC_BYTES;
+        if (!g_udb[i].used) { r[80] = 0; continue; }   /* leave the rest random */
+        for (int k = 0; k < UDB_NAME_MAX; k++) r[k] = (uint8_t)g_udb[i].name[k];
+        udb_put32(r + 24, g_udb[i].uid);
+        udb_put32(r + 28, g_udb[i].gid);
+        for (int k = 0; k < UDB_SALT_LEN; k++) r[32 + k] = g_udb[i].salt[k];
+        for (int k = 0; k < UDB_HASH_LEN; k++) r[48 + k] = g_udb[i].hash[k];
+        r[80] = 1;
+        r[81] = r[82] = r[83] = 0;
+    }
+    klock_release(&g_udb_lock);
+
+    sha256(pay + UDB_PAY_HDR, UDB_PAY_BYTES - UDB_PAY_HDR, pay + 24);
+}
+
+/* Verify and unpack. Returns 0 and fills *gen_out on success, negative if this
+ * image is not one of ours or does not verify. Does NOT touch g_udb — the
+ * caller decides whether this image wins. */
+static int udb_check(const uint8_t *pay, uint64_t *gen_out) {
+    for (int i = 0; i < 8; i++) if (pay[i] != (uint8_t)g_udb_magic[i]) return -1;
+    if (udb_get32(pay + 8) != 1) return -2;
+    uint8_t want[UDB_HASH_LEN];
+    sha256(pay + UDB_PAY_HDR, UDB_PAY_BYTES - UDB_PAY_HDR, want);
+    if (!udb_ct_eq(want, pay + 24, UDB_HASH_LEN)) return -3;
+    if (gen_out) *gen_out = udb_get64(pay + 16);
+    return 0;
+}
+
+static void udb_unpack(const uint8_t *pay) {
+    klock_acquire(&g_udb_lock);
+    for (int i = 0; i < UDB_MAX; i++) {
+        const uint8_t *r = pay + UDB_PAY_HDR + i * UDB_REC_BYTES;
+        cmemset(&g_udb[i], 0, sizeof g_udb[i]);
+        if (!r[80]) continue;
+        for (int k = 0; k < UDB_NAME_MAX; k++) g_udb[i].name[k] = (char)r[k];
+        g_udb[i].name[UDB_NAME_MAX - 1] = 0;
+        g_udb[i].uid = udb_get32(r + 24);
+        g_udb[i].gid = udb_get32(r + 28);
+        for (int k = 0; k < UDB_SALT_LEN; k++) g_udb[i].salt[k] = r[32 + k];
+        for (int k = 0; k < UDB_HASH_LEN; k++) g_udb[i].hash[k] = r[48 + k];
+        g_udb[i].fails = 0; g_udb[i].locked = 0;   /* volatile: never stored    */
+        g_udb[i].used = 1;
+    }
+    klock_release(&g_udb_lock);
+}
+
+/* payload -> file image: one fresh nonce per 512-byte segment. */
+static void udb_frame(const uint8_t *pay, uint8_t *img) {
+    for (int s = 0; s < UDB_IMG_SEGS; s++) {
+        uint8_t *seg = img + s * UDB_SEG_BYTES;
+        udb_rand_fill(seg, UDB_SEG_NONCE);
+        for (int k = 0; k < UDB_SEG_DATA; k++) seg[UDB_SEG_NONCE + k] = pay[s * UDB_SEG_DATA + k];
+    }
+}
+static void udb_unframe(const uint8_t *img, uint8_t *pay) {
+    for (int s = 0; s < UDB_IMG_SEGS; s++) {
+        const uint8_t *seg = img + s * UDB_SEG_BYTES;
+        for (int k = 0; k < UDB_SEG_DATA; k++) pay[s * UDB_SEG_DATA + k] = seg[UDB_SEG_NONCE + k];
+    }
+}
+
+/* Write the next generation into the slot it belongs to. Alternating A/B is
+ * what makes this survive an interrupted write: the slot NOT being written
+ * still holds the previous good image, and the reader prefers the highest
+ * generation that verifies. */
+/* The staging buffers are static, not stack: UDB_PAY_BYTES + UDB_IMG_BYTES is
+ * ~3 KiB and kernel stacks here are not sized for that. Static buffers need a
+ * guard, so this raw test-and-set serialises the whole save — including the
+ * generation increment, which is a plain ++ and is only safe because of it.
+ *
+ * A raw leaf flag rather than a klock on purpose: every rank below the VFS is
+ * already spoken for, and a ranked lock taken above vfs(2)/cas(3) and held
+ * across them would be the inversion this milestone exists to remove. It is a
+ * leaf — nothing is held when it is taken, and it is never taken while holding
+ * anything — and it backs off through krelax(), which yields on the BSP and
+ * PAUSE-spins on an AP. */
+static volatile int g_udb_save_busy = 0;
+
+static void udb_save(void) {
+    if (!g_udb_persist) return;
+    static uint8_t pay[UDB_PAY_BYTES];
+    static uint8_t img[UDB_IMG_BYTES];
+
+    while (__sync_lock_test_and_set(&g_udb_save_busy, 1)) krelax();
+
+    uint64_t gen = ++g_udb_gen;
+    udb_serialize(pay, gen);
+    udb_frame(pay, img);
+    const char *path = (gen & 1) ? UDB_PATH_A : UDB_PATH_B;
+    int rc = vfs_write_file(path, img, UDB_IMG_BYTES);
+
+    __sync_lock_release(&g_udb_save_busy);
+
+    if (rc < 0) {
+        kprintf("[udb    ] *** SAVE FAILED generation %u slot %s (rc %d)\n",
+                gen, (gen & 1) ? "A" : "B", (uint64_t)(int64_t)rc);
+        return;
+    }
+    __sync_fetch_and_add(&g_udb_saves, 1);
+    kprintf("[udb    ] saved generation %u to slot %s (%d bytes)\n",
+            gen, (gen & 1) ? "A" : "B", (uint64_t)UDB_IMG_BYTES);
+}
+
+/* Read one slot. Returns 0 and fills pay/gen if that slot holds a valid image. */
+static int udb_load_slot(const char *path, uint8_t *pay, uint64_t *gen) {
+    int di = vfs_find(path);
+    if (di < 0) return -1;                              /* absent: not a fault  */
+    static uint8_t img[UDB_IMG_BYTES];
+    int64_t n = vfs_read_file(di, img, UDB_IMG_BYTES);
+    if (n != (int64_t)UDB_IMG_BYTES) return -2;         /* short/torn           */
+    udb_unframe(img, pay);
+    return udb_check(pay, gen);
+}
+
+/* Boot-time load. Highest verifying generation wins.
+ *
+ * The three outcomes are deliberately distinct:
+ *   neither slot present  -> a fresh volume. Empty table, persistence armed.
+ *   one or both verify    -> adopt the newer.
+ *   present but NONE verify -> FAIL CLOSED. g_udb_unavailable denies every
+ *                            authentication until an operator intervenes. */
+static void udb_load(void) {
+    static uint8_t pa[UDB_PAY_BYTES], pb[UDB_PAY_BYTES];
+    uint64_t ga = 0, gb = 0;
+    int ra = udb_load_slot(UDB_PATH_A, pa, &ga);
+    int rb = udb_load_slot(UDB_PATH_B, pb, &gb);
+
+    if (ra == -1 && rb == -1) {                    /* nothing stored yet        */
+        g_udb_persist = 1;
+        kputs("[udb    ] no stored database — starting empty, persistence armed\n");
+        return;
+    }
+    if (ra != 0 && rb != 0) {
+        g_udb_unavailable = 1;
+        __sync_fetch_and_add(&g_udb_load_fail, 1);
+        kprintf("[udb    ] *** STORED DATABASE PRESENT BUT UNVERIFIABLE (a=%d b=%d) — "
+                "FAILING CLOSED: all authentication denied\n",
+                (uint64_t)(int64_t)ra, (uint64_t)(int64_t)rb);
+        return;
+    }
+    const uint8_t *win; uint64_t g;
+    if (ra == 0 && (rb != 0 || ga >= gb)) { win = pa; g = ga; }
+    else                                  { win = pb; g = gb; }
+    udb_unpack(win);
+    g_udb_gen = g;
+    g_udb_persist = 1;
+    int n = 0;
+    for (int i = 0; i < UDB_MAX; i++) if (g_udb[i].used) n++;
+    kprintf("[udb    ] loaded generation %u, %d account(s)%s\n",
+            g, (uint64_t)(int64_t)n,
+            (ra == 0 && rb == 0) ? " (both slots valid)" : "");
+
+    /* v0.75: the cross-reboot proof, in the same shape as v0.48's
+     * "vfs-reboot-test" above — creation is a deliberate manual act at the
+     * prompt (`udbpersist`), detection is automatic here. If this line appears
+     * it was printed by a LATER, completely separate QEMU process sharing the
+     * same disk image, which is the only thing that actually demonstrates
+     * persistence. A suite that boots a fresh image every time never can. */
+    klock_acquire(&g_udb_lock);
+    int marker = udb_find_locked("udbreboot");
+    uint32_t muid = marker >= 0 ? g_udb[marker].uid : 0;
+    klock_release(&g_udb_lock);
+    if (marker >= 0)
+        kprintf("[udb    ] CROSS-BOOT OK: account 'udbreboot' (uid %u) survived a reboot "
+                "at generation %u\n", (uint64_t)muid, g);
+}
+
 /* ===========================================================================
  * v0.48: MULTI-VOLUME ABSTRACTION — ROOT (unchanged), TMP (ephemeral RAM-only,
  * no CAS/journaling — matches real tmpfs semantics), DEV (read-only, a thin
@@ -19613,6 +19938,21 @@ static void cmd_auth_stress(void) {
     g_authpass = g_authfail = 0;
     uint64_t save = current_proc_idx;
 
+    /* v0.75 step 6: this suite CREATES ACCOUNTS, and as of persistence those
+     * accounts would outlive the boot. On the next boot with the same volume
+     * "root can create an account" would find m74alice already present, get
+     * EEXIST, and fail — the suite would break itself, on the second run only,
+     * which is the worst way to find out.
+     *
+     * So it snapshots the table, and restores and re-saves at the end. The
+     * volume is left exactly as it was found, and the suite stays hermetic
+     * across reboots the way every other suite here is. */
+    static struct udbent udb_snap[UDB_MAX];
+    klock_acquire(&g_udb_lock);
+    for (int i = 0; i < UDB_MAX; i++) udb_snap[i] = g_udb[i];
+    klock_release(&g_udb_lock);
+    /* generation is intentionally not snapshotted — see the restore below */
+
     /* ---------------- the KDF and its schema, as pure functions ------------ */
     uint8_t s1[UDB_SALT_LEN], s2[UDB_SALT_LEN];
     udb_make_salt(s1); udb_make_salt(s2);
@@ -19790,11 +20130,126 @@ static void cmd_auth_stress(void) {
     }
     current_proc_idx = save;
 
+    /* ---- v0.75 step 6: persistence, and put the table back ---------------- */
+    {
+        /* Round-trip as a pure function: serialise the CURRENT table, unpack it
+         * into a scratch copy, and compare. This runs before the restore, so it
+         * is testing an interesting table rather than an empty one. */
+        static uint8_t p1[UDB_PAY_BYTES], p2[UDB_PAY_BYTES];
+        static uint8_t i1[UDB_IMG_BYTES], i2[UDB_IMG_BYTES];
+        uint64_t g1 = 0;
+        udb_serialize(p1, 4242);
+        authcheck("a serialised image verifies its own digest", udb_check(p1, &g1) == 0);
+        authcheck("the generation survives serialisation", g1 == 4242);
+
+        /* THE PROPERTY THE WHOLE DESIGN EXISTS FOR: the same logical table,
+         * written twice, must produce DIFFERENT bytes — otherwise the store
+         * dedups and the absence of a new block says "nothing changed". */
+        udb_frame(p1, i1);
+        udb_serialize(p2, 4243);
+        udb_frame(p2, i2);
+        int same = 1;
+        for (int i = 0; i < UDB_IMG_BYTES; i++) if (i1[i] != i2[i]) { same = 0; break; }
+        authcheck("two writes of the same accounts produce DIFFERENT bytes (no dedup)", !same);
+
+        /* Every 512-byte segment must differ, not merely the header — a single
+         * image-wide nonce would leave the other CAS chunks identical, which is
+         * the per-chunk leak in quieter form. */
+        int allsegs = 1;
+        for (int s = 0; s < UDB_IMG_SEGS; s++) {
+            int segsame = 1;
+            for (int k = 0; k < UDB_SEG_BYTES; k++)
+                if (i1[s*UDB_SEG_BYTES+k] != i2[s*UDB_SEG_BYTES+k]) { segsame = 0; break; }
+            if (segsame) { allsegs = 0; break; }
+        }
+        authcheck("EVERY 512-byte segment differs between writes (per-chunk nonce)", allsegs);
+
+        /* A corrupted image must be rejected, not silently adopted. */
+        p1[UDB_PAY_HDR + 3] ^= 0xff;
+        authcheck("a single flipped body byte fails the digest", udb_check(p1, &g1) != 0);
+        p1[UDB_PAY_HDR + 3] ^= 0xff;
+        p1[0] ^= 0xff;
+        authcheck("a wrong magic is rejected", udb_check(p1, &g1) != 0);
+
+        /* The image is a FIXED size regardless of population, so the file
+         * length never publishes how many accounts exist. */
+        authcheck("the on-disk image size is independent of account count",
+                  UDB_IMG_BYTES == UDB_IMG_SEGS * UDB_SEG_BYTES);
+
+        /* Lockout state is NOT stored: unpack must clear it however the table
+         * looked when it was written. */
+        udb_serialize(p2, 7);
+        klock_acquire(&g_udb_lock);
+        int probe = -1;
+        for (int i = 0; i < UDB_MAX; i++) if (g_udb[i].used) { probe = i; break; }
+        if (probe >= 0) { g_udb[probe].fails = 2; g_udb[probe].locked = 1; }
+        klock_release(&g_udb_lock);
+        udb_unpack(p2);
+        int cleared = 1;
+        klock_acquire(&g_udb_lock);
+        for (int i = 0; i < UDB_MAX; i++) if (g_udb[i].fails || g_udb[i].locked) cleared = 0;
+        klock_release(&g_udb_lock);
+        authcheck("lockout state is never persisted — it comes back clear", cleared);
+
+        /* Put the table back exactly as found, and re-save so the volume is
+         * unchanged by this suite. */
+        klock_acquire(&g_udb_lock);
+        for (int i = 0; i < UDB_MAX; i++) g_udb[i] = udb_snap[i];
+        klock_release(&g_udb_lock);
+        /* The TABLE is restored; the GENERATION is deliberately NOT. Rewinding
+         * it would let a stale slot outrank a current one — this suite writes
+         * several generations, and if the counter were rolled back the next
+         * save could land a LOWER number than an image still sitting in the
+         * other slot, and udb_load() prefers the highest that verifies. It
+         * would then adopt this suite's throwaway accounts on the next boot.
+         * Generations only ever go up. */
+        udb_save();
+    }
+
     kprintf("[authstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_authpass, (uint64_t)g_authfail);
     if (!g_authfail)
         kputs("[authstrs] AUTH VERIFIED — salted KDF, constant-time verify, lockout, and a one-way privilege door\n");
     else kputs("[authstrs] AUTH DEFECTS PRESENT\n");
     kputs("-- done --\n");
+}
+
+/* v0.75 step 6: the cross-reboot proof. Deliberately a manual command and not
+ * part of the boot sequence — an OS does not get to invent an account on every
+ * boot, and a marker the boot creates for itself proves nothing about the boot
+ * before it. Run this once at the prompt, then reboot the SAME disk image: the
+ * "CROSS-BOOT OK" line from udb_load() is printed by a different QEMU process
+ * and is the only real evidence that anything persisted.
+ *
+ * Modelled on v0.48's vfscrashwrite / "vfs-reboot-test" pair, for the same
+ * reason: persistence is the one property a single boot cannot demonstrate. */
+static void cmd_udb_persist(void) {
+    kputs("-- UDB persistence marker --\n");
+    if (g_udb_unavailable) {
+        kputs("[udb    ] database is UNAVAILABLE (failed closed); refusing to write\n");
+        return;
+    }
+    int rc = udb_add("udbreboot", "reboot-proof", 4242, 4242);
+    if (rc == 0)
+        kprintf("[udb    ] created 'udbreboot' and saved at generation %u — "
+                "reboot this same disk image and look for CROSS-BOOT OK\n", g_udb_gen);
+    else if (rc == -17)
+        kprintf("[udb    ] 'udbreboot' already exists (generation %u) — it came from "
+                "an earlier boot, which is the point\n", g_udb_gen);
+    else
+        kprintf("[udb    ] could not create the marker: rc %d\n", (uint64_t)(int64_t)rc);
+    kputs("-- done --\n");
+}
+
+static void cmd_udb_stat(void) {
+    int n = 0;
+    klock_acquire(&g_udb_lock);
+    for (int i = 0; i < UDB_MAX; i++) if (g_udb[i].used) n++;
+    klock_release(&g_udb_lock);
+    kprintf("[udb    ] accounts=%d generation=%u saves=%u persist=%d unavailable=%d "
+            "load_failures=%u image=%d bytes (%d segments)\n",
+            (uint64_t)(int64_t)n, g_udb_gen, g_udb_saves,
+            (uint64_t)(int64_t)g_udb_persist, (uint64_t)(int64_t)g_udb_unavailable,
+            g_udb_load_fail, (uint64_t)UDB_IMG_BYTES, (uint64_t)UDB_IMG_SEGS);
 }
 
 static void cmd_wimp_stress(void) {
@@ -24880,6 +25335,8 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "usersstress")) cmd_users_stress();
     else if (!kstrcmp(argv[0], "authstress")) cmd_auth_stress();   /* v0.74 — see boot sequence */
     else if (!kstrcmp(argv[0], "shastress"))  cmd_sha_stress();    /* v0.75 — SHA-256 vectors */
+    else if (!kstrcmp(argv[0], "udbpersist")) cmd_udb_persist();   /* v0.75 — cross-boot proof */
+    else if (!kstrcmp(argv[0], "udbstat"))    cmd_udb_stat();
     else if (!kstrcmp(argv[0], "appsstress")) cmd_apps_stress();
     else if (!kstrcmp(argv[0], "posixstress")) cmd_posix_stress();
     else if (!kstrcmp(argv[0], "toolchainstress")) cmd_selfhost_test();
@@ -25065,6 +25522,11 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cpp_ring_selftest();
     cmd_cas();
     cmd_vfs();
+    /* v0.75 step 6: the user database comes off the volume as soon as there IS
+     * a volume, and before anything can authenticate against it. Placed after
+     * cmd_vfs() because the image is stored as VFS files, and before every
+     * suite because authstrs manipulates the same table. */
+    udb_load();
     cmd_sched();
     cmd_net();
     cmd_timestream();
