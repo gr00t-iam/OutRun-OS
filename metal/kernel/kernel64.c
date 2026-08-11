@@ -13447,9 +13447,13 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     }
     case 36: {   /* SYS_BIND(fd, port) -> 0 ok, negative error */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        int si = sock_of_fd((int)(int64_t)a0, 0); uint16_t port = (uint16_t)a1;
+        int sfd = (int)(int64_t)a0;
+        int si = sock_of_fd(sfd, 0); uint16_t port = (uint16_t)a1;
         if (si < 0 || port == 0) return (uint64_t)-9;                  /* EBADF/EINVAL */
         klock_acquire(&g_net_lock);
+        /* v0.75: `si` was resolved under the ofile lock, which is now released.
+         * Re-establish that the slot is still ours before writing to it. */
+        if (!sock_fd_still_ours(si, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
         int rc = -1;
         int taken = net_find_bound(port);
         if (taken < 0 || taken == si) { g_sock[si].lport = port; g_sock[si].bound = 1; rc = 0; }
@@ -13648,7 +13652,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     case 38: {   /* SYS_SEND(fd, buf, len) -> bytes sent, or negative */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
         int fl = 0;
-        int si = sock_of_fd((int)(int64_t)a0, &fl);
+        int sfd = (int)(int64_t)a0;
+        int si = sock_of_fd(sfd, &fl);
         uint64_t ubuf = a1; uint32_t len = (uint32_t)a2;
         if (si < 0) return (uint64_t)-9;
         if (len > SOCK_DGRAM_MAX) len = SOCK_DGRAM_MAX;
@@ -13656,6 +13661,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         uint8_t stage[SOCK_DGRAM_MAX];
         cmemcpy(stage, (const void *)ubuf, len);
         klock_acquire(&g_net_lock);
+        /* v0.75: the descriptor may have been closed and reissued since it was
+         * resolved. Checked BEFORE the ENOTCONN test below so a stale handle
+         * reports EBADF rather than being described as a live-but-unconnected
+         * socket — the caller's fd is the thing that went away. */
+        if (!sock_fd_still_ours(si, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
         if (!g_sock[si].used || !g_sock[si].connected || g_sock[si].listening) {
             klock_release(&g_net_lock); return (uint64_t)-107;         /* ENOTCONN */
         }
@@ -13711,14 +13721,19 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   *             caller are written against it. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
         int fl = 0;
-        int si = sock_of_fd((int)(int64_t)a0, &fl);
+        int sfd = (int)(int64_t)a0;
+        int si = sock_of_fd(sfd, &fl);
         uint64_t ubuf = a1; uint32_t maxlen = (uint32_t)a2;
         if (si < 0) return (uint64_t)-9;
         if (!access_ok(kprocs[tg_of((int)current_proc_idx)].cr3, ubuf, maxlen, 1)) return (uint64_t)-14;
         uint64_t t0 = g_ticks;
         for (;;) {
             klock_acquire(&g_net_lock);
-            if (!g_sock[si].used) { klock_release(&g_net_lock); return (uint64_t)-9; }
+            /* v0.75: was `!g_sock[si].used`, which cannot tell a slot that was
+             * never freed from one freed and immediately reallocated. This is a
+             * BLOCKING poll, so the window is not the resolve->acquire gap
+             * alone — it reopens on every iteration of this loop. */
+            if (!sock_fd_still_ours(si, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
             if (g_sock[si].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
             if (g_sock[si].stream) {
                 struct nsock *c = &g_sock[si];
@@ -14659,10 +14674,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * pretending to size it per socket would be a parameter with
                   * no effect. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        int si = sock_of_fd((int)(int64_t)a0, 0);
+        int sfd = (int)(int64_t)a0;
+        int si = sock_of_fd(sfd, 0);
         if (si < 0) return (uint64_t)-9;
         int64_t rc;
         klock_acquire(&g_net_lock);
+        /* v0.75: see sock_fd_still_ours() — the descriptor may have been closed
+         * and reissued between the ofile lock and this one. */
+        if (!sock_fd_still_ours(si, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
         if (!g_sock[si].bound)         rc = -22;    /* EINVAL: nothing to listen on */
         else if (g_sock[si].connected) rc = -22;    /* EINVAL: already a peer socket */
         else { g_sock[si].listening = 1;
@@ -14688,7 +14707,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * truncated. `flags` may carry SOCK_NONBLOCK for the new
                   * descriptor. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        int li = sock_of_fd((int)(int64_t)a0, 0);
+        int sfd = (int)(int64_t)a0;
+        int li = sock_of_fd(sfd, 0);
         if (li < 0) return (uint64_t)-9;
         uint64_t upeer = a1;
         int owner = fd_owner();
@@ -14697,12 +14717,22 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         /* Claim the child's socket slot BEFORE dequeuing the peer: if the table
          * is full we must leave the request queued for a later accept, not
          * consume and discard a client's first datagram. */
+        /* v0.75: this reads g_sock[li].stream WITHOUT the net lock, which is
+         * safe only because of what `stream` is: it is set when the slot is
+         * allocated and cleared only by the wipe that frees it, so it never
+         * changes under a live socket. A stale `li` can therefore steer us into
+         * the wrong branch, and nothing worse — BOTH branches revalidate under
+         * the lock below and return EBADF, so a wrong branch costs an error
+         * code path, not a wrong action. */
         if (g_sock[li].stream) {
             /* v0.67: a real accept. The connection is already ESTABLISHED —
              * the handshake completed in tcp_input without waiting for the
              * application, which is what stops a busy server from timing its
              * peers out. accept() only transfers ownership. */
             klock_acquire(&g_net_lock);
+            /* v0.75: the listener's descriptor may have been closed and
+             * reissued since it was resolved. */
+            if (!sock_fd_still_ours(li, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
             if (g_sock[li].state != TCPS_LISTEN) { klock_release(&g_net_lock); return (uint64_t)-22; }
             if (g_sock[li].aq_count == 0) {
                 klock_release(&g_net_lock);
@@ -14729,7 +14759,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             return (uint64_t)(int64_t)nfd2;
         }
         klock_acquire(&g_net_lock);
-        if (!g_sock[li].used || !g_sock[li].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
+        /* v0.75: EBADF for a descriptor that went away, EINVAL only for a live
+         * socket that is not a listener. The old test collapsed both into
+         * EINVAL, which describes the wrong fault to the caller. */
+        if (!sock_fd_still_ours(li, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
+        if (!g_sock[li].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
         if (g_sock[li].pcount == 0) { klock_release(&g_net_lock);
                                       __sync_fetch_and_add(&g_net_eagain, 1);
                                       return (uint64_t)-11; }                    /* EAGAIN */
