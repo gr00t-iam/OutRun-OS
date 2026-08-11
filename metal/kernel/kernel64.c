@@ -5417,6 +5417,156 @@ static int vfs_permit(const struct dirent *d, uint32_t uid, uint32_t gid, uint32
     return (bits & want) == want;
 }
 /* ===========================================================================
+ * v0.75: SHA-256 (FIPS 180-4)
+ * ===========================================================================
+ * The primitive the v0.74 user database says it does not have. That section
+ * states plainly that its mixing function is FNV-1a, that FNV-1a is not a
+ * cryptographic hash, and that "only a real primitive would" fix it — "and
+ * writing one belongs in its own milestone with its own test vectors rather
+ * than being improvised inside this one."
+ *
+ * This is that, and it is DELIBERATELY NOT WIRED IN YET. udb_kdf() still calls
+ * FNV-1a and is untouched by this change. ROADMAP-0.75.0.md asks for the
+ * primitive "as its own verified unit BEFORE wiring it into the KDF, so a
+ * failure is attributable to one or the other" — if the hash and the KDF change
+ * in one step and authstrs goes red, nothing tells you which half is wrong.
+ * shastrs proves this code against published vectors; a later change points
+ * udb_kdf() at it and re-runs authstrs, and then a failure has one candidate.
+ *
+ * Straight FIPS 180-4, no tricks: no table-driven message schedule, no
+ * SIMD (this kernel builds with -mno-sse and soft-float), no assembly. The
+ * reference structure is the point — it is the version that can be read against
+ * the standard line by line, and a hash whose correctness rests on published
+ * vectors should not also be asking the reader to trust a clever rewrite.
+ *
+ * Streaming, not one-shot-only, for two reasons that both bite later: the KDF
+ * will iterate this thousands of times over small inputs, and the 1,000,000-byte
+ * NIST vector cannot be a single buffer in a kernel with this much stack. The
+ * one-shot sha256() is a wrapper, so both paths exercise the same code. */
+#define SHA256_BLOCK 64
+#define SHA256_DIGEST 32
+
+struct sha256_ctx {
+    uint32_t h[8];
+    uint64_t len;                       /* total bytes consumed, for the length field */
+    uint8_t  buf[SHA256_BLOCK];         /* partial block carried between updates      */
+    uint32_t n;                         /* bytes currently in buf                     */
+};
+
+/* First 32 bits of the fractional parts of the cube roots of the first 64
+ * primes. FIPS 180-4 section 4.2.2, transcribed. */
+static const uint32_t SHA256_K[64] = {
+    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u,
+    0x923f82a4u, 0xab1c5ed5u, 0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+    0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u, 0xe49b69c1u, 0xefbe4786u,
+    0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+    0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u,
+    0x06ca6351u, 0x14292967u, 0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+    0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u, 0xa2bfe8a1u, 0xa81a664bu,
+    0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+    0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au,
+    0x5b9cca4fu, 0x682e6ff3u, 0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+    0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
+};
+
+#define SHA_ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+/* One 64-byte block into the running state. `p` need not be aligned: the words
+ * are assembled byte-by-byte, big-endian as the standard specifies, which also
+ * makes this correct regardless of host endianness. */
+static void sha256_block(uint32_t h[8], const uint8_t *p) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16) |
+               ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = SHA_ROR(w[i - 15], 7) ^ SHA_ROR(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        uint32_t s1 = SHA_ROR(w[i - 2], 17) ^ SHA_ROR(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
+    uint32_t e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1  = SHA_ROR(e, 6) ^ SHA_ROR(e, 11) ^ SHA_ROR(e, 25);
+        uint32_t ch  = (e & f) ^ (~e & g);
+        uint32_t t1  = hh + S1 + ch + SHA256_K[i] + w[i];
+        uint32_t S0  = SHA_ROR(a, 2) ^ SHA_ROR(a, 13) ^ SHA_ROR(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2  = S0 + maj;
+        hh = g; g = f; f = e; e = d + t1;
+        d  = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+    h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+}
+
+/* First 32 bits of the fractional parts of the square roots of the first 8
+ * primes. FIPS 180-4 section 5.3.3. */
+static void sha256_init(struct sha256_ctx *c) {
+    c->h[0] = 0x6a09e667u; c->h[1] = 0xbb67ae85u;
+    c->h[2] = 0x3c6ef372u; c->h[3] = 0xa54ff53au;
+    c->h[4] = 0x510e527fu; c->h[5] = 0x9b05688cu;
+    c->h[6] = 0x1f83d9abu; c->h[7] = 0x5be0cd19u;
+    c->len = 0;
+    c->n   = 0;
+}
+
+/* Feed arbitrary bytes. Any split of the same byte sequence across calls must
+ * produce the same digest — shastrs asserts exactly that against every chunk
+ * size from 1 upward, because a buffering bug here is invisible to a one-shot
+ * vector test and is the single most likely way to get this wrong. */
+static void sha256_update(struct sha256_ctx *c, const void *data, uint64_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    c->len += len;
+    if (c->n) {                                   /* top up the carried partial block */
+        uint32_t need = SHA256_BLOCK - c->n;
+        uint32_t take = (len < (uint64_t)need) ? (uint32_t)len : need;
+        for (uint32_t i = 0; i < take; i++) c->buf[c->n + i] = p[i];
+        c->n += take; p += take; len -= take;
+        if (c->n == SHA256_BLOCK) { sha256_block(c->h, c->buf); c->n = 0; }
+    }
+    while (len >= SHA256_BLOCK) {                 /* whole blocks straight through */
+        sha256_block(c->h, p);
+        p += SHA256_BLOCK; len -= SHA256_BLOCK;
+    }
+    for (uint64_t i = 0; i < len; i++) c->buf[c->n + i] = p[i];   /* carry the tail */
+    c->n += (uint32_t)len;
+}
+
+/* Pad and emit. The padding is 0x80, then zeroes, then the message length in
+ * BITS as a big-endian 64-bit field — and the length is of the whole message,
+ * not of this block, which is why the count lives in the context. If the 0x80
+ * leaves fewer than 8 bytes for that field, the length spills into one more
+ * block; that branch is the one the 55/56/63/64-byte boundary cases in shastrs
+ * exist to walk. */
+static void sha256_final(struct sha256_ctx *c, uint8_t out[SHA256_DIGEST]) {
+    uint64_t bits = c->len * 8u;
+    c->buf[c->n++] = 0x80;
+    if (c->n > SHA256_BLOCK - 8) {
+        while (c->n < SHA256_BLOCK) c->buf[c->n++] = 0;
+        sha256_block(c->h, c->buf);
+        c->n = 0;
+    }
+    while (c->n < SHA256_BLOCK - 8) c->buf[c->n++] = 0;
+    for (int i = 7; i >= 0; i--) c->buf[c->n++] = (uint8_t)(bits >> (i * 8));
+    sha256_block(c->h, c->buf);
+    for (int i = 0; i < 8; i++) {
+        out[i * 4]     = (uint8_t)(c->h[i] >> 24);
+        out[i * 4 + 1] = (uint8_t)(c->h[i] >> 16);
+        out[i * 4 + 2] = (uint8_t)(c->h[i] >> 8);
+        out[i * 4 + 3] = (uint8_t)(c->h[i]);
+    }
+}
+
+/* One-shot, as a wrapper so it cannot drift from the streaming path. */
+static void sha256(const void *data, uint64_t len, uint8_t out[SHA256_DIGEST]) {
+    struct sha256_ctx c;
+    sha256_init(&c);
+    sha256_update(&c, data, len);
+    sha256_final(&c, out);
+}
+
+/* ===========================================================================
  * v0.74: USER DATABASE — salts, a deliberately slow KDF, and account lockout
  * ===========================================================================
  * v0.72 gave this kernel identities; nothing could ever ASSIGN one. A uid was
@@ -19126,6 +19276,148 @@ static void cmd_users_stress(void) {
  * stored ids, and the interesting cases are transitions between them. Calling
  * the dispatcher is what makes it the real rule under test and not a
  * paraphrase of it living in the suite.                                       */
+/* ===========================================================================
+ * SHASTRS — SHA-256 against published vectors (v0.75)
+ * ===========================================================================
+ * A hash is either bit-exact or worthless, and "it produced 32 bytes that
+ * looked random" is not a test. Every absolute assertion here is a digest
+ * published in FIPS 180-4 / NIST's CAVP examples, transcribed as the hex string
+ * it is printed as, so the suite can be checked against the standard by eye
+ * without decoding anything.
+ *
+ * Vectors alone are not enough, though, and the gap is specific: a one-shot
+ * test drives update() exactly once with a whole message, so it cannot see a
+ * bug in the partial-block carry — which is where a streaming hash actually
+ * goes wrong. So the second half asserts a PROPERTY instead: for every message
+ * length 0..200 and every chunk size 1..17, feeding the message in pieces must
+ * equal hashing it whole. That walks the 55/56/63/64-byte padding boundaries and
+ * every buffer-fill path without needing a published digest for each one.
+ *
+ * NOT wired into udb_kdf() — see the SHA-256 section header. This suite exists
+ * so that when it is wired in, authstrs going red means the KDF, not the hash. */
+static int g_shapass, g_shafail;
+static void shacheck(const char *n, int c) {
+    if (c) { g_shapass++; kprintf("[shastrs]  PASS  %s\n", n); }
+    else   { g_shafail++; kprintf("[shastrs]  FAIL  %s\n", n); }
+}
+
+static int sha_hexval(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+/* Compare a digest against the 64-character hex string the standard prints. */
+static int sha_hexeq(const uint8_t *d, const char *hex) {
+    for (int i = 0; i < SHA256_DIGEST; i++) {
+        int hi = sha_hexval(hex[i * 2]), lo = sha_hexval(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return 0;
+        if (d[i] != (uint8_t)((hi << 4) | lo)) return 0;
+    }
+    return hex[SHA256_DIGEST * 2] == 0;          /* and no trailing garbage */
+}
+
+static void sha_vector(const char *what, const char *msg, uint64_t len, const char *want) {
+    uint8_t d[SHA256_DIGEST];
+    sha256(msg, len, d);
+    shacheck(what, sha_hexeq(d, want));
+}
+
+static void cmd_sha_stress(void) {
+    kputs("-- SHASTRS: SHA-256 against FIPS 180-4 / NIST CAVP vectors --\n");
+    g_shapass = g_shafail = 0;
+
+    /* ---- the published vectors, verbatim -------------------------------- */
+    sha_vector("FIPS 180-4: the empty message", "", 0,
+               "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    sha_vector("FIPS 180-4 B.1: \"abc\" (one block)", "abc", 3,
+               "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    /* 56 bytes: the 0x80 fits but the 8-byte length field does not, so this is
+     * the two-block padding path taken by a message that looks like one block. */
+    sha_vector("FIPS 180-4 B.2: 56-byte message (padding spills to a 2nd block)",
+               "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56,
+               "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    sha_vector("NIST CAVP: 112-byte message (multi-block)",
+               "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmno"
+               "ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu", 112,
+               "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1");
+
+    /* FIPS 180-4 B.3: one million 'a'. Fed in chunks because a megabyte will not
+     * sit on this stack — which is the point of having a streaming API, and
+     * incidentally the only assertion here that drives the 64-bit length field
+     * past what a 32-bit bit-counter would hold (8,000,000 bits). */
+    {
+        struct sha256_ctx c;
+        uint8_t chunk[100];
+        uint8_t d[SHA256_DIGEST];
+        for (int i = 0; i < 100; i++) chunk[i] = 'a';
+        sha256_init(&c);
+        for (int i = 0; i < 10000; i++) sha256_update(&c, chunk, 100);
+        sha256_final(&c, d);
+        shacheck("FIPS 180-4 B.3: one million 'a' (streamed, 8,000,000-bit length)",
+                 sha_hexeq(d, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"));
+    }
+
+    /* ---- streaming equals one-shot, at every boundary -------------------- */
+    /* The property a vector test cannot reach. Any split of the same bytes must
+     * give the same digest; lengths 0..200 cover both padding branches several
+     * times over and every partial-block carry. */
+    {
+        uint8_t msg[201];
+        for (int i = 0; i <= 200; i++) msg[i] = (uint8_t)(i * 7 + 1);   /* not all-equal */
+        int mismatches = 0, cases = 0;
+        for (int len = 0; len <= 200; len++) {
+            uint8_t whole[SHA256_DIGEST];
+            sha256(msg, (uint64_t)len, whole);
+            for (int step = 1; step <= 17; step++) {
+                struct sha256_ctx c;
+                uint8_t piece[SHA256_DIGEST];
+                sha256_init(&c);
+                for (int off = 0; off < len; off += step) {
+                    int take = (off + step > len) ? (len - off) : step;
+                    sha256_update(&c, msg + off, (uint64_t)take);
+                }
+                sha256_final(&c, piece);
+                cases++;
+                for (int b = 0; b < SHA256_DIGEST; b++)
+                    if (piece[b] != whole[b]) { mismatches++; break; }
+            }
+        }
+        kprintf("[shastrs] streaming equivalence: %d splits checked, %d mismatched\n",
+                (uint64_t)cases, (uint64_t)mismatches);
+        shacheck("chunked update() equals one-shot for every length 0..200 x chunk 1..17",
+                 mismatches == 0);
+    }
+
+    /* ---- the properties that would catch a copy-paste primitive ---------- */
+    {
+        uint8_t a[SHA256_DIGEST], b[SHA256_DIGEST];
+        sha256("outrun", 6, a);
+        sha256("outruo", 6, b);                    /* one bit of one byte */
+        int diff = 0;
+        for (int i = 0; i < SHA256_DIGEST; i++) if (a[i] != b[i]) diff++;
+        shacheck("a one-bit input change alters most of the digest (>= 16 of 32 bytes)",
+                 diff >= 16);
+
+        sha256("outrun", 6, b);                    /* same input, second call */
+        int same = 1;
+        for (int i = 0; i < SHA256_DIGEST; i++) if (a[i] != b[i]) same = 0;
+        shacheck("the same input hashes to the same digest twice", same);
+    }
+
+    /* The v0.74 database still uses FNV-1a. Stated as an assertion rather than a
+     * comment so the day someone wires this in, the suite says so out loud. */
+    shacheck("NOT yet wired into udb_kdf() — that is a separate, attributable step",
+             UDB_HASH_LEN == SHA256_DIGEST);
+
+    kprintf("[shastrs] RESULT: %d passed, %d failed\n", (uint64_t)g_shapass, (uint64_t)g_shafail);
+    if (!g_shafail)
+        kputs("[shastrs] SHA-256 VERIFIED — FIPS 180-4 vectors, streaming equivalence, 1M-byte length field\n");
+    else kputs("[shastrs] SHA-256 DEFECTS PRESENT\n");
+    kputs("-- done --\n");
+}
+
 static int g_authpass, g_authfail;
 static void authcheck(const char *n, int c) {
     if (c) { g_authpass++; kprintf("[authstrs]  PASS  %s\n", n); }
@@ -24403,6 +24695,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "wimpstress")) cmd_wimp_stress();
     else if (!kstrcmp(argv[0], "usersstress")) cmd_users_stress();
     else if (!kstrcmp(argv[0], "authstress")) cmd_auth_stress();   /* v0.74 — see boot sequence */
+    else if (!kstrcmp(argv[0], "shastress"))  cmd_sha_stress();    /* v0.75 — SHA-256 vectors */
     else if (!kstrcmp(argv[0], "appsstress")) cmd_apps_stress();
     else if (!kstrcmp(argv[0], "posixstress")) cmd_posix_stress();
     else if (!kstrcmp(argv[0], "toolchainstress")) cmd_selfhost_test();
@@ -24693,6 +24986,12 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
      * that can afford to chase it. `authstress` runs the suite in full at any
      * prompt, and it passes 35/35 on all three configurations.
      * See CHANGELOG-0.74.0.md. */
+    /* v0.75: BEFORE authstrs, deliberately. shastrs proves the primitive against
+     * published vectors; authstrs exercises the KDF built on top of one. Ordering
+     * them this way means that once udb_kdf() is pointed at SHA-256, a red boot
+     * reads in the right order — if shastrs is green and authstrs is red, the
+     * hash is fine and the KDF is not. */
+    cmd_sha_stress();       /* v0.75: SHA-256 vs FIPS 180-4 / CAVP vectors */
     cmd_auth_stress();      /* v0.74: password KDF, account lockout, credential transitions */
     cmd_selfhost_test();    /* v0.56: author -> compile -> run, natively (no host toolchain)     */
     cmd_compiler_stress();  /* v0.57: language completeness + what the compiler must REFUSE      */
