@@ -882,3 +882,135 @@ scope here rather than half-done.
 
 Same discipline as Tier 2: land the format as its own verified unit before
 wiring it in, so a failure has one candidate.
+
+---
+
+## STEP 6 — PERSISTENT USER DATABASE STORAGE — IMPLEMENTED
+
+Accounts survive a reboot. The plan above is implemented essentially as written;
+what follows is what changed, what it cost, and the two things the first real
+cross-boot run caught.
+
+### Shape
+
+`/etc/udb.a` and `/etc/udb.b`, written alternately, each `UDB_IMG_BYTES` (1536)
+— three fixed 512-byte segments, each carrying its own freshly drawn nonce.
+
+```
+payload (1488 B, fixed)          segment on disk (512 B, x3)
+  0  magic "ORUNUDB1"              0  nonce[16]     <- fresh EVERY write
+  8  version, reserved            16  payload slice
+ 16  generation
+ 24  sha256 over [56..end)
+ 56  16 records x 84 B
+ ..  random tail
+```
+
+Record: `name[24] uid gid salt[16] hash[32] used pad[3]`. No `fails`, no
+`locked` — see below.
+
+### Why a nonce per SEGMENT and not per image
+
+A VFS file is stored as per-512-byte-block CAS chunks (`chunk_hash[i]`), so
+dedup is observable **per chunk**. One nonce in the header would leave the other
+chunks byte-identical whenever they had not changed, which is the same leak the
+design exists to close, one level quieter. With a nonce in every segment, every
+chunk is new on every write and dedup behaviour carries no information at all.
+
+`authstrs` asserts this rather than assuming it: two writes of the same accounts
+must produce different bytes, **and every 512-byte segment must differ**.
+
+Cost: one block per segment per write, no dedup savings, forever. That is the
+trade — the savings were the leak.
+
+### What was NOT persisted, and what that costs
+
+Lockout counters. They change on every FAILED authentication, so storing them
+would make each failed login write a block, and an observer counting writes
+would be counting failed logins — a new side channel opened by closing another.
+
+The price is real and is not hidden: **lockout state resets across a reboot**,
+which weakens it against an attacker who can force reboots. Recorded here as a
+known weakness rather than presented as a design win.
+
+### Fail closed
+
+An image that is present but does not verify sets `g_udb_unavailable` and
+`udb_auth()` denies everything. Carrying on with an empty table would be a
+system where the next caller creates the first account.
+
+### Two defects the first cross-boot run found
+
+1. **The generation was being rewound.** `authstrs` snapshots and restores the
+   table so it stays hermetic, and the first version restored the *counter* too.
+   Unsound: the suite writes several generations, so a rolled-back counter can
+   make the next save carry a LOWER number than an image still sitting in the
+   other slot, and the loader prefers the highest that verifies — it would have
+   adopted the suite's throwaway accounts on a later boot. Table restored,
+   generation never.
+2. The slot letter printed as an empty string (a `char` passed to `%s`) —
+   cosmetic, but it made the A/B alternation unreadable in precisely the log
+   being used to check it.
+
+Neither was found by the compiler or by the 10-boot gate. Both were found by
+booting twice on one disk, which is the only test that can see this feature.
+
+### authstrs had to change, and its count moved
+
+The suite CREATES accounts, which now outlive the boot. Left alone, the next
+boot on the same volume would find `m74alice` present, get EEXIST, and fail
+"root can create an account" — the suite breaking itself on the second run only.
+It now snapshots, restores and re-saves, leaving the volume as it found it.
+
+**Assertions move 35 -> 43.** The "still numbering 35" invariant recorded in the
+Tier 2 section above was about the KDF swap not disturbing existing assertions,
+and it still holds — all 35 are unmodified. The eight additions are new
+coverage: round-trip, digest rejection, magic rejection, fixed size, lockout
+never persisting, and the no-dedup property itself.
+
+### Verification
+
+The gate cannot see this feature. `tocver.sh` and every harness before it build
+a FRESH disk image per boot, so a green 10-boot run says nothing about whether
+anything persisted. Persistence is demonstrated separately, by hand:
+
+```
+boot 1 (fresh disk):  [udb] no stored database - starting empty, persistence armed
+                      [udb] created 'udbreboot' and saved at generation 5
+boot 2 (SAME disk, a different QEMU process):
+                      [udb] loaded generation 5, 1 account(s) (both slots valid)
+                      [udb] CROSS-BOOT OK: account 'udbreboot' (uid 4242)
+                            survived a reboot at generation 5
+```
+
+The marker is a manual `udbpersist` command, not a boot-time act, in the shape
+of v0.48's `vfs-reboot-test`: a marker the boot creates for itself proves
+nothing about the boot before it.
+
+Standard gate, fresh images: uniprocessor **45 suites / 0 failed**; ten `-smp 4`
+boots **10 OK / 0 HANG / 0 PANIC**, 0 suite failures and 0 rank faults in any
+boot. Build 0 errors, 35 warnings.
+
+### A pre-existing defect this surfaced (NOT caused by this work)
+
+Booting twice on one volume fails two suites: `[vfsstrs] 18 passed, 1 failed`
+("VFS journal commit is genuinely DEFERRED") and `[usersstrs] 16 passed, 2
+failed` ("a newly created file gets the default mode", "a stranger CAN open
+another user's 0644 file for reading").
+
+Established as pre-existing by negative control: the **merged `main` kernel from
+before this branch** was put through the identical two-boot sequence and
+produces the same two failures. The suite set is not idempotent across boots on
+a re-used volume, independently of the user database. Untouched here, and it
+deserves its own investigation — every regression run to date has used a fresh
+image, so this has never been exercised.
+
+### Still open
+
+- The lockout-across-reboot weakness above.
+- No confidentiality: salts and digests are readable by anyone who can read the
+  volume. There is no key store and nothing to encrypt with that does not live
+  on the same volume, so this remains deliberately out of scope.
+- No account deletion or password change syscall yet, so the revert-to-an-old-
+  password case the nonce defends against is not yet reachable from ring 3. The
+  defence is in place ahead of the path that needs it.
