@@ -14699,7 +14699,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                                       return (uint64_t)-11; }                    /* EAGAIN */
         int ci = -1;
         for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) {
-            cmemset(&g_sock[i], 0, sizeof g_sock[i]);
+            sock_slot_wipe(i);
             g_sock[i].used = 1; g_sock[i].waiter_tid = -1; g_sock[i].fd = -1;
             ci = i; break;
         }
@@ -21445,7 +21445,7 @@ static int tcpstrs_grab_sock(void) {
     klock_acquire(&g_net_lock);
     for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) { si = i; break; }
     if (si >= 0) {
-        cmemset(&g_sock[si], 0, sizeof g_sock[si]);
+        sock_slot_wipe(si);
         struct nsock *t = &g_sock[si];
         t->used = 1; t->stream = 1; t->waiter_tid = -1; t->fd = -1;
         t->connected = 1; t->bound = 1;
