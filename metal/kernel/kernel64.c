@@ -3209,6 +3209,16 @@ static inline void execbuf_release(void) { __sync_lock_release(&g_execbuf_lock);
 
 /* v0.75: imbalance counters, reported by klock_release below. */
 static volatile uint64_t g_rank_underflow = 0, g_rank_mismatch = 0;
+/* v0.75: times sys_connect's retransmit loop was entered from an AP. This
+ * counts ARRIVALS, not faults — the ring-3 client runs on whichever core holds
+ * it, so a healthy -smp 4 boot is expected to be non-zero. It earns its keep as
+ * a measure of how often the AP path is exercised at all: a run reporting zero
+ * has not tested the thing we changed. */
+static volatile uint64_t g_connect_ap_yield = 0;
+/* v0.75: times sys_connect found its socket slot reissued underneath it across
+ * the retransmit loop's lock release. This one IS a fault counter — non-zero
+ * means a stale-handle window was hit and refused rather than acted on. */
+static volatile uint64_t g_connect_stale = 0;
 
 /* Rank bookkeeping storage for the CURRENT context (see the pcb comment).    */
 /* v0.75: THE STORAGE MUST BELONG TO WHATEVER CAN HOLD A LOCK ACROSS A YIELD.
@@ -8295,8 +8305,26 @@ struct nsock {
     int      acceptq[SOCK_BACKLOG];          /* listener: COMPLETED connections    */
     int      aq_head, aq_tail, aq_count;
     int      parent;                         /* child: its listener, or -1         */
+    /* v0.75: which OCCUPANT of this slot, not which slot. A socket index is an
+     * address, and an address is not an identity — sys_connect releases
+     * g_net_lock inside its SYN-retransmit loop while still holding a raw
+     * `struct nsock *`, so a close and reopen inside that window hands it back
+     * a DIFFERENT socket living at the same address. Bumped on every transition
+     * in or out of the slot, so a reference captured before one compares
+     * unequal after it. The same shape as kproc::gen, for the same reason. */
+    uint32_t gen;
 };
 static struct nsock g_sock[NSOCK];
+
+/* v0.75: recycle a socket slot, carrying its generation across the wipe. `gen`
+ * is the one field a wipe must NOT clear: zeroing it would restart the counter
+ * and let a stale reference match again, which is precisely the case it exists
+ * to catch. Every cmemset of a g_sock[] entry goes through here. */
+static void sock_slot_wipe(int si) {
+    uint32_t g = g_sock[si].gen;
+    cmemset(&g_sock[si], 0, sizeof g_sock[si]);
+    g_sock[si].gen = g + 1;
+}
 static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len); /* fwd: v0.67 */
 static struct klock g_net_lock = { 0, "net", 9, 0, 0, 0, 0, 0 };
 static volatile uint64_t g_net_tx_frames = 0;
@@ -8344,7 +8372,7 @@ static void net_sock_release_locked(int si) {
             if (g_sock[i].used && !g_sock[i].listening && g_sock[i].bound &&
                 g_sock[i].lport == g_sock[si].lport && i != si)
                 g_sock[i].hup = 1;
-    cmemset(&g_sock[si], 0, sizeof g_sock[si]);
+    sock_slot_wipe(si);
     g_sock[si].waiter_tid = -1;
     g_sock[si].fd = -1;
 }
@@ -8622,7 +8650,7 @@ static void tcp_input(int si, struct tseg *g) {
         int ci = -1;
         for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) { ci = i; break; }
         if (ci < 0) return;
-        cmemset(&g_sock[ci], 0, sizeof g_sock[ci]);
+        sock_slot_wipe(ci);
         struct nsock *c = &g_sock[ci];
         c->used = 1; c->owner = s->owner; c->waiter_tid = -1; c->fd = -1;
         c->stream = 1; c->bound = 1; c->lport = s->lport;
@@ -12284,7 +12312,7 @@ static uint64_t sys_futex_wait(struct sysframe *sf, uint64_t uaddr, uint64_t val
         uint64_t dl = g_ticks + timeout;
         while (*(volatile uint64_t *)uaddr == val) {
             if (g_ticks >= dl) return WAIT_RV_TIMEDOUT;
-            sched_yield();
+            krelax();  /* v0.75: BSP-only yield; AP must PAUSE */
         }
         return WAIT_RV_OK;
     }
@@ -12383,7 +12411,7 @@ static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, ui
      * than spinning — which on a uniprocessor is the difference between
      * waiting and preventing the event from ever happening. */
     if (!sf || !can_park()) {
-        while (g_ticks < dl) { sched_yield(); }
+        while (g_ticks < dl) { krelax();  /* v0.75 */ }
         kprocs[me].ep_deadline = 0;
         return 0;
     }
@@ -12392,7 +12420,7 @@ static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, ui
     /* Only reached if the caller did not arrive through a `syscall` we can
      * rewind onto; fall back to the bounded yield rather than parking with no
      * way to re-run the scan. */
-    while (g_ticks < dl) { sched_yield(); }
+    while (g_ticks < dl) { krelax();  /* v0.75 */ }
     kprocs[me].ep_deadline = 0;
     return 0;
 }
@@ -12443,7 +12471,7 @@ static uint64_t sys_thread_join(struct sysframe *sf, uint64_t tid, uint64_t out)
         uint64_t dl = g_ticks + FUTEX_DEFAULT_TICKS;
         while (!(kprocs[L].thr_done & (1u << tid))) {
             if (g_ticks >= dl) return WAIT_RV_TIMEDOUT;
-            sched_yield();
+            krelax();  /* v0.75 */
         }
         if (out) *(volatile uint64_t *)out = kprocs[L].thr_exit[tid];
         return WAIT_RV_OK;
@@ -13373,7 +13401,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         klock_acquire(&g_net_lock);
         int si = -1;
         for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) {
-            cmemset(&g_sock[i], 0, sizeof g_sock[i]);
+            sock_slot_wipe(i);
             g_sock[i].used = 1; g_sock[i].owner = owner;
             g_sock[i].waiter_tid = -1; g_sock[i].fd = -1;
             g_sock[i].stream = want_stream; g_sock[i].parent = -1;
@@ -13465,6 +13493,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                      * spins on the tick counter is betting that interrupts are
                      * enabled underneath it; sched_yield gives the rest of the
                      * system a turn and cannot wedge if that bet is wrong. */
+                    /* v0.75: the occupant we are retransmitting FOR. Captured
+                     * under the lock, before the first release. Everything the
+                     * loop does to `c` is only valid while the slot still holds
+                     * this socket. */
+                    uint32_t expected_gen = c->gen;
                     for (int t = 0; t < 64 && c->state == TCPS_SYN_SENT; t++) {
                         /* v0.75 INSTRUMENTATION: this release/yield/re-acquire
                          * window is where the last residual rank violation is
@@ -13486,7 +13519,54 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                         int tid0 = g_cur;
                         klock_release(&g_net_lock);
                         uint8_t d1 = *dsp;
-                        sched_yield();
+                        /* v0.75 HYPOTHESIS TEST, one branch. sched_yield()
+                         * operates on g_cur/g_threads[] — the BSP scheduler's
+                         * tables — and has NO cpu_idx() guard of its own; krelax
+                         * guards its own call with `cpu_idx()==0 && g_sched_on`,
+                         * so the BSP-only constraint is known and enforced
+                         * elsewhere. This syscall runs on whichever core the
+                         * ring-3 task occupies and calls it unguarded.
+                         *
+                         * If an AP ever reaches here it is switching itself onto
+                         * a BSP kernel thread's stack, which would explain the
+                         * suite-39 hang outright. Counted AND printed, because a
+                         * hung boot never reaches the end-of-boot summary — the
+                         * line has to be in the log at the moment it happens. If
+                         * this never fires across a hanging run, the hypothesis
+                         * is dead and the cross-core dump becomes the next step. */
+                        /* v0.75 FIX. This was a bare sched_yield(), which
+                         * operates on g_cur/g_threads[] — the BSP scheduler's
+                         * tables — and carries no core guard of its own. This
+                         * syscall runs on whichever core the ring-3 task
+                         * occupies, so an AP reaching here selected a BSP kernel
+                         * thread and switched ITSELF onto that thread's stack,
+                         * while the BSP might be running the very same thread.
+                         *
+                         * Not theoretical: the counter below fired in every
+                         * -smp 4 boot measured, always the same shape —
+                         * "sys_connect sched_yield() on AP cpu=2 pid=709" (the
+                         * tcpstr client) on the first retransmit iteration. It
+                         * fired on boots that hung AND on boots that completed,
+                         * which is what an intermittent corruption looks like:
+                         * the illegal call always happens, and whether it wedges
+                         * depends on what the BSP's scheduler state is at that
+                         * instant.
+                         *
+                         * krelax() is exactly the guarded form and already
+                         * exists for this reason — it yields on the BSP and
+                         * PAUSE-spins on an AP, which is the correct backoff
+                         * where there is no kernel scheduler to yield to.
+                         *
+                         * The counter counts AP ARRIVALS at this site, not
+                         * faults. An AP reaching here is normal and expected —
+                         * the ring-3 client runs wherever it is scheduled — and
+                         * a healthy -smp 4 boot shows a non-zero count. What
+                         * changed is what it DOES on arrival: krelax(), never
+                         * sched_yield(). Read it as "how often the AP path was
+                         * exercised", which is what makes it useful.
+                         */
+                        if (cpu_idx() != 0) __sync_fetch_and_add(&g_connect_ap_yield, 1);
+                        krelax();
                         uint8_t *dsp2; (void)rank_ctx(&dsp2);
                         uint8_t d2 = *dsp2;
                         int tid1 = g_cur;
@@ -13497,6 +13577,20 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                                     (uint64_t)(int64_t)tid0, (uint64_t)(int64_t)tid1,
                                     dsp == dsp2 ? "same" : "CHANGED", (uint64_t)cpu_idx());
                         klock_acquire(&g_net_lock);
+                        /* v0.75: the slot may have been closed and reissued
+                         * while the lock was down. `c` still points at valid
+                         * memory — g_sock[] is static — so nothing faults; it
+                         * just addresses SOMEONE ELSE'S socket, and the SYN we
+                         * are about to retransmit would be sent on their
+                         * connection with our sequence numbers. Check identity,
+                         * not liveness: `used` alone cannot tell a slot that
+                         * was never freed from one freed and immediately
+                         * reallocated, which is the common case under load. */
+                        if (!c->used || c->gen != expected_gen) {
+                            __sync_fetch_and_add(&g_connect_stale, 1);
+                            klock_release(&g_net_lock);
+                            return (uint64_t)(int64_t)-104;     /* ECONNRESET */
+                        }
                         if (c->state != TCPS_SYN_SENT) break;
                         c->snd_nxt = c->iss;
                         tcp_output(si, TH_SYN, 0, 0);
@@ -14605,7 +14699,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                                       return (uint64_t)-11; }                    /* EAGAIN */
         int ci = -1;
         for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) {
-            cmemset(&g_sock[i], 0, sizeof g_sock[i]);
+            sock_slot_wipe(i);
             g_sock[i].used = 1; g_sock[i].waiter_tid = -1; g_sock[i].fd = -1;
             ci = i; break;
         }
@@ -21351,7 +21445,7 @@ static int tcpstrs_grab_sock(void) {
     klock_acquire(&g_net_lock);
     for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) { si = i; break; }
     if (si >= 0) {
-        cmemset(&g_sock[si], 0, sizeof g_sock[si]);
+        sock_slot_wipe(si);
         struct nsock *t = &g_sock[si];
         t->used = 1; t->stream = 1; t->waiter_tid = -1; t->fd = -1;
         t->connected = 1; t->bound = 1;
@@ -24307,6 +24401,19 @@ static void shell_run(void) {
      * them from the absence of warnings. All three must be 0. */
     kprintf("[klock  ] rank violations=%u underflow=%u mismatch=%u\n",
             g_rank_violations, g_rank_underflow, g_rank_mismatch);
+    /* v0.75: the sys_connect counters. apyield is COVERAGE — how often an AP
+     * actually entered the retransmit loop, so a run reporting 0 has not
+     * exercised the AP path and its clean result says nothing about it. stale
+     * is a FAULT count: slots reissued underneath the loop and refused.
+     *
+     * Printed here rather than left as a variable only a debugger could read.
+     * A counter nothing prints is not instrumentation — the first -smp 4 matrix
+     * of this fix grepped its logs for a stale count that no code could ever
+     * emit, and read the resulting zeroes as evidence.
+     *
+     * Caveat this cannot fix: a HUNG boot never reaches this line, so these
+     * numbers describe surviving boots only. */
+    kprintf("[connect] apyield=%u stale=%u\n", g_connect_ap_yield, g_connect_stale);
     kputs("\nType 'help' for commands, 'demo' for the capability walk-through.\n");
     kputs("outrun> ");
     for (;;) {

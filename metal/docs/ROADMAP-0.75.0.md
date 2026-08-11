@@ -416,3 +416,82 @@ a login program; lockout expiry and administrative unlock. The queued TCP
 hardening work (congestion window, slow start, fast retransmit, Karn/Jacobson
 RTO, segment coalescing) is independent of all of the above and unaffected by
 this milestone's ordering.
+
+---
+
+## SUITE 39 (`tcpstrs`) `-smp 4` HANG — RESOLVED
+
+The intermittent hang that stalled every `-smp 4` boot at `[tcpstrs]` is fixed.
+Two defects, both on the `sys_connect` SYN-retransmit path, both of the same
+family: **something treated a transient handle as a stable identity.**
+
+### 1. An AP called the BSP's scheduler (the cause)
+
+`sched_yield()` operates on `g_cur` / `g_threads[]` — the BSP scheduler's
+tables — and carries no core guard. Five syscall paths called it unguarded, so
+an AP reaching any of them picked a BSP kernel thread and switched *itself*
+onto that thread's stack while the BSP might be running the very same thread:
+`sys_connect`, `sys_futex_wait`, `sys_epoll_wait` (x2), `sys_thread_join`.
+
+All five now call `krelax()`, which already existed for exactly this case: it
+yields on the BSP and `PAUSE`-spins on an AP, where there is no kernel
+scheduler to yield to. BSP behaviour is unchanged by construction.
+
+### 2. A socket index is not a socket identity (latent, unproven)
+
+`sys_connect` released `g_net_lock` inside its retransmit loop while holding a
+raw `struct nsock *`. `g_sock[]` is static, so the pointer never dangles — it
+just addresses whoever occupies that slot when the lock returns, and the loop
+would retransmit our SYN with our sequence numbers onto their session.
+
+`struct nsock` now carries a generation, every slot wipe goes through
+`sock_slot_wipe()` (which carries the counter across the `cmemset` and bumps
+it), and the loop revalidates after each re-acquire, returning `-ECONNRESET` on
+mismatch. Same shape as defect B's `ppid_slot` fix, for the same reason.
+
+**This one is committed on its argument, not on evidence: it never fired.**
+`stale=0` across all 20 verification boots. It is correct and, on this
+workload, inert.
+
+### Evidence
+
+3-arm interleaved matrix, 8 rounds, round-robin so host drift hits all arms:
+
+| arm | build | OK | HANG |
+|-----|-------|----|------|
+| `ap`  | neither fix    | 4 | 4 |
+| `fix` | AP-yield only  | 7 | 1 |
+| `sg`  | both fixes     | 8 | 0 |
+
+Final binary, 20 boots at `-smp 4`: **20 OK / 0 HANG / 0 PANIC**, 44 suites and
+0 failures every boot, rank violations/underflow/mismatch all 0. An AP entered
+the retransmit loop in 14 of the 20, so the fixed path was genuinely exercised
+rather than merely not taken.
+
+Pooling the baseline arm with ten earlier boots of the same `ap.iso`: the
+unfixed kernel hangs **11 times in 18 boots** against **1 in 16** for the arms
+carrying the AP-yield fix.
+
+### Two process notes, because both cost real time
+
+- **A run that boots the wrong image is worse than no run.** The first
+  verification of the AP-yield fix booted the *detector* ISO while writing to a
+  directory named for the fixed one, and its result was reported as evidence
+  that the fix did not work. It was evidence about the unfixed kernel. Every
+  harness now stamps the md5 of the image it boots into every log it writes.
+- **A counter nothing prints is not instrumentation.** `g_connect_stale` was
+  incremented but never emitted; the first matrix grepped for a string no code
+  could produce and got zeroes from all three arms. Both `sys_connect` counters
+  now print in the end-of-boot summary. Note they are readable only on boots
+  that survive to reach it.
+
+`g_connect_ap_yield` counts AP **arrivals** at the yield site, before the
+backoff runs. Non-zero is expected and healthy on `-smp 4` — it measures
+coverage of the AP path, not faults. `g_connect_stale` is the fault counter.
+
+### Still open on the socket paths
+
+`sock_of_fd()` resolves the fd outside `g_net_lock` and the index is used after
+the lock is taken, so the fd->slot mapping is still a TOCTOU window. The
+generation counter now makes that window *detectable* wherever a caller cares
+to check it, but only `sys_connect` checks today.
