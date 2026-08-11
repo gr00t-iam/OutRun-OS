@@ -8404,6 +8404,27 @@ static int sock_of_fd(int fd, int *flags_out) {
     return si;
 }
 
+/* v0.75: does slot `si` STILL belong to descriptor `fd`? Caller holds
+ * g_net_lock and must NOT hold g_ofile_lock.
+ *
+ * sock_of_fd() resolves under the ofile lock (rank 1) and releases it; a caller
+ * then climbs to the net lock (rank 9). The descriptor can be closed and
+ * reissued in that gap, leaving a slot index that names a socket the caller no
+ * longer owns.
+ *
+ * This checks the socket's own back-pointer to its descriptor, which the net
+ * lock already protects. Deliberately NOT a second sock_of_fd() call: that
+ * would take rank 1 while holding rank 9 — a rank INVERSION, and the exact
+ * shape of the violation the v0.75 rank work exists to prevent. Validating
+ * against state the held lock covers needs no second acquisition and cannot
+ * invert anything.
+ *
+ * A close frees the slot (used=0, fd=-1); a reissue repoints it at a different
+ * descriptor. Either way this compares unequal. */
+static inline int sock_fd_still_ours(int si, int fd) {
+    return si >= 0 && si < NSOCK && g_sock[si].used && g_sock[si].fd == fd;
+}
+
 /* Enqueue a datagram into a socket's RX ring and wake any parked receiver.
  * Caller holds g_net_lock. Drops silently if the ring is full (UDP semantics).*/
 static void net_sock_enqueue(int si, const uint8_t *data, uint16_t len) {
@@ -13445,11 +13466,26 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * for an operation that already completed would be a lie a
                   * caller would then wait on. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
-        int si = sock_of_fd((int)(int64_t)a0, 0);
+        int sfd = (int)(int64_t)a0;
         uint32_t addr = (uint32_t)a1; uint16_t port = (uint16_t)a2;
-        if (si < 0) return (uint64_t)-9;
-        int fl = 0; (void)sock_of_fd((int)(int64_t)a0, &fl);
+        /* v0.75: ONE resolution, not two. This used to call sock_of_fd() twice
+         * — once for the slot, again for the flags — which is two independent
+         * lookups of a descriptor that can change between them, with the second
+         * discarding the slot it had just resolved. A single call cannot
+         * disagree with itself. */
+        int fl = 0;
+        int si = sock_of_fd(sfd, &fl);
+        if (si < 0) return (uint64_t)-9;                    /* EBADF */
         klock_acquire(&g_net_lock);
+        /* v0.75: close the resolve->acquire window. `si` was read under the
+         * ofile lock, which is now released; re-establish that this slot is
+         * still the socket `sfd` names before touching it. See
+         * sock_fd_still_ours() for why this is not a second sock_of_fd(). */
+        if (!sock_fd_still_ours(si, sfd)) {
+            __sync_fetch_and_add(&g_connect_stale, 1);
+            klock_release(&g_net_lock);
+            return (uint64_t)-9;                            /* EBADF */
+        }
         int rc = -1;
         if (g_sock[si].listening) rc = -22;                 /* EINVAL: a listener */
         else if (g_sock[si].stream) {
@@ -13586,7 +13622,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                          * not liveness: `used` alone cannot tell a slot that
                          * was never freed from one freed and immediately
                          * reallocated, which is the common case under load. */
-                        if (!c->used || c->gen != expected_gen) {
+                        if (!sock_fd_still_ours(si, sfd) || c->gen != expected_gen) {
                             __sync_fetch_and_add(&g_connect_stale, 1);
                             klock_release(&g_net_lock);
                             return (uint64_t)(int64_t)-104;     /* ECONNRESET */
