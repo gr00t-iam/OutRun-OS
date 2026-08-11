@@ -551,23 +551,52 @@ Like the generation counter, the new check **never fired** (`stale=0`
 throughout). It is committed on its argument, not on evidence of the race
 occurring.
 
-### NOT closed: the same window in five sibling syscalls
+### The five sibling syscalls — now also closed
 
-`sys_connect()` is fixed. The identical resolve-then-climb gap remains in every
-other `sock_of_fd()` caller:
+`sys_connect()` was fixed first; the identical resolve-then-climb gap existed in
+every other `sock_of_fd()` caller. All five now revalidate with
+`sock_fd_still_ours()` immediately after acquiring the net lock, returning
+`-EBADF` and releasing the lock.
 
-| syscall | checks `used`? | checks fd back-pointer? |
-|---------|----------------|--------------------------|
-| `bind`   | no  | no |
-| `send`   | yes | no |
-| `recv`   | yes | no |
-| `listen` | no  | no |
-| `accept` | no  | no |
+| syscall | before | after |
+|---------|--------|-------|
+| `bind`   | no check          | `sock_fd_still_ours()` |
+| `send`   | `used` only       | `sock_fd_still_ours()`, before the ENOTCONN test |
+| `recv`   | `used` only       | `sock_fd_still_ours()`, **inside** the blocking poll loop |
+| `listen` | no check          | `sock_fd_still_ours()` |
+| `accept` | no check          | `sock_fd_still_ours()` in both branches |
 
-Checking `used` is not sufficient: a slot freed and immediately reallocated is
-`used` again. `sock_fd_still_ours()` now exists, so each is a one-line change,
-but they are untouched here and **v0.75 network-stack hardening should not be
-described as closed until they are.**
+Checking `used` was not the same question: a slot freed and immediately
+reallocated is `used` again, and that is the common case under load.
+
+Three of these are not mechanical copies of the `sys_connect` change:
+
+- **`recv`** puts the check inside its blocking poll loop rather than before
+  it. The window there is not the resolve->acquire gap alone — it reopens on
+  every iteration, which makes it the longest exposure of the five.
+- **`send`** checks before the ENOTCONN test, so a stale handle reports EBADF
+  instead of being described as a live-but-unconnected socket. The caller's
+  descriptor is the thing that went away.
+- **`accept`** now distinguishes EBADF (descriptor gone) from EINVAL (live
+  socket that is not a listener); the old test collapsed both into EINVAL. Its
+  unlocked read of `g_sock[li].stream` is deliberately left alone: `stream` is
+  set at allocation and cleared only by the wipe that frees the slot, so it
+  never changes under a live socket. A stale index can steer the wrong branch
+  and nothing worse, because both branches revalidate under the lock — a wrong
+  branch costs an error path, not a wrong action.
+
+Verified: uniprocessor 44 suites / 0 failed, `[tcpstrs] 28 passed`; ten `-smp 4`
+boots **10 OK / 0 HANG / 0 PANIC**, 0 suite failures and **0 rank violations,
+underflow or mismatch in any boot**. Build 0 errors, 35 warnings.
+
+As with `sys_connect`, **none of these checks fired** (`stale=0` throughout).
+They are committed on their argument, not on evidence of the race occurring.
+
+### Phase 5 (network stack hardening) — CLOSED
+
+Every `sock_of_fd()` caller now validates its descriptor under the lock that
+protects the answer. The v0.75 network work is: the AP-yield fix, the socket
+generation counter, and this descriptor revalidation across all six syscalls.
 
 ## TIER 2 HANDOFF STATE (next milestone)
 
