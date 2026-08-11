@@ -1,0 +1,256 @@
+# OutRun OS v0.76.0-metal — roadmap
+
+Milestone 76. v0.75.0 is tagged (`74fd9b3`). This milestone is defined by what
+that tag deliberately did **not** claim, recorded at the end of
+`ROADMAP-0.75.0.md` and carried here verbatim in substance.
+
+v0.75 was a milestone about **identity** — a slot index is not an identity, a
+pid is not a slot, a socket handle is not a socket, a descriptor is not a
+binding. v0.76 is a milestone about **evidence**: three of the things v0.75
+shipped are believed rather than demonstrated, and one of them is the headline
+fix of the milestone before it.
+
+---
+
+## THE CARRYOVER, WITH WHAT IS ALREADY KNOWN
+
+### 1. The suite set is not idempotent across boots on a re-used volume
+
+**Evidence.** Boot any v0.75 kernel twice on one disk image. First boot:
+45 suites, 0 FAIL. Second boot, same image:
+
+```
+[vfsstrs]   RESULT: 18 passed, 1 failed
+[usersstrs] RESULT: 16 passed, 2 failed
+```
+
+Three assertions, named exactly:
+
+```
+[vfsstrs]   FAIL  VFS journal commit is genuinely DEFERRED (on-disk dir region is stale before apply)
+[usersstrs] FAIL  a newly created file gets the default mode
+[usersstrs] FAIL  a stranger CAN open another user's 0644 file for reading
+```
+
+Confirmed **pre-existing** by negative control: the merged `main` kernel from
+before the persistence branch produces the identical three. This is not a
+regression from v0.75 — it is something v0.75 was the first thing to look for.
+
+**Root cause, already located — and these are TEST defects, not kernel
+defects.** Both suites assume they are creating their fixtures for the first
+time:
+
+- `usersstrs` (kernel64.c ~19604) does
+  `vfs_open_for("m72own", alice, 1)` with `creat=1`, then asserts the file has
+  `VFS_MODE_DEFAULT` and is readable by a stranger at 0644. On a re-used volume
+  `m72own` already exists **carrying the mode later assertions in the same
+  suite changed it to**, so "newly created" is false and the mode is no longer
+  the default.
+- `vfsstrs` (kernel64.c ~17713) proves the journal is deferred with
+  `deferred_ok = (praw->used == 0 || praw->file_hash != DENTS[idx].file_hash)`.
+  On a re-used volume the on-disk dirent for `vfs-crash-test` already exists
+  from the previous boot **with the same content and therefore the same
+  hash** — content addressing makes this deterministic, not lucky — so the
+  "on-disk is stale" precondition cannot hold and the assertion is defeated by
+  its own fixture.
+
+**Why it is now urgent rather than cosmetic.** v0.75 shipped persistence. A
+volume with prior state is, as of the tag, a **supported configuration** — it is
+the entire point of step 6. Yet the suite set has never been run that way, and
+cannot currently pass when it is. Worse, the two-boot dirty-volume run is *the
+only configuration that can validate persistence at all*: every gate harness to
+date builds a fresh image per boot, so a green gate says nothing about the
+feature v0.75 closed on.
+
+**A trap to design around.** Not every cross-boot artifact is contamination.
+`vfs-reboot-test` (v0.48) and `udbreboot` (v0.75) exist **precisely** to survive
+a reboot and are the proofs that recovery and persistence work. A blanket
+"delete all fixtures at boot" would destroy the only cross-boot evidence in the
+tree. The fix must distinguish *fixtures a suite owns and must reset* from
+*artifacts that are deliberately durable*.
+
+**Definition of done.** A `dirty-volume` gate configuration — boot twice on one
+image, both boots 0 FAIL — added to the matrix and green.
+
+### 2. Toolchain suites' wall-clock budgets break on a loaded host
+
+**Evidence** (from v0.74/v0.75 observation, at ~6x CPU oversubscription):
+
+```
+[langstrs] 8 passed, 2 failed        (exit 970 — the compile-run-validate step)
+[toolstrs] ... TIMED OUT waiting for the compiler
+[pipestrs] ...
+```
+
+**Nature.** These are wall-clock budgets in the self-hosting suites, not
+correctness failures. But they are what breaks a regression run on a busy
+machine, and this environment is TCG-only — there is no KVM to absorb the
+variance. A gate that fails under load is a gate people learn to re-run until it
+passes, which is how a real failure gets waved through.
+
+**Definition of done.** No suite fails because the host was busy. Preferred
+shape: assertions wait on a *condition with an unbounded-but-observable* wait
+(progress-based), or a budget scaled from a measured baseline taken during the
+same boot, rather than a constant chosen on an idle machine. A suite that must
+give up should say "gave up after N" distinctly from "got the wrong answer" —
+today they are the same red line.
+
+### 3. Tier 1 step 3 — the fork race has never been reproduced uninstrumented
+
+**This is the most important unfinished item in the project.**
+
+v0.74 found an intermittent `posixstrs` failure under `-smp 4`: a forked child
+reported the wrong parent through `getppid` (exit 44) and the parent's `waitpid`
+then timed out (exit 702). v0.75 read the path, found three real defects (A:
+non-atomic `g_next_pid`; B: `ppid_slot` with no generation; C: identity syscalls
+using raw slots), and fixed all three. Every configuration is now green.
+
+**But:** the original failure was never reproduced *without* instrumentation, so
+the clean runs do not distinguish **"fixed"** from **"did not fire"**. Twelve
+clean runs were also obtained with the fix reverted. The three defects are real
+and were fixed on their own merits — each is provable by reading — but the causal
+link from them to the observed symptom remains an argument, not a measurement.
+
+This is the same epistemic hole this project has repeatedly proven costly. In
+v0.75 alone: a hypothesis was shipped and later disproven by measurement; a
+20-boot "verification" was run against the wrong ISO and its conclusion had to
+be withdrawn; a counter was grepped for that no code could emit. Every one of
+those was caught by insisting on evidence. This item is the same insistence,
+applied to the milestone's own headline fix.
+
+**Definition of done — one of these two, explicitly:**
+
+- **(a) Reproduce it.** Find a configuration that fires the original symptom on
+  an unfixed kernel, then show the fixed kernel clean on the same configuration.
+  The most likely levers, per v0.74: a slower host, higher oversubscription, a
+  different binary layout, or an artificially widened window (a deliberate delay
+  between `kproc_unlock()` and the pid assignment on a *reverted* build, used
+  only as a reproducer).
+- **(b) Retire the claim honestly.** If it cannot be reproduced after a bounded
+  effort, say so in the changelog in those words — "three real defects were
+  fixed; the causal link to the v0.74 symptom is unproven" — and stop carrying
+  it as an open verification item. What is not acceptable is carrying it
+  silently into a third milestone.
+
+---
+
+## TIER 1 — VERIFICATION INTEGRITY
+
+The gate must mean something before anything is built on top of it.
+
+1. **Suite idempotency + a dirty-volume gate configuration.** Carryover 1.
+2. **Load-tolerant timing in the toolchain suites.** Carryover 2.
+3. **Fork-race causality: reproduce or retire.** Carryover 3.
+4. **A gate that states its own coverage.** Each harness already stamps the md5
+   of the image it booted — a habit adopted mid-v0.75 after a 20-boot run was
+   discovered to have booted the wrong ISO. Extend it: every gate run should
+   emit, in one line, which configurations ran, how many boots each, and what
+   was *not* covered. A gate whose gaps are invisible is how "verified" drifts
+   away from "measured".
+
+## TIER 2 — ARCHITECTURE
+
+1. **A memory-hard KDF.** PBKDF2-HMAC-SHA-256 (c=4096) buys serial CPU cost
+   only; GPUs and ASICs keep a large advantage. Argon2id or scrypt over the
+   existing primitive. The v0.75 structure was built so this is a change to
+   `udb_kdf()` and nothing else — that claim held once already for the FNV-1a →
+   PBKDF2 swap and should hold again. Land the primitive against published
+   vectors as its own verified unit *before* wiring it in, exactly as SHA-256
+   was.
+2. **Password change and account deletion syscalls.** Today there is no way to
+   change a password from ring 3 — which means the revert-to-an-old-password
+   case that the per-segment nonce defends against **is not yet reachable**. The
+   defence shipped ahead of the path that needs it; this closes the gap and
+   makes the defence testable end to end.
+3. **Lockout state across a reboot, without a new side channel.** v0.75
+   deliberately did not persist failure counters: they change on every failed
+   authentication, so storing them naively makes each failed login a visible
+   write, and an observer counting writes counts failed logins. Wanted: lockout
+   that survives a reboot without publishing authentication failures through
+   write traffic. Likely shapes — a fixed-cadence write regardless of outcome,
+   or coarse buckets that only occasionally change state. This is a design
+   problem, not an implementation one, and should be designed before it is
+   scheduled.
+4. **Confidentiality for the stored database — scoped, or explicitly deferred.**
+   There is no key store, no TPM, and nothing to encrypt the image with that
+   does not live on the same volume. Absent a key story this is not
+   implementable, only theatre. Recommend: **deferred**, restated in the
+   changelog so it is not mistaken for an oversight.
+
+---
+
+## HIGHEST PRIORITY, AND THE FIRST BRANCH
+
+### Recommendation: carryover 1 — suite idempotency on a re-used volume
+
+Not because it is the deepest problem. Carryover 3 is. Because it is the one
+that **blocks measurement of something already shipped**, and it is cheap:
+
+- v0.75 shipped persistence, so a volume with prior state is a supported
+  configuration as of the tag. The suite set cannot currently pass on one.
+  Shipping a persistence feature while being unable to boot twice on a disk
+  without failures is an inconsistency inside the release itself.
+- The two-boot dirty-volume run is the **only** configuration that can validate
+  persistence. Until it is green, step 6 is guarded by one hand-run test.
+- Both root causes are already located, and both are test defects — bounded,
+  well-understood work, not research.
+- It produces a new gate configuration, which then guards everything after it —
+  including carryover 3, which will need to run many boots and compare
+  configurations that differ only in kernel.
+
+Carryover 3 is the milestone's headline and should be second, once there is a
+gate worth trusting to measure it with. Carryover 2 pairs naturally with 3,
+since reproducing an SMP race is likely to involve deliberately loading the
+host — which is exactly the condition that currently breaks the toolchain
+suites, and would otherwise confound the experiment.
+
+### First branch: `v076-suite-idempotency`
+
+**Step 0 — a dirty-volume harness, as a first-class script.**
+Boot N times on one image, report per-boot suite results and diffs between
+boots. Every existing harness recreates the image; this one must not. Stamp the
+ISO md5 into every log, as all v0.75 harnesses now do.
+
+**Step 1 — characterise before fixing.** Run 3 consecutive boots and enumerate
+*every* assertion whose result differs between boot 1 and boot 2, and between
+boot 2 and boot 3. **Do not assume the count is three.** The known three come
+from a two-boot run; a third boot may expose more, and a suite that fails on
+boot 2 may mask a different failure on boot 3. This step produces the actual
+work list. It is also the step that would catch a fourth failure that a fix for
+the first three would otherwise hide.
+
+**Step 2 — decide the hygiene policy, once, and apply it uniformly.**
+Two candidate policies, and the choice should be explicit:
+  - *Own-and-reset*: each suite deletes/recreates its fixtures at entry. Matches
+    what `authstrs` already does for the user database as of v0.75.
+  - *Unique-per-boot names*: fixtures carry a boot-unique suffix.
+  Own-and-reset is preferred — it keeps names stable in logs and does not grow
+  the directory on every boot (the VFS directory has a fixed slot count and has
+  run out before).
+  **Constraint:** `vfs-reboot-test` and `udbreboot` are deliberately durable
+  cross-boot evidence and must be exempt. The policy needs an explicit
+  allow-list, not a blanket sweep.
+
+**Step 3 — fix the three known assertions**, each addressed at its cause:
+  - `usersstrs`: reset `m72own` (unlink then create) so mode and ownership are
+    established by this boot, not inherited.
+  - `vfsstrs`: the deferred-journal proof needs a fixture whose on-disk state is
+    genuinely stale. Since content addressing makes identical content produce an
+    identical hash, the fixture content must differ per boot — a counter or the
+    tick value folded in — or the test must remove the dirent first.
+
+**Step 4 — add `dirty-volume` to the gate**: two boots on one image, both
+0 FAIL, alongside UP / smp4-bios / smp4-iommu. Then re-run the full matrix.
+
+**Definition of done for the branch:** three consecutive boots on one volume,
+0 FAIL each, with the cross-boot artifacts (`vfs-reboot-test`, `udbreboot`)
+still doing their job — verified by the `CROSS-BOOT OK` line still appearing,
+not merely by absence of failures.
+
+### Explicitly out of scope for v0.76
+
+Carried from v0.75 so they are not rediscovered: an execute permission bit,
+directory permissions, supplementary groups, a login program, lockout expiry and
+administrative unlock. The queued TCP hardening work (congestion window, slow
+start, fast retransmit, Karn/Jacobson RTO, segment coalescing) remains
+independent of all of the above.
