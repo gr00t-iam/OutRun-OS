@@ -731,22 +731,154 @@ Every `sock_of_fd()` caller now validates its descriptor under the lock that
 protects the answer. The v0.75 network work is: the AP-yield fix, the socket
 generation counter, and this descriptor revalidation across all six syscalls.
 
-## TIER 2 HANDOFF STATE (next milestone)
+## TIER 2 CRYPTO ENGINE — CLOSED
 
-The crypto half of "Persistent User Database Storage & Tier-2 Crypto Engine" is
-largely **already written and unmerged**, which is the first thing to know
-before starting it:
+Both halves are merged to `main`.
 
-- **PR #61** — SHA-256 (FIPS 180-4) as its own verified unit, against NIST
-  vectors. Open.
-- **PR #62** — `udb_kdf()` is PBKDF2-HMAC-SHA-256. Open, stacked on #61.
+- **PR #61** — SHA-256 (FIPS 180-4) as its own verified unit. Merged
+  (`285069b`).
+- **PR #62** — `udb_kdf()` is PBKDF2-HMAC-SHA-256 (RFC 8018), c = 4096,
+  dkLen = 32. Merged (`320acc2`).
 
-Both branch from `#60` and are 8 commits behind `main`, but `git merge-tree`
-reports **0 conflicts** against current `main`, so they rebase cleanly. Step 5
-of the milestone plan above is therefore mostly a review-and-merge task, not an
-implementation task.
+`udb_kdf()` was the only function that changed. `UDB_MAX`, `UDB_NAME_MAX`,
+`UDB_SALT_LEN`, `UDB_HASH_LEN`, `UDB_KDF_ROUNDS`, `UDB_MAX_FAILS`,
+`struct udbent`, `udb_make_salt()`, `udb_ct_eq()`, `udb_add()`, `udb_auth()`,
+the lockout state machine and both syscalls are untouched — and all 35
+`authstrs` assertions still pass, unmodified and still numbering 35. They
+assert *relationships* (same input → same digest, different salt → different
+digest, one character changes it), never values, which is exactly what made the
+primitive swappable.
 
-That leaves **step 6 (persist the user database)** as the real remaining work,
-with the open design question unchanged: the volume is content-addressed with
-no timestamps, so a password change must not be inferable from dedup
-behaviour.
+No truncation anywhere: dkLen = PRF output = `UDB_HASH_LEN` = 32, so the derived
+key is one whole HMAC output with nothing discarded and no multi-block
+concatenation. `shastrs` asserts `UDB_HASH_LEN == SHA256_DIGEST` so a future
+schema change cannot silently start truncating.
+
+Verified on merged `main`: **45 suites, 0 FAIL**, `shastrs` 19/19,
+`authstrs` 35/35; build 0 errors, 35 warnings.
+
+### A merge hazard worth recording
+
+#61 and #62 were stacked, and #61 was **squash**-merged. Main then carried the
+SHA-256 primitive as one new commit while #62's branch still carried the
+original commits that produced it, so git saw the same content added twice and
+conflicted — three kernel hunks, two roadmap hunks. Two of those conflicts were
+not merely stale but actively **wrong** on main's side: `shastrs` asserted "NOT
+yet wired into `udb_kdf()`", which #62 makes false.
+
+Resolved hunk-by-hunk, keeping #62's side, rather than by taking whole files —
+main's `sock_of_fd()` revalidation work (#66) lives in the same file and had
+auto-merged cleanly, and a whole-file resolution would have silently reverted
+it. #62's PR base also still pointed at `v075-tier2-crypto` and had to be
+retargeted to `main` after #61 merged.
+
+**For the next stacked pair:** merge the parent first, then re-merge `main` into
+the child and expect conflicts proportional to the parent's size. They are
+mechanical, but they are not automatic, and a whole-file "take ours" is the
+wrong reflex.
+
+### What remains: step 6, persist the user database
+
+Now the only open item in Tier 2. The design question is unchanged: the volume
+is content-addressed with no timestamps, so a password change must not be
+inferable from dedup behaviour. See the plan section below.
+
+### Not done, and honest about it
+
+PBKDF2 is **not memory-hard**. It buys serial CPU cost only, so GPUs and ASICs
+retain a large advantage over a defender, and c = 4096 is modest by modern
+standards. The "then Argon2 or scrypt over it" half of the v0.74 sentence
+remains open and is not claimed by this milestone.
+
+---
+
+## STEP 6 PLAN — PERSISTENT USER DATABASE STORAGE
+
+### The constraint that shapes everything
+
+The volume is content-addressed with no timestamps. An observer who can see
+which blocks exist learns things from *dedup behaviour alone*, without reading
+any content:
+
+- **A write that dedups is a write that changed nothing new.** If the UDB image
+  is written verbatim and a user reverts to a previous password, the image
+  becomes byte-identical to an earlier one, the store dedups, and no new block
+  appears. That is a direct signal: "this account went back to a password it
+  used before." Per-user salts do not help here — the salt is stable across a
+  password change for the same user, so the same password re-derives the same
+  digest and the same bytes.
+- **Per-record blocks leak which account changed.** If each user is its own
+  content unit, a password change replaces exactly one block, naming the
+  account even though the content is a digest.
+- **Size leaks population.** A file that grows with each account publishes how
+  many accounts exist.
+
+Per-user salts already solve the *cross-account* case: two users sharing a
+password produce different digests and therefore different bytes. The gap is
+the *same-account-over-time* case.
+
+### Proposed design
+
+1. **One fixed-size image, not per-record blocks.** Serialise the whole table —
+   `UDB_MAX` slots, every slot written whether occupied or not, unused slots
+   filled with random bytes rather than zeroes. Size is then constant and
+   independent of population, and no per-account block exists to be correlated.
+
+2. **A fresh random nonce in every write.** A 16-byte `image_nonce`, redrawn on
+   every mutation and covered by the checksum. This is the mechanism that
+   actually closes the stated hole: no two writes ever produce identical bytes,
+   so nothing ever dedups, so dedup behaviour carries no signal at all. Reverting
+   a password produces a fresh block exactly like any other change.
+
+   This costs one block per mutation with no dedup savings. That is the point —
+   the dedup savings *are* the leak.
+
+3. **Integrity: SHA-256 over the image**, which we now have. Store
+   `sha256(nonce || records)` in the header. A torn or tampered image is then
+   detectable rather than silently loaded.
+
+4. **Atomic replacement via a generation counter and a root flip.** Write the
+   new image, then update a single root reference. Header carries a
+   monotonically increasing `generation`; on load, prefer the highest generation
+   whose checksum verifies. Same shape as `kproc::gen` and `nsock::gen` — an
+   index or a location is not an identity, and the generation is what makes
+   "which version is real" answerable after a crash.
+
+5. **Fail closed on load.** If no image verifies, the database must NOT quietly
+   become empty — an empty UDB is a system where the next caller creates the
+   first account. Boot with the table marked unavailable so `udb_auth()` denies
+   everything, and require an explicit operator action to reinitialise.
+
+### The decision this forces, flagged rather than assumed
+
+**Should lockout state persist?** Failed-attempt counters change on every failed
+authentication. If they live in the image, every failed login writes a new
+block, and an observer counting writes counts failed logins — a fresh side
+channel introduced by the fix for another one. If they stay in memory, lockout
+resets across a reboot, which weakens it against an attacker who can force
+reboots.
+
+Recommendation: **persist accounts, keep lockout in memory for now**, and record
+the weakness explicitly rather than trading a visible leak for an invisible one.
+Revisit when there is a way to write without publishing that a write occurred.
+
+### What this does not provide
+
+Persistence adds no confidentiality. Salts and digests are readable by anyone
+who can read the volume; what protects passwords is the KDF, not the storage.
+There is no key store, no TPM, and nothing to encrypt the image *with* that is
+not itself on the same volume — so image encryption is deliberately out of
+scope here rather than half-done.
+
+### Suggested order
+
+1. On-disk format + `sha256` header + serialise/deserialise, with a `udbstrs`
+   round-trip assertion. No persistence wired in yet.
+2. Load/store against the volume, generation + root flip, crash-consistency
+   assertions (write, interrupt, reload → previous generation intact).
+3. Wire into boot and `udb_add()`/password change, then assert the property that
+   motivated all of it: **two writes of the same logical content produce
+   different blocks.**
+
+Same discipline as Tier 2: land the format as its own verified unit before
+wiring it in, so a failure has one candidate.
