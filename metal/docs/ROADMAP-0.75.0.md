@@ -514,6 +514,13 @@ fork fix, and none of the three is fixed here.
    already produce different digests (per-user salts), which helps, but the file
    as a whole wants thought before it is written.
 
+   > **Status: DONE.** Fixed-size A/B image, a fresh nonce in every 512-byte
+   > segment so nothing ever dedups, generation + root flip, SHA-256 integrity,
+   > fail-closed load, lockout state deliberately not stored. Proven by booting
+   > twice on one disk, which is the only test that can see it. See the STEP 6
+   > section at the end of this document — including the two defects that run
+   > caught and the pre-existing volume-reuse failures it surfaced.
+
 ### WHERE v0.75 STANDS
 
 | item | state |
@@ -524,21 +531,33 @@ fork fix, and none of the three is fixed here.
 | Tier 1 · the fork enqueue funnel | **fixed**, causality NOT reproduced uninstrumented |
 | Tier 1 · step 3, three clean smp4-bios runs | **NOT satisfied** — see PHASE 1 RESULT |
 | Tier 2 · item 5, SHA-256 + KDF | **done** — primitive and KDF, both vector-verified |
-| Tier 2 · item 6, persist the user database | **not started** |
+| Tier 2 · item 6, persist the user database | **done** — see STEP 6 below |
+| Network stack hardening (phase 5) | **done** — AP yields, socket generation, fd revalidation |
 
-Open defects found along the way, none of them fixed, in the order they should
-be taken seriously:
+**This table was stale for most of the milestone and is corrected here.** The
+three "open defects, none of them fixed" recorded below it were written before
+the SMP work; two of them have since been fixed, and leaving the list as it was
+would have had this document arguing against its own later sections.
 
-1. **The intermittent `-smp 4` page-fault panic.** It stops the machine and
-   produces no matrix at all. Present in `main` independent of any Tier 2 work.
-2. **`g_net_lock` re-entrancy**, now reproducing uncontended on smp4-bios 3 runs
-   in 5 — which is why `main` does not currently meet the release gate there.
-3. **Toolchain suites' wall-clock budgets** on a loaded host.
+1. ~~**The intermittent `-smp 4` page-fault panic.**~~ **FIXED.** The BSP's
+   ring-3 kernel resume point was per-CPU where it had to be per-THREAD (#63).
+2. ~~**`g_net_lock` re-entrancy.**~~ **FIXED.** Lock-rank storage is now keyed
+   to the task, which is the thing that migrates (#64), and the residual
+   suite-39 hang was an AP calling the BSP-only `sched_yield()` (#65). Twenty
+   consecutive `-smp 4` boots at 0 violations, 0 underflow, 0 mismatch.
+3. **Toolchain suites' wall-clock budgets** on a loaded host. **Still open** —
+   not a correctness failure, but it is what breaks a regression run on a busy
+   machine.
+4. **The suite set is not idempotent across boots on a re-used volume.**
+   **NEW, still open.** Booting twice on one disk fails `[vfsstrs]` (1) and
+   `[usersstrs]` (2). Surfaced by the step 6 cross-boot test and confirmed
+   pre-existing by negative control against the `main` kernel from before that
+   branch. Every regression run to date has used a fresh image, so this has
+   never been exercised — which is exactly why it survived this long.
 
-The next milestone-shaped piece of work is Tier 2 item 6 (persistence). The next
-CORRECTNESS-shaped piece is (1) above, and it should probably come first: a
-release gate cannot mean anything while one configuration in three intermittently
-halts before reaching the prompt.
+With (1) and (2) closed, the release gate is meaningful again: all three
+configurations reach the prompt. What remains for a v0.75.0 tag is the gate
+itself, run as the gate — see the closing section.
 
 ### Explicitly deferred past v0.75
 
@@ -777,11 +796,13 @@ the child and expect conflicts proportional to the parent's size. They are
 mechanical, but they are not automatic, and a whole-file "take ours" is the
 wrong reflex.
 
-### What remains: step 6, persist the user database
+### Step 6 — also done
 
-Now the only open item in Tier 2. The design question is unchanged: the volume
-is content-addressed with no timestamps, so a password change must not be
-inferable from dedup behaviour. See the plan section below.
+Persistence landed (#68). The design question it was blocked on — the volume is
+content-addressed with no timestamps, so a password change must not be inferable
+from dedup behaviour — is answered by a fresh nonce in every 512-byte segment,
+so no write ever dedups and dedup behaviour carries no signal. Tier 2 is
+complete. See the plan and the STEP 6 result section below.
 
 ### Not done, and honest about it
 
@@ -1014,3 +1035,83 @@ image, so this has never been exercised.
 - No account deletion or password change syscall yet, so the revert-to-an-old-
   password case the nonce defends against is not yet reachable from ring 3. The
   defence is in place ahead of the path that needs it.
+
+---
+
+## v0.75.0 RELEASE GATE — RUN AS THE GATE
+
+Baseline: `main` at the step 6 merge (#68). Build **0 errors, 35 warnings** —
+the same warning count this milestone started with, held across every change in
+it. Each log records the md5 of the image it booted.
+
+| configuration | boots | result | suites | failures | rank faults |
+|---|---|---|---|---|---|
+| uniprocessor            | 1  | OK | 45 | 0 | 0 |
+| `-smp 4` SeaBIOS        | 10 | **10 OK / 0 HANG / 0 PANIC** | 45 | 0 | 0 |
+| `-smp 4` q35 + VT-d     | 5  | **5 OK / 0 HANG / 0 PANIC**  | 47 | 0 | 0 |
+
+The VT-d column reports 47 suites rather than 45 because that configuration runs
+two additional IOMMU-specific suites; both pass.
+
+**All three configurations reach the prompt at 0 FAIL.** That is the first time
+this milestone can say so: the table earlier in this document recorded, until
+today, that `main` did not meet the gate because of the `-smp 4` panic and the
+`g_net_lock` re-entrancy. Both are closed.
+
+### A gate configuration that was not actually running
+
+The third config had to be written out by hand, and that is worth recording.
+`make qemu-iommu` expands `$(QEMU_IOMMU)`:
+
+```
+qemu-iommu: all
+	qemu-system-x86_64 $(QEMU_IOMMU) -cdrom ... 
+```
+
+**`QEMU_IOMMU` is not defined anywhere in the Makefile.** An undefined make
+variable expands to nothing, so that target has been booting with no
+`intel-iommu`, no `intremap`, and no q35 machine type — silently degrading into
+roughly the plain SMP configuration beside it. A gate configuration that
+collapses into the one next to it is not a third data point, and every
+"smp4-iommu" result recorded from that target since the variable went missing
+should be read with that in mind.
+
+The runs in the table above use the configuration spelled out explicitly:
+
+```
+-smp 4 -machine q35,kernel-irqchip=split -device intel-iommu,intremap=on
+       ... virtio-blk-pci,...,iommu_platform=on
+       ... virtio-net-pci,...,iommu_platform=on
+```
+
+The Makefile is **not** repaired here — the flags a gate target should carry are
+a deliberate choice, not something to infer from old logs and quietly commit
+under a documentation change. It is left as an explicit open item.
+
+### What a v0.75.0 tag would and would not be claiming
+
+Claimed, and measured:
+
+- the three defects Phase 1 named (A, B, C), fixed;
+- the intermittent `-smp 4` page-fault panic, fixed and verified against a
+  negative control;
+- lock-rank discipline: 0 violations / underflow / mismatch across every boot
+  in the table;
+- the suite-39 `tcpstrs` hang, fixed — 11 hangs in 18 baseline boots against
+  1 in 16 with the fix, then 20 consecutive clean boots;
+- SHA-256 and PBKDF2-HMAC-SHA-256, against published vectors and cross-checked
+  natively;
+- a user database that survives a reboot without leaking through dedup.
+
+NOT claimed:
+
+- **Tier 1 step 3 is still not satisfied.** The original fork race has never
+  been reproduced uninstrumented, so the clean runs do not distinguish "fixed"
+  from "did not fire". See PHASE 1 RESULT.
+- PBKDF2 is not memory-hard; Argon2/scrypt remains open.
+- Lockout state does not survive a reboot.
+- No confidentiality for the stored database.
+- The suite set is not idempotent across boots on a re-used volume — two suites
+  fail on a second boot, pre-existing and confirmed by negative control.
+- The toolchain suites' wall-clock budgets still break on a loaded host.
+- `make qemu-iommu` is still broken, per above.
