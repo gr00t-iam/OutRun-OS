@@ -24401,6 +24401,19 @@ static void shell_run(void) {
      * them from the absence of warnings. All three must be 0. */
     kprintf("[klock  ] rank violations=%u underflow=%u mismatch=%u\n",
             g_rank_violations, g_rank_underflow, g_rank_mismatch);
+    /* v0.75: the sys_connect counters. apyield is COVERAGE — how often an AP
+     * actually entered the retransmit loop, so a run reporting 0 has not
+     * exercised the AP path and its clean result says nothing about it. stale
+     * is a FAULT count: slots reissued underneath the loop and refused.
+     *
+     * Printed here rather than left as a variable only a debugger could read.
+     * A counter nothing prints is not instrumentation — the first -smp 4 matrix
+     * of this fix grepped its logs for a stale count that no code could ever
+     * emit, and read the resulting zeroes as evidence.
+     *
+     * Caveat this cannot fix: a HUNG boot never reaches this line, so these
+     * numbers describe surviving boots only. */
+    kprintf("[connect] apyield=%u stale=%u\n", g_connect_ap_yield, g_connect_stale);
     kputs("\nType 'help' for commands, 'demo' for the capability walk-through.\n");
     kputs("outrun> ");
     for (;;) {
