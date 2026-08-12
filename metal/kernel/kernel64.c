@@ -7345,6 +7345,66 @@ static int vfs_unlink(const char *name) {
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * v0.76: SUITE FIXTURE HYGIENE, AND THE THINGS IT MUST NOT TOUCH
+ *
+ * The suites assume they create their fixtures for the first time. On a volume
+ * that already has prior state — which v0.75 made a SUPPORTED configuration by
+ * shipping persistence — that assumption is false, and two suites fail on every
+ * boot after the first.
+ *
+ * The obvious fix, "reset the fixtures at entry", walks straight into a trap:
+ * some cross-boot state is not contamination, it is the EVIDENCE. Three names
+ * exist precisely to survive a reboot and are the only proof in this tree that
+ * recovery and persistence work at all:
+ *
+ *   vfs-reboot-test   v0.48 — journal-recovery across a simulated power loss
+ *   /etc/udb.a/.b     v0.75 — the persisted user database itself
+ *
+ * A blanket sweep would delete them, every dirty-boot run would still look
+ * green, and we would have destroyed the evidence while believing we had
+ * cleaned up. So the allow-list is ENFORCED here rather than written in a
+ * comment somewhere and remembered: a suite resets fixtures only through
+ * suite_fixture_reset(), and that function refuses these names out loud.
+ *
+ * "udbreboot" is an ACCOUNT, not a file, so nothing here can unlink it — it is
+ * listed anyway so the set of durable things is in one place, and so a future
+ * VFS fixture that happens to take that name is caught rather than silently
+ * allowed. */
+static const char *const g_durable_artifacts[] = {
+    "vfs-reboot-test",      /* v0.48 cross-reboot journal-recovery proof     */
+    "/etc/udb.a",           /* v0.75 persisted user database, slot A         */
+    "/etc/udb.b",           /* v0.75 persisted user database, slot B         */
+    "udbreboot",            /* v0.75 cross-boot account marker (not a file)  */
+    0
+};
+static volatile uint64_t g_fixture_resets = 0, g_fixture_refusals = 0;
+
+static int vfs_name_is_durable(const char *name) {
+    for (int i = 0; g_durable_artifacts[i]; i++)
+        if (!kstrcmp(name, g_durable_artifacts[i])) return 1;
+    return 0;
+}
+
+/* Reset a SUITE-OWNED fixture so the suite creates it fresh regardless of what
+ * a previous boot left behind. Returns 1 if something was removed, 0 if there
+ * was nothing to remove, -1 if the name is durable and the reset was refused. */
+static int suite_fixture_reset(const char *name) {
+    if (vfs_name_is_durable(name)) {
+        __sync_fetch_and_add(&g_fixture_refusals, 1);
+        kprintf("[fixture] REFUSED to reset '%s' — durable cross-boot artefact\n", name);
+        return -1;
+    }
+    if (vfs_find(name) < 0) return 0;          /* fresh volume: nothing to do */
+    int rc = vfs_unlink(name);
+    if (rc == 0) {
+        __sync_fetch_and_add(&g_fixture_resets, 1);
+        kprintf("[fixture] reset '%s' (left behind by a previous boot)\n", name);
+        return 1;
+    }
+    return 0;
+}
+
 /* ===========================================================================
  * v0.45: DESCRIPTOR TEARDOWN — the fd-leak half of kproc lifetime discipline
  * ===========================================================================
@@ -17700,7 +17760,27 @@ static void cmd_vfs_stress(void) {
              g_rank_violations == viol0);
 
     /* --- direct in-kernel proof: deferred journal apply + automatic boot recovery --- */
-    static const uint8_t crashpat[24] = "VFS-CRASH-RECOVERY-TEST";
+    /* v0.76: the content must be UNIQUE PER BOOT, and that is the whole fix.
+     *
+     * This proves the journal apply is deferred by showing the on-disk dirent
+     * does not yet match the in-memory one. With fixed content on a re-used
+     * volume the on-disk dirent already holds this exact payload from the
+     * previous boot — and because the store is content-addressed, identical
+     * content yields an identical hash *deterministically*, not by luck. So
+     * praw->file_hash == DENTS[idx].file_hash before the apply, the "on-disk is
+     * stale" precondition cannot hold, and the assertion is defeated by its own
+     * fixture rather than by anything the kernel did wrong.
+     *
+     * Varying the payload restores the precondition without touching content
+     * addressing: a hash that differs because the CONTENT differs is exactly
+     * what the CAS is supposed to produce. rdtsc rather than g_ticks — two
+     * boots reach this line at a similar tick count, and a fixture that is
+     * "usually unique" would reintroduce the same failure as a flake, which is
+     * strictly worse than the deterministic one it replaces. */
+    uint8_t crashpat[24] = "VFS-CRASH-RECOVERY-TEST";
+    { uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+      uint64_t u = ((uint64_t)hi << 32) | lo;
+      for (int i = 0; i < 6; i++) crashpat[16 + i] = (uint8_t)('a' + ((u >> (i * 5)) & 15)); }
     vfs_write_file("vfs-crash-test", crashpat, sizeof crashpat);   /* commits journal PENDING; dir_start left stale */
     int idx = vfs_find("vfs-crash-test");
     int deferred_ok = 0, recovered_ok = 0, reload_ok = 0;
@@ -19601,6 +19681,13 @@ static void cmd_users_stress(void) {
          * which reported itself as "could not create /src/t.c" and looked
          * for all the world like a permission bug in this milestone. */
         int held[6], nheld = 0;
+        /* v0.76: this block asserts things about a file it BELIEVES it just
+         * created — that it has the default mode, and that a stranger can read
+         * it at 0644. On a re-used volume "m72own" is already there, carrying
+         * the mode THIS SAME BLOCK's later assertions changed it to, so both
+         * claims are false and two assertions fail on every boot after the
+         * first. Reset it so "newly created" is true again. */
+        suite_fixture_reset("m72own");
         int fa = vfs_open_for("m72own", alice, 1);          /* alice creates it */
         if (fa >= 0) held[nheld++] = fa;
         int di = vfs_find("m72own");
