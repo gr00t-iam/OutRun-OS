@@ -23143,7 +23143,8 @@ static void cmd_pipe_stress(void) {
             a == 956 ? "writing with no reader did not report EPIPE" :
             a == 957 ? "the pipe did not survive fork inheritance" :
             a == 958 ? "redirection did not take effect" :
-            a == 959 ? "fork failed" : "unknown";
+            a == 959 ? "fork failed" :
+            a == 965 ? "a child WAIT TIMED OUT (deadline, not a pipe defect)" : "unknown";
         kprintf("[pipestrs] mechanism round FAILED: exit %d (want 950) — %s\n", a, why);
     }
     ppcheck("pipe round trip, finite-buffer bound, EAGAIN/EOF/EPIPE and fork "
@@ -23163,7 +23164,8 @@ static void cmd_pipe_stress(void) {
             b == 961 ? "occ could not compile one of the sources" :
             b == 962 ? "fork failed" :
             b == 963 ? "authoring a source into the VFS failed" :
-            b == 964 ? "/bin/vsh did not run the script cleanly" : "unknown";
+            b == 964 ? "/bin/vsh did not run the script cleanly" :
+            b == 965 ? "a child WAIT TIMED OUT (deadline, not a shell defect)" : "unknown";
         kprintf("[pipestrs] shell round FAILED: exit %d (want 960) — %s\n", b, why);
     }
     ppcheck("occ compiled /src/vsh.c — the shipped shell source, unmodified — "

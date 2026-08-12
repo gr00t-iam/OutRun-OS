@@ -1610,6 +1610,15 @@ static u32 osysncpu(void) {
  * the ticks actually consumed — so a log can say how long a stage really took
  * rather than only that it fitted, which is what makes the next budget an
  * observation instead of another guess. */
+/* Budgets in TICKS (100 Hz), shared by every driver that waits on a child.
+ * Ceilings for a pathological host, not expectations — measured figures on this
+ * host are 1.2 s for a small compile and 2.8 s for the largest one, so these are
+ * roughly 70x margin. They live here, next to the waiter, so there is one source
+ * of truth rather than a constant per suite. */
+#define WAIT_T_COMPILE 20000u      /* 200 s: one occ invocation                */
+#define WAIT_T_TOOL    20000u      /* 200 s: a tool that forks occ again       */
+#define WAIT_T_RUN      6000u      /*  60 s: running a produced program        */
+
 static i64 owaitpid_ticks(u32 pid, u32 budget, u32 *spent) {
     u32 t0 = osysticks(), n = 0;
     for (;;) {
@@ -3673,7 +3682,11 @@ static void pipe_worker(void) {
     for (i = 0; i < (int)clen; i++) if (buf[i] != cmsg[i])  sysc(SYS_EXIT, 957, 0, 0);
     if ((i64)sysc(SYS_READ, (u64)rfd, (u64)buf, 8) != 0)    sysc(SYS_EXIT, 957, 0, 0);
     sysc(SYS_CLOSE, (u64)rfd, 0, 0);
-    if (owaitpid((u32)r, 30000) != 43)                      sysc(SYS_EXIT, 957, 0, 0);
+    /* v0.76: a deadline, and a timeout no longer masquerades as "the pipe did
+     * not survive fork inheritance" — which is what exit 957 claims. */
+    { i64 pst = owaitpid_ticks((u32)r, WAIT_T_RUN, 0);
+      if (pst == -11)                                       sysc(SYS_EXIT, 965, 0, 0);
+      if (pst != 43)                                        sysc(SYS_EXIT, 957, 0, 0); }
 
     /* 8. REDIRECTION into a pipe: an ordinary SYS_WRITE, which knows nothing
      *    about any of this, lands in the pipe instead of on the console. */
@@ -3723,7 +3736,9 @@ static void pipe_worker(void) {
         sysc(SYS_EXIT, 44, 0, 0);
     }
     if (hr < 0)                                             sysc(SYS_EXIT, 959, 0, 0);
-    if (owaitpid((u32)hr, 30000) != 44)                     sysc(SYS_EXIT, 949, 0, 0);
+    { i64 hst = owaitpid_ticks((u32)hr, WAIT_T_RUN, 0);
+      if (hst == -11)                                       sysc(SYS_EXIT, 965, 0, 0);
+      if (hst != 44)                                        sysc(SYS_EXIT, 949, 0, 0); }
     if (hp[0] != 0)                                         sysc(SYS_EXIT, 949, 0, 0);  /* copy, not alias */
 
     oputs("  [pipe  ] bounds, EAGAIN/EOF/EPIPE, fork inheritance, redirection "
@@ -3782,7 +3797,11 @@ static int vsh_compile(const char *src, const char *out) {
         sysc(SYS_EXIT, 199, 0, 0);
     }
     if (pid < 0) return -1;
-    i64 st = owaitpid((u32)pid, 250000);
+    /* v0.76: a deadline, not a spin count. -2 distinguishes "the wait expired"
+     * from "the compiler said no" — the caller must not report a slow host as a
+     * compiler defect. */
+    i64 st = owaitpid_ticks((u32)pid, WAIT_T_COMPILE, 0);
+    if (st == -11) return -2;
     return st == 0 ? 0 : -1;
 }
 
@@ -3793,9 +3812,15 @@ static void vsh_worker(void) {
 
     /* /src/vsh.c is published by the kernel's SDK, not authored here — the
      * point is that the shipped source compiles, unmodified. */
-    if (vsh_compile("/src/vsh.c",  "/bin/vsh") < 0)        sysc(SYS_EXIT, 961, 0, 0);
-    if (vsh_compile("/src/emit.c", "/bin/emit") < 0)       sysc(SYS_EXIT, 961, 0, 0);
-    if (vsh_compile("/src/wcx.c",  "/bin/wcx") < 0)        sysc(SYS_EXIT, 961, 0, 0);
+    { int c1 = vsh_compile("/src/vsh.c",  "/bin/vsh");
+      if (c1 == -2) sysc(SYS_EXIT, 965, 0, 0);
+      if (c1 < 0)   sysc(SYS_EXIT, 961, 0, 0); }
+    { int c2 = vsh_compile("/src/emit.c", "/bin/emit");
+      if (c2 == -2) sysc(SYS_EXIT, 965, 0, 0);
+      if (c2 < 0)   sysc(SYS_EXIT, 961, 0, 0); }
+    { int c3 = vsh_compile("/src/wcx.c",  "/bin/wcx");
+      if (c3 == -2) sysc(SYS_EXIT, 965, 0, 0);
+      if (c3 < 0)   sysc(SYS_EXIT, 961, 0, 0); }
     oputs("  [vsh   ] occ built /bin/vsh, /bin/emit and /bin/wcx from source\n");
 
     i64 pid = ofork();
@@ -3806,7 +3831,9 @@ static void vsh_worker(void) {
         sysc(SYS_EXIT, 199, 0, 0);
     }
     if (pid < 0)                                           sysc(SYS_EXIT, 962, 0, 0);
-    if (owaitpid((u32)pid, 250000) != 0)                   sysc(SYS_EXIT, 964, 0, 0);
+    { i64 vst = owaitpid_ticks((u32)pid, WAIT_T_RUN, 0);
+      if (vst == -11)                                      sysc(SYS_EXIT, 965, 0, 0);
+      if (vst != 0)                                        sysc(SYS_EXIT, 964, 0, 0); }
 
     oputs("  [vsh   ] /bin/vsh ran a script using '>' and '|'\n");
     sysc(SYS_EXIT, 960, 0, 0);
@@ -3840,7 +3867,12 @@ static void posix_selfhost_worker(void) {
      * generic "child failed" 944 even though the compile went on to succeed
      * and print "compiled OK". A wait that times out and a child that fails
      * are different events and must not share an exit code. */
-    i64 cst = owaitpid((u32)pid, 250000);
+    /* v0.76: the comment above describes this exact defect being hit once
+     * already — the parent gave up while the child was still working. The
+     * response then was a distinct exit code, which made the symptom legible
+     * but left the cause in place: the budget was still a count of the WAITER'S
+     * own iterations, which means nothing in real time. It is a deadline now. */
+    i64 cst = owaitpid_ticks((u32)pid, WAIT_T_COMPILE, 0);
     if (cst == -11)                               sysc(SYS_EXIT, 947, 0, 0);
     if (cst != 0)                                 sysc(SYS_EXIT, 944, 0, 0);
 
@@ -3853,7 +3885,7 @@ static void posix_selfhost_worker(void) {
         sysc(SYS_EXIT, 198, 0, 0);
     }
     if (pid < 0)                                  sysc(SYS_EXIT, 945, 0, 0);
-    i64 rst = owaitpid((u32)pid, 250000);
+    i64 rst = owaitpid_ticks((u32)pid, WAIT_T_RUN, 0);
     if (rst == -11)                               sysc(SYS_EXIT, 948, 0, 0);
     /* 28 + 55 + 6 + 11 + 19 + 7 (BONUS) + 3 (ADD) + 5 (PPOK) + 2 (GUARD_OK)
      * — see the SELF_SRC comment for what each proves.
@@ -3967,9 +3999,12 @@ static i64 cs_compile(const char **av) {
  * See owaitpid_ticks(). Budgets below are ceilings for a pathological host, not
  * expectations — the elapsed figure is printed so they can be tightened from
  * measurement later instead of from taste. */
-#define LANG_T_COMPILE 20000u      /* 200 s: one occ invocation                */
-#define LANG_T_OMAKE   20000u      /* 200 s: omake, which forks occ again      */
-#define LANG_T_RUN      6000u      /*  60 s: running a produced program        */
+/* v0.76: these were LANG_T_*; they are now the shared WAIT_T_* defined beside
+ * owaitpid_ticks(), because toolstrs and pipestrs need the same budgets and two
+ * copies of the same number is how they drift apart. */
+#define LANG_T_COMPILE WAIT_T_COMPILE
+#define LANG_T_OMAKE   WAIT_T_TOOL
+#define LANG_T_RUN     WAIT_T_RUN
 
 static i64 cs_compile_ticks(const char **av, u32 budget, u32 *spent) {
     i64 pid = ofork();
