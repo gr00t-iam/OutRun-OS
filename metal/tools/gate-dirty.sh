@@ -58,42 +58,68 @@ echo "=============================================================="
 
 rc=0
 
+# Drive qemu's console with a PIPE, not a FIFO. The repo is routinely checked
+# out on a filesystem that cannot create named pipes at all — under WSL a
+# /mnt/c working tree is DrvFs, and mkfifo there fails outright with
+# "Operation not supported". A pipe needs no filesystem support and behaves
+# identically for this purpose.
+#
+# The feeder subshell waits for the prompt by watching the log qemu is writing,
+# then types. Only boot 1 needs input; the rest read /dev/null.
+feed_boot1() {
+    w=0
+    while [ "$w" -lt "$CAP" ]; do
+        grep -aq "Type 'help' for commands" "$1" 2>/dev/null && break
+        sleep 5; w=$((w+5))
+    done
+    sleep 2
+    printf 'udbpersist\n'
+    sleep 25                            # one 4096-round KDF, then the save
+    printf 'vfscrashwrite\n'            # LAST: halts the machine by design
+    sleep 10
+}
+
 for i in $(seq 1 "$BOOTS"); do
     LOG=$WORK/boot$i.log
-    FIFO=$WORK/boot$i.fifo
-    rm -f "$FIFO"; mkfifo "$FIFO"
-    exec 3<>"$FIFO"                     # hold stdin open so qemu never sees EOF
     echo "# iso=$ISO md5=$MD5 boot=$i qemu='${EXTRA:-uniprocessor}'" > "$LOG"
 
     # shellcheck disable=SC2086
-    qemu-system-x86_64 $EXTRA -cdrom "$ISO" -m 512M -nographic -no-reboot \
-      -vga none -device virtio-vga \
-      -drive file=$IMG,if=none,format=raw,id=vd0 \
-      -device virtio-blk-pci,drive=vd0,disable-legacy=on,disable-modern=off \
-      -netdev user,id=n0 \
-      -device virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,mac=52:54:00:ab:cd:ef \
-      < "$FIFO" >> "$LOG" 2>&1 &
+    if [ "$i" = "1" ]; then
+        feed_boot1 "$LOG" | qemu-system-x86_64 $EXTRA -cdrom "$ISO" -m 512M -nographic -no-reboot \
+          -vga none -device virtio-vga \
+          -drive file=$IMG,if=none,format=raw,id=vd0 \
+          -device virtio-blk-pci,drive=vd0,disable-legacy=on,disable-modern=off \
+          -netdev user,id=n0 \
+          -device virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,mac=52:54:00:ab:cd:ef \
+          >> "$LOG" 2>&1 &
+    else
+        qemu-system-x86_64 $EXTRA -cdrom "$ISO" -m 512M -nographic -no-reboot \
+          -vga none -device virtio-vga \
+          -drive file=$IMG,if=none,format=raw,id=vd0 \
+          -device virtio-blk-pci,drive=vd0,disable-legacy=on,disable-modern=off \
+          -netdev user,id=n0 \
+          -device virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,mac=52:54:00:ab:cd:ef \
+          < /dev/null >> "$LOG" 2>&1 &
+    fi
     q=$!; e=0
+    # Boot 1 must outlive the prompt — it still has two commands to type — so it
+    # waits for vfscrashwrite's own confirmation instead of for the prompt.
     while [ "$e" -lt "$CAP" ]; do
         kill -0 $q 2>/dev/null || break
-        grep -aq "Type 'help' for commands" "$LOG" 2>/dev/null && { sleep 5; break; }
-        grep -aq 'system halted' "$LOG" 2>/dev/null && { sleep 3; break; }
+        if [ "$i" = "1" ]; then
+            grep -aq 'vfscrashwrite: journal-committed' "$LOG" 2>/dev/null && { sleep 5; break; }
+        else
+            grep -aq "Type 'help' for commands" "$LOG" 2>/dev/null && { sleep 5; break; }
+            grep -aq 'system halted' "$LOG" 2>/dev/null && { sleep 3; break; }
+        fi
         sleep 5; e=$((e+5))
     done
 
     reached=0
     grep -aq "Type 'help' for commands" "$LOG" && reached=1
 
-    # Boot 1 creates the durable artefacts. vfscrashwrite is LAST — it halts.
-    if [ "$i" = "1" ] && [ "$reached" = "1" ]; then
-        printf 'udbpersist\n' >&3
-        sleep 25                        # one 4096-round KDF, then the save
-        printf 'vfscrashwrite\n' >&3
-        sleep 10
-    fi
-
     kill -9 $q 2>/dev/null; wait $q 2>/dev/null
-    exec 3>&-; rm -f "$FIFO"
+    pkill -f "qemu-system-x86_64 .*$IMG" 2>/dev/null
 
     suites=$(grep -ac 'RESULT:' "$LOG")
     fails=$(grep -aoE '^\[[a-z0-9 ]+\][ ]+FAIL[ ]+.*' "$LOG" | wc -l)
@@ -138,8 +164,17 @@ for i in $(seq 1 "$BOOTS"); do
     # Only the detection line carries "CROSS-BOOT OK: account".
     udb=$(grep -ac 'CROSS-BOOT OK: account' "$WORK/boot$i.log")
     vfs=$(grep -ac 'cross-reboot journal probe: content VERIFIED' "$WORK/boot$i.log")
-    printf 'boot %-2s udbreboot=%s vfs-reboot-test=%s\n' "$i" "$udb" "$vfs"
-    if [ "$i" -gt 1 ]; then
+    if [ "$i" = "1" ]; then
+        # Check boot 1 actually CREATED them. Without this, a failure to type at
+        # the console shows up as "did not survive" on boot 2 — the wrong
+        # diagnosis for the wrong boot, and the expensive kind to chase.
+        cu=$(grep -ac "created 'udbreboot'" "$WORK/boot$i.log")
+        cv=$(grep -ac 'vfscrashwrite: journal-committed' "$WORK/boot$i.log")
+        printf 'boot %-2s created: udbreboot=%s vfs-reboot-test=%s\n' "$i" "$cu" "$cv"
+        [ "$cu" -ge 1 ] || { echo "  !! boot 1 never created 'udbreboot' — console input did not land"; rc=1; }
+        [ "$cv" -ge 1 ] || { echo "  !! boot 1 never created 'vfs-reboot-test' — console input did not land"; rc=1; }
+    else
+        printf 'boot %-2s udbreboot=%s vfs-reboot-test=%s\n' "$i" "$udb" "$vfs"
         [ "$udb" -ge 1 ] || { echo "  !! 'udbreboot' did not survive into boot $i"; rc=1; }
         [ "$vfs" -ge 1 ] || { echo "  !! 'vfs-reboot-test' did not survive into boot $i"; rc=1; }
     fi
