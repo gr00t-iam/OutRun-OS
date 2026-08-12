@@ -357,3 +357,109 @@ and 3, **before** any reset policy is written.
 - **More than three boots.** Convergence is established between boots 2 and 3;
   a longer run has not been done and is probably unnecessary given the fixed
   point, but it is not proven beyond three.
+
+---
+
+## STEP 2/3 RESULT — FIXED, AND VERIFIED AGAINST A REAL BASELINE
+
+### The durable-artefact baseline that step 1 was missing
+
+Step 1 recorded a gap: it reported both cross-boot artefacts absent in every
+boot, which is not evidence they survive — they were never created, because both
+need a manual command at the prompt and the harness typed nothing.
+
+`dirty3.sh` now types them in boot 1: `udbpersist`, then `vfscrashwrite`. Order
+matters — `vfscrashwrite` halts the machine forever (`cli; hlt`) by design,
+simulating power loss, so it must be last.
+
+**Baseline, UNFIXED kernel, three boots on one image:**
+
+```
+boot 1: 0 failures | creates both markers
+boot 2: 3 failures | udbreboot detected (gen 5), vfs-reboot-test found + VERIFIED
+boot 3: 3 failures | udbreboot detected (gen 9), vfs-reboot-test found + VERIFIED
+```
+
+Both artefacts demonstrably survive dirty boots *before* any reset policy
+exists. That is what makes "they still survive after the fix" a real comparison
+rather than a vacuous one.
+
+### The fixes
+
+**`usersstrs`** — one stale fixture was failing two assertions. Reset `m72own`
+before creating it, so "newly created" is true again.
+
+**`vfsstrs`** — fixture content is now unique per boot. The assertion proves
+deferred apply by showing the on-disk dirent does not yet match the in-memory
+one; with fixed content on a re-used volume the on-disk dirent already holds
+that exact payload, and content addressing makes an identical hash follow
+*deterministically*. Varying the payload restores the precondition **without
+touching content addressing** — a hash that differs because the content differs
+is exactly what the CAS should produce.
+
+`rdtsc`, not `g_ticks`: two boots reach that line at a similar tick count, so
+`g_ticks` would be *usually* unique, and a fixture that is usually unique
+reintroduces this failure as a **flake** — strictly worse than the deterministic
+failure it replaces.
+
+**The allow-list is enforced, not documented.** `suite_fixture_reset()` refuses
+`vfs-reboot-test`, `/etc/udb.a`, `/etc/udb.b` and `udbreboot` out loud and counts
+refusals. Mechanical because the failure mode is silent: a blanket sweep would
+delete the only cross-boot evidence in the tree, every run would still look
+green, and the evidence would be gone while we believed we had cleaned up.
+
+### Verification
+
+**Dirty volume, fixed kernel, three boots on one image:**
+
+```
+boot 1  OK  45 suites  0 failing assertions  0 resets   (fresh: nothing to reset)
+boot 2  OK  45 suites  0 failing assertions  1 reset    0 refusals  both artefacts survive
+boot 3  OK  45 suites  0 failing assertions  1 reset    0 refusals  both artefacts survive
+```
+
+Consecutive-boot diffs empty in both directions. The reset fires only when there
+is something to reset, and `vfsstrs` passes with **zero** resets — consistent
+with its fix being content variation rather than deletion. That is how we know
+the two fixes each do their own work rather than one masking the other.
+
+**Fresh-image gate (no regression to the normal path):** uniprocessor 45/0;
+`-smp 4` 10 OK / 0 HANG / 0 PANIC, twice — 20 boots total, 0 rank faults.
+
+### An anomaly, recorded rather than explained away
+
+The first fresh-image gate run had **one** failing suite inside one boot:
+
+```
+[mcpre  ] FAIL  long probe never started on cpu1
+[mcpre  ] RESULT: 0 passed, 1 failed
+```
+
+Checked rather than assumed: across **277 boot logs** on this host, `[mcpre]`
+has failed exactly once, and that once is this run. So it cannot be dismissed as
+known-flaky on history alone.
+
+It did **not** reproduce: a confirmatory 10-boot run is 0 failures, and the same
+suite passed in the other 9 boots of the run that caught it. Total on the fixed
+kernel: **1 `[mcpre]` failure in 20 `-smp 4` boots.**
+
+Constructing a mechanism from this branch's changes is hard — two suite fixtures
+and a helper called only from `usersstrs`, none of it in the scheduling or IPI
+path. But "hard to construct" is not evidence, so the finding is:
+**unreproduced, unexplained, and not claimed to be pre-existing.**
+
+It belongs to **carryover 2**: a wall-clock assertion on a TCG-only host, in a
+session where QEMU runs and kernel builds had been contending for the machine
+throughout. That is precisely the class the roadmap describes as "fails because
+the host was busy, and is indistinguishable from a real failure" — and it is a
+concrete instance to aim carryover 2's work at. Failing log preserved at
+`mcpre-evidence/smp-6.log`.
+
+### Still not done for carryover 1
+
+- **`-smp 4` on a dirty volume** remains unmeasured. This branch verified the
+  dirty-volume path uniprocessor (for determinism) and the SMP path on fresh
+  images. The combination is the one square of the matrix still empty.
+- **The `dirty-volume` gate configuration is not yet wired into the gate.** The
+  harness exists and passes; making it a standing configuration is the remaining
+  step before carryover 1 can be called closed.
