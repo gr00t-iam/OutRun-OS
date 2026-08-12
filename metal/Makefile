@@ -206,6 +206,84 @@ gate-dirty: $(ISO)
 gate-dirty-smp: $(ISO)
 	$(MAKE) gate-dirty GATE_DIRTY_QEMU="-smp 4"
 
+# ===========================================================================
+# v0.76: RELEASE PACKAGING — mandatory for every version tag
+# ===========================================================================
+# See "Release Protocol" in CLAUDE.md at the repo root. The short version: a
+# release is not a tag, it is a tag plus an ISO that was built from a clean
+# tree, checksummed, and BOOTED.
+#
+#   make iso              build the bootable image (alias for `all`)
+#   make release-iso      clean rebuild + checksums + manifest
+#   make release-verify   boot the release image and refuse it unless clean
+#   make release          both, in the order that matters
+#
+# `all` already produces $(ISO); `iso` exists because "make iso" is what people
+# type and reach for, and a release protocol that depends on remembering that
+# the target is called something else is a protocol that gets skipped.
+RELEASE_DIR := $(BUILD)/release
+
+.PHONY: iso release-iso release-verify release release-version-check
+
+iso: $(ISO)
+	@echo "  ISO: $(ISO)"
+
+# The version in this Makefile names the artefact. If it disagrees with the git
+# tag, the artefact is misnamed and a "v0.76.0" release ships an
+# outrun-os-0.75.0.iso — which has already happened here once: v0.75.0 was
+# tagged while VERSION still read 0.74.0. Warn loudly rather than fail, because
+# building between releases is normal and a hard error would train people to
+# bypass the target.
+#
+# THREE outcomes, deliberately distinguished. A check that could not RUN must
+# not print the same reassuring thing as a check that ran and passed — and the
+# first draft of this did exactly that, reporting "no git tag found" when the
+# truth was "git refused to answer". (Seen live: a git worktree created by
+# Windows git stores a Windows-style path in its .git file, which Linux git
+# cannot resolve, so every git command inside it fails. The tag was there the
+# whole time.)
+release-version-check:
+	@if ! git rev-parse --git-dir >/dev/null 2>&1; then \
+	  echo "  [release] *** CANNOT VERIFY VERSION: git did not answer here."; \
+	  echo "  [release] *** This is NOT a pass. The artefact will be named"; \
+	  echo "  [release] *** outrun-os-$(VERSION).iso with nothing cross-checking it."; \
+	else \
+	  tag=$$(git describe --tags --abbrev=0 2>/dev/null); \
+	  if [ -z "$$tag" ]; then \
+	    echo "  [release] git has no tags yet; artefact will be named v$(VERSION)"; \
+	  elif [ "$$tag" != "v$(VERSION)" ]; then \
+	    echo "  [release] *** WARNING: git tag $$tag != Makefile VERSION $(VERSION)"; \
+	    echo "  [release] *** the ISO will be named outrun-os-$(VERSION).iso"; \
+	    echo "  [release] *** bump VERSION in metal/Makefile before tagging a release"; \
+	  else \
+	    echo "  [release] version check OK: $$tag"; \
+	  fi; \
+	fi
+
+# A release image is built from a CLEAN tree. An incremental build can carry an
+# object from a source state that no longer exists anywhere, and that is not
+# something you want to discover from a published artefact.
+release-iso: release-version-check
+	$(MAKE) clean
+	$(MAKE) all
+	@mkdir -p $(RELEASE_DIR)
+	cp $(ISO) $(RELEASE_DIR)/
+	cd $(RELEASE_DIR) && md5sum outrun-os-$(VERSION).iso    > outrun-os-$(VERSION).iso.md5
+	cd $(RELEASE_DIR) && sha256sum outrun-os-$(VERSION).iso > outrun-os-$(VERSION).iso.sha256
+	@echo "-------------------------------------------------------------"
+	@echo " RELEASE ARTEFACT"
+	@echo "   $(RELEASE_DIR)/outrun-os-$(VERSION).iso"
+	@cat $(RELEASE_DIR)/outrun-os-$(VERSION).iso.md5
+	@cat $(RELEASE_DIR)/outrun-os-$(VERSION).iso.sha256
+	@echo "-------------------------------------------------------------"
+	@echo " NOT YET VERIFIED — run 'make release-verify'"
+
+release-verify:
+	tools/release-verify.sh "$(RELEASE_DIR)/outrun-os-$(VERSION).iso" "" "$(BUILD)/release-verify"
+
+release: release-iso release-verify
+	@echo "  [release] ISO built, checksummed and booted clean."
+
 clean:
 	rm -rf $(BUILD) iso/boot/outrun-kernel.elf iso/boot/user_init.elf
 
