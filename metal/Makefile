@@ -181,6 +181,31 @@ qemu-usb: $(ISO) $(VBLK_IMG)
 	  -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-mouse,bus=xhci.0 \
 	  $(QEMU_BLK) $(QEMU_NET)
 
+# v0.76: THE DIRTY-VOLUME GATE CONFIGURATION.
+#
+# Every other qemu target here builds a fresh disk image per boot. That is
+# precisely why the suite set could be non-idempotent across boots for its whole
+# history without anyone noticing — nothing ever booted twice on one volume.
+# v0.75 shipped a persistent user database, which makes "the volume already has
+# state" a supported configuration, so it needs a configuration that tests it.
+#
+# Boot 1 runs the suites and then creates the two deliberately durable
+# cross-boot artefacts; boots 2..N reuse that same image and must reach the
+# prompt with zero failing assertions AND still find both artefacts. The script
+# exits non-zero on any of those, so this target FAILS rather than printing red
+# text and succeeding.
+#
+#   make gate-dirty                       3 boots, uniprocessor
+#   make gate-dirty-smp                   3 boots, -smp 4
+#   make gate-dirty GATE_DIRTY_BOOTS=5    longer run
+GATE_DIRTY_BOOTS ?= 3
+GATE_DIRTY_QEMU  ?=
+gate-dirty: $(ISO)
+	tools/gate-dirty.sh "$(ISO)" "$(GATE_DIRTY_BOOTS)" "$(GATE_DIRTY_QEMU)" "$(BUILD)/gate-dirty"
+
+gate-dirty-smp: $(ISO)
+	$(MAKE) gate-dirty GATE_DIRTY_QEMU="-smp 4"
+
 clean:
 	rm -rf $(BUILD) iso/boot/outrun-kernel.elf iso/boot/user_init.elf
 

@@ -463,3 +463,110 @@ concrete instance to aim carryover 2's work at. Failing log preserved at
 - **The `dirty-volume` gate configuration is not yet wired into the gate.** The
   harness exists and passes; making it a standing configuration is the remaining
   step before carryover 1 can be called closed.
+
+---
+
+## THE DIRTY-VOLUME GATE — INTEGRATED, AND WHAT IT IMMEDIATELY FOUND
+
+`tools/gate-dirty.sh`, driven by two Makefile targets:
+
+```
+make gate-dirty                      3 boots, uniprocessor
+make gate-dirty-smp                  3 boots, -smp 4
+make gate-dirty GATE_DIRTY_BOOTS=5   longer run
+```
+
+Boot 1 runs the suites on a fresh image and then types `udbpersist` and
+`vfscrashwrite` at the serial console to create the durable artefacts (in that
+order — `vfscrashwrite` halts the machine by design). Boots 2..N reuse that
+image untouched and must reach the prompt with zero failing assertions **and**
+still find both artefacts. The script exits non-zero on any of those.
+
+### Results
+
+| configuration | boot 1 | boot 2 | boot 3 | verdict |
+|---|---|---|---|---|
+| `make gate-dirty` (UP) | 45 / 0 fail | 45 / 0 fail, 1 reset | 45 / 0 fail, 1 reset | **PASS** |
+| `make gate-dirty-smp` | 45 / **2 fail** | 45 / 0 fail, 1 reset | 45 / 0 fail, 1 reset | **FAIL** |
+
+Both artefacts created in boot 1 and found in boots 2 and 3 in **every** run,
+uniprocessor and SMP alike. Consecutive-boot diffs empty. Refusals zero.
+
+### The question this pass was meant to answer, answered
+
+**Does multi-core execution on dirty persistent state behave deterministically?
+Yes.** Under `-smp 4`, boots 2 and 3 were identical in outcome across two
+independent runs: 0 failing assertions, 1 fixture reset each, 0 refusals, both
+artefacts surviving, empty diffs. The dirty-volume machinery behaves the same on
+four cores as on one.
+
+### Why the SMP gate nevertheless fails — and it is NOT the dirty volume
+
+Both `-smp 4` runs failed on **boot 1, the FRESH boot**, with the same two
+assertions:
+
+```
+[langstrs] FAIL  omake drove occ and the target it was asked for actually appeared
+[langstrs] FAIL  the driver compiled, ran and validated the language program (exit 970)
+```
+
+That is **carryover 2, verbatim** — `langstrs`, `exit 970`. Reproduced 2 out of
+2 runs, same boot, same assertions: systematic, not a flake.
+
+The mechanism is coherent, which is why it repeats. Boot 1 formats the CAS and
+populates the VFS from scratch, making it much the heaviest boot, and under
+`-smp 4` it does that with four vCPUs of TCG contention on a host with no KVM.
+`langstrs` then has to compile, run and validate inside a wall-clock budget
+chosen on an idle uniprocessor machine. Boots 2 and 3 mount an existing volume,
+do far less work, and pass.
+
+**Consequence for the milestone:** `gate-dirty-smp` is blocked behind carryover
+2. It is also now the most budget-stressed configuration in the matrix, so
+carryover 2 will surface there first and most often. That is an upgrade in
+evidence — carryover 2 was previously an anecdote about loaded hosts, and is now
+a reproducible failure with a named mechanism to aim the work at.
+
+`make gate-dirty` (uniprocessor) passes today and can join the standing gate
+immediately. `make gate-dirty-smp` should not, until carryover 2 is fixed:
+adding a configuration that fails for reasons unrelated to what it tests is how
+people learn to re-run a gate until it goes green.
+
+### Two harness defects found while building this, both worth recording
+
+1. **`mkfifo` is not portable to this working tree.** The first version drove
+   the console through a named pipe under `build/`. That fails outright when the
+   repo is checked out on `/mnt/c` — DrvFs under WSL cannot create FIFOs at all
+   ("Operation not supported"). Replaced with an ordinary pipeline, which needs
+   no filesystem support. It worked from a Linux-side path, so this would have
+   been invisible to anyone not using a Windows-side tree.
+
+2. **Two concurrent runs shared one output file.** After the mkfifo failure the
+   script kept going (`set -u`, not `set -e`), so the failed run was still alive
+   and writing when its replacement started. The merged log showed six boot
+   lines for a three-boot run — including a PASS that was reported before it was
+   noticed. A log that cannot identify which run produced it is not evidence.
+   Both runs were redone to uniquely-named files.
+
+Also fixed while building it: boot 1 now waits for `vfscrashwrite`'s own
+confirmation rather than for the prompt, because it still has two commands to
+type after the prompt appears and waiting on the prompt would kill it
+mid-sequence; and the script asserts boot 1 CREATED both artefacts, because
+console input failing to land would otherwise surface as "did not survive" on
+boot 2 — the wrong diagnosis on the wrong boot.
+
+### Measurement caveat
+
+Capturing the gate's exit status through the PowerShell -> WSL -> background
+path in use here reports 0 regardless of outcome; it read 0 on a run where make
+plainly printed `Error 1` / `Error 2`. GNU make exits non-zero when a recipe
+fails and its own stderr is the authoritative record. The exit path was also
+verified directly: `gate-dirty.sh` against a missing ISO returns **2**.
+
+### Carryover 1 status
+
+- Suite idempotency: **done** (#72).
+- Dirty-volume gate configuration: **built and passing uniprocessor**, wired
+  into the Makefile.
+- **Not closed:** the SMP dirty configuration cannot be made standing until
+  carryover 2 is fixed. Carryover 1 and carryover 2 are now coupled, which was
+  not visible when they were written as independent items.
