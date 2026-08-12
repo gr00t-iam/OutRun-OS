@@ -1567,6 +1567,65 @@ static i64 owaitpid(u32 pid, int spins) {
     return -11;
 }
 
+/* v0.76 carryover 2: A SPIN COUNT IS NOT A TIMEOUT.
+ *
+ * owaitpid() above gives up after a fixed number of poll-and-yield iterations.
+ * That number means completely different amounts of REAL TIME depending on how
+ * fast the waiter gets to spin relative to the child's progress — and under TCG
+ * those two rates are unrelated. With -smp 4 the waiter sits on its own vCPU
+ * spinning quickly while the child crawls, four vCPUs multiplexed onto however
+ * many host cores QEMU actually has, so the budget burns down at a rate that
+ * has nothing to do with whether the child is nearly finished.
+ *
+ * Measured, not theorised: `make gate-dirty-smp` failed on its first boot in
+ * 2 of 2 runs with "the compiler TIMED OUT building omake" (exit 984) — while
+ * /bin/omake was 36562 bytes, well-formed, and the assertion that occ built it
+ * PASSED in the same log. The compile finished; the waiter had already given up.
+ *
+ * So wait on the CLOCK instead. SYS_SYSINFO reports g_ticks (100 Hz), which
+ * advances in real time regardless of how many vCPUs are contending, so a
+ * budget expressed in ticks means the same thing at 1 vCPU and at 4. That is
+ * the whole point — it needs no scaling factor per core count, because a
+ * deadline is already invariant to the waiter's spin rate.
+ *
+ * owaitpid() itself is left alone: every other caller's spin budget keeps its
+ * current behaviour rather than being silently reinterpreted into a new unit. */
+#define TICKS_PER_SEC 100u
+
+static u32 osysticks(void) {
+    /* 24-byte header + up to 12 x 32-byte entries. */
+    static u32 si[104 / 4 + 12 * 8];
+    if (sysc(SYS_SYSINFO, (u64)si, 0, 0) < 0) return 0;
+    return si[5];                       /* hdr: ncpu nproc used free ram TICKS */
+}
+
+static u32 osysncpu(void) {
+    static u32 si[104 / 4 + 12 * 8];
+    if (sysc(SYS_SYSINFO, (u64)si, 0, 0) < 0) return 1;
+    return si[0] ? si[0] : 1;
+}
+
+/* Wait for `pid` until it exits or `budget` ticks of REAL TIME have passed.
+ * Returns the exit code, or -11 on deadline. If `spent` is non-null it receives
+ * the ticks actually consumed — so a log can say how long a stage really took
+ * rather than only that it fitted, which is what makes the next budget an
+ * observation instead of another guess. */
+static i64 owaitpid_ticks(u32 pid, u32 budget, u32 *spent) {
+    u32 t0 = osysticks(), n = 0;
+    for (;;) {
+        i64 r = owaitpid_poll(pid);
+        if (r != -11) { if (spent) *spent = osysticks() - t0; return r; }
+        /* Sample the clock every 256 polls, not every poll: SYS_SYSINFO walks
+         * the process table, and checking it as often as we check the child
+         * would make the waiter the expensive half of the wait. */
+        if ((++n & 255u) == 0 && (osysticks() - t0) >= budget) {
+            if (spent) *spent = osysticks() - t0;
+            return -11;
+        }
+        oyield();
+    }
+}
+
 /* ---- standard file descriptors --------------------------------------------
  * A userland fd table layered over the kernel's descriptors. fds 0/1/2 are
  * reserved for stdin/stdout/stderr and bound to the console; open() hands out
@@ -1613,6 +1672,16 @@ static i64 owrite(int fd, const char *buf, u64 n) {
     return (i64)sysc(SYS_WRITE_FILE, (u64)g_ofd[fd], (u64)buf, n);
 }
 static void oputs(const char *s) { owrite(STDOUT_FILENO, s, ostrlen(s)); }
+/* v0.76: ring 3 had no way to print a number, which is why every timing figure
+ * in this file was previously reported only as an exit code. A measurement you
+ * cannot print is a measurement nobody acts on. */
+static void oputu(u64 v) {
+    char b[24]; int i = 24;
+    b[--i] = 0;
+    if (!v) b[--i] = '0';
+    while (v) { b[--i] = (char)('0' + (int)(v % 10)); v /= 10; }
+    owrite(STDOUT_FILENO, &b[i], ostrlen(&b[i]));
+}
 static i64 oread(int fd, char *buf, u64 n) {
     if (fd < 0 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;
     if (g_ofd[fd] == OFD_CONSOLE) return 0;              /* no ring-3 tty input yet */
@@ -3894,6 +3963,25 @@ static i64 cs_compile(const char **av) {
     return owaitpid((u32)pid, 250000);
 }
 
+/* v0.76: the same compile, waited on by the CLOCK rather than by a spin count.
+ * See owaitpid_ticks(). Budgets below are ceilings for a pathological host, not
+ * expectations — the elapsed figure is printed so they can be tightened from
+ * measurement later instead of from taste. */
+#define LANG_T_COMPILE 20000u      /* 200 s: one occ invocation                */
+#define LANG_T_OMAKE   20000u      /* 200 s: omake, which forks occ again      */
+#define LANG_T_RUN      6000u      /*  60 s: running a produced program        */
+
+static i64 cs_compile_ticks(const char **av, u32 budget, u32 *spent) {
+    i64 pid = ofork();
+    if (pid == 0) {
+        static const char *ev[] = { "STAGE=compilerstrs", 0 };
+        oexecve("/bin/occ", av, ev);
+        sysc(SYS_EXIT, 199, 0, 0);
+    }
+    if (pid < 0) return -1;
+    return owaitpid_ticks((u32)pid, budget, spent);
+}
+
 /* --- role 40: LANGUAGE COMPLETENESS (the ring-3 half of `langstrs`) --------
  * v0.60. compilerstrs interrogates types and linkage; this interrogates the
  * four constructs v0.60 added — sizeof, declarations in a for-initialiser,
@@ -3996,9 +4084,18 @@ static i64 cs_compile(const char **av) {
 static void lang_stress_worker(void) {
     if (selfhost_author("/src/lang.c", LANG_SRC) < 0) sysc(SYS_EXIT, 971, 0, 0);
 
+    /* v0.76: report the shape of the machine this ran on. A budget failure on
+     * 4 vCPUs and one on 1 vCPU are different findings, and the log should not
+     * make the reader guess which it is looking at. */
+    { u32 nc = osysncpu();
+      oputs("  [lang  ] toolchain round starting on ");
+      oputu(nc); oputs(" cpu(s), clock-based budgets\n"); }
+
     /* ---- the language round ---- */
     { static const char *av[] = { "/bin/occ", "/src/lang.c", "-o", "/bin/lang.elf", 0 };
-      i64 st = cs_compile(av);
+      u32 el = 0;
+      i64 st = cs_compile_ticks(av, LANG_T_COMPILE, &el);
+      oputs("  [lang  ] compiled /src/lang.c in "); oputu(el / 10); oputs(" ds\n");
       if (st == -11) sysc(SYS_EXIT, 972, 0, 0);
       if (st != 0)   sysc(SYS_EXIT, 973, 0, 0);
     }
@@ -4010,7 +4107,7 @@ static void lang_stress_worker(void) {
           sysc(SYS_EXIT, 198, 0, 0);
       }
       if (pid < 0) sysc(SYS_EXIT, 974, 0, 0);
-      i64 rst = owaitpid((u32)pid, 250000);
+      i64 rst = owaitpid_ticks((u32)pid, LANG_T_RUN, 0);
       if (rst == -11) sysc(SYS_EXIT, 975, 0, 0);
       if (rst != 0) {
           oputs("  [lang  ] the compiled program failed check ");
@@ -4027,7 +4124,7 @@ static void lang_stress_worker(void) {
       for (int i = 0; i < 2; i++) {
           ounlink("/bin/lang_n.elf");
           if (selfhost_author("/src/lang_n.c", bodies[i]) < 0) sysc(SYS_EXIT, 977, 0, 0);
-          i64 st = cs_compile(n1);
+          i64 st = cs_compile_ticks(n1, LANG_T_COMPILE, 0);
           if (st == -11) sysc(SYS_EXIT, 978 + i, 0, 0);
           if (st == 0)   sysc(SYS_EXIT, 980 + i, 0, 0);   /* WRONGLY accepted */
           { int t = oopen("/bin/lang_n.elf");
@@ -4054,7 +4151,13 @@ static void lang_stress_worker(void) {
      * test that only compiled omake would not have noticed — it has to RUN it
      * and check that the target it was asked for actually appeared. */
     { static const char *av[] = { "/bin/occ", "/src/omake.c", "-o", "/bin/omake", 0 };
-      i64 st = cs_compile(av);
+      u32 el = 0;
+      /* THE STAGE THAT FAILED. Under -smp 4 this compile finished — /bin/omake
+       * came out 36562 bytes and well-formed — but the old spin-count waiter had
+       * already given up on it. A clock-based budget waits for the work, not for
+       * a number of its own iterations. */
+      i64 st = cs_compile_ticks(av, LANG_T_OMAKE, &el);
+      oputs("  [lang  ] compiled /src/omake.c in "); oputu(el / 10); oputs(" ds\n");
       if (st == -11) sysc(SYS_EXIT, 984, 0, 0);
       if (st != 0)   sysc(SYS_EXIT, 985, 0, 0);
     }
@@ -4068,7 +4171,9 @@ static void lang_stress_worker(void) {
           sysc(SYS_EXIT, 198, 0, 0);
       }
       if (pid < 0) sysc(SYS_EXIT, 986, 0, 0);
-      i64 rst = owaitpid((u32)pid, 400000);
+      u32 el = 0;
+      i64 rst = owaitpid_ticks((u32)pid, LANG_T_OMAKE, &el);
+      oputs("  [lang  ] omake ran in "); oputu(el / 10); oputs(" ds\n");
       if (rst == -11) sysc(SYS_EXIT, 987, 0, 0);
       if (rst != 0)   sysc(SYS_EXIT, 988, 0, 0);
       { int t = oopen("/bin/hello.elf");
@@ -4086,7 +4191,7 @@ static void lang_stress_worker(void) {
           sysc(SYS_EXIT, 198, 0, 0);
       }
       if (pid < 0) sysc(SYS_EXIT, 990, 0, 0);
-      i64 rst = owaitpid((u32)pid, 250000);
+      i64 rst = owaitpid_ticks((u32)pid, LANG_T_RUN, 0);
       if (rst == -11) sysc(SYS_EXIT, 991, 0, 0);
       if (rst != 42)  sysc(SYS_EXIT, 992, 0, 0);
     }
