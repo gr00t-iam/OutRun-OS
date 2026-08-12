@@ -1,0 +1,137 @@
+# OutRun OS — working agreements
+
+Repository conventions for anyone (human or agent) working in this tree.
+
+The kernel is a single large C file, `metal/kernel/kernel64.c`; ring-3 test
+drivers live in `metal/user/init.c`. Build and test targets are in
+`metal/Makefile`. The toolchain is Linux-hosted (gcc, nasm, rustc,
+grub-mkrescue, qemu). QEMU here is **TCG-only** — there is no KVM — which is why
+timing budgets in this tree must be expressed as deadlines rather than as
+iteration counts.
+
+---
+
+## Release Protocol — MANDATORY for every version tag
+
+**A release is not a tag. It is a tag plus an ISO that was built from a clean
+tree, checksummed, and booted.** No version tag is complete until all four steps
+below have been performed and their output recorded in the release notes.
+
+This is mandatory because it has already gone wrong: `v0.75.0` was tagged while
+`VERSION` in `metal/Makefile` still read `0.74.0`, so every image produced for
+that release was named `outrun-os-0.74.0.iso`. The protocol exists to make that
+class of mistake impossible to complete silently.
+
+### 1. Bump `VERSION` before tagging
+
+`VERSION` in `metal/Makefile` names the artefact. Bump it, commit it, and only
+then create the tag. `make release-iso` compares `VERSION` against
+`git describe --tags` and warns loudly when they disagree — heed it.
+
+### 2. Build the release ISO from a clean tree
+
+```
+cd metal
+make release-iso
+```
+
+This runs `make clean` first, on purpose. An incremental build can carry an
+object file from a source state that no longer exists anywhere in the tree, and
+a published artefact is the worst place to discover that.
+
+It produces, in `metal/build/release/`:
+
+- `outrun-os-<VERSION>.iso`
+- `outrun-os-<VERSION>.iso.md5`
+- `outrun-os-<VERSION>.iso.sha256`
+
+### 3. Verify the ISO actually boots
+
+```
+make release-verify
+```
+
+"It compiled" and "it boots" are different claims, and an artefact that has only
+been built has been checked for neither. This boots the exact image that will be
+published, from a fresh volume, and **fails** unless:
+
+- it reaches the shell prompt,
+- every suite that reported did so with zero failures,
+- no lock-rank violation, underflow or mismatch appeared.
+
+`make release` does steps 2 and 3 in that order.
+
+### 4. Record the checksum in the release notes
+
+Publish the MD5 (and SHA-256) alongside the tag. An image whose checksum is not
+written down anywhere cannot later be shown to be the one that was tested.
+
+### Why the checksum requirement is not ceremony
+
+Twice in this project a test run has been discovered to have booted a **different
+image** than the one it claimed to be testing — once invalidating a 20-boot
+verification whose conclusion had to be publicly withdrawn. Every harness in
+`metal/tools/` now stamps the md5 of the image it booted into every log it
+writes, and release artefacts carry theirs beside them. A log that cannot name
+the binary it came from is not evidence.
+
+---
+
+## Gate configurations
+
+The release gate is not one command. Before tagging, all of these should be
+green, and the release notes should say which were run and which were not:
+
+| target / harness | what it covers |
+|---|---|
+| `make qemu` | uniprocessor, fresh image |
+| `-smp 4` SeaBIOS (see `metal/tools/`) | multi-core, fresh image |
+| `make qemu-iommu` | `-smp 4` + q35 + VT-d, `intremap=on` |
+| `make gate-dirty` | 3 boots on ONE reused image, uniprocessor |
+| `make gate-dirty-smp` | 3 boots on ONE reused image, `-smp 4` |
+| `make release-verify` | the published artefact itself |
+
+`gate-dirty*` exists because every other configuration builds a fresh disk per
+boot, which is why the suite set was able to be non-idempotent across boots for
+its whole history without anyone noticing. Persisted state is a supported
+configuration; it needs a configuration that tests it.
+
+---
+
+## Evidence conventions
+
+These are not style preferences. Each was adopted after a specific failure in
+this repository.
+
+- **Stamp the image.** Every harness writes the md5 of the ISO it booted into
+  every log it produces. See above for why.
+- **A counter nothing prints is not instrumentation.** A stale-handle counter
+  was once incremented but never emitted; a verification run then grepped its
+  logs for a string no code could produce and read the resulting zeroes as
+  evidence of correctness.
+- **Negative controls.** Before attributing a failure to a change, reproduce it
+  on the build *without* the change. Two "fixes" in this tree were disproven
+  this way, and one pre-existing defect was correctly cleared of blame.
+- **A timeout must be a deadline.** `SYS_WAITPID` is non-blocking, so a ring-3
+  "timeout" expressed as a spin count budgets the *waiter's* iterations, not
+  time — and means completely different durations at 1 vCPU and at 4. Use
+  `owaitpid_ticks()`; `SYS_SYSINFO` reports `g_ticks` at 100 Hz.
+- **Don't assume a search was complete.** Truncated `grep | head` output has
+  twice produced a confidently wrong conclusion here — once missing two of five
+  call sites, once reporting a Makefile variable as undefined when it was
+  defined 7 lines past the cut.
+- **Say what was not covered.** A gate whose gaps are invisible is how
+  "verified" drifts away from "measured".
+
+---
+
+## Lock ranks
+
+`klock` enforces an acquisition order. Acquiring a lower rank while holding a
+higher one is an inversion and will be reported. Current ranks: `ofile` 1,
+`vfs` 2, `cas` 3, `vblk` 4, `surf` 5, `net` 9, `udb` 13.
+
+The common trap: helpers that take `g_ofile_lock` (rank 1) look harmless but
+cannot be called while holding `g_net_lock` (rank 9). Validate against state the
+lock you already hold protects, rather than re-deriving it through a lower-ranked
+one.
