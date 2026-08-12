@@ -688,3 +688,42 @@ build                 0 errors, 35 warnings (unchanged baseline)
   idiom. That audit is the natural next step and should not be assumed done.
 - **The `[mcpre]` anomaly** recorded under the dirty-gate work (1 occurrence in
   277 boot logs, never reproduced) is untouched and remains unexplained.
+
+---
+
+## CARRYOVER 2 — toolstrs and pipestrs converted
+
+The idiom carryover 2 fixed in `langstrs` was still present everywhere else.
+All 14 `owaitpid()` sites were enumerated (no truncated search); the six
+belonging to `toolstrs` (role 38) and `pipestrs` (roles 40/41) now use
+`owaitpid_ticks()`.
+
+Beyond the unit change: both `pipe_worker` waits had collapsed a timeout into a
+wrong answer — a hung child and a broken pipe both exited 957, "the pipe did not
+survive fork inheritance", which would send a reader after a pipe bug that does
+not exist. They now report **965**, and the kernel decoders for both pipestrs
+rounds were extended to print "a child WAIT TIMED OUT (deadline, not a pipe
+defect)". `vsh_compile` returns -2 on deadline so a slow host is not reported as
+a compiler defect. Budgets consolidated into `WAIT_T_*` beside the waiter.
+
+Verified on the discriminating configuration — `-smp 4`, boot 1, the case that
+failed 2 of 2 before carryover 2:
+
+```
+boot 1  OK  suites=45  failing-assertions=0   (245s)
+[toolstrs] RESULT:  9 passed, 0 failed
+[pipestrs] RESULT: 12 passed, 0 failed
+[langstrs] RESULT: 10 passed, 0 failed
+```
+
+**Still spin-based, and next:** `compilerstrs` (`cs_compile` ~3987, plus a direct
+wait ~4256). It is compile-heavy — the same risk class as `langstrs`, which
+started all of this — and is the highest-risk remaining site. Scheduled for
+v0.77 per the release trajectory.
+
+**A harness lesson, again.** Three runs of `make gate-dirty*` were launched
+against the same `build/gate-dirty` workdir; each begins with `rm -rf` on it, so
+they deleted the directory out from under each other and killed one another's
+QEMU. Two runs were misread as "the environment is reaping jobs" before the real
+cause was found. `gate-dirty` should take a unique workdir per invocation, or
+refuse to start when another instance holds one.

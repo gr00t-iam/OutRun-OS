@@ -200,8 +200,12 @@ qemu-usb: $(ISO) $(VBLK_IMG)
 #   make gate-dirty GATE_DIRTY_BOOTS=5    longer run
 GATE_DIRTY_BOOTS ?= 3
 GATE_DIRTY_QEMU  ?=
+# The workdir carries the shell's PID so two invocations can never `rm -rf`
+# each other's logs. gate-dirty.sh also takes an flock and refuses to start
+# while another run holds it — see the comment there for what happened without
+# these. The chosen path is printed in the run's own header.
 gate-dirty: $(ISO)
-	tools/gate-dirty.sh "$(ISO)" "$(GATE_DIRTY_BOOTS)" "$(GATE_DIRTY_QEMU)" "$(BUILD)/gate-dirty"
+	tools/gate-dirty.sh "$(ISO)" "$(GATE_DIRTY_BOOTS)" "$(GATE_DIRTY_QEMU)" "$(BUILD)/gate-dirty-$$$$"
 
 gate-dirty-smp: $(ISO)
 	$(MAKE) gate-dirty GATE_DIRTY_QEMU="-smp 4"

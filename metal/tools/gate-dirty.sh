@@ -40,6 +40,34 @@ CAP=${GATE_DIRTY_CAP:-480}
 [ -r "$ISO" ] || { echo "gate-dirty: cannot read ISO '$ISO'"; exit 2; }
 command -v qemu-system-x86_64 >/dev/null || { echo "gate-dirty: qemu-system-x86_64 not found"; exit 2; }
 
+# v0.76: REFUSE TO RUN CONCURRENTLY.
+#
+# This script begins by `rm -rf`-ing its workdir. Three of these were once
+# launched against the same default workdir at the same time; each wiped the
+# directory out from under the others and killed their QEMU processes, and the
+# resulting truncated logs were misread as an environment problem before the
+# real cause was found.
+#
+# Two guards, because either alone is thin. The lock stops two runs existing at
+# once — which is what actually corrupts state, and which would invalidate the
+# timing anyway, since two -smp 4 boots on one host contend for the same cores.
+# The PID-unique workdir the Makefile passes means that even if the lock is
+# somehow bypassed (a stale filesystem without flock, say), no run can delete
+# another's logs.
+LOCK=${GATE_DIRTY_LOCK:-$(dirname "$WORK")/.gate-dirty.lock}
+mkdir -p "$(dirname "$LOCK")"
+exec 9>"$LOCK" || { echo "gate-dirty: cannot create lock $LOCK"; exit 2; }
+if command -v flock >/dev/null 2>&1; then
+    if ! flock -n 9; then
+        echo "gate-dirty: REFUSING TO START — another gate run holds $LOCK."
+        echo "  Concurrent runs wipe each other's workdir and contend for the"
+        echo "  cores whose timing this gate measures. Wait for the other run."
+        exit 3
+    fi
+else
+    echo "gate-dirty: WARNING: flock unavailable; concurrency is NOT guarded."
+fi
+
 rm -rf "$WORK"; mkdir -p "$WORK"
 IMG=$WORK/disk.img
 MD5=$(md5sum "$ISO" | cut -d' ' -f1)
@@ -54,6 +82,7 @@ echo "   iso     : $ISO"
 echo "   md5     : $MD5"
 echo "   boots   : $BOOTS   (one image, reused — never recreated)"
 echo "   qemu    : ${EXTRA:-<uniprocessor>}"
+echo "   workdir : $WORK"
 echo "=============================================================="
 
 rc=0
