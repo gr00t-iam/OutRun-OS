@@ -570,3 +570,121 @@ verified directly: `gate-dirty.sh` against a missing ISO returns **2**.
 - **Not closed:** the SMP dirty configuration cannot be made standing until
   carryover 2 is fixed. Carryover 1 and carryover 2 are now coupled, which was
   not visible when they were written as independent items.
+
+---
+
+## CARRYOVER 2 — RESOLVED, AND IT WAS NOT A TIMEOUT VALUE
+
+### What the failure actually was
+
+Two premises this milestone inherited were wrong, and both had to go before the
+fix could be right.
+
+**"exit 970" is the SUCCESS code, not the failure.** The assertion reads
+"...validated the language program (exit 970)" because 970 is what it *expects*.
+Carrying "exit 970" forward as though it named the error — which
+`ROADMAP-0.75.0.md` did, and which was repeated here — pointed at the wrong
+thing entirely. The real failure codes are 971..992, and the kernel prints which
+one with a plain-English reason.
+
+Reproduced in isolation, the log said:
+
+```
+[langstrs] driver exit 984 — the compiler TIMED OUT building omake
+...
+[langstrs] /bin/omake: 36562 bytes, 72 chunk(s), compiled by occ on this system
+[langstrs]  PASS  occ compiled /src/omake.c — the shipped build tool, unmodified
+```
+
+**The compile SUCCEEDED.** `/bin/omake` came out 36562 bytes and well-formed,
+and the assertion that occ built it passed in the same boot that exited 984.
+The work finished; the waiter had already given up. And `/bin/hello.elf` was
+missing not because of the argv defect (989) but because the driver exited
+before ever reaching the stage that builds it.
+
+### The actual defect: a spin count is not a timeout
+
+`SYS_WAITPID` is **non-blocking** in this kernel and takes no timeout at all —
+it returns `-11` while the child runs. So ring 3's
+
+```c
+static i64 owaitpid(u32 pid, int spins) {
+    for (int i = 0; i < spins; i++) { ... oyield(); }
+    return -11;
+}
+```
+
+budgets a number of **the waiter's own iterations**, not a duration. Under TCG
+the waiter's spin rate and the child's progress rate are unrelated: with
+`-smp 4` the waiter sits on its own vCPU spinning quickly while the compiler
+crawls across four vCPUs multiplexed onto however many host cores QEMU has.
+
+How wrong that is, now measured:
+
+```
+[lang  ] toolchain round starting on 4 cpu(s), clock-based budgets
+[lang  ] compiled /src/lang.c in 12 ds     (1.2 s)
+[lang  ] compiled /src/omake.c in 28 ds    (2.8 s)   <- the stage that failed
+[lang  ] omake ran in 13 ds                (1.3 s)
+```
+
+The omake compile takes **2.8 seconds**. A quarter of a million poll-and-yield
+iterations were exhausted inside that window — each is a cheap syscall plus a
+yield — so under four vCPUs the old budget amounted to roughly a second or two
+of real time. That is why it failed **2 of 2** reproducibly rather than
+flakily.
+
+It also rules out the obvious fix. Scaling the spin count by `ncpu` would have
+been arithmetic on a quantity with no time meaning.
+
+### The fix: wait on the clock
+
+`SYS_SYSINFO` already reports `g_ticks` (100 Hz) and `ncpu`, so no new syscall
+was needed. `owaitpid_ticks(pid, budget, spent)` polls the child but checks a
+**real-time deadline**, sampling the clock every 256 polls — `SYS_SYSINFO` walks
+the process table, and checking it as often as the child would make the waiter
+the expensive half of the wait.
+
+A tick budget means the same thing at 1 vCPU and at 4, so it needs **no
+per-core scaling factor**: a deadline is already invariant to the waiter's spin
+rate. That is the property the old design lacked.
+
+`owaitpid()` itself is deliberately unchanged. Every other caller keeps its
+current spin budget rather than having it silently reinterpreted into a new
+unit — a change that would have quietly altered a dozen unrelated tests.
+
+Budgets are ceilings for a pathological host, not expectations: 200 s per
+compile, 200 s for omake, 60 s per program run. Worst case 112000 ticks against
+the outer `posix_drain` watchdog's 140000, checked so the inner deadline still
+fires first. Against the measured 2.8 s they are ~70x margin — deliberate for a
+ceiling, and now an *informed* margin, because the driver prints the real figure
+for every stage on every boot.
+
+### `oputu()`
+
+Ring 3 had **no way to print a number**. That is why every timing figure in
+`init.c` was previously reported only as an exit code, and why this defect
+survived: the data needed to see it could not be emitted. Added alongside the
+fix.
+
+### Verification
+
+```
+make gate-dirty-smp   boot1 45/0   boot2 45/0   boot3 45/0    PASS
+                      diffs empty, both durable artefacts survive
+[langstrs]            8 passed / 2 failed  ->  10 passed / 0 failed
+fresh-image gate      UP 45/0 ; -smp 4  10 OK / 0 HANG / 0 PANIC
+                      0 suite failures, 0 rank faults
+build                 0 errors, 35 warnings (unchanged baseline)
+```
+
+### What this does NOT close
+
+- **The other toolchain suites.** `toolstrs` and `pipestrs` were named alongside
+  `langstrs` in the original carryover with "TIMED OUT waiting for the
+  compiler". They were not observed failing here, and they have **not** been
+  audited for the same spin-count-as-timeout pattern. `owaitpid(pid, spins)` is
+  still used throughout the tree; this change converted one driver, not the
+  idiom. That audit is the natural next step and should not be assumed done.
+- **The `[mcpre]` anomaly** recorded under the dirty-gate work (1 occurrence in
+  277 boot logs, never reproduced) is untouched and remains unexplained.
