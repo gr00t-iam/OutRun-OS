@@ -2359,6 +2359,23 @@ static void panic_dump(struct isr_frame *f) {
  * That audit is a snapshot; this line is the invariant.                    */
 static void cmemset(void *d, int v, uint64_t n);   /* fwd: defined with the string helpers */
 static void kproc_reset(struct kproc *p) {
+    /* v0.77 carryover 3: `gen` is the ONE field that must SURVIVE this function,
+     * so it is saved across the backstop below and restored, incremented, at the
+     * end. Everything else here describes a slot's next occupant; `gen` counts
+     * how many occupants the slot has had, and a counter zeroed on every reset
+     * counts nothing.
+     *
+     * This is not hypothetical. The v0.72 cmemset backstop below zeroed `gen`
+     * before the `p->gen++` at the bottom ran, so EVERY slot read gen == 1 on
+     * EVERY recycle, for every release from v0.72 onward. ppid_live()'s
+     * generation compare therefore always found 1 == 1 and degenerated to the
+     * `used`-only test it was written in v0.75 to replace — v0.75 defect B was
+     * live in the shipped kernel the whole time. The comment on the increment
+     * already warned that "a memset here would silently reinstate the bug"; the
+     * memset that did it was thirty lines above the warning, added earlier, and
+     * no test could see the difference because no test outlived a parent. See
+     * role 53 in init.c, which is what finally measured it. */
+    uint32_t gen_keep = p->gen;
     cmemset(p, 0, sizeof *p);
     p->pid = 0;
     p->name[0] = 0;
@@ -2391,8 +2408,12 @@ static void kproc_reset(struct kproc *p) {
      * still pointing at it as a parent must stop resolving. Incremented, never
      * blanked — the counter's value is the whole point, and a memset here would
      * silently reinstate the bug. Wraps at 2^32 recycles of one slot, which at
-     * this kernel's spawn rate is not reachable in a boot. */
-    p->gen++;
+     * this kernel's spawn rate is not reachable in a boot.
+     *
+     * v0.77 carryover 3: carried across the backstop rather than read out of the
+     * struct, because the struct's copy was zeroed at the top of this function.
+     * See the note there. */
+    p->gen = gen_keep + 1;
     p->nthreads = 1; p->ustack_next = 0; p->argc = 0; p->exit_authoritative = 0;
     /* v0.61: a fresh slot is its OWN thread-group leader. kproc_spawn fixes up
      * tg_leader to the real index right after this returns (kproc_reset takes a
@@ -22116,6 +22137,66 @@ static int posix_drain(int *procs, int nproc, struct px_round *R, uint64_t watch
     }
 }
 
+/* ===========================================================================
+ * v0.77 carryover 3: THE CROSS-GENERATION ORPHAN PHASE
+ * ===========================================================================
+ * Runs once, after the rounds, as its own phase rather than as an eighth
+ * worker. Two reasons, both structural rather than stylistic:
+ *
+ *  - The thing under test is a SLOT RECYCLE, and role 53 arranges one by
+ *    relying on kproc_spawn's first-fit ordering (see the role's comment in
+ *    init.c). Six other workers forking concurrently would leave that ordering
+ *    to chance, and an experiment whose premise holds only sometimes reports
+ *    "inconclusive" as if it were "pass".
+ *
+ *  - The process whose answer matters — C — is a GRANDCHILD of the worker, so
+ *    px_sample() does not discover it (it matches direct children of the seven
+ *    workers only) and posix_drain() would therefore not wait for it. Rather
+ *    than widen that discovery and change what every other round counts, this
+ *    phase drains on its own predicate: role 53 is inherited across fork and
+ *    cleared by kproc_reset, so "no live slot carries role 53" is an exact
+ *    statement that the whole tree is terminal.
+ *
+ * The verdict travels outward by pid: W's exit code is 1000000 + C's pid, and
+ * C's own exit code is read from the reap log — which is keyed on pid precisely
+ * because the kproc table is not a reliable place to look once a slot has been
+ * recycled, and this phase recycles one on purpose. */
+/* Rebase note: written as 52 against v0.77; v0.81 gave 52 to
+ * mcq_resident_probe (see cmd_mcq), so this is 53. */
+#define PX_ORPH_ROLE  53
+#define PX_ORPH_BASE  1000000ull
+
+static int px_orphan_live(void) {
+    int n = 0;
+    for (int i = 0; i < n_kproc; i++)
+        if (kprocs[i].used && !kprocs[i].exited && kprocs[i].role == PX_ORPH_ROLE) n++;
+    return n;
+}
+
+/* Drain until W's status is latched AND nothing in its tree is still running.
+ * Returns 0 on the watchdog, which the caller must report as a failure and not
+ * as an absent result. */
+static int px_orphan_drain(uint32_t wpid, uint64_t *wcode, uint64_t watchdog) {
+    uint64_t t0 = g_ticks, lastlog = g_ticks, spins = 0;
+    int got = 0;
+    for (;;) {
+        if (!got && posix_reap_lookup(wpid, wcode, 0)) got = 1;
+        if (got && px_orphan_live() == 0) return 1;
+        if (g_ticks - t0 >= watchdog) return 0;
+        int q = rq_pop(0);
+        if (q >= 0) { cpu_exec_proc(0, q); sched_yield(); continue; }
+        futex_timeout_scan();
+        if (++spins & 1) sched_yield();
+        if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);
+        if (g_ticks - lastlog >= 200) {
+            lastlog = g_ticks;
+            kprintf("[posixstrs] .. orphan phase waiting ticks=%u latched=%d live=%d\n",
+                    g_ticks - t0, (uint64_t)got, (uint64_t)(int64_t)px_orphan_live());
+        }
+        __asm__ volatile("pause");
+    }
+}
+
 static void cmd_posix_stress(void) {
     kputs("-- POSIX STRESS: fork/exec chains, signal frames, pthread mutexes --\n");
     g_pxpass = g_pxfail = 0;
@@ -22266,8 +22347,67 @@ static void cmd_posix_stress(void) {
         }
     }
 
+    /* v0.77 carryover 3: the cross-generation orphan. See px_orphan_drain(). */
+    int orph_ran = 0, orph_recycled = 0, orph_nostranger = 0;
+    {
+        uint64_t wcode = 0, ccode = 0;
+        int w = kproc_spawn("posix-orph", PCAP_FILESYSTEM);
+        if (w < 0) kputs("[posixstrs] orphan phase: kproc_spawn failed\n");
+        else {
+            kprocs[w].role = PX_ORPH_ROLE;
+            uint64_t e = elf_load(w, g_user_elf, g_user_elf_end - g_user_elf);
+            current_proc_idx = save;
+            if (!e) kputs("[posixstrs] orphan phase: the worker's ELF did not load\n");
+            else {
+                kprocs[w].entry = e;
+                uint32_t wpid = kprocs[w].pid;
+                rq_push(0, w);
+                __sync_synchronize();
+                if (n > 1) lapic_ipi(0, IPI_PING, 1);
+                int drained = px_orphan_drain(wpid, &wcode, 3000);
+                current_proc_idx = save;
+                if (!drained)
+                    kprintf("[posixstrs] orphan phase WATCHDOG: worker pid %u, %d task(s) still live\n",
+                            wpid, (uint64_t)(int64_t)px_orphan_live());
+                else if (wcode < PX_ORPH_BASE)
+                    kprintf("[posixstrs] orphan phase: worker pid %u FAILED its own assertions: exit %u\n",
+                            wpid, wcode);
+                else {
+                    uint32_t cpid = (uint32_t)(wcode - PX_ORPH_BASE);
+                    if (!posix_reap_lookup(cpid, &ccode, 0))
+                        kprintf("[posixstrs] orphan phase: the orphan (pid %u) left no reap-log entry\n", cpid);
+                    else {
+                        orph_ran = 1;
+                        kprintf("[posixstrs] orphan phase: orphan pid %u exited %u\n", cpid, ccode);
+                        /* 42 is the ONLY code that also proves the premise: C
+                         * exits 42 exactly when it observed getppid() go to 0,
+                         * which cannot happen until the generation moved. */
+                        if (ccode == 42) orph_recycled = 1;
+                        if (ccode >= 2000000)
+                            kprintf("[posixstrs] orphan phase: orphan pid %u got STRANGER pid %u from getppid()\n",
+                                    cpid, ccode - 2000000);
+                        else orph_nostranger = 1;
+                        if (ccode == 47)
+                            kputs("[posixstrs] orphan phase: the parent's slot was never recycled — result is INCONCLUSIVE, not a pass\n");
+                    }
+                }
+            }
+        }
+    }
+
     pxcheck("every round ran all 7 POSIX workers to a terminal state (no watchdog timeout)",
             rnd == POSIXSTRESS_ROUNDS && rounds_ok);
+    /* Three separate assertions on purpose. The middle one is the positive
+     * control: without it, a build in which the recycle never happened would
+     * report the same clean pass as one in which it happened and was handled
+     * correctly — which is exactly how the -DFORK_RACE_REPRO baseline managed
+     * to read 12/12 while testing nothing. */
+    pxcheck("the cross-generation orphan experiment ran end to end (worker, doomed parent and orphan all terminal)",
+            orph_ran);
+    pxcheck("the doomed parent's slot really was recycled while the orphan still pointed at it (positive control)",
+            orph_recycled);
+    pxcheck("getppid() across that recycle answered orphan (0), never a stranger's pid",
+            orph_ran && orph_nostranger);
     pxcheck("every worker's ring-3 assertions passed (exit code == its success sentinel)", codes_ok);
     pxcheck("fork() produced real children: distinct pid AND distinct cr3 from the parent", ppid_ok);
     pxcheck("every forked child ran its own image and exited 42", child_ok && nchild_total > 0);
