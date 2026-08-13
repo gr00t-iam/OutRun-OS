@@ -2120,6 +2120,10 @@ static volatile uint64_t g_next_pid = 1;
  * a stranger. Zero in a normal build, because the generation compare rejects
  * those before they get here. */
 static volatile uint64_t g_reproc_stale_ppid = 0;
+/* v0.77 carryover 3 follow-up: how often ppid_live() found a parent link whose
+ * slot had been recycled. Counted in EVERY build — see ppid_live(). This is the
+ * number that says whether the guard was exercised at all. */
+static volatile uint64_t g_ppid_gen_mismatch = 0;
 
 /* The only way to obtain a pid. A single atomic RMW — no lock needed, and none
  * of the callers hold one.
@@ -2165,15 +2169,34 @@ static int ppid_live(int c) {
     int par = kprocs[c].ppid_slot;
     if (par < 0 || par >= n_kproc) return -1;
     if (!kprocs[par].used) return -1;
+    if (kprocs[par].gen != kprocs[c].ppid_gen) {
+        /* v0.77 carryover 3 follow-up: DETECTION is counted in every build,
+         * including the shipping one. Previously the only counter here lived
+         * inside the #ifdef, so a released kernel incremented nothing and its
+         * zero meant "no code can make this non-zero" rather than "no stale
+         * link was resolved" — the same shape as the counter this project
+         * already burned itself on by grepping logs for a string no code could
+         * emit. A non-zero value here is positive evidence that the guard is
+         * live and doing work on this boot.
+         *
+         * Read the two numbers as a pair:
+         *   detected  > 0 and resolved == 0   the guard fired and held (fixed)
+         *   detected  > 0 and resolved  > 0   stale links resolved anyway (bug)
+         *   detected == 0                     INCONCLUSIVE — the workload never
+         *                                     produced a recycled parent, so
+         *                                     this boot tested nothing here. */
+        __sync_fetch_and_add(&g_ppid_gen_mismatch, 1);
 #ifndef FORK_RACE_REPRO
-    if (kprocs[par].gen != kprocs[c].ppid_gen) return -1;   /* slot recycled */
+        return -1;                                          /* slot recycled */
 #else
-    /* The pre-v0.75 test: `used` alone. True for a recycled slot holding a
-     * different process entirely, which is exactly the bug. Counted so the log
-     * says how often the reverted path returned a stranger. */
-    if (kprocs[par].gen != kprocs[c].ppid_gen)
+        /* The pre-v0.75 test: `used` alone. True for a recycled slot holding a
+         * different process entirely, which is exactly the bug. Counted so the
+         * log says how often the reverted path returned a stranger. Note this
+         * increment is still build-gated, so `resolved == 0` is TRIVIALLY true
+         * in a normal build — it is not the evidence. `detected` is. */
         __sync_fetch_and_add(&g_reproc_stale_ppid, 1);
 #endif
+    }
     return par;
 }
 
@@ -22408,6 +22431,15 @@ static void cmd_posix_stress(void) {
             orph_recycled);
     pxcheck("getppid() across that recycle answered orphan (0), never a stranger's pid",
             orph_ran && orph_nostranger);
+    /* The kernel-side counterpart, and the reason it is two checks rather than
+     * one: `detected > 0` is the load-bearing claim (the guard ran and found
+     * something this boot), while `resolved == 0` is trivially true in a build
+     * whose only increment site is compiled out. Asserting the trivial one
+     * alone is how a suite reports "verified" about code it never reached. */
+    pxcheck("ppid_live()'s generation guard was actually exercised this boot (stale links detected > 0)",
+            g_ppid_gen_mismatch > 0);
+    pxcheck("no stale parent link was ever resolved to a live slot",
+            g_reproc_stale_ppid == 0);
     pxcheck("every worker's ring-3 assertions passed (exit code == its success sentinel)", codes_ok);
     pxcheck("fork() produced real children: distinct pid AND distinct cr3 from the parent", ppid_ok);
     pxcheck("every forked child ran its own image and exited 42", child_ok && nchild_total > 0);
@@ -22492,7 +22524,9 @@ static void cmd_posix_stress(void) {
               if (kprocs[j].used && kprocs[j].pid == kprocs[i].pid) dup++;
       }
       kprintf("[posixstrs] CONTROL duplicate-pid pairs now live = %d\n", (uint64_t)(int64_t)dup);
-      kprintf("[posixstrs] stale ppid resolutions (reverted build only) = %u\n",
+      kprintf("[posixstrs] stale parent links DETECTED (all builds) = %u\n",
+              g_ppid_gen_mismatch);
+      kprintf("[posixstrs] stale parent links RESOLVED ANYWAY (the bug) = %u\n",
               g_reproc_stale_ppid);
 #ifdef FORK_RACE_REPRO
       kputs("[posixstrs] *** BUILT WITH FORK_RACE_REPRO — defect B's generation "

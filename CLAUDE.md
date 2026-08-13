@@ -135,6 +135,21 @@ this repository.
   was once incremented but never emitted; a verification run then grepped its
   logs for a string no code could produce and read the resulting zeroes as
   evidence of correctness.
+- **A counter nothing *increments* is not evidence either.** The same mistake
+  one step earlier. `g_reproc_stale_ppid` was printed on every boot and read
+  zero on every boot — because its only increment site was inside
+  `#ifdef FORK_RACE_REPRO`, so in a shipping build no code could raise it. Zero
+  meant "unreachable", not "did not happen". Any counter that gates a claim must
+  be live in the build the claim is about. Where a guard is being verified,
+  count the DETECTIONS (the guard fired) separately from the FAILURES (it fired
+  and did the wrong thing anyway): detections > 0 is what proves the boot
+  exercised the path at all, and a suite that asserts only the failure count is
+  green on a workload that never reached the code. See `ppid_live()`.
+- **A test that cannot fail has not passed.** Before believing a new assertion,
+  build the tree with the fix reverted and watch it fail. Carryover 3's harness
+  reported 12/12 against a deliberately broken kernel for a whole session
+  because the workload could not reach the defect; the reverted build is what
+  exposed that, and it is now the standing check for any guard-verifying test.
 - **Negative controls.** Before attributing a failure to a change, reproduce it
   on the build *without* the change. Two "fixes" in this tree were disproven
   this way, and one pre-existing defect was correctly cleared of blame.
