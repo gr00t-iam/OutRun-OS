@@ -2115,6 +2115,11 @@ static int n_kproc = 0;
  * counter handing out identities without atomicity is a bug on its own terms,
  * not because it was the one being hunted. See ROADMAP-0.75.0.md. */
 static volatile uint64_t g_next_pid = 1;
+/* v0.77 carryover 3: how often the FORK_RACE_REPRO build's reverted ppid_live()
+ * resolved a parent link whose slot had been recycled — i.e. handed the caller
+ * a stranger. Zero in a normal build, because the generation compare rejects
+ * those before they get here. */
+static volatile uint64_t g_reproc_stale_ppid = 0;
 
 /* The only way to obtain a pid. A single atomic RMW — no lock needed, and none
  * of the callers hold one.
@@ -2144,12 +2149,31 @@ static uint64_t pid_alloc(void) {
  * Returning -1 collapses three cases readers already had to handle the same way
  * — never had a parent, parent's slot out of range, parent died and its slot
  * was reused — into one answer: this process is an orphan. */
+/* v0.77 carryover 3: FORK_RACE_REPRO reverts the generation compare — and ONLY
+ * the generation compare — to the pre-v0.75 shape, so the defect can be shown to
+ * produce the v0.74 symptom rather than argued to.
+ *
+ * Opt-in at build time (`make EXTRA=-DFORK_RACE_REPRO`), never in a release
+ * build, following the EXTRA=-DPOSIX_ITER precedent. Defect A's fix stays in
+ * place in BOTH builds on purpose: the duplicate-pid detector is the control,
+ * and it must read zero in the reproducing build. A run that produces exit 44
+ * with zero duplicate pids separates B's contribution from A's, which is the
+ * whole point — v0.75 already measured A out ("zero collisions across a full
+ * failing boot") and this must not quietly reintroduce it as a confounder. */
 static int ppid_live(int c) {
     if (c < 0 || c >= n_kproc) return -1;
     int par = kprocs[c].ppid_slot;
     if (par < 0 || par >= n_kproc) return -1;
     if (!kprocs[par].used) return -1;
+#ifndef FORK_RACE_REPRO
     if (kprocs[par].gen != kprocs[c].ppid_gen) return -1;   /* slot recycled */
+#else
+    /* The pre-v0.75 test: `used` alone. True for a recycled slot holding a
+     * different process entirely, which is exactly the bug. Counted so the log
+     * says how often the reverted path returned a stranger. */
+    if (kprocs[par].gen != kprocs[c].ppid_gen)
+        __sync_fetch_and_add(&g_reproc_stale_ppid, 1);
+#endif
     return par;
 }
 
@@ -22310,6 +22334,31 @@ static void cmd_posix_stress(void) {
     pxcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
             g_frame_free_depth == g_frames_freed - g_frames_reused);
     pxcheck("no lock-rank violation anywhere in the POSIX paths", g_rank_violations == viol0);
+    /* v0.77 carryover 3. The duplicate-pid detector v0.75 used to clear defect A
+     * was removed once it had done its job, so it is re-created here as the
+     * CONTROL for the defect-B experiment: if exit 44 appears while this reads
+     * zero, the symptom cannot be blamed on duplicate pids.
+     *
+     * Honest about its strength: this is a point-in-time scan of the live table,
+     * not the per-spawn check v0.75 ran, so it can miss a duplicate that existed
+     * and was reaped earlier in the boot. It is adequate here only because
+     * pid_alloc() is a single atomic RMW in BOTH builds, which makes duplicates
+     * structurally impossible rather than merely unobserved — the scan confirms
+     * that reasoning rather than carrying the argument alone. */
+    { int dup = 0;
+      for (int i = 0; i < n_kproc; i++) {
+          if (!kprocs[i].used || !kprocs[i].pid) continue;
+          for (int j = i + 1; j < n_kproc; j++)
+              if (kprocs[j].used && kprocs[j].pid == kprocs[i].pid) dup++;
+      }
+      kprintf("[posixstrs] CONTROL duplicate-pid pairs now live = %d\n", (uint64_t)(int64_t)dup);
+      kprintf("[posixstrs] stale ppid resolutions (reverted build only) = %u\n",
+              g_reproc_stale_ppid);
+#ifdef FORK_RACE_REPRO
+      kputs("[posixstrs] *** BUILT WITH FORK_RACE_REPRO — defect B's generation "
+            "compare is REVERTED. This build is a reproducer, not a kernel.\n");
+#endif
+    }
     kprintf("[posixstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_pxpass, (uint64_t)g_pxfail);
     if (!g_pxfail)
         kputs("[posixstrs] POSIX STRESS VERIFIED — fork/exec/waitpid, signal frames and pthread mutexes leak-free\n");
