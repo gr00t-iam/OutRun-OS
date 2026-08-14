@@ -865,6 +865,8 @@ static void occ_pop_rax(void)       { occ_emit(0x58); }
 static void occ_pop_rdi(void)       { occ_emit(0x5F); }
 static void occ_mov_rdi_rax(void)   { occ_emit(0x48); occ_emit(0x89); occ_emit(0xC7); }
 static void occ_load_rax_ind(void)  { occ_emit(0x48); occ_emit(0x8B); occ_emit(0x00); }  /* rax=[rax] */
+/* v0.77: one of the emitter primitives; unused by the current codegen paths. */
+__attribute__((unused))
 static void occ_store_rdi_rax(void) { occ_emit(0x48); occ_emit(0x89); occ_emit(0x07); }  /* [rdi]=rax */
 static void occ_test_rax(void)      { occ_emit(0x48); occ_emit(0x85); occ_emit(0xC0); }
 static void occ_lea_local(int off)  { /* lea rax,[rbp+off] */

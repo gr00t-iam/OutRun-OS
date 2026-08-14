@@ -173,3 +173,6 @@ gdt64:
 .pointer:
     dw $ - gdt64 - 1
     dq gdt64
+
+; v0.77: non-executable stack marker (see boot/switch.asm).
+section .note.GNU-stack noalloc noexec nowrite progbits

@@ -294,3 +294,6 @@ user_blob_start:
 .msg2: db "  [ring3 ] SYSCALL sys_hardware_passthrough returned ", 0
 .nl:   db 10, 0
 user_blob_end:
+
+; v0.77: non-executable stack marker (see boot/switch.asm).
+section .note.GNU-stack noalloc noexec nowrite progbits

@@ -125,3 +125,6 @@ isr_common:
 idt_load:
     lidt [rdi]
     ret
+
+; v0.77: non-executable stack marker (see boot/switch.asm).
+section .note.GNU-stack noalloc noexec nowrite progbits
