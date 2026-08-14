@@ -12381,6 +12381,27 @@ static void prcheck(const char *n, int c) {
     else   { g_prfail++; kprintf("[mcpre  ]  FAIL  %s\n", n); }
 }
 
+/* v0.77: this suite's three waits were bare 500/500/3000-tick constants, and the
+ * first of them FAILED the v0.77.0 release gate on boot 3 of a dirty -smp 4 run
+ * with "long probe never started on cpu1" — the anomaly v0.76 recorded once and
+ * could not explain. See CHANGELOG-0.77.0.md and the committed log
+ * OUTRUN-0.77-gate-dirty-smp-boot3-mcpre.log.
+ *
+ * 500 ticks is 5 seconds of WALL CLOCK for another vCPU to pick up queued work.
+ * That is a budget chosen on an idle machine, and this host is TCG-only with no
+ * KVM: the guest's four vCPUs are multiplexed onto host threads the guest does
+ * not schedule, so how long cpu1 takes to reach ring 3 has no fixed relationship
+ * to anything the guest controls. It is carryover 2's defect — a constant that
+ * describes the observer rather than the thing observed — in KERNEL code.
+ *
+ * These are ceilings for a pathological host, not expectations. The normal case
+ * is well under one tick, which is why the elapsed figure is now PRINTED on the
+ * success path too: the next person to touch these numbers should be able to
+ * read the real distribution instead of guessing again. */
+#define MCPRE_T_START    6000u    /*  60 s: cpu1 picks the queued probe up      */
+#define MCPRE_T_PREEMPT  6000u    /*  60 s: the preempt IPI lands at CPL3       */
+#define MCPRE_T_JOIN    12000u    /* 120 s: both threads run to completion      */
+
 static void cmd_mcpre(void) {
     kputs("-- IPI PREEMPTION: force a ring-3 thread off its core mid-loop, resume it on ANOTHER --\n");
     g_prpass = g_prfail = 0;
@@ -12416,9 +12437,21 @@ static void cmd_mcpre(void) {
     rq_push(1, pl);
     lapic_ipi(g_cpu[1].apic_id, IPI_PING, 0);
     uint64_t t0 = g_ticks;                              /* wait until it's IN ring 3 */
-    while (!(kprocs[pl].ran_on & 2u) && g_ticks - t0 < 500) __asm__ volatile("pause");
+    while (!(kprocs[pl].ran_on & 2u) && g_ticks - t0 < MCPRE_T_START) __asm__ volatile("pause");
+    uint64_t t_start = g_ticks - t0;
     { uint64_t tw = g_ticks; while (g_ticks - tw < 3) __asm__ volatile("pause"); }
-    if (!(kprocs[pl].ran_on & 2u)) { kputs("[mcpre  ] FAIL  long probe never started on cpu1\n"); g_prfail++; goto done; }
+    if (!(kprocs[pl].ran_on & 2u)) {
+        /* Say WHY it gave up and what the machine looked like when it did. The
+         * v0.76 occurrence of this line carried none of that, which is most of
+         * why it stayed unexplained for two milestones. */
+        kprintf("[mcpre  ] FAIL  long probe never started on cpu1 — DEADLINE after %u tick(s); "
+                "cpu1 rq depth %d, %u cpu(s) online\n",
+                t_start, (uint64_t)(int64_t)(g_cpu[1].rq_t - g_cpu[1].rq_h),
+                (uint64_t)g_ncpu_online);
+        g_prfail++; goto done;
+    }
+    kprintf("[mcpre  ] long probe reached ring 3 on cpu1 in %u tick(s) (ceiling %u)\n",
+            t_start, (uint64_t)MCPRE_T_START);
 
     int mig = (g_ncpu_online >= 3) ? 2 : 1;             /* resume target          */
     kprocs[pl].migrate_to = mig;
@@ -12427,13 +12460,13 @@ static void cmd_mcpre(void) {
     kprintf("[mcpre  ] pid %u is mid-loop in ring 3 on cpu1; queueing pid %u AT THE FRONT and firing IPI %d\n",
             kprocs[pl].pid, kprocs[ps].pid, (uint64_t)IPI_PREEMPT);
     t0 = g_ticks;                                       /* fire until it lands at CPL3 */
-    while (g_cpu[1].preempt_count == pc0 && !kprocs[pl].exited && g_ticks - t0 < 500) {
+    while (g_cpu[1].preempt_count == pc0 && !kprocs[pl].exited && g_ticks - t0 < MCPRE_T_PREEMPT) {
         lapic_ipi(g_cpu[1].apic_id, IPI_PREEMPT, 0);
         uint64_t tw = g_ticks; while (g_ticks - tw < 2) __asm__ volatile("pause");
     }
 
     t0 = g_ticks;                                       /* join both threads      */
-    while ((!kprocs[pl].exited || !kprocs[ps].exited) && g_ticks - t0 < 3000)
+    while ((!kprocs[pl].exited || !kprocs[ps].exited) && g_ticks - t0 < MCPRE_T_JOIN)
         __asm__ volatile("pause");
     current_proc_idx = save;
 

@@ -178,83 +178,141 @@ make in the same commit as a warning sweep, days before a tag. A single RWX LOAD
 segment is ordinary for a freestanding kernel of this shape. It is left visible
 and named here rather than suppressed.
 
+## `mcpre` — CARRYOVER 2 WAS ALSO IN THE KERNEL
+
+The first release candidate for this tag **failed its own gate**, and the fix
+below is the reason there is a second one.
+
+`make gate-dirty-smp` failed on boot 3 of 3 with:
+
+```
+[mcpre  ] FAIL  long probe never started on cpu1
+```
+
+This is the anomaly v0.76 recorded — one occurrence in 277 boot logs, never
+reproduced, unexplained, and with its evidence log lost because "preserved" meant
+a working directory rather than a commit. It reproduced here at **1 failing
+assertion in 6 dirty-SMP boots**, and this time the log is committed and
+md5-stamped.
+
+**The mechanism, read from the source.** The assertion queues a probe on cpu1,
+sends an IPI, and waits for it to reach ring 3:
+
+```c
+uint64_t t0 = g_ticks;
+while (!(kprocs[pl].ran_on & 2u) && g_ticks - t0 < 500) __asm__ volatile("pause");
+```
+
+500 ticks is **5 seconds of wall clock** for another vCPU to pick up queued work.
+On a TCG-only host the guest's four vCPUs are multiplexed onto host threads the
+guest does not schedule, so the quantity being bounded has no fixed relationship
+to the thing being waited for. **That is carryover 2's defect exactly** — the
+same argument that condemned `owaitpid`'s spin budget in v0.76 and
+`pthread_join`'s retry count earlier in this changelog — except in **kernel**
+code, where nobody had thought to look for it.
+
+Two milestones described this as a suspected wall-clock flake. It was not
+suspected any more once the constant was read.
+
+### What changed
+
+All three of the suite's budgets are now named ceilings, because converting only
+the one that fired would repeat the mistake this release opened by criticising:
+
+```c
+#define MCPRE_T_START    6000u    /*  60 s: cpu1 picks the queued probe up */
+#define MCPRE_T_PREEMPT  6000u    /*  60 s: the preempt IPI lands at CPL3  */
+#define MCPRE_T_JOIN    12000u    /* 120 s: both threads run to completion */
+```
+
+**The elapsed figure is now printed on the success path**, not only on failure:
+
+```
+[mcpre  ] long probe reached ring 3 on cpu1 in N tick(s) (ceiling 6000)
+```
+
+The normal case is well under one tick. Printing it means the next person to
+touch these numbers reads a distribution instead of guessing, which is the
+`oputu()` lesson from v0.76 applied to the kernel side.
+
+**And the give-up now explains itself.** The old line said only that the probe
+never started. It now reports that a DEADLINE expired, how many ticks it waited,
+cpu1's run-queue depth and how many cpus were online — because the absence of
+exactly that detail is most of why this stayed unexplained for two milestones.
+
+**This raises a ceiling; it does not prove a cause.** If cpu1 is genuinely
+wedged rather than merely starved, the assertion still fails — 60 s later, with
+diagnostics attached. That is the intended outcome: a slow host stops being
+indistinguishable from a broken one, which is the whole of carryover 2.
+
 ## VERIFICATION
 
 ```
 outrun-os-0.77.0.iso
-md5     863590eaf2536d45225d890ff3ee516e
-sha256  6fc7a26bce1455eeffa345e4fefe9765132a3b695063b9ded39cdfd58f5d39b3
+md5     f669a57b52c847627916c4bb07a78302
+sha256  bcd6b436845b05c648622f7cec822b80c0c4d7fff7fcb19a96f798a4b41dfdbf
 ```
 
-Every configuration below booted that exact image; each log's first line carries
-the md5.
+This is **release candidate 2**. RC1 (md5 `863590eaf2536d45225d890ff3ee516e`)
+failed its own gate and was not tagged; the `mcpre` section above is what
+changed between them. Every configuration below booted the image named here, and
+each log's first line carries that md5.
 
 ### Fresh-image matrix
 
 | configuration | suites | passed | failed | rank faults | boot |
 |---|---|---|---|---|---|
-| uniprocessor (`make release-verify`) | 45 | 479 | **0** | 0 | 305 s |
-| `-smp 4`, SeaBIOS | 45 | 495 | **0** | 0 | 225 s |
+| uniprocessor (`make release-verify`) | 45 | 479 | **0** | 0 | 300 s |
+| `-smp 4`, SeaBIOS | 45 | 495 | **0** | 0 | 215 s |
 | `-smp 4`, q35 + VT-d, `intremap=on` | 47 | 508 | **0** | 0 | 230 s |
 
-47 rather than 45 under VT-d is `iommu` and `capdma`, which are config-gated on
-the emulated unit — the tell that the target really is running with an IOMMU.
+47 rather than 45 under VT-d is `iommu` and `capdma`, config-gated on the
+emulated unit — the tell that the target really is running with an IOMMU rather
+than having quietly degraded to plain q35.
 
-Logs: `metal/docs/OUTRUN-0.77-boot-{uniprocessor,smp4-bios,smp4-iommu}.log`.
+### Dirty-volume gate
 
-### Dirty-volume gate — and it FAILED
+| configuration | boot 1 | boot 2 | boot 3 | verdict |
+|---|---|---|---|---|
+| `make gate-dirty-smp`, run 1 | 45 / 0 | 45 / 0, 1 reset | 45 / 0, 1 reset | **PASS** |
+| `make gate-dirty-smp`, run 2 | 45 / 0 | 45 / 0, 1 reset | 45 / 0, 1 reset | **PASS** |
+| `make gate-dirty` (UP) | 45 / 0 | 45 / 0, 1 reset | 45 / 0, 1 reset | **PASS** |
 
-| run | binary | boot 1 | boot 2 | boot 3 | verdict |
-|---|---|---|---|---|---|
-| `make gate-dirty-smp` | v0.77.0 release ISO | 45 / 0 | 45 / 0 | 45 / **1 fail** | **FAIL** |
-| repeat, same ISO | v0.77.0 release ISO | 45 / 0 | 45 / 0 | 45 / 0 | PASS |
-| negative control | pre-sweep `00f7a8c` (md5 `6364ac09`) | 45 / 0 | 45 / 0 | 45 / 0 | PASS |
+Two SMP runs rather than one on purpose: the failure being fixed occurred at
+1 in 6 dirty-SMP boots, and a single 3-boot run would have had roughly a 6-in-10
+chance of passing even with nothing fixed. Six boots is still not a proof — it
+is simply the smallest number that is not self-deceiving.
+
+Consecutive-boot diffs empty in both directions in all three runs; both durable
+cross-boot artefacts created in boot 1 and found in every later boot; zero
+fixture-reset refusals; dual failure counters agreeing at zero in every log.
+
+**15 boots total across six configurations, 0 failing assertions, 0 rank
+faults.**
+
+### What the new instrumentation measured
 
 ```
-[mcpre  ] FAIL  long probe never started on cpu1
-[mcpre  ] RESULT: 0 passed, 1 failed
+[mcpre  ] long probe reached ring 3 on cpu1 in 0 tick(s) (ceiling 6000)
 ```
 
-**The `[mcpre]` anomaly v0.76 could not explain has reproduced.** Preserved,
-md5-stamped, at `metal/docs/OUTRUN-0.77-gate-dirty-smp-boot3-mcpre.log` — v0.76
-recorded its own occurrence as "preserved" at a path that was never committed
-and is now gone, so this one is committed.
+**0 ticks, in all 8 SMP boots that reached it.** That figure is worth more than
+the pass it accompanies. The normal case is under a single 10 ms tick, and the
+budget that failed was 500 ticks — so the failure was never a marginal overrun
+of a slightly-too-tight constant. Whatever happened, cpu1 did not run queued
+work for more than **500 times** the normal latency.
 
-**The mechanism, read from the source rather than guessed at.** The assertion
-queues a probe on cpu1, sends an IPI, and waits:
+The new ceiling therefore buys margin against host scheduling noise, and the
+honest reading is that it makes a *spurious* failure much less likely without
+touching whatever produced the real one. The elapsed print exists so that the
+next occurrence arrives with a number attached instead of an argument.
 
-```c
-uint64_t t0 = g_ticks;
-while (!(kprocs[pl].ran_on & 2u) && g_ticks - t0 < 500) __asm__ volatile("pause");
-if (!(kprocs[pl].ran_on & 2u)) { ... "long probe never started on cpu1" ... }
+### Build
+
 ```
-
-That is a **500-tick (5 s) wall-clock budget** for another vCPU to pick up queued
-work — a constant chosen on an idle machine, on a TCG-only host where the guest's
-four vCPUs are multiplexed onto host threads the guest does not control. It is
-carryover 2's defect exactly, in **kernel** code this time rather than ring 3,
-and it is the same reasoning that condemned `owaitpid`'s spin budget: the
-quantity being bounded has no fixed relationship to the thing being waited for.
-
-**What the evidence supports, and what it does not.**
-
-- The suite has a documented `-smp 4` flake history predating all of this:
-  `OUTRUN-0.47-boot-smp4-bios-flake.log` and
-  `OUTRUN-0.48-boot-smp4-iommu-flake.log` are named "flake" in the tree. Those
-  two are a **different** assertion in the same suite ("the captured context
-  MIGRATED CORES"), so they are context, not precedent.
-- *This* assertion has now fired **twice in the project's history** — once in
-  v0.76, once here — both under `-smp 4`, never uniprocessor.
-- **The negative control does not exonerate the warning sweep.** It passed 3
-  boots, but at the observed rate of 1 in 6 a 3-boot control has roughly a 6-in-10
-  chance of missing the failure even if the rate were unchanged. It is weak
-  evidence, and calling it a clean bill of health would be the same error this
-  project has made before. What carries more weight is that the sweep touched no
-  scheduling, IPI or run-queue code, and that the failing budget is a constant
-  that predates it by many milestones.
-
-**Rate on this artefact: 1 failing assertion in 6 dirty-SMP boots** (two runs of
-three), plus 0 in the three fresh-image configurations.
+0 errors, 1 warning (ld: LOAD segment with RWX permissions — see above)
+clean under -Wall -Wextra -Werror for both the kernel and ring 3
+```
 
 ## WHAT THIS RELEASE DOES NOT DO
 
@@ -270,6 +328,13 @@ three), plus 0 in the three fresh-image configurations.
   the difference between catching it next time and mistaking it again.
 - **`SYS_THREAD_JOIN` has no timeout argument.** See above; the natural v0.78
   item, and the only thing that would bound a lost wake in useful time.
+- **Why cpu1 stalled in the `mcpre` failure is unexplained.** The budget it blew
+  is fixed and instrumented, and that is all. The measurement makes the gap
+  starker rather than smaller: the probe normally reaches ring 3 in **0 ticks**,
+  and the old ceiling was 500, so cpu1 failed to run queued work for over 500x
+  the normal latency. A raised ceiling cannot explain that; it only stops a host
+  hiccup from being indistinguishable from it. If it recurs, the log will now
+  carry the waited ticks, cpu1's run-queue depth and the online cpu count.
 - **The virtio-net BAR assumption is documented, not repaired.**
 - **The RWX LOAD segment** stands, deliberately.
 - **No memory-hard KDF, no password-change syscalls, no reboot-surviving
@@ -282,11 +347,14 @@ three), plus 0 in the three fresh-image configurations.
 ## COVERAGE THIS GATE DID NOT PROVIDE
 
 - **Bare metal and Proxmox are untested.** Every result is QEMU, TCG, no KVM.
-- **One boot per fresh-image configuration**, three for the dirty one. These are
-  not soak runs; a 1-in-6 event like the `pthreads_smp` wake loss would not be
-  expected to appear, and its absence here is **not** evidence it is gone.
-- **`make gate-dirty` (uniprocessor) was not re-run for this tag** — the SMP
-  dirty configuration was, and it is the stricter of the two.
+- **One boot per fresh-image configuration**, six across two dirty-SMP runs and
+  three uniprocessor. These are not soak runs. Six dirty-SMP boots against a
+  1-in-6 event is the smallest sample that is not self-deceiving, **not** a
+  demonstration that the event is gone — neither for `mcpre` nor for the
+  `pthreads_smp` wake loss, which did not recur here and remains unexplained.
+- **Neither open intermittent has a negative control.** For `mcpre` a 3-boot
+  control on the pre-sweep tree passed, which at 1-in-6 proves very little; it
+  was run before the fix existed and has not been repeated against it.
 - **The warning sweep is verified by the gate, not by inspection of every
   site.** 16 of the 44 changes are whitespace, but the sweep touched a compiler,
   a kernel and a driver probe, and only a booting matrix distinguishes "compiles
