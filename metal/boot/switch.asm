@@ -30,3 +30,8 @@ switch_context:
     pop  rbp
     pop  rbx
     ret
+
+; v0.77: mark the stack non-executable. Without this section the linker assumes
+; an executable stack for the whole image and says so on every link. This object
+; is the one that triggered it; the note is empty and occupies no space.
+section .note.GNU-stack noalloc noexec nowrite progbits

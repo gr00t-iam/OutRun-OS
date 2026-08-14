@@ -2773,6 +2773,9 @@ static int      g_virtio_kdev   = -1;   /* index into kdevs[], -1 = not found */
 static uint64_t g_virtio_common = 0;    /* offset of common-config in the BAR */
 static uint64_t g_virtio_devcfg = 0;    /* offset of device-config in the BAR */
 
+/* v0.77: superseded by the modern per-device probes but kept as the readable
+ * reference for the legacy capability walk. */
+__attribute__((unused))
 static void pci_probe_virtio(uint8_t bus, uint8_t dev, uint8_t fn) {
     uint32_t id = pci_cfg_read32(bus, dev, fn, 0x00);
     uint16_t device_id = (uint16_t)(id >> 16);
@@ -4478,6 +4481,19 @@ static int virtionet_probe(uint8_t bus, uint8_t dev, uint8_t fn) {
     }
     if (common_bar < 0) { kputs("[vnet   ] no virtio caps\n"); return 0; }
 
+    /* v0.77: these three are set by the capability walk and never read, which is
+     * what -Wunused-but-set-variable was pointing at. The reason they are unread
+     * is an ASSUMPTION, not an oversight: everything below maps common_bar alone
+     * and treats notify/isr/devcfg as offsets INTO it, so a device that placed a
+     * capability in a different BAR would be mis-driven silently. vblk's walk
+     * (see pci_probe_virtio_blk) compares them against common_bar and bails.
+     *
+     * Left as an explicit discard rather than repaired, because adding a check
+     * here is a behavioural change and this sweep is cosmetic by contract. It is
+     * recorded in CHANGELOG-0.77.0.md as a finding, not fixed. QEMU puts all
+     * four in BAR 4, which is why this has never bitten. */
+    (void)notify_bar; (void)isr_bar; (void)devcfg_bar;
+
     uint32_t cmd = pci_cfg_read32(bus, dev, fn, 0x04);
     pci_cfg_write32(bus, dev, fn, 0x04, cmd | 0x6);        /* mem + bus master     */
 
@@ -4665,7 +4681,11 @@ static void dhcpd_fn(void *arg) {
     if (!g_udp[slot].ready) { kputs("[dhcpd  ] no DHCP reply (timeout)\n"); g_dhcpd_done = 1; return; }
 
     /* zero-copy: parse the DHCP payload straight from the routed pointer.      */
-    const uint8_t *d = g_udp[slot].payload;
+    /* v0.77: the cast is now explicit. payload is volatile (the NIC writes it);
+     * dropping that qualifier implicitly was a silent discard, and saying so out
+     * loud is the difference between a decision and an accident. The packet is
+     * complete and quiescent by the time it is parsed here. */
+    const uint8_t *d = (const uint8_t *)g_udp[slot].payload;
     const uint8_t *yi = d + 16;                           /* yiaddr             */
     int msg_type = 0; const uint8_t *srv = 0;
     const uint8_t *o = d + 240;                           /* options after cookie */
@@ -14427,11 +14447,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * mapped contiguously at WIN_USER_V + id*WIN_SURF_MAXB. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
         int rw = (int)(a0 >> 16), rh = (int)(a0 & 0xFFFF);
-        if (rw < WIN_MIN_W) rw = WIN_MIN_W; if (rw > WIN_MAX_W) rw = WIN_MAX_W;
-        if (rh < WIN_MIN_H) rh = WIN_MIN_H; if (rh > WIN_MAX_H) rh = WIN_MAX_H;
+        if (rw < WIN_MIN_W) rw = WIN_MIN_W;
+        if (rw > WIN_MAX_W) rw = WIN_MAX_W;
+        if (rh < WIN_MIN_H) rh = WIN_MIN_H;
+        if (rh > WIN_MAX_H) rh = WIN_MAX_H;
         uint32_t accent = (uint32_t)a1 ? (uint32_t)a1 : 0x22E4FFu;   /* default C_CYAN */
         int cw = rw - 4, chh = rh - WIN_TITLE_H - 3;                 /* content rect */
-        if (cw < 1) cw = 1; if (chh < 1) chh = 1;
+        if (cw < 1) cw = 1;
+        if (chh < 1) chh = 1;
         uint64_t cbytes = (uint64_t)cw * chh * 4;
         uint64_t cpages = (cbytes + 0xFFF) / 0x1000;
 
@@ -16152,8 +16175,10 @@ static void map_user_stack(uint64_t cr3) {
  * Returns the ring-3 RSP the process must start with. */
 static uint64_t uargs_build(uint64_t cr3, int argc, const char argv[][UARG_LEN],
                             int envc, const char envp[][UARG_LEN]) {
-    if (argc < 0) argc = 0; if (argc > UARG_N) argc = UARG_N;
-    if (envc < 0) envc = 0; if (envc > UARG_N) envc = UARG_N;
+    if (argc < 0) argc = 0;
+    if (argc > UARG_N) argc = UARG_N;
+    if (envc < 0) envc = 0;
+    if (envc > UARG_N) envc = UARG_N;
     /* The block sits inside the stack's top page, which map_user_stack mapped. */
     uint64_t pte = walk_pte(cr3, UARGS_V & ~0xFFFull);
     if (!(pte & PTE_PRESENT)) return USTK_INIT;              /* nothing to write into */
@@ -16195,9 +16220,12 @@ static uint64_t uargs_default(uint64_t cr3, const char *name) {
     while (n < UARG_LEN - 1 && name && name[n]) { argv[0][n] = name[n]; n++; }
     argv[0][n] = 0;
     const char *e0 = "PATH=/", *e1 = "OUTRUN=" KERNEL_VERSION, *e2 = "HOME=/";
-    for (n = 0; n < UARG_LEN - 1 && e0[n]; n++) envp[0][n] = e0[n]; envp[0][n] = 0;
-    for (n = 0; n < UARG_LEN - 1 && e1[n]; n++) envp[1][n] = e1[n]; envp[1][n] = 0;
-    for (n = 0; n < UARG_LEN - 1 && e2[n]; n++) envp[2][n] = e2[n]; envp[2][n] = 0;
+    for (n = 0; n < UARG_LEN - 1 && e0[n]; n++) envp[0][n] = e0[n];
+    envp[0][n] = 0;
+    for (n = 0; n < UARG_LEN - 1 && e1[n]; n++) envp[1][n] = e1[n];
+    envp[1][n] = 0;
+    for (n = 0; n < UARG_LEN - 1 && e2[n]; n++) envp[2][n] = e2[n];
+    envp[2][n] = 0;
     return uargs_build(cr3, 1, argv, 3, envp);
 }
 
@@ -17649,7 +17677,7 @@ static void cmd_vfs_stress(void) {
         vfscheck("a slash-separated PATH is a valid VFS name and resolves by full path",
                  i1 >= 0 && n1 == 6 && rb[0] == 'S' && rb[4] == 'O');
 
-        /* Prefix listing: exactly the two /usr/include/*.h at the top level plus
+        /* Prefix listing: exactly the two *.h files at the top level of /usr/include plus
          * the two long ones underneath it — four entries, and NOT /usr/lib. */
         int under_inc = 0, under_lib = 0;
         for (int i = 0; i < VFS_MAXFILES; i++) {
@@ -18359,7 +18387,7 @@ static int exec_from_cas(const char *name, int proc_idx) {
  *                      it makes programs that call strlen() fail to compile,
  *                      which is exactly the property a real /usr/lib has.
  *
- *   /usr/include/*.h   are NOT consumed by the compiler, and this file will not
+ *   *.h under /usr/include   are NOT consumed by the compiler, and this file will not
  *                      pretend otherwise: occ has no preprocessor, so it skips
  *                      `#` lines entirely (see occ_next). They are the
  *                      normative, human-readable declaration of the ABI and of
@@ -18800,7 +18828,7 @@ static const char SDK_LIB_README[] =
  * These are generated by tools/mkstr.py from the real files under user/, which
  * is the whole point: /src/vedit.c and /src/omake.c are several hundred lines
  * of occ-subset C each, and a program that only exists as \n-spliced quotes
- * inside this file cannot be read, diffed or reviewed. Edit user/*.oc; the
+ * inside this file cannot be read, diffed or reviewed. Edit the *.oc files under user/; the
  * build regenerates the header.
  *
  * What is published here is SOURCE, not binaries. Nothing ships /bin/vedit.elf
@@ -19093,7 +19121,12 @@ static void draw_str(int x, int y, const char *s, uint32_t c) {
 
 /* --- fixed-point (16.16) window physics: settle a non-overlapping layout ---- */
 #define FX 16
-#define FXI(v) ((int64_t)(v) << FX)
+/* v0.77: shift in the UNSIGNED domain and convert back. `(int64_t)v << 16` is
+ * undefined when v is negative (C11 6.5.7p4), and window physics uses negative
+ * coordinates and velocities constantly. On two's complement this produces the
+ * identical bit pattern, so the layout is unchanged — the undefined behaviour
+ * is what goes away, not the arithmetic. */
+#define FXI(v) ((int64_t)((uint64_t)(int64_t)(v) << FX))
 #define FXMUL(a,b) (((int64_t)(a) * (int64_t)(b)) >> FX)
 #define FX_HALF 32768   /* one PIT tick advances a per-frame velocity by v/2   */
 struct win { int64_t x, y, vx, vy, tx, ty; int w, h; uint32_t edge; };
@@ -19517,13 +19550,18 @@ static int wimp_key(int ch) {
 }
 
 /* Process real pointer + keyboard hardware for the interactive desktop. */
+/* v0.77: driven from the shell command path in earlier milestones; retained so
+ * the input step stays visible next to the compositor it belongs to. */
+__attribute__((unused))
 static void wimp_input_step(void) {
     static uint8_t prevbtn = 0;
     int dx = g_mouse_dx, dy = g_mouse_dy;
     g_mouse_dx = 0; g_mouse_dy = 0;
     g_cur_x += dx; g_cur_y -= dy;                         /* mouse Y is inverted */
-    if (g_cur_x < 0) g_cur_x = 0; if (g_cur_x >= (int)g_fb_width)  g_cur_x = g_fb_width - 1;
-    if (g_cur_y < 0) g_cur_y = 0; if (g_cur_y >= (int)g_fb_height) g_cur_y = g_fb_height - 1;
+    if (g_cur_x < 0) g_cur_x = 0;
+    if (g_cur_x >= (int)g_fb_width)  g_cur_x = g_fb_width - 1;
+    if (g_cur_y < 0) g_cur_y = 0;
+    if (g_cur_y >= (int)g_fb_height) g_cur_y = g_fb_height - 1;
 
     uint8_t btn = g_mouse_btn & 1;
     if (btn && !prevbtn) wimp_pointer(g_cur_x, g_cur_y, 1);
@@ -19532,7 +19570,8 @@ static void wimp_input_step(void) {
         klock_acquire(&g_wm_lock);
         if (g_wm_drag >= 0 && g_wmwin[g_wm_drag].used) {
             int nx = g_cur_x - g_wm_drag_dx, ny = g_cur_y - g_wm_drag_dy;
-            if (nx < 0) nx = 0; if (ny < 0) ny = 0;
+            if (nx < 0) nx = 0;
+            if (ny < 0) ny = 0;
             if (nx > (int)g_fb_width - 40)  nx = g_fb_width - 40;
             if (ny > (int)g_fb_height - WIN_TITLE_H) ny = g_fb_height - WIN_TITLE_H;
             g_wmwin[g_wm_drag].x = nx; g_wmwin[g_wm_drag].y = ny;
@@ -21191,7 +21230,7 @@ static void cmd_posix_stress(void) {
 
     if (n > 1)
         pxcheck("POSIX workers genuinely overlapped in ring 3 across cores (SMP)",
-                g_inr3_max >= 2 && g_inr3_max >= inr3_0);
+                g_inr3_max >= 2 && g_inr3_max >= (int)inr3_0);
     else
         kputs("[posixstrs] NOTE  uniprocessor: the workers are time-multiplexed through one core,\n"
               "[posixstrs]       so simultaneous ring-3 residency is not assertable here. The\n"
@@ -21289,7 +21328,8 @@ static void cmd_cc(int argc, char **argv) {
       }
       const char *e0 = "PATH=/usr/lib", *e1 = "OUTRUN=" KERNEL_VERSION;
       int n; for (n = 0; n < UARG_LEN - 1 && e0[n]; n++) ev[0][n] = e0[n]; ev[0][n] = 0;
-      for (n = 0; n < UARG_LEN - 1 && e1[n]; n++) ev[1][n] = e1[n]; ev[1][n] = 0;
+      for (n = 0; n < UARG_LEN - 1 && e1[n]; n++) ev[1][n] = e1[n];
+      ev[1][n] = 0;
       uargs_build(kprocs[p].cr3, na, (const char (*)[UARG_LEN])av,
                                  2, (const char (*)[UARG_LEN])ev); }
 
@@ -23396,8 +23436,10 @@ static void canvas_mouse(void) {
     __asm__ volatile("sti");
 
     g_cur_x += dx; g_cur_y += dy;
-    if (g_cur_x < 0) g_cur_x = 0; if (g_cur_x >= g_fb_width)  g_cur_x = g_fb_width - 1;
-    if (g_cur_y < 0) g_cur_y = 0; if (g_cur_y >= g_fb_height) g_cur_y = g_fb_height - 1;
+    if (g_cur_x < 0) g_cur_x = 0;
+    if (g_cur_x >= (int)g_fb_width)  g_cur_x = (int)g_fb_width - 1;
+    if (g_cur_y < 0) g_cur_y = 0;
+    if (g_cur_y >= (int)g_fb_height) g_cur_y = (int)g_fb_height - 1;
 
     if (dz) canvas_zoom_to(g_cur_x, g_cur_y,           /* wheel zooms at cursor  */
                            dz < 0 ? (FXI(1) + FXI(1) / 5) : (FXI(1) * 5 / 6));
@@ -24003,7 +24045,8 @@ static void cmd_cursor(void) {
         for (int a = 0; a < 5; a++) for (int b = 0; b < 5; b++) {
             int rx = w2sx(s2wx(sxs[a])), ry = w2sy(s2wy(sys_[b]));
             int64_t ex = iabs64(rx - sxs[a]), ey = iabs64(ry - sys_[b]);
-            if (ex > worst) worst = ex; if (ey > worst) worst = ey;
+            if (ex > worst) worst = ex;
+            if (ey > worst) worst = ey;
             if (ex > 1 || ey > 1) rt_ok = 0;
         }
     }
@@ -24031,7 +24074,8 @@ static void cmd_cursor(void) {
             canvas_zoom_at(cx, cy, FXI(1) + FXI(1) / 5);        /* zoom in  */
             int64_t ax = s2wx(cx), ay = s2wy(cy);
             int64_t e1 = iabs64(ax - bx) >> FX, e2 = iabs64(ay - by) >> FX;
-            if (e1 > wmax) wmax = e1; if (e2 > wmax) wmax = e2;
+            if (e1 > wmax) wmax = e1;
+            if (e2 > wmax) wmax = e2;
             if (e1 > 2 || e2 > 2) anchor_ok = 0;
             canvas_zoom_at(cx, cy, FXI(1) * 5 / 6);             /* zoom out */
             int64_t rx = s2wx(cx), ry = s2wy(cy);
@@ -24059,7 +24103,7 @@ static void cmd_cursor(void) {
         g_focus = i;
         int cx = w2sx(g_wins[i].x + FXI(g_wins[i].w / 2));
         int cy = w2sy(g_wins[i].y + FXI(g_wins[i].h / 2));
-        if (cx < 0 || cx >= g_fb_width || cy < 0 || cy >= g_fb_height) continue;
+        if (cx < 0 || cx >= (int)g_fb_width || cy < 0 || cy >= (int)g_fb_height) continue;
         if (canvas_pick(cx, cy) != i) pick_ok = 0;
     }
     xcheck("hit-testing matches rendering (centre of each window picks it)", pick_ok);

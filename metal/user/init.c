@@ -320,6 +320,21 @@ static inline void w32(u64 a, u32 v) { *(volatile u32 *)a = v; }
 static inline u32  r32(u64 a)        { return *(volatile u32 *)a; }
 static inline void w64(u64 a, u64 v) { *(volatile u64 *)a = v; }
 
+/* v0.77: the fault-injection sites write through a deliberately bad pointer to
+ * prove the kernel reclaims resources on the FAULT exit path as well as on
+ * SYS_EXIT. Written as `*(volatile u32 *)0x1 = ...` the optimiser sees the
+ * constant and emits -Warray-bounds ("subscript 0 is outside array bounds"),
+ * which is a true observation about code whose entire purpose is to be invalid.
+ *
+ * Laundering the address through an empty asm makes it opaque to the optimiser
+ * WITHOUT changing what executes: the same store to the same address, still
+ * faulting. Suppressing the diagnostic with a pragma would have silenced the
+ * category everywhere, including somewhere it might one day be right. */
+static inline volatile u32 *fault_ptr(u64 a) {
+    __asm__ volatile("" : "+r"(a));
+    return (volatile u32 *)a;
+}
+
 /* virtio 1.0 common-config register offsets */
 #define VC_DFEAT_SEL 0x00
 #define VC_DFEAT     0x04
@@ -853,7 +868,7 @@ static void gpu_driver(int fault_before_flush) {
     if (px[0] != pattern) sysc(SYS_EXIT, 1102, 0, 0);
 
     if (fault_before_flush) {
-        volatile u32 *bad = (volatile u32 *)0x1;
+        volatile u32 *bad = fault_ptr(0x1);
         *bad = 0xDEAD;                                      /* deliberate fault: never reached past here */
     }
 
@@ -882,7 +897,7 @@ static void audio_driver(int fault_after_configure) {
     if (vaddr <= 0) sysc(SYS_EXIT, 1201, 0, 0);
 
     if (fault_after_configure) {
-        volatile u32 *bad = (volatile u32 *)0x1;
+        volatile u32 *bad = fault_ptr(0x1);
         *bad = 0xDEAD;                                      /* deliberate fault: never reached past here */
     }
 
@@ -915,7 +930,7 @@ static void net_driver(int fault_after_bind) {
     if ((i64)sysc(SYS_BIND, (u64)fd, (u64)port, 0) != 0) sysc(SYS_EXIT, 1302, 0, 0);
 
     if (fault_after_bind) {
-        volatile u32 *bad = (volatile u32 *)0x1;
+        volatile u32 *bad = fault_ptr(0x1);
         *bad = 0xDEAD;                                       /* deliberate fault: socket must still be reclaimed */
     }
 
@@ -1270,7 +1285,7 @@ static void app_harness(int which, int fault_mid_frame) {
             app_str(&W, 4, 4, "ABOUT TO FAULT", 0xFF2D9B);
             app_damage(&W);
         }
-        volatile u32 *bad = (volatile u32 *)0x1;
+        volatile u32 *bad = fault_ptr(0x1);
         *bad = 0xDEAD;                                      /* crash holding a window */
     }
     if (which == 0)      app_terminal(3);
@@ -1360,7 +1375,7 @@ static void wimp_driver(int fault_after_create) {
     }
 
     if (fault_after_create) {
-        volatile u32 *bad = (volatile u32 *)0x1;
+        volatile u32 *bad = fault_ptr(0x1);
         *bad = 0xDEAD;                                       /* deliberate fault: windows AND their widgets must still be released */
     }
 
@@ -1595,13 +1610,17 @@ static i64 owaitpid(u32 pid, int spins) {
 static u32 osysticks(void) {
     /* 24-byte header + up to 12 x 32-byte entries. */
     static u32 si[104 / 4 + 12 * 8];
-    if (sysc(SYS_SYSINFO, (u64)si, 0, 0) < 0) return 0;
+    /* v0.77: the cast is NOT cosmetic. sysc() returns u64, so `< 0` was always
+     * false and this error check could never fire — a guard that cannot fail is
+     * the same class as a counter nothing prints. Now a failed SYS_SYSINFO
+     * really does return 0 ticks, which is what every caller already assumed. */
+    if ((i64)sysc(SYS_SYSINFO, (u64)si, 0, 0) < 0) return 0;
     return si[5];                       /* hdr: ncpu nproc used free ram TICKS */
 }
 
 static u32 osysncpu(void) {
     static u32 si[104 / 4 + 12 * 8];
-    if (sysc(SYS_SYSINFO, (u64)si, 0, 0) < 0) return 1;
+    if ((i64)sysc(SYS_SYSINFO, (u64)si, 0, 0) < 0) return 1;   /* v0.77: see osysticks */
     return si[0] ? si[0] : 1;
 }
 
@@ -1843,6 +1862,10 @@ static void ofree(void *q) {
     }
 }
 
+/* v0.77: part of the ring-3 heap API and kept deliberately; no driver happens
+ * to call it today. Marked rather than deleted — removing a working allocator
+ * to quiet a warning trades a real capability for a cosmetic one. */
+__attribute__((unused))
 static void *ocalloc(u64 cnt, u64 sz) {
     u64 n = cnt * sz;
     u8 *q = (u8 *)omalloc(n);
@@ -2075,6 +2098,9 @@ static int pthread_join(pthread_t t, void **ret) {
 
 static pthread_t pthread_self(void) { return (pthread_t)sysc(SYS_GETTID, 0, 0, 0); }
 
+/* v0.77: the pthread shim is an API surface, not a call graph. Workers return
+ * normally today, so nothing calls this — that is not a reason to delete it. */
+__attribute__((unused))
 static void pthread_exit(void *ret) {
     int i = pthread_self();
     if (i >= 0 && i < PTHREAD_MAX) {
@@ -2264,7 +2290,11 @@ static void posix_signal_worker(void) {
     /* Two wild writes in a row. The second one matters as much as the first:
      * it only reaches the handler if SYS_SIGUNMASK really cleared the block
      * sig_deliver installed, so this catches a one-shot-only implementation. */
-    for (int round = 0; round < 2; round++) {
+    /* v0.77: volatile because osetjmp/olongjmp cross this loop — a non-volatile
+     * local held in a register at setjmp time has an indeterminate value after
+     * the longjmp (C11 7.13.2.1p3). It has worked so far because gcc happened
+     * to spill it; that is luck, not a guarantee. */
+    for (volatile int round = 0; round < 2; round++) {
         if (osetjmp(&g_segv_jb) == 0) {
             volatile u32 *wild = (volatile u32 *)0x0000500000004000ull;  /* unmapped, in range */
             *wild = 0xDEADBEEF;                       /* -> SIGSEGV -> handler -> longjmp */

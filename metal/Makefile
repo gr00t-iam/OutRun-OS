@@ -20,7 +20,7 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-VERSION := 0.76.0
+VERSION := 0.77.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean
@@ -87,7 +87,12 @@ $(BUILD)/ipc_ring.o: cpp/ipc_ring.cpp | $(BUILD)
 	@echo "  c++ obj:   $@ (freestanding)"
 
 # ---- userland: a standalone ring-3 ELF shipped as a boot module ------------
-UCFLAGS := -ffreestanding -O2 -Wall -mcmodel=large -fno-pic -fno-stack-protector -fno-builtin \
+# v0.77: -Wextra brought to parity with the kernel's CFLAGS. Ring 3 had been held
+# to -Wall alone, and the three findings that appeared the moment it was raised
+# were not stylistic: two `< 0` guards on a u64 return that could never fire, and
+# a loop counter live across osetjmp/olongjmp without volatile. A warning level
+# that differs between two halves of one tree hides defects in the quieter half.
+UCFLAGS := -ffreestanding -O2 -Wall -Wextra -mcmodel=large -fno-pic -fno-stack-protector -fno-builtin \
            -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -msoft-float
 # v0.57: occ.c is #included by init.c, so it is a real prerequisite. Without it
 # listed here, `make` reported success while silently shipping the PREVIOUS
