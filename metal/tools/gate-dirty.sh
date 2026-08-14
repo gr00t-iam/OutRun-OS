@@ -151,8 +151,19 @@ for i in $(seq 1 "$BOOTS"); do
     pkill -f "qemu-system-x86_64 .*$IMG" 2>/dev/null
 
     suites=$(grep -ac 'RESULT:' "$LOG")
-    fails=$(grep -aoE '^\[[a-z0-9 ]+\][ ]+FAIL[ ]+.*' "$LOG" | wc -l)
-    grep -aoE '^\[[a-z0-9 ]+\][ ]+FAIL[ ]+.*' "$LOG" | sed 's/[[:space:]]\+/ /g' | sort > "$WORK/fail$i.txt"
+
+    # TWO INDEPENDENT FAILURE COUNTERS. See the same comment in
+    # release-verify.sh: the original pattern required a lowercase tag and a
+    # space after FAIL, and `[pthreads_smp] FAIL:` satisfied neither. This gate
+    # reported PASS on a -smp 4 boot whose own RESULT line read
+    # `5 passed, 1 failed`. The assertion-line count is now cross-checked
+    # against the suites' own RESULT tallies, and disagreement fails the gate:
+    # a wider pattern alone would just be the same single point of blindness,
+    # moved.
+    FAILRE='^\[[a-zA-Z0-9_. -]+\][ ]*FAIL[: ].*'
+    fails=$(grep -aoE "$FAILRE" "$LOG" | wc -l | tr -d ' ')
+    tally=$(grep -ao 'RESULT: [0-9]* passed, [0-9]* failed' "$LOG" | awk '{f+=$4} END {print f+0}')
+    grep -aoE "$FAILRE" "$LOG" | sed 's/[[:space:]]\+/ /g' | sort > "$WORK/fail$i.txt"
     resets=$(grep -ac '^\[fixture\] reset' "$LOG")
     refus=$(grep -ac '^\[fixture\] REFUSED' "$LOG")
 
@@ -165,6 +176,12 @@ for i in $(seq 1 "$BOOTS"); do
 
     [ "$reached" = "1" ] || rc=1
     [ "$fails" -eq 0 ] || rc=1
+    [ "$tally" -eq 0 ] || rc=1
+    [ "$fails" -eq "$tally" ] || {
+        echo "  !! failure counters DISAGREE on boot $i: assertion lines=$fails, RESULT tally=$tally"
+        echo "  !! that is a defect in this harness, not a verdict on the boot"
+        rc=1
+    }
     # A refusal means a suite tried to reset a durable artefact. The allow-list
     # stopped it, but the attempt is a defect in the suite and must be loud.
     [ "$refus" -eq 0 ] || { echo "  !! a suite attempted to reset a durable artefact"; rc=1; }
