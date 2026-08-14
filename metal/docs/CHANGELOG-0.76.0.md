@@ -270,24 +270,31 @@ milestone inherits a list rather than a discovery.
   but do not carry it silently into a third milestone. It is carried here
   **explicitly**, unaddressed, and it is now the oldest open item in the
   project.
-- **`pthread_join` is still a spin count, not a deadline** — and it is the
-  mechanism behind the `pthreads_smp` failure above. It polls a non-blocking
-  `SYS_THREAD_JOIN` for `k < 20000` iterations with no `oyield()` on the
-  `EAGAIN` path, then returns `ETIMEDOUT_NEG`; the caller collapses that into
-  `EXIT(945)`, "pthread_join failed **or** timed out". That is carryover 2's
-  defect, in a suite carryover 2 never named, with the same
-  timeout-reported-as-a-defect conflation that #76 fixed for `pipestrs`. It was
-  observed **once in six dirty-SMP boots** — boot 2 of run 1, not reproduced by
-  a deliberate three-boot repeat — and does not appear in any of the 150
-  committed boot logs in this tree. One occurrence is not a rate, and the
-  mechanism named above is read from the source rather than demonstrated by
-  experiment, which this project's own history says is an argument. The failing
-  log is committed at
+- **`pthread_join` is still a spin count, not a deadline**, and its caller
+  collapses a timeout into `EXIT(945)` — "pthread_join failed **or** timed out"
+  — the same conflation #76 fixed for `pipestrs`. It was observed **once in six
+  dirty-SMP boots** — boot 2 of run 1, not reproduced by a deliberate three-boot
+  repeat — and does not appear in any of the 150 committed boot logs in this
+  tree. The failing log is committed at
   `metal/docs/OUTRUN-0.76-gate-dirty-smp-boot2-pthreads_smp.log`, md5-stamped
   with the image it booted. **Carried to v0.77 as a carryover item**, alongside
   `compilerstrs` — same idiom, same conversion to `owaitpid_ticks`-style
   deadlines, and the same requirement that a deadline report itself distinctly
   from a defect.
+
+  > **CORRECTED IN v0.77, BY MEASUREMENT.** This entry originally stated that
+  > the spin count *was the mechanism* behind the failure, and described
+  > `SYS_THREAD_JOIN` as non-blocking. Both were wrong, and both were inferred
+  > by analogy with carryover 2 rather than measured — the exact move this
+  > milestone exists to distrust. `SYS_THREAD_JOIN` **parks** the caller
+  > (`block_ring3`, `FUTEX_DEFAULT_TICKS` = 20000 ticks = 200 s). The preserved
+  > log shows the posixstrs breadcrumb reaching **+19802 ticks** before the
+  > driver exited, and that boot took **425 s** against 260 s and 220 s for its
+  > siblings: the kernel's own park deadline expired inside a **single** call.
+  > The 20000-iteration loop never went round twice and had nothing to do with
+  > it. What is real in the entry above is the *conflation* — a deadline
+  > reported as a join defect — which is what v0.77 fixes. The unexplained part
+  > is now sharper, not softer: **a wake was lost, and why is unknown.**
 - **`compilerstrs` is still spin-based** (`cs_compile`, plus a direct wait). It
   is compile-heavy — the same risk class as `langstrs`, which started all of
   this — and remains the highest-risk unconverted site. Carried to v0.77, where
