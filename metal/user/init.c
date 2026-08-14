@@ -1619,6 +1619,21 @@ static u32 osysncpu(void) {
 #define WAIT_T_TOOL    20000u      /* 200 s: a tool that forks occ again       */
 #define WAIT_T_RUN      6000u      /*  60 s: running a produced program        */
 
+/* v0.77: joining a thread. 20 s, deliberately BELOW role 31's 3000-tick (30 s)
+ * posix_drain watchdog so the inner deadline fires first and the log names the
+ * assertion instead of reporting "not every task reached a terminal state".
+ *
+ * READ THIS BEFORE TRUSTING IT. Unlike SYS_WAITPID, SYS_THREAD_JOIN *parks* the
+ * caller (block_ring3, FUTEX_DEFAULT_TICKS = 20000 ticks = 200 s). A userland
+ * deadline can only be checked BETWEEN syscalls, so it bounds the retry loop —
+ * the "woken, still not done, ask again" path — and it does NOT bound a single
+ * park. If a wake is genuinely lost, the first call blocks for the kernel's
+ * 200 s and this budget never gets to fire. Making that case fast needs a
+ * timeout argument to SYS_THREAD_JOIN, which the ABI does not have; see the
+ * v0.77 notes. Claiming otherwise would be the same error as budgeting a
+ * waiter's spins and calling it a timeout. */
+#define WAIT_T_JOIN     2000u      /*  20 s: one thread join, retries included */
+
 static i64 owaitpid_ticks(u32 pid, u32 budget, u32 *spent) {
     u32 t0 = osysticks(), n = 0;
     for (;;) {
@@ -2013,19 +2028,49 @@ static int pthread_create(pthread_t *out, void *(*fn)(void *), void *arg) {
 /* SYS_THREAD_JOIN answers -EAGAIN for "you slept, the state changed, ask
  * again": a woken task resumes with only RAX to carry a result, and the waker
  * is in another address space and cannot fill in our pointer. The loop is
- * bounded so a join can FAIL rather than hang. */
+ * bounded so a join can FAIL rather than hang.
+ *
+ * v0.77: the bound is now a DEADLINE. It was `for (k = 0; k < 20000; k++)`,
+ * which counts retries — and a retry here is a park/wake cycle of unknown
+ * duration, so the constant described no amount of time at all. Same class as
+ * the v0.76 owaitpid() defect, though NOT the same mechanism, which is worth
+ * being exact about because the v0.76 changelog first got it wrong: this
+ * syscall blocks, so 20000 retries was never a fast spin.
+ *
+ * What was actually measured (gate-dirty-smp, boot 2, preserved log
+ * OUTRUN-0.76-gate-dirty-smp-boot2-pthreads_smp.log): the posixstrs breadcrumb
+ * reached +19802 ticks and the driver then exited — the kernel's own park
+ * deadline (FUTEX_DEFAULT_TICKS, 20000 ticks) expiring in a SINGLE call, which
+ * returned -ETIMEDOUT. The retry loop never went round twice. That boot took
+ * 425 s against 260 s and 220 s for its siblings, which is the same 200 s
+ * seen from outside.
+ *
+ * So the deadline below is the honest bound on the RETRY path, and the return
+ * value is what actually fixes the observed symptom: a timeout now comes back
+ * as ETIMEDOUT_NEG distinctly, instead of being handed to a caller that cannot
+ * tell it from a broken join. */
 static int pthread_join(pthread_t t, void **ret) {
     if (t < 0 || t >= PTHREAD_MAX) return -1;
     u64 code = 0;
-    for (int k = 0; k < 20000; k++) {
+    u32 t0 = osysticks(), n = 0;
+    for (;;) {
         i64 r = (i64)sysc(SYS_THREAD_JOIN, (u64)t, (u64)(void *)&code, 0);
-        if (r == EAGAIN_NEG) continue;
+        if (r == ETIMEDOUT_NEG) return ETIMEDOUT_NEG;   /* the kernel's own park deadline */
+        if (r == EAGAIN_NEG) {
+            /* Sample the clock every 256 retries, not every retry: SYS_SYSINFO
+             * walks the process table. Same reasoning as owaitpid_ticks(). */
+            if ((++n & 255u) == 0 && (osysticks() - t0) >= WAIT_T_JOIN) return ETIMEDOUT_NEG;
+            /* A wake that finds the thread still running returns immediately,
+             * so without this a wake storm would busy-spin through the syscall.
+             * The common case is parked inside the call and never reaches here. */
+            oyield();
+            continue;
+        }
         if (r != 0) return (int)r;
         if (ret) *ret = g_pthr[t].ret;             /* the value, not the code */
         g_pthr[t].state = 3;                       /* joined; slot NOT recycled */
         return 0;
     }
-    return ETIMEDOUT_NEG;
 }
 
 static pthread_t pthread_self(void) { return (pthread_t)sysc(SYS_GETTID, 0, 0, 0); }
@@ -2081,13 +2126,22 @@ static int kthread_create(u64 (*fn)(u64), u64 arg, u64 stack_top) {
     __sync_synchronize();
     return (int)(i64)sysc(SYS_THREAD_CREATE, (u64)(void *)kthr_tramp, (u64)i, stack_top);
 }
+/* v0.77: converted with pthread_join, and for the same reason. Converting one
+ * of two joins that call the same syscall in the same shape is how v0.76 left
+ * toolstrs and pipestrs behind when it fixed langstrs — the idiom is the defect,
+ * not the call site. */
 static int kthread_join(int tid, u64 *code) {
-    for (int k = 0; k < 20000; k++) {
+    u32 t0 = osysticks(), n = 0;
+    for (;;) {
         i64 r = (i64)sysc(SYS_THREAD_JOIN, (u64)tid, (u64)(void *)code, 0);
-        if (r == EAGAIN_NEG) continue;
+        if (r == ETIMEDOUT_NEG) return ETIMEDOUT_NEG;
+        if (r == EAGAIN_NEG) {
+            if ((++n & 255u) == 0 && (osysticks() - t0) >= WAIT_T_JOIN) return ETIMEDOUT_NEG;
+            oyield();
+            continue;
+        }
         return (int)r;
     }
-    return ETIMEDOUT_NEG;
 }
 
 /* The bare-word futex mutex role 43 was written against. It is the SAME mutex
@@ -2263,7 +2317,11 @@ static void posix_thread_worker(void) {
         if (pthread_create(&t[i], pw_body, (void *)(u64)i) != 0) sysc(SYS_EXIT, 901, 0, 0);
     for (int i = 0; i < PW_THREADS; i++) {
         void *ret = 0;
-        if (pthread_join(t[i], &ret) != 0)          sysc(SYS_EXIT, 902, 0, 0);
+        /* v0.77: a deadline is not a defect. These were one code, so a slow host
+         * and a broken join were the same red line. */
+        i64 jr = pthread_join(t[i], &ret);
+        if (jr == ETIMEDOUT_NEG)                    sysc(SYS_EXIT, 908, 0, 0);
+        if (jr != 0)                                sysc(SYS_EXIT, 902, 0, 0);
         if ((u64)ret != (u64)(i + 1))               sysc(SYS_EXIT, 907, 0, 0);
     }
     for (int i = 0; i < PW_THREADS; i++) if (!g_pw_ran[i]) sysc(SYS_EXIT, 904, 0, 0);
@@ -2479,7 +2537,13 @@ static void pthreads_smp_worker(void) {
 
     for (int i = 0; i < PS_THREADS; i++) {
         void *r = 0;
-        if (pthread_join(t[i], &r) != 0)      sysc(SYS_EXIT, 945, 0, 0);
+        /* v0.77: 945 meant "pthread_join failed OR timed out", and the one
+         * observed failure of this suite was the timeout half — a lost wake that
+         * expired the kernel's 200 s park. Reported as a join defect, it sent a
+         * reader after a join bug that does not exist. 937 is the deadline. */
+        i64 jr = pthread_join(t[i], &r);
+        if (jr == ETIMEDOUT_NEG)              sysc(SYS_EXIT, 937, 0, 0);
+        if (jr != 0)                          sysc(SYS_EXIT, 945, 0, 0);
         if ((u64)r != (u64)(500 + i))         sysc(SYS_EXIT, 946, 0, 0);
     }
     if (g_ps_ran != ((1ull << PS_THREADS) - 1))          sysc(SYS_EXIT, 947, 0, 0);
@@ -3982,18 +4046,10 @@ static void posix_selfhost_worker(void) {
 #define CS_N3 "struct Q { int a; };\nstruct Q { char a; };\nint main() { return 0; }\n"
 #define CS_N4 "#include \"cs_hdr.h\"\nint main() { struct S1 s; return s.zzz; }\n"
 
-/* Compile `srcs` and return the compiler's exit status, or -1 if it could not
- * be run at all. Used for both the positive and the negative rounds. */
-static i64 cs_compile(const char **av) {
-    i64 pid = ofork();
-    if (pid == 0) {
-        static const char *ev[] = { "STAGE=compilerstrs", 0 };
-        oexecve("/bin/occ", av, ev);
-        sysc(SYS_EXIT, 199, 0, 0);
-    }
-    if (pid < 0) return -1;
-    return owaitpid((u32)pid, 250000);
-}
+/* v0.77: the spin-budgeted cs_compile() is GONE rather than left beside its
+ * replacement. Both rounds now call cs_compile_ticks() below. A dead helper
+ * that still compiles is how the old idiom comes back: the next person to add
+ * a round copies whichever one their eye lands on. */
 
 /* v0.76: the same compile, waited on by the CLOCK rather than by a spin count.
  * See owaitpid_ticks(). Budgets below are ceilings for a pathological host, not
@@ -4241,7 +4297,13 @@ static void compiler_stress_worker(void) {
     /* ---- positive round: two units, one ELF, run it ---- */
     { static const char *av[] = { "/bin/occ", "/src/cs_a.c", "/src/cs_b.c",
                                   "-o", "/bin/cs.elf", 0 };
-      i64 st = cs_compile(av);
+      /* v0.77: was cs_compile(), which waited 250000 of the WAITER's iterations.
+       * This is the last compile-heavy spin budget in the tree and the one the
+       * v0.76 changelog named as highest-risk: same stage shape as langstrs,
+       * which failed 2 of 2 on -smp 4 boot 1 before it was converted. */
+      u32 el = 0;
+      i64 st = cs_compile_ticks(av, LANG_T_COMPILE, &el);
+      oputs("  [compst] compiled the two-unit build in "); oputu(el); oputs(" ds\n");
       if (st == -11) sysc(SYS_EXIT, 954, 0, 0);           /* compiler timed out */
       if (st != 0)   sysc(SYS_EXIT, 955, 0, 0);           /* should have built  */
     }
@@ -4253,7 +4315,7 @@ static void compiler_stress_worker(void) {
           sysc(SYS_EXIT, 198, 0, 0);
       }
       if (pid < 0) sysc(SYS_EXIT, 956, 0, 0);
-      i64 rst = owaitpid((u32)pid, 250000);
+      i64 rst = owaitpid_ticks((u32)pid, LANG_T_RUN, 0);   /* v0.77: was 250000 spins */
       if (rst == -11) sysc(SYS_EXIT, 957, 0, 0);
       if (rst != 0) {
           /* the program returns the number of the check that failed */
@@ -4273,7 +4335,7 @@ static void compiler_stress_worker(void) {
       for (int i = 0; i < 4; i++) {
           ounlink("/bin/cs_n.elf");
           if (selfhost_author("/src/cs_n.c", bodies[i]) < 0) sysc(SYS_EXIT, 959, 0, 0);
-          i64 st = cs_compile(n1);
+          i64 st = cs_compile_ticks(n1, LANG_T_COMPILE, 0);     /* v0.77 */
           if (st == -11)      sysc(SYS_EXIT, 960 + i, 0, 0);   /* timed out      */
           if (st == 0)        sysc(SYS_EXIT, 964 + i, 0, 0);   /* WRONGLY built  */
           { int t = oopen("/bin/cs_n.elf");

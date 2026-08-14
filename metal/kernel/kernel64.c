@@ -21121,6 +21121,11 @@ static void cmd_posix_stress(void) {
             if (R.code[i] != want[i]) {
                 kprintf("[posixstrs] round %d '%s' (role %u pid %u) FAILED: exit %u (want %u)\n",
                         rnd, labels[i], (uint64_t)roles[i], R.pid[i], R.code[i], want[i]);
+                /* v0.77: role 31 splits a join deadline (908) from a join defect
+                 * (902). Without this line the reader sees a bare number and the
+                 * two are indistinguishable again at the point it matters. */
+                if (roles[i] == 31 && R.code[i] == 908)
+                    kprintf("[posixstrs]   ^ a join DEADLINE expired — not a join defect\n");
                 codes_ok = 0;
             }
             /* The thread group must be fully accounted for: nthreads back to 0
@@ -21814,7 +21819,8 @@ static void cmd_pthreads_smp(void) {
         R.code[0] == 942 ? "pthread_create failed" :
         R.code[0] == 943 ? "not every worker reached the condition variable" :
         R.code[0] == 944 ? "a worker passed the predicate BEFORE it was ever set" :
-        R.code[0] == 945 ? "pthread_join failed or timed out" :
+        R.code[0] == 937 ? "a join DEADLINE expired (deadline, not a join defect)" :
+        R.code[0] == 945 ? "pthread_join FAILED — a real error, not a deadline (that is 937)" :
         R.code[0] == 946 ? "a thread's return value came back wrong" :
         R.code[0] == 947 ? "not every worker ran" :
         R.code[0] == 948 ? "THE COUNTER CAME OUT SHORT — the mutex is not mutually exclusive" :
