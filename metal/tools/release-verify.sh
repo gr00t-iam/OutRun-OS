@@ -59,18 +59,41 @@ rm -f "$IMG"
 
 rc=0
 suites=$(grep -ac 'RESULT:' "$LOG")
-fails=$(grep -aoE '^\[[a-z0-9 ]+\][ ]+FAIL[ ]+.*' "$LOG" | wc -l)
+
+# TWO INDEPENDENT FAILURE COUNTERS, because one of them was blind.
+#
+# This read '^\[[a-z0-9 ]+\][ ]+FAIL[ ]+' — a lowercase-only tag, and a space
+# required after FAIL. A real failing assertion escaped it on BOTH counts: the
+# suite tag `pthreads_smp` carries an underscore, and the line reads `FAIL:`
+# with a colon. The gate printed PASS on a boot whose own RESULT line said
+# `5 passed, 1 failed`. A counter that cannot see a failure is worse than no
+# counter, because it is believed — and this one had been believed by every
+# release gate that used it.
+#
+# The fix is not only a wider pattern. The pattern is now cross-checked against
+# a counter derived from a different line entirely (the suites' own RESULT
+# tallies), and DISAGREEMENT ITSELF FAILS THE GATE. A single counter can go
+# blind again the next time a suite invents a tag; two counters derived from
+# different lines cannot go blind in the same direction quietly.
+FAILRE='^\[[a-zA-Z0-9_. -]+\][ ]*FAIL[: ].*'
+fails=$(grep -aoE "$FAILRE" "$LOG" | wc -l | tr -d ' ')
+tally=$(grep -ao 'RESULT: [0-9]* passed, [0-9]* failed' "$LOG" | awk '{f+=$4} END {print f+0}')
 ranks=$(grep -acE 'rank violations=[1-9]|underflow=[1-9]|mismatch=[1-9]' "$LOG")
+
+worst=$fails; [ "$tally" -gt "$worst" ] && worst=$tally
 
 grep -aq "Type 'help' for commands" "$LOG" || { echo "FAIL: never reached the prompt (${e}s)"; rc=1; }
 grep -aq 'system halted' "$LOG" && { echo "FAIL: the kernel halted"; rc=1; }
 [ "$suites" -gt 0 ] || { echo "FAIL: no suite reported at all"; rc=1; }
-[ "$fails" -eq 0 ] || { echo "FAIL: $fails failing assertion(s):"; \
-                        grep -aoE '^\[[a-z0-9 ]+\][ ]+FAIL[ ]+.*' "$LOG" | sed 's/^/    /'; rc=1; }
+[ "$fails" -eq "$tally" ] || { echo "FAIL: the two failure counters DISAGREE"; \
+                               echo "      assertion lines=$fails, RESULT tally=$tally"; \
+                               echo "      that is a defect in the instrument, not a verdict on the run"; rc=1; }
+[ "$worst" -eq 0 ] || { echo "FAIL: $worst failing assertion(s):"; \
+                        grep -aoE "$FAILRE" "$LOG" | sed 's/^/    /'; rc=1; }
 [ "$ranks" -eq 0 ] || { echo "FAIL: lock-rank fault reported"; rc=1; }
 
 echo "suites reporting   : $suites"
-echo "failing assertions : $fails"
+echo "failing assertions : $fails   (RESULT tally: $tally)"
 echo "rank faults        : $ranks"
 echo "boot time          : ${e}s"
 echo
