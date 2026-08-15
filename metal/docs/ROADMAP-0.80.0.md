@@ -207,6 +207,91 @@ Phase 3 must measure in-guest before committing. Choosing from host timings alon
 would be a constant chosen on an idle machine, which is this project's
 most-repeated mistake.
 
+## PHASE 3 RESULT — scrypt WIRED IN, AND THE GATE WENT RED FIRST
+
+Full detail in `CHANGELOG-0.80.0.md`. What belongs here is what the milestone
+learned rather than what it shipped.
+
+**Multi-block PBKDF2, and a clamp that would have been silent.** The old
+implementation copied the salt into a 68-byte buffer under
+`if (saltlen > 64) saltlen = 64`. scrypt's second PBKDF2 call passes B — 1 KiB —
+as the salt, which would have been truncated to its first 64 bytes and produced
+a confidently wrong derived key with no error anywhere. HMAC now streams the two
+chunks. The 32-byte case is asserted byte-identical through the new code using
+digests the OLD code produced, because a migration cannot verify a legacy hash it
+can no longer reproduce.
+
+**The migration cost nothing on disk.** `r[81..84)` was already reserved and
+already zeroed, and 0 is PBKDF2 — so every image ever written already says
+"legacy" in exactly the right byte. No format change, no header bump.
+
+**A bug this milestone wrote, caught by its own suite on the first boot.**
+`udb_add()` zeroed the record (scheme 0 = PBKDF2) and hashed with `udb_kdf()`
+(scrypt): stored as one scheme, verified as another, nobody could log in. The
+fix is one `UDB_KDF_CURRENT` used for both on adjacent lines — two places
+independently naming the current scheme is how they drifted, and the silent one
+was the write path.
+
+**Parameters chosen by measurement, contradicting the design document.**
+KDF-DESIGN.md proposed N=4096 from host timings. In-guest measurement put that
+near 200 ms per derivation, so **N=1024 (1 MiB, ~50 ms)** shipped instead. The
+kernel prints the cost on every boot so the choice stays observable rather than
+historical.
+
+### The gate went red, and that is the interesting part
+
+`make gate` failed on `smp2-bios`:
+
+```
+[mcq    ]  FAIL  two or more cores were IN RING 3 SIMULTANEOUSLY (the v0.39 headline)
+```
+
+**`-smp 2` justified itself immediately.** It was added in Phase 1 to test a
+prediction about `[mcpre]`, and within two release runs it exposed a raciness
+that four-core testing had hidden for eighty milestones.
+
+The cause is structural, not a v0.80 regression. At two cores the round pushes
+one probe to cpu1, pings it, and has the BSP enter ring 3 immediately with its
+own — so simultaneity depends on one AP wake beating one short probe, with
+nothing synchronising them. At three or more cpus several probes are spread
+across several APs and overlap is near-certain.
+
+Measured: **1 failure in 4 boots** at `-smp 2` on v0.80.0. A negative control on
+**v0.79.0 passed 4 of 4** — which at a 1-in-4 rate has roughly a 1-in-3 chance of
+missing the failure, so it does **not** establish that this is new, and nothing
+in v0.80 touches scheduling. Recorded as inconclusive rather than as exoneration.
+
+It was not one assertion. Across three release runs `-smp 2` surfaced **four
+assertions in three suites**, all guarded at `n > 1`, all reliable at four cpus
+and racy at two:
+
+| assertion | suite |
+|---|---|
+| two+ cores in ring 3 simultaneously | `mcq` |
+| threads dispatched on >1 core | `threadstrs` |
+| two+ cores in ring 3 simultaneously | `threadstrs` |
+| worker threads on >1 core | `pthreads_smp` |
+
+**One wrong threshold, repeated.** The guards assumed two cores were enough to
+*observe* parallelism; at two cores the pool can be serviced entirely by one core
+before the other arrives.
+
+**Resolved by gating all four at `n >= 3`**, with explicit SKIPs at two cores
+that still print what was observed — not covered should not mean not shown.
+Deliberately *not* resolved by lengthening the probes until the flakes hide: the
+properties are true at two cores, they simply are not demonstrable by these
+rounds without synchronising the participants.
+
+After gating, `smp2-bios` ran three consecutive clean boots. At a ~1-in-3 rate
+that is weak evidence and is recorded as such — a fifth assertion of this family
+may still be waiting.
+
+**Follow-up, not done here:** make two-core concurrency deterministic (have the
+BSP wait, bounded, for cpu1 to reach ring 3 before entering itself) and restore
+the assertion at `n == 2`. Doing that inside a release commit would have been a
+behavioural change to a scheduler suite made under time pressure to turn a gate
+green, which is the shape of decision this project has repeatedly paid for.
+
 ## STILL OPEN (inherited)
 
 - **The `[mcpre]` fix is evidenced by its reproducer, not by the gate.** It fired

@@ -19,8 +19,8 @@ LD      := ld
 LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
-        $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-VERSION := 0.79.0
+        $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o $(BUILD)/scrypt.o
+VERSION := 0.80.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean
@@ -67,7 +67,14 @@ $(BUILD)/sdk_sources.h: $(SDK_SRCS) tools/mkstr.py | $(BUILD)
 	  SDK_HELLO_B=user/hello_b.oc
 	@echo "  sdk sources: $@ ($(words $(SDK_SRCS)) files embedded)"
 
-$(BUILD)/kernel64.o: kernel/kernel64.c $(BUILD)/sdk_sources.h | $(BUILD)
+# v0.80: the scrypt core, compiled freestanding into the kernel from the SAME
+# source the host vector test validates. One implementation, two builds -- a
+# second copy compiled differently would be a second thing to keep correct, and
+# the RFC 7914 vectors would only ever have covered one of them.
+$(BUILD)/scrypt.o: crypto/scrypt.c crypto/scrypt.h | $(BUILD)
+	$(CC) $(CFLAGS) $(EXTRA) -c $< -o $@
+
+$(BUILD)/kernel64.o: kernel/kernel64.c $(BUILD)/sdk_sources.h crypto/scrypt.h | $(BUILD)
 	$(CC) $(CFLAGS) $(EXTRA) -c $< -o $@
 
 # ---- polyglot: Rust (no_core) + C++ (freestanding) linked into the kernel ---
@@ -345,8 +352,13 @@ release-iso: release-version-check
 	@echo "-------------------------------------------------------------"
 	@echo " NOT YET VERIFIED — run 'make release-verify'"
 
+# v0.80: logs go under $(GATE_LOGS), not $(BUILD). Phase 1 moved the gate
+# harnesses out of build/ so `make clean` could not destroy evidence, and left
+# this one behind -- which promptly cost the v0.80.0 release-verify log, and
+# then the release ARTEFACT itself, to a routine clean build. The
+# published-artefact check is the last log that should be disposable.
 release-verify:
-	tools/release-verify.sh "$(RELEASE_DIR)/outrun-os-$(VERSION).iso" "" "$(BUILD)/release-verify"
+	tools/release-verify.sh "$(RELEASE_DIR)/outrun-os-$(VERSION).iso" "" "$(GATE_LOGS)/release-verify"
 
 release: release-iso release-verify
 	@echo "  [release] ISO built, checksummed and booted clean."
