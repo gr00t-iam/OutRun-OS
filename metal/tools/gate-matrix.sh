@@ -46,11 +46,40 @@ flock -n 9 || { echo "gate-matrix: another run holds $WORK"; exit 2; }
 MD5=$(md5sum "$ISO" | cut -d' ' -f1)
 GPU="-vga none -device virtio-vga"
 
+# v0.80: NAME THIS RUN, AND PRUNE THE REST.
+#
+# .logs/ was introduced in v0.78 so `make clean` could not destroy evidence. It
+# worked, and it created a second hazard: runs accumulate, and any command that
+# reads `.logs/gate/matrix-*/…` is reading several runs at once. That has now
+# produced two wrong readings — a "19 PASS / 1 FAIL" tally whose single FAIL came
+# from a deliberate reproducer directory, and a v0.79 release check that reported
+# the boot banner as 0.73.0-metal by picking up a pre-bump run.
+#
+# Both were caught, but "caught by noticing" is not a property to rely on. So the
+# run records WHERE it is, and anything reporting on a gate reads that pointer
+# instead of a glob. See `make gate-summary`.
+LAST=$(dirname "$WORK")/LAST_RUN
+printf '%s\n' "$WORK" > "$LAST" 2>/dev/null || true
+
+# Keep the last few runs and drop older ones, so the directory cannot grow into
+# the same trap by another route. Reproducer dirs (any name not matching the
+# run prefix) are deliberately left alone — they are named evidence, not runs.
+PRUNE_KEEP=${GATE_KEEP:-3}
+_base=$(basename "$WORK" | sed 's/-[0-9]*$//')
+_dir=$(dirname "$WORK")
+ls -dt "$_dir/$_base"-* 2>/dev/null | tail -n +$((PRUNE_KEEP + 1)) | while read -r old; do
+    [ "$old" = "$WORK" ] && continue
+    rm -rf "$old"
+done
+
 echo "=============================================================="
 echo " FRESH-IMAGE RELEASE MATRIX"
 echo "   iso     : $ISO"
 echo "   md5     : $MD5"
 echo "   configs : $CONFIGS"
+echo "   run dir : $WORK"
+echo "             (recorded in $(dirname "$WORK")/LAST_RUN; read it with 'make gate-summary',"
+echo "              never with a glob over matrix-* — that has misreported twice)"
 echo "   workdir : $WORK"
 echo "=============================================================="
 
@@ -66,6 +95,13 @@ for CFG in $CONFIGS; do
     NET="-netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,mac=52:54:00:ab:cd:ef"
     case "$CFG" in
       uniprocessor) SMP="" ;;
+      # v0.80: two cores. Work stealing needs a thief, and at -smp 2 the only
+      # other core is the BSP -- which is running the suite, not stealing. The
+      # v0.79 account of the [mcpre] failure predicts it therefore cannot fail
+      # here, which is a falsifiable claim this configuration exists to test.
+      # It is also the smallest topology in which any cross-core path runs at
+      # all, and several SMP suites have only ever been exercised at four.
+      smp2-bios)    SMP="-smp 2" ;;
       smp4-bios)    SMP="-smp 4" ;;
       smp4-iommu)
         SMP="-smp 4 -machine q35,kernel-irqchip=split -device intel-iommu,intremap=on,caching-mode=on"
