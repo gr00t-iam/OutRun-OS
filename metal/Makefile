@@ -20,7 +20,11 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o $(BUILD)/scrypt.o
-VERSION := 0.80.0
+# v0.81 DEV CYCLE. The suffix is deliberate and it propagates: the ISO is named
+# outrun-os-0.81.0-dev.iso, so a development image cannot be mistaken for a
+# release artefact by its filename alone. At release time this becomes plain
+# 0.81.0 and KERNEL_VERSION becomes 0.81.0-metal.
+VERSION := 0.81.0-dev
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean
@@ -324,9 +328,18 @@ release-version-check:
 	    echo "  [release] version check OK: $$tag"; \
 	  fi; \
 	fi
+# v0.81: the check now understands a dev cycle. Hardcoding "$(VERSION)-metal"
+# would have warned on every build for the whole cycle, and a check that cries
+# wolf all cycle is one people learn to scroll past -- which is exactly how the
+# stale 0.73.0-metal banner survived four releases and made this check
+# necessary in the first place.
 	@kv=$$(sed -n 's/^#define KERNEL_VERSION "\(.*\)"$$/\1/p' kernel/kernel64.c); \
-	if [ "$$kv" != "$(VERSION)-metal" ]; then \
-	  echo "  [release] *** WARNING: KERNEL_VERSION is \"$$kv\", VERSION is $(VERSION)"; \
+	case "$(VERSION)" in \
+	  *-dev) want="$(VERSION)" ;;      # dev cycle: banner IS the version \
+	  *)     want="$(VERSION)-metal" ;; \
+	esac; \
+	if [ "$$kv" != "$$want" ]; then \
+	  echo "  [release] *** WARNING: KERNEL_VERSION is \"$$kv\", expected \"$$want\""; \
 	  echo "  [release] *** the kernel will PRINT $$kv at boot, tell every ring-3"; \
 	  echo "  [release] *** process OUTRUN=$$kv, and answer 'ver' with it, no matter"; \
 	  echo "  [release] *** what the ISO is called. Fix kernel64.c before tagging."; \
