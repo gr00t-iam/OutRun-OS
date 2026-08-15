@@ -20,7 +20,7 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-VERSION := 0.77.0
+VERSION := 0.78.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean
@@ -99,8 +99,13 @@ UCFLAGS := -ffreestanding -O2 -Wall -Wextra -mcmodel=large -fno-pic -fno-stack-p
 # compiler — an edit to occ.c alone never reached the image, which cost a full
 # boot cycle to notice. A header-style dependency that make cannot see is worse
 # than a slow build.
+# v0.78: UEXTRA is EXTRA's ring-3 counterpart. EXTRA reaches only the kernel
+# compile rule, so until now a -D could not gate anything in init.c — which meant
+# a reproducer needing BOTH a kernel change and a ring-3 change could not be
+# built at all. Same caveat as EXTRA, and it bites the same way: make has no
+# dependency on the flag's VALUE, so `make clean` when toggling either.
 $(BUILD)/user_init.o: user/init.c user/occ.c | $(BUILD)
-	$(CC) $(UCFLAGS) -c $< -o $@
+	$(CC) $(UCFLAGS) $(UEXTRA) -c $< -o $@
 $(BUILD)/user_init.elf: $(BUILD)/user_init.o user/user.ld
 	$(LD) -n -T user/user.ld $< -o $@
 	@echo "  user ELF linked: $@"
@@ -203,6 +208,18 @@ qemu-usb: $(ISO) $(VBLK_IMG)
 #   make gate-dirty                       3 boots, uniprocessor
 #   make gate-dirty-smp                   3 boots, -smp 4
 #   make gate-dirty GATE_DIRTY_BOOTS=5    longer run
+# v0.78: GATE EVIDENCE LIVES OUTSIDE build/.
+#
+# Every harness used to write its logs under $(BUILD), which `make clean`
+# removes. That has now cost this project real evidence twice: a carryover-3
+# reproduction had to be re-run because clean ate its logs, and the only copy of
+# the unexplained v0.76 [mcpre] failure is simply gone — its roadmap entry still
+# says "preserved at" a path that no longer exists anywhere.
+#
+# .logs/ is gitignored, so this is about surviving a build step, not about
+# committing everything: what matters gets copied into docs/ deliberately.
+GATE_LOGS ?= .logs/gate
+
 GATE_DIRTY_BOOTS ?= 3
 GATE_DIRTY_QEMU  ?=
 # The workdir carries the shell's PID so two invocations can never `rm -rf`
@@ -210,10 +227,37 @@ GATE_DIRTY_QEMU  ?=
 # while another run holds it — see the comment there for what happened without
 # these. The chosen path is printed in the run's own header.
 gate-dirty: $(ISO)
-	tools/gate-dirty.sh "$(ISO)" "$(GATE_DIRTY_BOOTS)" "$(GATE_DIRTY_QEMU)" "$(BUILD)/gate-dirty-$$$$"
+	tools/gate-dirty.sh "$(ISO)" "$(GATE_DIRTY_BOOTS)" "$(GATE_DIRTY_QEMU)" "$(GATE_LOGS)/dirty-$$$$"
 
 gate-dirty-smp: $(ISO)
 	$(MAKE) gate-dirty GATE_DIRTY_QEMU="-smp 4"
+
+# v0.78: THE FRESH-IMAGE MATRIX, as a target anyone can run.
+#
+# CLAUDE.md has named uniprocessor / -smp 4 SeaBIOS / -smp 4 q35+VT-d as gate
+# configurations since v0.76, but only the first had a target (release-verify).
+# The other two were driven by a harness that lived outside the tree, which
+# means the release matrix was reproducible by exactly one person. That is not
+# a gate, it is a habit — so it is now tools/gate-matrix.sh and `make gate`.
+#
+#   make gate                                  all three fresh configurations
+#   make gate GATE_CONFIGS="smp4-iommu"        just one
+#   make gate-all                              fresh matrix + both dirty gates
+#
+# gate-matrix.sh prints an explicit coverage line naming what it did NOT test,
+# because a gate whose gaps are invisible is how "verified" drifts away from
+# "measured".
+.PHONY: gate gate-all
+GATE_CONFIGS ?= uniprocessor smp4-bios smp4-iommu
+gate: $(ISO)
+	tools/gate-matrix.sh "$(ISO)" "$(GATE_LOGS)/matrix-$$$$" $(GATE_CONFIGS)
+
+# The whole standing gate in one command, in the order that fails cheapest
+# first: a fresh-image break should not wait behind nine dirty boots.
+gate-all: $(ISO)
+	$(MAKE) gate
+	$(MAKE) gate-dirty
+	$(MAKE) gate-dirty-smp
 
 # ===========================================================================
 # v0.76: RELEASE PACKAGING — mandatory for every version tag
@@ -267,6 +311,15 @@ release-version-check:
 	  else \
 	    echo "  [release] version check OK: $$tag"; \
 	  fi; \
+	fi
+	@kv=$$(sed -n 's/^#define KERNEL_VERSION "\(.*\)"$$/\1/p' kernel/kernel64.c); \
+	if [ "$$kv" != "$(VERSION)-metal" ]; then \
+	  echo "  [release] *** WARNING: KERNEL_VERSION is \"$$kv\", VERSION is $(VERSION)"; \
+	  echo "  [release] *** the kernel will PRINT $$kv at boot, tell every ring-3"; \
+	  echo "  [release] *** process OUTRUN=$$kv, and answer 'ver' with it, no matter"; \
+	  echo "  [release] *** what the ISO is called. Fix kernel64.c before tagging."; \
+	else \
+	  echo "  [release] kernel banner check OK: $$kv"; \
 	fi
 
 # A release image is built from a CLEAN tree. An incremental build can carry an

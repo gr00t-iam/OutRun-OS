@@ -1653,6 +1653,35 @@ static u32 osysncpu(void) {
  * waiter's spins and calling it a timeout. */
 #define WAIT_T_JOIN     2000u      /*  20 s: one thread join, retries included */
 
+/* v0.78: role 29's fork/waitpid wait — the LAST spin budget in this file, and
+ * the one carryover 3 is actually about. It was `owaitpid(child, 30000)`, and
+ * the v0.75 fork-race account names its expiry as the trigger for both observed
+ * symptoms: the parent gives up (702), exits, its slot is recycled, and only
+ * then does the child ask who its parent is (44).
+ *
+ * A spin count made that budget mean different durations at 1 vCPU and at 4,
+ * which is exactly why the failure looked like a race sensitive to host speed
+ * and binary layout. 2000 ticks sits below role 29's own 3000-tick posix_drain
+ * watchdog so the inner deadline fires first and the log names an assertion
+ * rather than reporting that the round never finished. */
+#ifdef FORK_TIGHT_DEADLINE
+/* v0.78 REPRODUCER, NEVER shipped. Build with
+ *   make clean && make EXTRA=-DFORK_FUNNEL_REPRO UEXTRA=-DFORK_TIGHT_DEADLINE
+ *
+ * 20 ticks sits deliberately BETWEEN the two measured populations: a fixed
+ * kernel dispatches a forked child in 1-8 ticks even at 1.5x host
+ * oversubscription, while the funnel reproducer takes 52-94. A deadline in the
+ * gap fires for one and not the other, which is what makes the pair a
+ * controlled experiment instead of two anecdotes.
+ *
+ * This is how the v0.74 symptom is reached on a host that is otherwise too fast
+ * to show it: not by making the machine slower, but by moving the budget down
+ * to where the machine already is. */
+#define WAIT_T_FORK       20u      /* 0.2 s: REPRODUCER ONLY                   */
+#else
+#define WAIT_T_FORK     2000u      /*  20 s: fork -> child exit                */
+#endif
+
 static i64 owaitpid_ticks(u32 pid, u32 budget, u32 *spent) {
     u32 t0 = osysticks(), n = 0;
     for (;;) {
@@ -2211,6 +2240,9 @@ static volatile int g_chld_hits = 0;
 static void on_sigchld(int s) { (void)s; g_chld_hits++; }
 
 static void posix_fork_worker(void) {
+#ifdef FORK_TIGHT_DEADLINE
+    oputs("  [posix ] *** FORK_TIGHT_DEADLINE build: waitpid budget is 20 ticks, NOT 2000\n");
+#endif
     u32 mypid = ogetpid();
     osigaction(SIGCHLD, on_sigchld);
     i64 r = ofork();
@@ -2225,9 +2257,17 @@ static void posix_fork_worker(void) {
     }
     /* ---- PARENT ---- */
     u32 child = (u32)r;
-    i64 code = owaitpid(child, 30000);
-    if (code == -11) sysc(SYS_EXIT, 702, 0, 0);       /* child never finished */
-    if (code != 42)  sysc(SYS_EXIT, 703, 0, 0);       /* wrong exit status    */
+    /* v0.78: a real-time deadline, and it REPORTS ITSELF. The old line waited a
+     * spin count and the only thing the log ever learned was the exit code —
+     * so "the child never ran" and "I stopped asking too early" arrived as the
+     * same number, on a budget that meant different durations per core count. */
+    u32 spent = 0;
+    i64 code = owaitpid_ticks(child, WAIT_T_FORK, &spent);
+    oputs("  [posix ] waitpid on the forked child returned after ");
+    oputu(spent);
+    oputs(" tick(s)\n");
+    if (code == -11) sysc(SYS_EXIT, 702, 0, 0);       /* DEADLINE: gave up waiting */
+    if (code != 42)  sysc(SYS_EXIT, 703, 0, 0);       /* ran, but wrong exit status */
     /* SIGCHLD is posted by the kernel when the child's space is reclaimed; give
      * the delivery boundary a few syscalls to hand it to our handler.        */
     for (int i = 0; i < 64 && !g_chld_hits; i++) oyield();

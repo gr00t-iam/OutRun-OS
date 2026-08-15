@@ -16,7 +16,17 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.73.0-metal"
+/* v0.78: this read "0.73.0-metal" and had done since v0.73 — so the boot banner,
+ * the `outrun> ver` output and the OUTRUN= environment variable handed to every
+ * ring-3 process all claimed 0.73.0 through FOUR tagged releases (v0.74, v0.75,
+ * v0.76, v0.77).
+ *
+ * It is the same class of defect as the v0.75 incident that created the release
+ * protocol — an artefact naming itself wrongly — and it survived that protocol
+ * because release-version-check only ever compared the Makefile's VERSION against
+ * the git tag. The string the KERNEL prints was never in the comparison. It is
+ * now: see release-version-check in metal/Makefile, which greps this line. */
+#define KERNEL_VERSION "0.78.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -844,6 +854,10 @@ static inline void write_cr3(uint64_t v) {
 #define PTE_HUGE    0x80ull
 #define PTE_NX      (1ull << 63)     /* no-execute (requires EFER.NXE)            */
 extern uint8_t _stext[], _etext[], _kernel_end[];   /* from the linker script    */
+/* v0.78: read-only data has its own bounds now. Before this, harden_kernel_wx()
+ * knew only about _etext, so everything above it — .rodata and .eh_frame
+ * included — was mapped RW+NX, and read-only data was writable. */
+extern uint8_t _srodata[], _erodata[];
 #define ADDR_MASK   0x000ffffffffff000ull
 
 static uint64_t kernel_cr3 = 0;
@@ -1570,6 +1584,7 @@ static void harden_kernel_wx(void) {
     uint64_t *pdpt = (uint64_t *)(pml4[0] & ADDR_MASK);
     uint64_t *pd   = (uint64_t *)(pdpt[0] & ADDR_MASK);
     uint64_t stext = (uint64_t)_stext, etext = (uint64_t)_etext, kend = (uint64_t)_kernel_end;
+    uint64_t srod = (uint64_t)_srodata, erod = (uint64_t)_erodata;
     uint64_t split_hp = (kend + 0x1FFFFF) / 0x200000;      /* huge pages to 4K-split */
     __asm__ volatile("cli");
     /* CR0.WP: enforce read-only pages even in ring 0, so kernel code is immutable */
@@ -1581,8 +1596,12 @@ static void harden_kernel_wx(void) {
             for (int i = 0; i < 512; i++) {
                 uint64_t va = hp * 0x200000 + (uint64_t)i * 0x1000;
                 uint64_t f = PTE_PRESENT;
-                if (va >= stext && va < etext) f |= 0;      /* code: R + X          */
-                else f |= PTE_WRITE | PTE_NX;               /* data: RW + NX        */
+                if (va >= stext && va < etext) f |= 0;      /* code:   R  + X       */
+                /* v0.78: .rodata and .eh_frame are neither writable NOR executable.
+                 * They used to fall into the else below and come out RW+NX, which
+                 * made every constant in the kernel a writable target. */
+                else if (va >= srod && va < erod) f |= PTE_NX;   /* rodata: R  + NX */
+                else f |= PTE_WRITE | PTE_NX;               /* data:   RW + NX      */
                 pt[i] = (va & ADDR_MASK) | f;
             }
             pd[hp] = ((uint64_t)pt & ADDR_MASK) | PTE_PRESENT | PTE_WRITE;
@@ -1918,6 +1937,17 @@ struct kproc {
      * See ROADMAP-0.75.0.md. */
     int      ppid_slot;           /* parent kproc slot, for SIGCHLD (-1 = none)     */
     uint32_t ppid_gen;            /* parent's `gen` when the link was made          */
+    /* v0.78 FORK TELEMETRY. enq_tick is stamped when sys_fork queues the child;
+     * disp_lat is how many ticks passed before any core actually dispatched it.
+     *
+     * This exists because v0.75's account of the fork race rests on exactly this
+     * number — "the failing children waited long enough for the parent's
+     * 30000-poll waitpid budget to expire" — and that measurement was taken on a
+     * one-off instrumented build that no longer exists. A quantity that decides
+     * whether a defect is real should not have to be re-instrumented each time
+     * someone wants to look at it. */
+    uint64_t enq_tick;            /* g_ticks when queued by fork (0 = not a fork)  */
+    uint32_t disp_lat;            /* ticks from enqueue to first dispatch          */
     /* Bumped on every recycle of this slot, by kproc_reset. NOT cleared there —
      * it is the one field whose whole purpose is to survive the wipe and count
      * it, so it is set apart from the blanking loop deliberately. */
@@ -2287,6 +2317,7 @@ static void kproc_reset(struct kproc *p) {
     p->redir_out = -1;
     p->uctx = (struct uctx){0};
     p->ran_on = 0;
+    p->enq_tick = 0; p->disp_lat = 0;              /* v0.78 fork telemetry */
     /* v0.55: POSIX state — default dispositions, nothing pending/blocked,
      * one thread in the group, per-thread stacks start below the main stack. */
     for (int sg = 0; sg < NSIG; sg++) p->sig_handler[sg] = 0;
@@ -10269,6 +10300,11 @@ static volatile uint32_t g_futex_waits = 0, g_futex_wakes = 0, g_futex_timeouts 
  * which cores its threads were dispatched on, or whether their stacks came
  * back. Reset by the suite before each run. */
 static volatile uint32_t g_thr_ran_mask   = 0;   /* union of ran_on over departed threads */
+/* v0.78: enqueue-to-first-dispatch latency for FORKED children, in ticks.
+ * Always on, always printed by posixstrs. A counter nothing prints is not
+ * instrumentation — and this is the counter the whole carryover-3 argument
+ * turns on. */
+static volatile uint32_t g_fork_disp_n = 0, g_fork_disp_sum = 0, g_fork_disp_max = 0;
 static volatile uint32_t g_thr_released   = 0;   /* thread slots released                 */
 static volatile uint32_t g_thr_stk_pages  = 0;   /* stack pages handed back to the allocator */
 static volatile uint32_t g_futex_lost_races = 0;   /* wakes that landed mid-arming */
@@ -11427,7 +11463,16 @@ static void cpu_exec_proc(int c, int p) {
     set_syscall_stack((uint64_t)(g_syscall_stack[c] + sizeof g_syscall_stack[c]));
     __sync_fetch_and_or(&kprocs[p].ran_on, 1u << c);
     kprocs[p].migrate_pin = -1;   /* v0.52: one-shot directed-migration pin consumed on run */
-    __sync_fetch_and_add(&kprocs[p].dispatches, 1);
+    uint32_t prevd = __sync_fetch_and_add(&kprocs[p].dispatches, 1);
+    /* v0.78: first dispatch of a forked child — record how long it sat queued. */
+    if (prevd == 0 && kprocs[p].enq_tick) {
+        uint32_t lat = (uint32_t)(g_ticks - kprocs[p].enq_tick);
+        kprocs[p].disp_lat = lat;
+        __sync_fetch_and_add(&g_fork_disp_n, 1);
+        __sync_fetch_and_add(&g_fork_disp_sum, lat);
+        for (;;) { uint32_t m = g_fork_disp_max;
+                   if (lat <= m || __sync_bool_compare_and_swap(&g_fork_disp_max, m, lat)) break; }
+    }
     uint32_t dl = __sync_fetch_and_add(&g_dlog_n, 1);  /* v0.40: dispatch log  */
     if (dl < DLOG_LEN) g_dlog[dl] = p;
     int now = __sync_add_and_fetch(&g_inr3, 1);
@@ -12834,7 +12879,26 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
      * not), and the causal link to the posixstrs race is SUPPORTED BY ONE
      * INSTRUMENTED MEASUREMENT AND NOT YET REPRODUCED UNINSTRUMENTED.
      * See ROADMAP-0.75.0.md. */
+    /* v0.78: stamp BEFORE the enqueue, so the measurement includes the enqueue
+     * itself and can never read negative. Non-zero is what marks this slot as a
+     * forked child for the dispatch hook. */
+    kprocs[ch].enq_tick = g_ticks ? g_ticks : 1;
+#ifdef FORK_FUNNEL_REPRO
+    /* v0.78 REPRODUCER, NEVER shipped. This restores v0.75's defect — the
+     * hardcoded preferred core — so the funnel can be MEASURED rather than
+     * argued about. Build with `make clean && make EXTRA=-DFORK_FUNNEL_REPRO`.
+     *
+     * The clean-build is not optional: EXTRA reaches only the kernel compile
+     * rule and make has no dependency on the flag's value, so a plain `make`
+     * afterwards leaves this object in place and produces a reproducer kernel
+     * with fresh userland, under a filename and a build log that both look
+     * entirely normal. That has already cost this project a wasted analysis,
+     * which is why the banner below exists: trust the log, not the command
+     * you think you typed. */
+    rq_push_any(0, ch);
+#else
     rq_push_any((int)cpu_idx(), ch);
+#endif
     for (int cc = 1; cc < MAX_CPUS; cc++)               /* let an idle sibling steal it */
         if (g_cpu[cc].online) lapic_ipi(g_cpu[cc].apic_id, IPI_PING, 0);
     g_forks++;
@@ -12910,10 +12974,42 @@ static void sys_yield_ring3(struct sysframe *sf) {
  * is already complete; the park itself still happens later, in cpu_exec_proc,
  * because until this core has finished unwinding the task is still RUNNING
  * here and a second core resuming it would put one task on two cores. */
+/* v0.78: as block_ring3, but the CALLER ALREADY HOLDS the futex lock, having
+ * made its decision to sleep while holding it. Releases the lock. Never returns.
+ *
+ * THIS EXISTS BECAUSE THE LOST WAKEUP WAS REAL, and it was in the gap between a
+ * caller's condition check and its arming. Both callers below took the lock,
+ * tested their condition, RELEASED the lock, and only then called block_ring3 —
+ * which takes the lock again to arm. A waker landing in that gap scans for
+ * `parked` or `wait_armed`, finds the waiter in NEITHER state, matches nobody,
+ * and spends its wake on empty air. The waiter then arms and parks against a
+ * wake that has already happened, and sleeps until the 200 s deadline.
+ *
+ * That is the mechanism behind `[pthreads_smp] exit 937` in the v0.76 and v0.78
+ * gate logs: both failing boots are short by exactly one wake (45/44, 46/45)
+ * where every passing boot balances. sys_futex_wait's own comment claimed the
+ * compare-and-park was "atomic against SYS_FUTEX_WAKE (both take the futex
+ * lock)" — the property was documented, believed, and not implemented.
+ *
+ * With the lock held across check-and-arm, the two orderings are:
+ *   waker acquires first  -> its state change precedes our check, we see it and
+ *                            do not sleep at all
+ *   waiter acquires first -> we are armed before the waker can scan, so it sees
+ *                            wait_armed and sets wake_pending
+ * Neither loses the wakeup, which is what the protocol comment above always
+ * said and now describes the code.
+ *
+ * No extra memory barriers are needed on x86-64: __sync_lock_test_and_set is a
+ * full barrier and __sync_lock_release is a release store, so the lock itself
+ * orders the publication of wait_key/wait_armed against every waker's scan.
+ * Adding smp_mb() around these fields would be cargo — the ordering was never
+ * the defect, the lock GAP was. */
 static void __attribute__((noreturn))
-block_ring3(struct sysframe *sf, int p, uint64_t key, uint64_t timeout) {
+block_ring3_locked(struct sysframe *sf, int p, uint64_t key, uint64_t timeout) {
+    /* Capture BEFORE arming, exactly as before: by the time another core can
+     * observe wait_armed the uctx must already be complete. Doing it under the
+     * lock costs a register-block copy of hold time and buys the atomicity. */
     uctx_from_sysframe(&kprocs[p].uctx, sf, WAIT_RV_OK);
-    futex_lock();
     kprocs[p].wait_restart  = 0;      /* returns from the call, does not repeat it */
     kprocs[p].wait_key      = key;
     kprocs[p].wait_deadline = g_ticks + timeout;
@@ -12928,6 +13024,19 @@ block_ring3(struct sysframe *sf, int p, uint64_t key, uint64_t timeout) {
     resume_kernel(RET_PREEMPTED);            /* cpu_exec_proc parks or requeues */
     for (;;) __asm__ volatile("hlt");        /* unreachable                     */
 }
+
+/* There is deliberately NO unconditional `block_ring3(...)` wrapper any more.
+ *
+ * It existed, both parkers used it, and its signature is precisely what caused
+ * the lost wakeup: it invites a caller to test its condition, drop the lock (or
+ * never take it), and then park — which is the window a waker falls into. Every
+ * caller must now hold the futex lock across its own decision and hand it over,
+ * so the dangerous shape is not merely discouraged, it is unavailable.
+ *
+ * Deleted rather than kept and marked unused, for the same reason v0.77 deleted
+ * the spin-budgeted cs_compile() instead of leaving it beside its replacement:
+ * the next person to add a parker copies whichever primitive their eye lands
+ * on. */
 
 /* v0.64 Phase 2: park exactly as block_ring3 does, but arrange for the task to
  * resume by RE-EXECUTING ITS SYSCALL instead of returning from it.
@@ -12993,6 +13102,17 @@ static int block_ring3_restart(struct sysframe *sf, int p, uint64_t key,
  * not the machine. */
 #define FUTEX_DEFAULT_TICKS 20000ull
 
+#ifdef FUTEX_RACE_REPRO
+/* v0.78 REPRODUCER ONLY: the shortened deadline applies to the JOIN park alone.
+ *
+ * The first version of this reproducer shortened FUTEX_DEFAULT_TICKS itself, and
+ * that was wrong — every park in the kernel uses it, so a 2 s global deadline
+ * perturbed subsystems that have nothing to do with the defect and wedged the
+ * boot 24 suites in. A reproducer that changes more than the path under test
+ * cannot attribute what it observes. Only the join deadline moves now. */
+#define FUTEX_REPRO_JOIN_TICKS 200ull
+#endif
+
 /* Can this context park at all? A Model-A pcb uthread cannot: it belongs to the
  * BSP thread scheduler, not to a run queue, so there is no RET_PREEMPTED path
  * to unwind through. Those callers fall back to yield-and-recheck, which is
@@ -13029,10 +13149,12 @@ static uint64_t sys_futex_wait(struct sysframe *sf, uint64_t uaddr, uint64_t val
         }
         return WAIT_RV_OK;
     }
+    /* v0.78: the lock is held ACROSS the compare and the arm. It used to be
+     * released here, between the two, which is the lost-wakeup window this
+     * function's own comment says cannot exist. See block_ring3_locked(). */
     futex_lock();
     if (*(volatile uint64_t *)uaddr != val) { futex_unlock(); return (uint64_t)-11; }
-    futex_unlock();
-    block_ring3(sf, p, key, timeout);         /* never returns */
+    block_ring3_locked(sf, p, key, timeout);  /* never returns; releases the lock */
 }
 
 /* SYS_EPOLL_WAIT(epfd, events, maxevents_and_timeout) -> ready count, or negative.
@@ -13128,6 +13250,58 @@ static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, ui
         kprocs[me].ep_deadline = 0;
         return 0;
     }
+    /* v0.78 — WHY THIS ONE IS NOT CONVERTED TO block_ring3_locked(), AND WHY THAT
+     * IS CORRECT RATHER THAN A GAP LEFT OPEN.
+     *
+     * v0.78 closed a lost-wakeup window in sys_futex_wait and sys_thread_join by
+     * holding g_futex_lock across the condition check and the arming. This
+     * function has the same shape — the readiness scan above releases
+     * g_ofile_lock at the end of its loop, and the arming happens here — so the
+     * same treatment looks like the obvious next step. It is not, for two
+     * independent reasons, and the second one is the important one.
+     *
+     * 1. IT WOULD NOT DEADLOCK; IT WOULD LEAK A LOCK, WHICH IS WORSE.
+     *    block_ring3_restart() is noreturn: it unwinds through resume_kernel()
+     *    into cpu_exec_proc and this stack frame never runs again. It releases
+     *    g_futex_lock itself, immediately before the unwind, precisely because
+     *    of that. A g_ofile_lock held across the call would never be released by
+     *    anybody — the first epoll park would permanently wedge every descriptor
+     *    operation in the system. Ordering is not the obstacle here; liveness is.
+     *
+     *    (On ordering: ep_notify_fd deliberately collects under g_ofile_lock and
+     *    wakes OUTSIDE it — "the ordering discipline puts [run-queue locks]
+     *    strictly outside the descriptor lock, never nested inside it". Holding
+     *    ofile across the arm would be the first violation of that rule in the
+     *    tree, and it would be introduced to fix something that is not broken.)
+     *
+     * 2. A LOST WAKE HERE IS LATE, NEVER WRONG — and that is the whole
+     *    difference from the join case. This park uses the RESTART protocol:
+     *    wait_restart is set, RIP is rewound onto the `syscall`, and RAX carries
+     *    78. So every exit from the park — a real wake, a spurious wake, or the
+     *    deadline expiring through futex_timeout_scan — resumes by RE-EXECUTING
+     *    SYS_EPOLL_WAIT, which rescans readiness from scratch before it consults
+     *    anything else. A wake that goes missing therefore costs a delay bounded
+     *    by ep_deadline, after which the rescan finds the event and reports it
+     *    correctly.
+     *
+     *    That deadline is absolute and survives restarts (see above), so a lost
+     *    wake cannot extend the wait past what the caller asked for.
+     *
+     *    Contrast sys_thread_join, which was converted: there a lost wake became
+     *    -ETIMEDOUT, an ERROR, which ring 3 reported as a join defect after 200 s.
+     *    Late-but-correct and wrong are not the same failure, and only one of
+     *    them justifies holding a rank-1 klock across a noreturn unwind.
+     *
+     * THE INVARIANT, stated so it can be checked rather than re-derived:
+     *   Any parker whose wake carries INFORMATION the waiter cannot recompute
+     *   must arm atomically with its condition check (block_ring3_locked).
+     *   Any parker that RE-EXECUTES and recomputes its condition on resume may
+     *   arm separately, and must have a bounded deadline so the recomputation is
+     *   guaranteed to happen. epoll is the second kind. Futex and join are the
+     *   first, because their answer is decided by the waker.
+     *
+     * If a future change makes epoll's wake carry information — anything the
+     * rescan cannot rediscover — this reasoning expires with it. */
     __sync_fetch_and_add(&g_epoll_parks, 1);
     block_ring3_restart(sf, me, EPOLL_WAIT_KEY(epi), dl - g_ticks, 78);
     /* Only reached if the caller did not arrive through a `syscall` we can
@@ -13175,12 +13349,64 @@ static uint64_t sys_thread_join(struct sysframe *sf, uint64_t tid, uint64_t out)
     }
     /* Already gone: answer from the leader's table. This is checked FIRST and
      * again on every retry, so a thread that exits between two calls is never
-     * waited on forever. */
+     * waited on forever.
+     *
+     * v0.78: and the check is now made UNDER THE FUTEX LOCK, held continuously
+     * until this task is armed. It was not, and that is the lost wakeup this
+     * suite has failed on twice. thread_exit sets thr_done and then calls
+     * futex_wake_key(JOIN_KEY_OF(L,t)), which needs this lock — so with the
+     * check and the arm inside one critical section, an exit either happens
+     * before our read (we see thr_done and never sleep) or after our arm (its
+     * wake finds wait_armed). Previously it could land between the two and
+     * match nothing at all, leaving the joiner parked until the 200 s deadline
+     * and surfacing in ring 3 as exit 937 — a join timeout, naming nothing
+     * about futexes and nothing about the thread that had already exited. */
+#ifdef FUTEX_RACE_REPRO
+    /* THE PRE-v0.78 SHAPE, RESTORED ON PURPOSE: test the condition with the lock
+     * NOT held, then arm separately. The delay between them only widens a window
+     * that was always there — it does not create one. Without the widening the
+     * race fires roughly 1 boot in 8, which is too rare to demonstrate anything;
+     * with it, every join that races an exit loses its wake.
+     *
+     * This is the control build for the fix in this commit. Never shipped. */
     if (kprocs[L].thr_done & (1u << tid)) {
         if (out) *(volatile uint64_t *)out = kprocs[L].thr_exit[tid];
         return WAIT_RV_OK;
     }
     if (!sf || !can_park()) {
+        uint64_t dl0 = g_ticks + FUTEX_REPRO_JOIN_TICKS;
+        while (!(kprocs[L].thr_done & (1u << tid))) {
+            if (g_ticks >= dl0) return WAIT_RV_TIMEDOUT;
+            krelax();
+        }
+        if (out) *(volatile uint64_t *)out = kprocs[L].thr_exit[tid];
+        return WAIT_RV_OK;
+    }
+    /* Widen the window with a SPIN COUNT, deliberately, and this is the one place
+     * in the tree where that is the correct instrument rather than the defect.
+     *
+     * The first attempt waited on g_ticks. That hangs: g_ticks is advanced by the
+     * BSP timer interrupt, and this runs inside a syscall on the BSP with
+     * interrupts masked, so the clock it waits for cannot move. The boot wedged
+     * with no output and no breadcrumb. What is wanted here is not a duration at
+     * all — it is "hold this core long enough for another to run", which is a
+     * quantity of execution, and a spin count measures exactly that. */
+    for (volatile int spin = 0; spin < 4000000; spin++) __asm__ volatile("pause");
+    futex_lock();
+    block_ring3_locked(sf, p, JOIN_KEY_OF(L, tid), FUTEX_REPRO_JOIN_TICKS);
+#endif
+    futex_lock();
+    if (kprocs[L].thr_done & (1u << tid)) {
+        uint64_t code = kprocs[L].thr_exit[tid];
+        futex_unlock();
+        /* The user-memory store happens OUTSIDE the lock: access_ok above says
+         * the page is present, but a raw leaf spinlock is not something to hold
+         * across a write to another address space's mapping. */
+        if (out) *(volatile uint64_t *)out = code;
+        return WAIT_RV_OK;
+    }
+    if (!sf || !can_park()) {
+        futex_unlock();
         uint64_t dl = g_ticks + FUTEX_DEFAULT_TICKS;
         while (!(kprocs[L].thr_done & (1u << tid))) {
             if (g_ticks >= dl) return WAIT_RV_TIMEDOUT;
@@ -13189,7 +13415,7 @@ static uint64_t sys_thread_join(struct sysframe *sf, uint64_t tid, uint64_t out)
         if (out) *(volatile uint64_t *)out = kprocs[L].thr_exit[tid];
         return WAIT_RV_OK;
     }
-    block_ring3(sf, p, JOIN_KEY_OF(L, tid), FUTEX_DEFAULT_TICKS);   /* never returns */
+    block_ring3_locked(sf, p, JOIN_KEY_OF(L, tid), FUTEX_DEFAULT_TICKS);  /* releases the lock */
 }
 
 /* SYS_SIGRETURN() — pop the frame sig_deliver pushed and resume the interrupted
@@ -21198,6 +21424,14 @@ static void cmd_posix_stress(void) {
                  * two are indistinguishable again at the point it matters. */
                 if (roles[i] == 31 && R.code[i] == 908)
                     kprintf("[posixstrs]   ^ a join DEADLINE expired — not a join defect\n");
+                /* v0.78: role 29's two failure modes are the whole of carryover 3,
+                 * and until now the log distinguished them only by a bare number. */
+                if (roles[i] == 29 && R.code[i] == 702)
+                    kprintf("[posixstrs]   ^ the parent's waitpid DEADLINE expired — the child "
+                            "had not exited yet; compare the fork dispatch latency below\n");
+                if (roles[i] == 29 && R.code[i] == 703)
+                    kprintf("[posixstrs]   ^ the child RAN and exited with the wrong status — "
+                            "a real defect, not a deadline\n");
                 codes_ok = 0;
             }
             /* The thread group must be fully accounted for: nthreads back to 0
@@ -21246,6 +21480,25 @@ static void cmd_posix_stress(void) {
 
     kprintf("[posixstrs] this suite: %u fork(s), %u execve(s), %u thread(s), %d child kproc(s)\n",
             g_forks - fork0, g_execs - exec0, g_threads_made - thr0, (uint64_t)nchild_total);
+
+    /* v0.78: THE NUMBER CARRYOVER 3 TURNS ON, printed on every boot.
+     *
+     * v0.75 fixed a defect that funnelled every forked child onto cpu 0's queue
+     * regardless of which core forked it, while the waiting parent drained a
+     * different queue. Its evidence was one instrumented build measuring exactly
+     * this latency, and that build no longer exists — so the causal claim has
+     * been carried, unverifiable, through three milestones.
+     *
+     * It costs two counters to never be in that position again. If the child is
+     * dispatched promptly, a parent that times out did NOT lose a race with the
+     * scheduler, and the search moves elsewhere. If the latency is large, the
+     * argument is measured rather than asserted. */
+    if (g_fork_disp_n)
+        kprintf("[posixstrs] fork enqueue->first dispatch: n=%u  max=%u tick(s)  avg=%u tick(s)\n",
+                (uint64_t)g_fork_disp_n, (uint64_t)g_fork_disp_max,
+                (uint64_t)(g_fork_disp_sum / g_fork_disp_n));
+    else
+        kprintf("[posixstrs] fork enqueue->first dispatch: NO SAMPLES (no child was dispatched)\n");
     pxcheck("fork/exec/thread counters all advanced (the syscalls really ran)",
             g_forks - fork0 >= (uint64_t)POSIXSTRESS_ROUNDS * 2 &&
             g_execs - exec0 >= (uint64_t)POSIXSTRESS_ROUNDS &&
@@ -21859,6 +22112,7 @@ static void cmd_pthreads_smp(void) {
     int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
     uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
     uint32_t viol0 = g_rank_violations, waits0 = g_futex_waits, wakes0 = g_futex_wakes;
+    uint32_t tmo0 = g_futex_timeouts;          /* v0.78: see the lost-wake assertion */
     g_thr_ran_mask = 0; g_thr_released = 0; g_thr_stk_pages = 0;
 
     int p = kproc_spawn("pthreadsmp", PCAP_FILESYSTEM);
@@ -21913,6 +22167,31 @@ static void cmd_pthreads_smp(void) {
      * flipped. This is what separates the two. */
     pscheck("threads PARKED on the mutex and the condvar rather than spinning",
             g_futex_waits > waits0 && g_futex_wakes > wakes0);
+    /* v0.78: NO PARK IN THIS SUITE MAY END IN A TIMEOUT — the assertion that
+     * names the defect this suite has twice failed on without anyone being able
+     * to say why. Measured across seven -smp 4 boots:
+     *
+     *   passing  44/44  43/43  45/45  46/46  44/44   — parks balance wakes
+     *   failing  45/44  46/45                        — short by exactly one
+     *
+     * Both failures (v0.76 gate-dirty-smp boot 2, v0.78 gate smp4-bios) are one
+     * park that never received its wake. The thread then sits in SYS_THREAD_JOIN
+     * until the kernel's own 200 s park deadline expires, which is why those
+     * boots take ~435 s against ~230 s, and why the symptom surfaced in ring 3
+     * as a join timeout (937) rather than as anything mentioning futexes.
+     *
+     * The test is on the TIMEOUT counter, not on parks-minus-wakes. The balance
+     * is what the evidence showed, but `g_futex_wakes` counts threads woken or
+     * armed while a park can also end by timing out — so parks == wakes is a
+     * correlation that happened to hold in five samples, and parks that time out
+     * is the thing actually being claimed. utstrs and epstrs already assert this
+     * counter the same way; this is that idiom, applied where it was missing.
+     *
+     * This does NOT fix the lost wake. See ROADMAP-0.78.0.md, where it stays
+     * open. It converts a 200-second stall reported under a misleading name into
+     * an immediate failure reported under the right one. */
+    pscheck("no futex park in this suite timed out (every park got its wake)",
+            g_futex_timeouts == tmo0);
     int cores = 0;
     for (int c = 0; c < MAX_CPUS; c++) if (g_thr_ran_mask & (1u << c)) cores++;
     if (n > 1) pscheck("worker threads were dispatched on MORE THAN ONE core", cores >= 2);
@@ -24595,6 +24874,27 @@ static int wp_poison(void) {
     return g_fault_caught && g_fault_vector == 14;
 }
 
+/* Write to the R+NX read-only data region; expect a write-protect #PF.
+ *
+ * v0.78: the exact parallel of wp_poison() above, and it exists because the
+ * property it tests was FALSE until this milestone. .rodata sat above _etext,
+ * harden_kernel_wx() mapped everything above _etext as RW+NX, and so every
+ * constant in the kernel — jump tables, string literals, the embedded SDK
+ * sources — was quietly writable. A boundary nothing tests is a boundary that
+ * drifts, which is why this is an assertion and not a comment. */
+static int rodata_poison(void) {
+    g_fault_caught = 0; g_fault_vector = 0; g_fault_expected = 1;
+    __asm__ volatile(
+        "lea 2f(%%rip), %%rax\n movq %%rax, %0\n"
+        "movq %%rsp, %1\n"
+        "movb $0x90, (%2)\n"                               /* write into .rodata   */
+        "2:\n"
+        : "=m"(g_fault_recover_rip), "=m"(g_fault_recover_rsp)
+        : "r"((uint64_t)(uintptr_t)_srodata) : "rax", "memory");
+    g_fault_expected = 0;
+    return g_fault_caught && g_fault_vector == 14;
+}
+
 static void cmd_stress(void) {
     kputs("-- STRESS & ENFORCEMENT (fault injection + TLB/CR3 + W^X/NX) --\n");
     g_spass = g_sfail = 0;
@@ -24615,6 +24915,14 @@ static void cmd_stress(void) {
 
     /* (3) write-protect: kernel code is immutable */
     scheck("writing to R+X kernel code traps (#PF, code immutable)", wp_poison());
+
+    /* (3b) v0.78: and read-only data is genuinely read-only. Until the linker
+     * script grew separate segments this assertion would have FAILED: .rodata
+     * was mapped RW+NX because it sits above _etext. */
+    scheck("writing to R+NX kernel .rodata traps (#PF, constants immutable)", rodata_poison());
+    kprintf("[stress ] .rodata window %X..%X (%u KiB), NX and write-protected\n",
+            (uint64_t)(uintptr_t)_srodata, (uint64_t)(uintptr_t)_erodata,
+            (uint64_t)(((uintptr_t)_erodata - (uintptr_t)_srodata) >> 10));
 
     /* (4) TLB staleness under remap: remap a vaddr to a new frame, invlpg, and  */
     /* confirm the read reflects the NEW frame (no stale TLB entry survives)     */
@@ -25590,6 +25898,19 @@ static void shell_run(void) {
      * Caveat this cannot fix: a HUNG boot never reaches this line, so these
      * numbers describe surviving boots only. */
     kprintf("[connect] apyield=%u stale=%u\n", g_connect_ap_yield, g_connect_stale);
+#ifdef FORK_FUNNEL_REPRO
+    /* Loud, unmissable, and in the LOG rather than in someone's memory of which
+     * command they ran. A reproducer kernel that looks like a normal one has
+     * already been read as a clean baseline once in this project. */
+    kputs("\n*** BUILT WITH FORK_FUNNEL_REPRO — fork enqueues to cpu0 unconditionally.\n");
+    kputs("*** This is v0.75's DEFECT, restored on purpose. NOT a release kernel.\n");
+#endif
+#ifdef FUTEX_RACE_REPRO
+    kputs("\n*** BUILT WITH FUTEX_RACE_REPRO — thread_join tests thr_done OUTSIDE the\n");
+    kputs("*** futex lock and arms separately, with the window widened by 2 ticks, and\n");
+    kputs("*** the park deadline shortened to 2 s. This is the pre-v0.78 lost-wakeup\n");
+    kputs("*** defect, restored on purpose. NOT a release kernel.\n");
+#endif
     kputs("\nType 'help' for commands, 'demo' for the capability walk-through.\n");
     kputs("outrun> ");
     for (;;) {
