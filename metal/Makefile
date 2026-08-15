@@ -99,8 +99,13 @@ UCFLAGS := -ffreestanding -O2 -Wall -Wextra -mcmodel=large -fno-pic -fno-stack-p
 # compiler — an edit to occ.c alone never reached the image, which cost a full
 # boot cycle to notice. A header-style dependency that make cannot see is worse
 # than a slow build.
+# v0.78: UEXTRA is EXTRA's ring-3 counterpart. EXTRA reaches only the kernel
+# compile rule, so until now a -D could not gate anything in init.c — which meant
+# a reproducer needing BOTH a kernel change and a ring-3 change could not be
+# built at all. Same caveat as EXTRA, and it bites the same way: make has no
+# dependency on the flag's VALUE, so `make clean` when toggling either.
 $(BUILD)/user_init.o: user/init.c user/occ.c | $(BUILD)
-	$(CC) $(UCFLAGS) -c $< -o $@
+	$(CC) $(UCFLAGS) $(UEXTRA) -c $< -o $@
 $(BUILD)/user_init.elf: $(BUILD)/user_init.o user/user.ld
 	$(LD) -n -T user/user.ld $< -o $@
 	@echo "  user ELF linked: $@"
@@ -214,6 +219,33 @@ gate-dirty: $(ISO)
 
 gate-dirty-smp: $(ISO)
 	$(MAKE) gate-dirty GATE_DIRTY_QEMU="-smp 4"
+
+# v0.78: THE FRESH-IMAGE MATRIX, as a target anyone can run.
+#
+# CLAUDE.md has named uniprocessor / -smp 4 SeaBIOS / -smp 4 q35+VT-d as gate
+# configurations since v0.76, but only the first had a target (release-verify).
+# The other two were driven by a harness that lived outside the tree, which
+# means the release matrix was reproducible by exactly one person. That is not
+# a gate, it is a habit — so it is now tools/gate-matrix.sh and `make gate`.
+#
+#   make gate                                  all three fresh configurations
+#   make gate GATE_CONFIGS="smp4-iommu"        just one
+#   make gate-all                              fresh matrix + both dirty gates
+#
+# gate-matrix.sh prints an explicit coverage line naming what it did NOT test,
+# because a gate whose gaps are invisible is how "verified" drifts away from
+# "measured".
+.PHONY: gate gate-all
+GATE_CONFIGS ?= uniprocessor smp4-bios smp4-iommu
+gate: $(ISO)
+	tools/gate-matrix.sh "$(ISO)" "$(BUILD)/gate-matrix-$$$$" $(GATE_CONFIGS)
+
+# The whole standing gate in one command, in the order that fails cheapest
+# first: a fresh-image break should not wait behind nine dirty boots.
+gate-all: $(ISO)
+	$(MAKE) gate
+	$(MAKE) gate-dirty
+	$(MAKE) gate-dirty-smp
 
 # ===========================================================================
 # v0.76: RELEASE PACKAGING — mandatory for every version tag

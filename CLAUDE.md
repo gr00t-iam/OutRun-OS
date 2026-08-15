@@ -84,12 +84,24 @@ green, and the release notes should say which were run and which were not:
 
 | target / harness | what it covers |
 |---|---|
-| `make qemu` | uniprocessor, fresh image |
-| `-smp 4` SeaBIOS (see `metal/tools/`) | multi-core, fresh image |
-| `make qemu-iommu` | `-smp 4` + q35 + VT-d, `intremap=on` |
+| `make gate` | **all three fresh-image configurations, in one command** |
 | `make gate-dirty` | 3 boots on ONE reused image, uniprocessor |
 | `make gate-dirty-smp` | 3 boots on ONE reused image, `-smp 4` |
+| `make gate-all` | `gate` + both dirty gates |
 | `make release-verify` | the published artefact itself |
+
+`make gate` (v0.78, `tools/gate-matrix.sh`) runs uniprocessor, `-smp 4` SeaBIOS
+and `-smp 4` q35+VT-d with `intremap=on`, each on a fresh image. Before it
+existed, only the first of those had a target: the other two were driven by a
+harness that lived outside the tree, so the release matrix was reproducible by
+exactly one person. That is a habit, not a gate.
+
+It also prints a **coverage line** naming what it did not test, and it counts
+failures twice — matching assertion lines against the suites' own `RESULT`
+tallies — with disagreement failing the gate on its own. See below for why.
+
+The single-configuration targets (`make qemu`, `make qemu-iommu`) still exist
+and are the right thing for interactive work; they do not check anything.
 
 `gate-dirty*` exists because every other configuration builds a fresh disk per
 boot, which is why the suite set was able to be non-idempotent across boots for

@@ -844,6 +844,10 @@ static inline void write_cr3(uint64_t v) {
 #define PTE_HUGE    0x80ull
 #define PTE_NX      (1ull << 63)     /* no-execute (requires EFER.NXE)            */
 extern uint8_t _stext[], _etext[], _kernel_end[];   /* from the linker script    */
+/* v0.78: read-only data has its own bounds now. Before this, harden_kernel_wx()
+ * knew only about _etext, so everything above it — .rodata and .eh_frame
+ * included — was mapped RW+NX, and read-only data was writable. */
+extern uint8_t _srodata[], _erodata[];
 #define ADDR_MASK   0x000ffffffffff000ull
 
 static uint64_t kernel_cr3 = 0;
@@ -1570,6 +1574,7 @@ static void harden_kernel_wx(void) {
     uint64_t *pdpt = (uint64_t *)(pml4[0] & ADDR_MASK);
     uint64_t *pd   = (uint64_t *)(pdpt[0] & ADDR_MASK);
     uint64_t stext = (uint64_t)_stext, etext = (uint64_t)_etext, kend = (uint64_t)_kernel_end;
+    uint64_t srod = (uint64_t)_srodata, erod = (uint64_t)_erodata;
     uint64_t split_hp = (kend + 0x1FFFFF) / 0x200000;      /* huge pages to 4K-split */
     __asm__ volatile("cli");
     /* CR0.WP: enforce read-only pages even in ring 0, so kernel code is immutable */
@@ -1581,8 +1586,12 @@ static void harden_kernel_wx(void) {
             for (int i = 0; i < 512; i++) {
                 uint64_t va = hp * 0x200000 + (uint64_t)i * 0x1000;
                 uint64_t f = PTE_PRESENT;
-                if (va >= stext && va < etext) f |= 0;      /* code: R + X          */
-                else f |= PTE_WRITE | PTE_NX;               /* data: RW + NX        */
+                if (va >= stext && va < etext) f |= 0;      /* code:   R  + X       */
+                /* v0.78: .rodata and .eh_frame are neither writable NOR executable.
+                 * They used to fall into the else below and come out RW+NX, which
+                 * made every constant in the kernel a writable target. */
+                else if (va >= srod && va < erod) f |= PTE_NX;   /* rodata: R  + NX */
+                else f |= PTE_WRITE | PTE_NX;               /* data:   RW + NX      */
                 pt[i] = (va & ADDR_MASK) | f;
             }
             pd[hp] = ((uint64_t)pt & ADDR_MASK) | PTE_PRESENT | PTE_WRITE;
@@ -1918,6 +1927,17 @@ struct kproc {
      * See ROADMAP-0.75.0.md. */
     int      ppid_slot;           /* parent kproc slot, for SIGCHLD (-1 = none)     */
     uint32_t ppid_gen;            /* parent's `gen` when the link was made          */
+    /* v0.78 FORK TELEMETRY. enq_tick is stamped when sys_fork queues the child;
+     * disp_lat is how many ticks passed before any core actually dispatched it.
+     *
+     * This exists because v0.75's account of the fork race rests on exactly this
+     * number — "the failing children waited long enough for the parent's
+     * 30000-poll waitpid budget to expire" — and that measurement was taken on a
+     * one-off instrumented build that no longer exists. A quantity that decides
+     * whether a defect is real should not have to be re-instrumented each time
+     * someone wants to look at it. */
+    uint64_t enq_tick;            /* g_ticks when queued by fork (0 = not a fork)  */
+    uint32_t disp_lat;            /* ticks from enqueue to first dispatch          */
     /* Bumped on every recycle of this slot, by kproc_reset. NOT cleared there —
      * it is the one field whose whole purpose is to survive the wipe and count
      * it, so it is set apart from the blanking loop deliberately. */
@@ -2287,6 +2307,7 @@ static void kproc_reset(struct kproc *p) {
     p->redir_out = -1;
     p->uctx = (struct uctx){0};
     p->ran_on = 0;
+    p->enq_tick = 0; p->disp_lat = 0;              /* v0.78 fork telemetry */
     /* v0.55: POSIX state — default dispositions, nothing pending/blocked,
      * one thread in the group, per-thread stacks start below the main stack. */
     for (int sg = 0; sg < NSIG; sg++) p->sig_handler[sg] = 0;
@@ -10269,6 +10290,11 @@ static volatile uint32_t g_futex_waits = 0, g_futex_wakes = 0, g_futex_timeouts 
  * which cores its threads were dispatched on, or whether their stacks came
  * back. Reset by the suite before each run. */
 static volatile uint32_t g_thr_ran_mask   = 0;   /* union of ran_on over departed threads */
+/* v0.78: enqueue-to-first-dispatch latency for FORKED children, in ticks.
+ * Always on, always printed by posixstrs. A counter nothing prints is not
+ * instrumentation — and this is the counter the whole carryover-3 argument
+ * turns on. */
+static volatile uint32_t g_fork_disp_n = 0, g_fork_disp_sum = 0, g_fork_disp_max = 0;
 static volatile uint32_t g_thr_released   = 0;   /* thread slots released                 */
 static volatile uint32_t g_thr_stk_pages  = 0;   /* stack pages handed back to the allocator */
 static volatile uint32_t g_futex_lost_races = 0;   /* wakes that landed mid-arming */
@@ -11427,7 +11453,16 @@ static void cpu_exec_proc(int c, int p) {
     set_syscall_stack((uint64_t)(g_syscall_stack[c] + sizeof g_syscall_stack[c]));
     __sync_fetch_and_or(&kprocs[p].ran_on, 1u << c);
     kprocs[p].migrate_pin = -1;   /* v0.52: one-shot directed-migration pin consumed on run */
-    __sync_fetch_and_add(&kprocs[p].dispatches, 1);
+    uint32_t prevd = __sync_fetch_and_add(&kprocs[p].dispatches, 1);
+    /* v0.78: first dispatch of a forked child — record how long it sat queued. */
+    if (prevd == 0 && kprocs[p].enq_tick) {
+        uint32_t lat = (uint32_t)(g_ticks - kprocs[p].enq_tick);
+        kprocs[p].disp_lat = lat;
+        __sync_fetch_and_add(&g_fork_disp_n, 1);
+        __sync_fetch_and_add(&g_fork_disp_sum, lat);
+        for (;;) { uint32_t m = g_fork_disp_max;
+                   if (lat <= m || __sync_bool_compare_and_swap(&g_fork_disp_max, m, lat)) break; }
+    }
     uint32_t dl = __sync_fetch_and_add(&g_dlog_n, 1);  /* v0.40: dispatch log  */
     if (dl < DLOG_LEN) g_dlog[dl] = p;
     int now = __sync_add_and_fetch(&g_inr3, 1);
@@ -12834,7 +12869,26 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
      * not), and the causal link to the posixstrs race is SUPPORTED BY ONE
      * INSTRUMENTED MEASUREMENT AND NOT YET REPRODUCED UNINSTRUMENTED.
      * See ROADMAP-0.75.0.md. */
+    /* v0.78: stamp BEFORE the enqueue, so the measurement includes the enqueue
+     * itself and can never read negative. Non-zero is what marks this slot as a
+     * forked child for the dispatch hook. */
+    kprocs[ch].enq_tick = g_ticks ? g_ticks : 1;
+#ifdef FORK_FUNNEL_REPRO
+    /* v0.78 REPRODUCER, NEVER shipped. This restores v0.75's defect — the
+     * hardcoded preferred core — so the funnel can be MEASURED rather than
+     * argued about. Build with `make clean && make EXTRA=-DFORK_FUNNEL_REPRO`.
+     *
+     * The clean-build is not optional: EXTRA reaches only the kernel compile
+     * rule and make has no dependency on the flag's value, so a plain `make`
+     * afterwards leaves this object in place and produces a reproducer kernel
+     * with fresh userland, under a filename and a build log that both look
+     * entirely normal. That has already cost this project a wasted analysis,
+     * which is why the banner below exists: trust the log, not the command
+     * you think you typed. */
+    rq_push_any(0, ch);
+#else
     rq_push_any((int)cpu_idx(), ch);
+#endif
     for (int cc = 1; cc < MAX_CPUS; cc++)               /* let an idle sibling steal it */
         if (g_cpu[cc].online) lapic_ipi(g_cpu[cc].apic_id, IPI_PING, 0);
     g_forks++;
@@ -21198,6 +21252,14 @@ static void cmd_posix_stress(void) {
                  * two are indistinguishable again at the point it matters. */
                 if (roles[i] == 31 && R.code[i] == 908)
                     kprintf("[posixstrs]   ^ a join DEADLINE expired — not a join defect\n");
+                /* v0.78: role 29's two failure modes are the whole of carryover 3,
+                 * and until now the log distinguished them only by a bare number. */
+                if (roles[i] == 29 && R.code[i] == 702)
+                    kprintf("[posixstrs]   ^ the parent's waitpid DEADLINE expired — the child "
+                            "had not exited yet; compare the fork dispatch latency below\n");
+                if (roles[i] == 29 && R.code[i] == 703)
+                    kprintf("[posixstrs]   ^ the child RAN and exited with the wrong status — "
+                            "a real defect, not a deadline\n");
                 codes_ok = 0;
             }
             /* The thread group must be fully accounted for: nthreads back to 0
@@ -21246,6 +21308,25 @@ static void cmd_posix_stress(void) {
 
     kprintf("[posixstrs] this suite: %u fork(s), %u execve(s), %u thread(s), %d child kproc(s)\n",
             g_forks - fork0, g_execs - exec0, g_threads_made - thr0, (uint64_t)nchild_total);
+
+    /* v0.78: THE NUMBER CARRYOVER 3 TURNS ON, printed on every boot.
+     *
+     * v0.75 fixed a defect that funnelled every forked child onto cpu 0's queue
+     * regardless of which core forked it, while the waiting parent drained a
+     * different queue. Its evidence was one instrumented build measuring exactly
+     * this latency, and that build no longer exists — so the causal claim has
+     * been carried, unverifiable, through three milestones.
+     *
+     * It costs two counters to never be in that position again. If the child is
+     * dispatched promptly, a parent that times out did NOT lose a race with the
+     * scheduler, and the search moves elsewhere. If the latency is large, the
+     * argument is measured rather than asserted. */
+    if (g_fork_disp_n)
+        kprintf("[posixstrs] fork enqueue->first dispatch: n=%u  max=%u tick(s)  avg=%u tick(s)\n",
+                (uint64_t)g_fork_disp_n, (uint64_t)g_fork_disp_max,
+                (uint64_t)(g_fork_disp_sum / g_fork_disp_n));
+    else
+        kprintf("[posixstrs] fork enqueue->first dispatch: NO SAMPLES (no child was dispatched)\n");
     pxcheck("fork/exec/thread counters all advanced (the syscalls really ran)",
             g_forks - fork0 >= (uint64_t)POSIXSTRESS_ROUNDS * 2 &&
             g_execs - exec0 >= (uint64_t)POSIXSTRESS_ROUNDS &&
@@ -21859,6 +21940,7 @@ static void cmd_pthreads_smp(void) {
     int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
     uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
     uint32_t viol0 = g_rank_violations, waits0 = g_futex_waits, wakes0 = g_futex_wakes;
+    uint32_t tmo0 = g_futex_timeouts;          /* v0.78: see the lost-wake assertion */
     g_thr_ran_mask = 0; g_thr_released = 0; g_thr_stk_pages = 0;
 
     int p = kproc_spawn("pthreadsmp", PCAP_FILESYSTEM);
@@ -21913,6 +21995,31 @@ static void cmd_pthreads_smp(void) {
      * flipped. This is what separates the two. */
     pscheck("threads PARKED on the mutex and the condvar rather than spinning",
             g_futex_waits > waits0 && g_futex_wakes > wakes0);
+    /* v0.78: NO PARK IN THIS SUITE MAY END IN A TIMEOUT — the assertion that
+     * names the defect this suite has twice failed on without anyone being able
+     * to say why. Measured across seven -smp 4 boots:
+     *
+     *   passing  44/44  43/43  45/45  46/46  44/44   — parks balance wakes
+     *   failing  45/44  46/45                        — short by exactly one
+     *
+     * Both failures (v0.76 gate-dirty-smp boot 2, v0.78 gate smp4-bios) are one
+     * park that never received its wake. The thread then sits in SYS_THREAD_JOIN
+     * until the kernel's own 200 s park deadline expires, which is why those
+     * boots take ~435 s against ~230 s, and why the symptom surfaced in ring 3
+     * as a join timeout (937) rather than as anything mentioning futexes.
+     *
+     * The test is on the TIMEOUT counter, not on parks-minus-wakes. The balance
+     * is what the evidence showed, but `g_futex_wakes` counts threads woken or
+     * armed while a park can also end by timing out — so parks == wakes is a
+     * correlation that happened to hold in five samples, and parks that time out
+     * is the thing actually being claimed. utstrs and epstrs already assert this
+     * counter the same way; this is that idiom, applied where it was missing.
+     *
+     * This does NOT fix the lost wake. See ROADMAP-0.78.0.md, where it stays
+     * open. It converts a 200-second stall reported under a misleading name into
+     * an immediate failure reported under the right one. */
+    pscheck("no futex park in this suite timed out (every park got its wake)",
+            g_futex_timeouts == tmo0);
     int cores = 0;
     for (int c = 0; c < MAX_CPUS; c++) if (g_thr_ran_mask & (1u << c)) cores++;
     if (n > 1) pscheck("worker threads were dispatched on MORE THAN ONE core", cores >= 2);
@@ -24595,6 +24702,27 @@ static int wp_poison(void) {
     return g_fault_caught && g_fault_vector == 14;
 }
 
+/* Write to the R+NX read-only data region; expect a write-protect #PF.
+ *
+ * v0.78: the exact parallel of wp_poison() above, and it exists because the
+ * property it tests was FALSE until this milestone. .rodata sat above _etext,
+ * harden_kernel_wx() mapped everything above _etext as RW+NX, and so every
+ * constant in the kernel — jump tables, string literals, the embedded SDK
+ * sources — was quietly writable. A boundary nothing tests is a boundary that
+ * drifts, which is why this is an assertion and not a comment. */
+static int rodata_poison(void) {
+    g_fault_caught = 0; g_fault_vector = 0; g_fault_expected = 1;
+    __asm__ volatile(
+        "lea 2f(%%rip), %%rax\n movq %%rax, %0\n"
+        "movq %%rsp, %1\n"
+        "movb $0x90, (%2)\n"                               /* write into .rodata   */
+        "2:\n"
+        : "=m"(g_fault_recover_rip), "=m"(g_fault_recover_rsp)
+        : "r"((uint64_t)(uintptr_t)_srodata) : "rax", "memory");
+    g_fault_expected = 0;
+    return g_fault_caught && g_fault_vector == 14;
+}
+
 static void cmd_stress(void) {
     kputs("-- STRESS & ENFORCEMENT (fault injection + TLB/CR3 + W^X/NX) --\n");
     g_spass = g_sfail = 0;
@@ -24615,6 +24743,14 @@ static void cmd_stress(void) {
 
     /* (3) write-protect: kernel code is immutable */
     scheck("writing to R+X kernel code traps (#PF, code immutable)", wp_poison());
+
+    /* (3b) v0.78: and read-only data is genuinely read-only. Until the linker
+     * script grew separate segments this assertion would have FAILED: .rodata
+     * was mapped RW+NX because it sits above _etext. */
+    scheck("writing to R+NX kernel .rodata traps (#PF, constants immutable)", rodata_poison());
+    kprintf("[stress ] .rodata window %X..%X (%u KiB), NX and write-protected\n",
+            (uint64_t)(uintptr_t)_srodata, (uint64_t)(uintptr_t)_erodata,
+            (uint64_t)(((uintptr_t)_erodata - (uintptr_t)_srodata) >> 10));
 
     /* (4) TLB staleness under remap: remap a vaddr to a new frame, invlpg, and  */
     /* confirm the read reflects the NEW frame (no stale TLB entry survives)     */
@@ -25590,6 +25726,13 @@ static void shell_run(void) {
      * Caveat this cannot fix: a HUNG boot never reaches this line, so these
      * numbers describe surviving boots only. */
     kprintf("[connect] apyield=%u stale=%u\n", g_connect_ap_yield, g_connect_stale);
+#ifdef FORK_FUNNEL_REPRO
+    /* Loud, unmissable, and in the LOG rather than in someone's memory of which
+     * command they ran. A reproducer kernel that looks like a normal one has
+     * already been read as a clean baseline once in this project. */
+    kputs("\n*** BUILT WITH FORK_FUNNEL_REPRO — fork enqueues to cpu0 unconditionally.\n");
+    kputs("*** This is v0.75's DEFECT, restored on purpose. NOT a release kernel.\n");
+#endif
     kputs("\nType 'help' for commands, 'demo' for the capability walk-through.\n");
     kputs("outrun> ");
     for (;;) {
