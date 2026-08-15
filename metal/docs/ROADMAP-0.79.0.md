@@ -271,6 +271,110 @@ Open questions Phase 2 must answer rather than assume:
   found, read by nobody.** A separate potential dropped wake, needing its own
   answer rather than being folded into either fix above.
 
+## PHASE 2 RESULT — BOTH FIXED, AND THE OBVIOUS FIX WAS THE WRONG ONE
+
+### 1. `cmd_mcpre` pins the probe — with `migrate_pin`, not `affinity`
+
+The first attempt was `kprocs[pl].affinity = 1u << 1`, a lifetime mask. It
+worked, in the narrow sense that the reported failure stopped: under
+`CPU1_STALL_REPRO` the probe reached ring 3 on cpu1 in 21 ticks with `ran_on 2`,
+and "long probe never started on cpu1" passed.
+
+It also broke the suite's headline assertion:
+
+```
+[mcpre  ]  FAIL  the captured context MIGRATED CORES: started on cpu1, finished on cpu2
+```
+
+`cmd_mcpre` exists to prove a preempted ring-3 context can **resume on a
+different core**, and it deliberately sets `migrate_to = 2`. A lifetime pin to
+cpu1 forbids exactly that. Fixing the first half of a test by breaking the second
+half is not a fix; it moves which assertion is red.
+
+Note this was the failure mode the v0.47 and v0.48 "-flake" logs recorded — the
+same suite, the other assertion. Both are the same root cause seen from two
+sides: an unpinned task in a work-stealing scheduler, once when a sibling took it
+too early and once when it was prevented from moving at all.
+
+`migrate_pin` is the mechanism that fits: a **one-shot** home, consumed by
+`cpu_exec_proc` on the first dispatch. It guarantees cpu1 gets the first run —
+all `ran_on & 2` requires — and is spent before the directed migration happens.
+
+Validated with the reproducer **still widening the window**, which is what makes
+it a proof rather than a coincidence:
+
+```
+[mcpre  ] long probe reached ring 3 on cpu1 in 36 tick(s) (ceiling 6000)
+[mcpre  ] cpu1 preempt_count +1; long: exit 21 ran_on 6   <- bits 1|2, cpu1 then cpu2
+[mcpre  ]  PASS x5, including MIGRATED CORES
+```
+
+36 ticks against a 0-tick baseline: cpu1 was demonstrably still being delayed,
+and the probe waited for it instead of being stolen. The pin changed the outcome,
+not the timing.
+
+### 2. `ap_main` idles race-free — and `sti; hlt` alone would not have done it
+
+The window is closed with the full idiom:
+
+```c
+__asm__ volatile("cli");
+if (g_cpu[idx].rq_h != g_cpu[idx].rq_t) { __asm__ volatile("sti"); continue; }
+g_cpu[idx].dbg_where = CPUW_HALTED;
+__asm__ volatile("sti; hlt");
+```
+
+**Replacing the bare `hlt` with `sti; hlt` and nothing else would have changed
+nothing at all**, and it is worth being explicit because it looks like the fix:
+`cpu_exec_proc` returns with interrupts already enabled, so that `sti` is a
+no-op and the window stays exactly where it was. The interrupt shadow only buys
+something when the decision to sleep was taken with interrupts masked.
+
+With IF clear across the re-check both orderings are safe — a push before the
+read is seen and we loop; a push after it leaves its IPI **pending**, delivered
+the instant `sti; hlt` enables interrupts. The unlocked read of `rq_h`/`rq_t` can
+report work when there is none (a wasted lap) but never the reverse, which is the
+direction that matters.
+
+Stealing is deliberately not re-checked with interrupts off: a sibling with
+spare work is a transient worth learning about on the next wake, whereas a push
+aimed at this core is not, because nothing re-announces it.
+
+**This fixes nothing that was observed failing.** It is closed on its own merits
+and claimed as nothing else — Phase 1 hypothesised it as the `[mcpre]` cause and
+the reproducer refuted that.
+
+### Validation
+
+```
+make clean && make            0 errors, 0 warnings; no CPU1_STALL_REPRO residue
+                              in the shipping image (checked with strings)
+
+make gate   uniprocessor      45 suites  481 passed  0 failed  0 rank faults
+            -smp 4 SeaBIOS    45 suites  497 passed  0 failed  0 rank faults
+            -smp 4 q35+VT-d   47 suites  510 passed  0 failed  0 rank faults
+
+make gate-dirty-smp           3 boots, 0 failing assertions, diffs empty
+```
+
+`mcpre` reports **0 ticks** to reach cpu1 in every configuration, with the
+migration assertion passing in all of them. 0 ticks is the same figure the
+unpinned build produced when it happened to win the race — the pin costs nothing
+in the common case and decides the uncommon one.
+
+**What this validation does and does not establish.** The gate cannot show the
+`[mcpre]` failure is gone, because it fired roughly 1 boot in 8 and six clean
+boots is consistent with it still being there. The evidence is the reproducer:
+it failed deterministically before the pin and passes with the window still
+widened after it. That distinction is the same one v0.78 drew for the lost
+wakeup, and it is the reason the reproducer stays in the tree.
+
+The reproducer flag and its spin remain in the tree, gated behind
+`CPU1_STALL_REPRO` so the shipping build contains neither. Kept for the same
+reason `FORK_FUNNEL_REPRO`, `FORK_TIGHT_DEADLINE` and `FUTEX_RACE_REPRO` are
+kept: it is the instrument that proves this fix, and deleting it would oblige the
+next person who touches `rq_steal` to re-derive it.
+
 ## STILL OPEN (inherited)
 
 - **`SYS_THREAD_JOIN` has no timeout argument.**

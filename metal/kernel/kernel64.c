@@ -11840,8 +11840,41 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
          */
         if (idx == 1) { for (volatile int w = 0; w < 4000000; w++) __asm__ volatile("pause"); }
 #endif
+        /* v0.79: THE RACE-FREE IDLE. The check must happen with interrupts OFF,
+         * and the sti must be adjacent to the hlt.
+         *
+         * Replacing the bare `hlt` with `sti; hlt` alone would have changed
+         * NOTHING here, and it is worth saying why, because it looks like the
+         * fix and is not: cpu_exec_proc returns with interrupts already enabled,
+         * so the sti would be a no-op and the window would be exactly where it
+         * was. The interrupt shadow after sti only buys anything if the decision
+         * to sleep was made while interrupts were masked.
+         *
+         * With IF clear across the re-check, the two orderings are both safe:
+         *   producer pushed BEFORE our read -> we see rq_t moved and loop again
+         *   producer pushes AFTER our read  -> its IPI stays PENDING (IF=0) and
+         *                                      is delivered the instant sti/hlt
+         *                                      enables interrupts, waking us
+         * The unlocked read of rq_h/rq_t is deliberate and safe in that
+         * direction: it may say `work` when there is none (a wasted lap), never
+         * `no work` when a push has already landed.
+         *
+         * Stealing is not re-checked here. A sibling with work to steal is a
+         * transient we can afford to learn about on the next wake; a push aimed
+         * AT THIS CORE is not, because nothing else will re-announce it.
+         *
+         * NOTE ON SCOPE: this window is real and is now closed, but it is NOT
+         * what the [mcpre] failure was. That was work stealing in the test (see
+         * cmd_mcpre). Phase 1 of v0.79 hypothesised this window as the cause and
+         * the reproducer refuted it. Fixed here on its own merits, and claimed
+         * to fix nothing else. */
+        __asm__ volatile("cli");
+        if (g_cpu[idx].rq_h != g_cpu[idx].rq_t) {
+            __asm__ volatile("sti");
+            continue;                                     /* work arrived: no halt */
+        }
         g_cpu[idx].dbg_where = CPUW_HALTED;
-        __asm__ volatile("hlt");                          /* woken by IPIs     */
+        __asm__ volatile("sti; hlt");                     /* atomic: sti shadow covers hlt */
     }
 }
 
@@ -12563,6 +12596,45 @@ static void cmd_mcpre(void) {
     kprocs[ps].entry = es;
 
     uint32_t pc0 = g_cpu[1].preempt_count;
+    /* v0.79: PIN THE PROBE TO CPU1. This is not a hint, it is the precondition
+     * of the assertion below, which requires ran_on & 2 — that the probe ran ON
+     * CPU1 specifically.
+     *
+     * rq_push(1, pl) only puts the task on cpu1's QUEUE. rq_steal honours exactly
+     * two things, a task's affinity mask and its one-shot migrate_pin, and this
+     * probe carried neither — so any idle sibling was free to take it. When cpu1
+     * won the race the assertion passed; when cpu1 was slow enough that cpu2 or
+     * cpu3 got there first, the probe ran elsewhere, ran_on never gained bit 1,
+     * and the suite reported "long probe never started on cpu1" about a core
+     * that was perfectly healthy and had simply been beaten to the work.
+     *
+     * That is the whole of the intermittent [mcpre] failure seen in the v0.76 and
+     * v0.77 gates. It survived two milestones partly because the message names a
+     * stall, and partly because v0.77 read it as a wall-clock budget and raised
+     * the ceiling 500 -> 6000 ticks — which cannot help, since waiting longer
+     * does not un-steal a task. See ROADMAP-0.79.0.md.
+     *
+     * Queueing to a core is not running on that core in a scheduler with work
+     * stealing. The kernel has two mechanisms for saying otherwise, and the
+     * choice between them matters here:
+     *
+     *   affinity     a LIFETIME mask. Role 31 uses it because its threads must
+     *                only ever run on cpu 0.
+     *   migrate_pin  a ONE-SHOT home, consumed by the first dispatch
+     *                (cpu_exec_proc clears it on run).
+     *
+     * It must be migrate_pin. This suite's headline assertion is that the
+     * preempted context RESUMES ON ANOTHER CORE — "started on cpu1, finished on
+     * cpu2" — so a lifetime pin to cpu1 would forbid the very thing being
+     * tested. Tried first as `affinity = 1u << 1`: the probe then stayed on cpu1
+     * exactly as intended for the first dispatch, and the migration assertion
+     * duly failed. A pin that fixes the first half of a test by breaking the
+     * second half is not a fix.
+     *
+     * One shot is precisely the right lifetime: it guarantees cpu1 gets the
+     * FIRST run, which is all `ran_on & 2` requires, and is spent by the time the
+     * directed migration to cpu2 happens. */
+    kprocs[pl].migrate_pin = 1;
     rq_push(1, pl);
     lapic_ipi(g_cpu[1].apic_id, IPI_PING, 0);
     uint64_t t0 = g_ticks;                              /* wait until it's IN ring 3 */
