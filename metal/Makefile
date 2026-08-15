@@ -20,7 +20,7 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o
-VERSION := 0.77.0
+VERSION := 0.78.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean
@@ -311,6 +311,15 @@ release-version-check:
 	  else \
 	    echo "  [release] version check OK: $$tag"; \
 	  fi; \
+	fi
+	@kv=$$(sed -n 's/^#define KERNEL_VERSION "\(.*\)"$$/\1/p' kernel/kernel64.c); \
+	if [ "$$kv" != "$(VERSION)-metal" ]; then \
+	  echo "  [release] *** WARNING: KERNEL_VERSION is \"$$kv\", VERSION is $(VERSION)"; \
+	  echo "  [release] *** the kernel will PRINT $$kv at boot, tell every ring-3"; \
+	  echo "  [release] *** process OUTRUN=$$kv, and answer 'ver' with it, no matter"; \
+	  echo "  [release] *** what the ISO is called. Fix kernel64.c before tagging."; \
+	else \
+	  echo "  [release] kernel banner check OK: $$kv"; \
 	fi
 
 # A release image is built from a CLEAN tree. An incremental build can carry an

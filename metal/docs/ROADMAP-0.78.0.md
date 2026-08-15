@@ -279,6 +279,80 @@ for a possible deadlock. Left alone deliberately; epoll re-executes its syscall
 on wake and re-scans readiness, so a lost wake there costs a bounded wait rather
 than a wrong answer.
 
+## PHASE 3 RESULT — EPOLL AUDITED AND DELIBERATELY LEFT ALONE, VERSION BUMPED
+
+### `sys_epoll_wait`: the answer is "document it", and here is why
+
+Phase 2 closed the check-vs-park window in `sys_futex_wait` and
+`sys_thread_join` by holding the futex lock across the condition check and the
+arming. `sys_epoll_wait` has the same shape — the readiness scan releases
+`g_ofile_lock`, and the arming happens afterwards — so converting it looks like
+the obvious next step. Two findings say otherwise, and the second is decisive.
+
+**1. It would not deadlock; it would leak a lock, which is worse.**
+`block_ring3_restart()` is `noreturn`: it unwinds through `resume_kernel()` into
+`cpu_exec_proc` and the calling frame never runs again. It releases the futex
+lock itself immediately before the unwind, precisely for that reason. A
+`g_ofile_lock` held across it would be released by nobody — **the first epoll
+park would permanently wedge every descriptor operation in the system.** The
+obstacle is liveness, not ordering.
+
+On ordering specifically: `ep_notify_fd` already collects under `g_ofile_lock`
+and wakes *outside* it, with the rule stated in its own comment — run-queue
+locks sit "strictly outside the descriptor lock, never nested inside it".
+Holding ofile across the arm would be the tree's first violation of that rule,
+introduced to fix something that turns out not to be broken.
+
+**2. A lost wake here is LATE, never WRONG.** This park uses the restart
+protocol: `wait_restart` is set, RIP is rewound onto the `syscall`, RAX carries
+78. Every exit from the park — real wake, spurious wake, or the deadline
+expiring via `futex_timeout_scan` — resumes by **re-executing SYS_EPOLL_WAIT**,
+which rescans readiness from scratch before consulting anything else. A missing
+wake therefore costs a delay bounded by `ep_deadline` (absolute, preserved
+across restarts), after which the rescan finds the event and reports it
+correctly.
+
+That is the whole difference from the join case. There, a lost wake became
+`-ETIMEDOUT` — an *error*, reported by ring 3 as a join defect after 200 s.
+Late-but-correct and wrong are not the same failure, and only one of them
+justifies holding a rank-1 klock across a `noreturn` unwind.
+
+**The invariant is now written in `kernel64.c`** beside the park, in checkable
+form rather than as a conclusion to be re-derived:
+
+> Any parker whose wake carries INFORMATION the waiter cannot recompute must arm
+> atomically with its condition check (`block_ring3_locked`). Any parker that
+> RE-EXECUTES and recomputes its condition on resume may arm separately, and must
+> have a bounded deadline so the recomputation is guaranteed to happen.
+
+epoll is the second kind; futex and join are the first, because their answer is
+decided by the waker. The comment also states its own expiry condition: if a
+future change makes epoll's wake carry information the rescan cannot rediscover,
+the reasoning dies with it.
+
+### The kernel had been lying about its own version for four releases
+
+`KERNEL_VERSION` read `"0.73.0-metal"`. It had read that since v0.73 — so the
+boot banner, the `ver` command and the `OUTRUN=` environment variable handed to
+every ring-3 process all announced **0.73.0** through v0.74, v0.75, v0.76 and
+v0.77.
+
+This is the same class of defect as the v0.75 incident that created the release
+protocol in the first place: an artefact naming itself wrongly. It survived that
+protocol because `release-version-check` only ever compared the Makefile's
+`VERSION` against the git tag — the string the *kernel prints* was never in the
+comparison, so four releases passed a check that could not see it.
+
+Both are fixed: `KERNEL_VERSION` is `0.78.0-metal`, and
+`release-version-check` now greps `kernel64.c` and fails loudly when the banner
+disagrees with `VERSION`. Verified by running it: `kernel banner check OK:
+0.78.0-metal`.
+
+The lesson is the one this project keeps re-learning in new places — a check
+that covers one representation of a fact does not cover the others. There were
+three names for this release (the ISO filename, the git tag, the kernel banner)
+and the gate compared two of them.
+
 ## STILL OPEN
 
 - ~~`make clean` ate the first reproduction's boot logs~~ — **fixed.** Both gate
@@ -289,8 +363,18 @@ than a wrong answer.
 - ~~The lost wake behind the v0.76 `pthreads_smp` failure~~ — **FOUND AND FIXED
   in phase 2 above.** It was a check-vs-park window in `sys_futex_wait` and
   `sys_thread_join`, reproduced on demand and closed.
+- ~~`sys_epoll_wait` has the same check-then-arm shape~~ — **audited in phase 3
+  and deliberately not converted.** Holding `g_ofile_lock` across a `noreturn`
+  unwind would leak it permanently, and epoll's restart protocol makes a lost
+  wake late rather than wrong. The invariant that decides which parkers need
+  atomic arming is now written beside the code, with its expiry condition.
 - **Why cpu1 stalled in the v0.77 `mcpre` failure** — unexplained; the budget
-  is fixed and instrumented, the cause is not known.
-- **`SYS_THREAD_JOIN` still has no timeout argument.**
+  is fixed and instrumented, the cause is not known. This is now the oldest
+  unexplained item in the tree, the position carryover 3 held for three
+  milestones.
+- **`SYS_THREAD_JOIN` still has no timeout argument.** With the lost wakeup
+  fixed this is much less pressing than it looked in v0.77 — the 200 s park
+  deadline is no longer reachable by the defect that used to reach it — but the
+  ABI gap is real and a genuinely wedged thread still costs 200 s.
 - **The virtio-net BAR assumption** is documented, not repaired.
 - The v0.76/v0.77 security and POSIX gaps carry forward unchanged.

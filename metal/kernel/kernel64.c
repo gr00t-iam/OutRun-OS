@@ -16,7 +16,17 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#define KERNEL_VERSION "0.73.0-metal"
+/* v0.78: this read "0.73.0-metal" and had done since v0.73 — so the boot banner,
+ * the `outrun> ver` output and the OUTRUN= environment variable handed to every
+ * ring-3 process all claimed 0.73.0 through FOUR tagged releases (v0.74, v0.75,
+ * v0.76, v0.77).
+ *
+ * It is the same class of defect as the v0.75 incident that created the release
+ * protocol — an artefact naming itself wrongly — and it survived that protocol
+ * because release-version-check only ever compared the Makefile's VERSION against
+ * the git tag. The string the KERNEL prints was never in the comparison. It is
+ * now: see release-version-check in metal/Makefile, which greps this line. */
+#define KERNEL_VERSION "0.78.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -13240,6 +13250,58 @@ static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, ui
         kprocs[me].ep_deadline = 0;
         return 0;
     }
+    /* v0.78 — WHY THIS ONE IS NOT CONVERTED TO block_ring3_locked(), AND WHY THAT
+     * IS CORRECT RATHER THAN A GAP LEFT OPEN.
+     *
+     * v0.78 closed a lost-wakeup window in sys_futex_wait and sys_thread_join by
+     * holding g_futex_lock across the condition check and the arming. This
+     * function has the same shape — the readiness scan above releases
+     * g_ofile_lock at the end of its loop, and the arming happens here — so the
+     * same treatment looks like the obvious next step. It is not, for two
+     * independent reasons, and the second one is the important one.
+     *
+     * 1. IT WOULD NOT DEADLOCK; IT WOULD LEAK A LOCK, WHICH IS WORSE.
+     *    block_ring3_restart() is noreturn: it unwinds through resume_kernel()
+     *    into cpu_exec_proc and this stack frame never runs again. It releases
+     *    g_futex_lock itself, immediately before the unwind, precisely because
+     *    of that. A g_ofile_lock held across the call would never be released by
+     *    anybody — the first epoll park would permanently wedge every descriptor
+     *    operation in the system. Ordering is not the obstacle here; liveness is.
+     *
+     *    (On ordering: ep_notify_fd deliberately collects under g_ofile_lock and
+     *    wakes OUTSIDE it — "the ordering discipline puts [run-queue locks]
+     *    strictly outside the descriptor lock, never nested inside it". Holding
+     *    ofile across the arm would be the first violation of that rule in the
+     *    tree, and it would be introduced to fix something that is not broken.)
+     *
+     * 2. A LOST WAKE HERE IS LATE, NEVER WRONG — and that is the whole
+     *    difference from the join case. This park uses the RESTART protocol:
+     *    wait_restart is set, RIP is rewound onto the `syscall`, and RAX carries
+     *    78. So every exit from the park — a real wake, a spurious wake, or the
+     *    deadline expiring through futex_timeout_scan — resumes by RE-EXECUTING
+     *    SYS_EPOLL_WAIT, which rescans readiness from scratch before it consults
+     *    anything else. A wake that goes missing therefore costs a delay bounded
+     *    by ep_deadline, after which the rescan finds the event and reports it
+     *    correctly.
+     *
+     *    That deadline is absolute and survives restarts (see above), so a lost
+     *    wake cannot extend the wait past what the caller asked for.
+     *
+     *    Contrast sys_thread_join, which was converted: there a lost wake became
+     *    -ETIMEDOUT, an ERROR, which ring 3 reported as a join defect after 200 s.
+     *    Late-but-correct and wrong are not the same failure, and only one of
+     *    them justifies holding a rank-1 klock across a noreturn unwind.
+     *
+     * THE INVARIANT, stated so it can be checked rather than re-derived:
+     *   Any parker whose wake carries INFORMATION the waiter cannot recompute
+     *   must arm atomically with its condition check (block_ring3_locked).
+     *   Any parker that RE-EXECUTES and recomputes its condition on resume may
+     *   arm separately, and must have a bounded deadline so the recomputation is
+     *   guaranteed to happen. epoll is the second kind. Futex and join are the
+     *   first, because their answer is decided by the waker.
+     *
+     * If a future change makes epoll's wake carry information — anything the
+     * rescan cannot rediscover — this reasoning expires with it. */
     __sync_fetch_and_add(&g_epoll_parks, 1);
     block_ring3_restart(sf, me, EPOLL_WAIT_KEY(epi), dl - g_ticks, 78);
     /* Only reached if the caller did not arrive through a `syscall` we can
