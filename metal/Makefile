@@ -248,7 +248,12 @@ gate-dirty-smp: $(ISO)
 # because a gate whose gaps are invisible is how "verified" drifts away from
 # "measured".
 .PHONY: gate gate-all
-GATE_CONFIGS ?= uniprocessor smp4-bios smp4-iommu
+# v0.80: -smp 2 joins the matrix. Work stealing needs a thief, and at two
+# cores the only other core is the BSP running the suite -- so v0.79's
+# account of the [mcpre] failure predicts it cannot fail there. That
+# prediction was left unrun when v0.79 shipped; this makes it part of every
+# gate rather than a note in a roadmap.
+GATE_CONFIGS ?= uniprocessor smp2-bios smp4-bios smp4-iommu
 gate: $(ISO)
 	tools/gate-matrix.sh "$(ISO)" "$(GATE_LOGS)/matrix-$$$$" $(GATE_CONFIGS)
 
@@ -345,6 +350,36 @@ release-verify:
 
 release: release-iso release-verify
 	@echo "  [release] ISO built, checksummed and booted clean."
+
+# v0.80: .logs/ is NOT removed by `clean` -- that is the entire point of it
+# (see GATE_LOGS above; make clean has destroyed harness evidence twice).
+# clean-logs is the explicit way to purge it, so discarding evidence is always
+# something someone typed, never a side effect of building.
+.PHONY: clean-logs gate-summary
+clean-logs:
+	rm -rf $(GATE_LOGS)
+	@echo "  purged $(GATE_LOGS) -- gate evidence; make clean never touches it"
+
+# v0.80: report on THE LAST RUN, not on a glob.
+#
+# Reading .logs/gate/matrix-*/ spans every run still on disk, and that has
+# twice produced a wrong answer here: a failure tally that counted a
+# deliberate reproducer directory, and a v0.79 release check that read the
+# boot banner from a pre-bump run and reported 0.73.0-metal. Both were caught
+# by noticing, which is not a property to depend on. gate-matrix.sh records
+# its directory in LAST_RUN; this reads that and nothing else.
+gate-summary:
+	@d=$$(cat $(GATE_LOGS)/LAST_RUN 2>/dev/null); \
+	if [ -z "$$d" ] || [ ! -d "$$d" ]; then \
+	  echo "  no recorded gate run (looked in $(GATE_LOGS)/LAST_RUN)"; exit 1; fi; \
+	echo "  run dir : $$d"; \
+	echo "  image   : $$(grep -aho 'md5=[a-f0-9]*' $$d/*.log | sort -u)"; \
+	echo "  banner  : $$(grep -aho 'bare-metal kernel [0-9.]*-metal' $$d/*.log | sort -u)"; \
+	for f in $$d/*.log; do \
+	  p=$$(grep -ao 'RESULT: [0-9]* passed, [0-9]* failed' $$f | awk '{p+=$$2; f+=$$4} END {printf "%d passed / %d failed", p, f}'); \
+	  r=$$(grep -acE 'rank violations=[1-9]|underflow=[1-9]|mismatch=[1-9]' $$f); \
+	  printf "  %-14s %-28s rank-faults %s\n" "$$(basename $$f .log)" "$$p" "$$r"; \
+	done
 
 clean:
 	rm -rf $(BUILD) iso/boot/outrun-kernel.elf iso/boot/user_init.elf
