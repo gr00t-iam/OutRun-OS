@@ -26,7 +26,7 @@
  * because release-version-check only ever compared the Makefile's VERSION against
  * the git tag. The string the KERNEL prints was never in the comparison. It is
  * now: see release-version-check in metal/Makefile, which greps this line. */
-#define KERNEL_VERSION "0.78.0-metal"
+#define KERNEL_VERSION "0.79.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -272,7 +272,24 @@ struct cpu_local {
     uint64_t cur_proc;                       /* the capability gate reads this */
     struct tss64 *tss;                       /* this CPU's own TSS            */
     volatile uint32_t online;
-    volatile uint32_t resched;               /* IPI asked this CPU to resched */
+    /* v0.79: a COUNT of deferred cross-core preemptions, not a pending flag.
+     *
+     * It was `resched = 1`, written by the CPL0 path of smp_preempt_ipi and read
+     * by nobody, ever, with nothing to clear it. An audit for v0.79 found it
+     * vestigial: a field shaped like a mechanism that was not one.
+     *
+     * It is deliberately NOT wired into a yield check. When the preempt IPI
+     * catches this core in the kernel there is nothing safe to yield to — that is
+     * the entire reason the path defers — and the real mechanism is the SENDER
+     * retrying until the IPI lands at CPL3 (see cmd_mcpre's retry loop). Acting
+     * on the flag would either do nothing or preempt at exactly the point the
+     * code just decided it must not.
+     *
+     * So it counts instead. The comment on that path claims deferral is
+     * "statistically immediate: the probes spend >99% of their time" in ring 3 —
+     * a plausible assertion that nothing measured. Now it is measured, and the
+     * mcpre summary prints it. */
+    volatile uint32_t resched;               /* deferred preempt IPIs (CPL0 hits) */
     volatile uint32_t ipi_ping;              /* pings received                */
     volatile uint32_t work_done;
     volatile uint64_t probe_val;             /* what this cpu read at g_probe_va */
@@ -291,6 +308,24 @@ struct cpu_local {
     uint8_t  rank_stack[8];                  /* klock ranks held by the context      */
     uint8_t  rank_sp;                        /* running on this CPU (APs only; the   */
     volatile int dbg_was_idle;               /* v0.43: DEBUG_SMP_SCHED idle-edge latch */
+    /* v0.79: WHERE IS THIS CORE? A one-word breadcrumb, updated at the handful
+     * of points an AP can be sitting in, so a stalled core can be asked rather
+     * than guessed at.
+     *
+     * The [mcpre] "long probe never started on cpu1" failure has been open since
+     * v0.76 and unexplained through two releases for exactly one reason: when it
+     * fired, nothing recorded what cpu1 was doing. The assertion printed that the
+     * probe had not run and nothing else — so every hypothesis about it (a slow
+     * host, a lost IPI, a wedged core) was equally consistent with the evidence,
+     * which is another way of saying there was no evidence.
+     *
+     * A store of a constant to a per-CPU cache line is far cheaper than the work
+     * between the points it marks, so this is not gated behind a debug flag. A
+     * breadcrumb you have to enable is a breadcrumb you do not have when the rare
+     * thing happens — see the v0.76 [mcpre] log, which was never captured. */
+    volatile uint32_t dbg_where;             /* v0.79: CPUW_* below            */
+    volatile uint32_t dbg_halts;             /* v0.79: times this core halted  */
+    volatile uint64_t dbg_last_run_tick;     /* v0.79: g_ticks at last dispatch */
     /* v0.75: how many ring-3 excursions this CPU is nested inside. Appended at
      * the END of the struct on purpose — the asm contract pins offsets 8/16/24
      * and the compiler pins 80, and all four are _Static_assert-ed below. */
@@ -11672,7 +11707,7 @@ static void smp_preempt_ipi(struct isr_frame *f) {
         return;
     }
     if ((f->cs & 3) != 3) {
-        me->resched = 1;                     /* in-kernel: defer, sender retries */
+        me->resched++;                       /* in-kernel: defer, sender retries (counted, v0.79) */
         lapic_eoi();
         return;
     }
@@ -11691,6 +11726,16 @@ static void smp_preempt_ipi(struct isr_frame *f) {
 
 /* What an AP does for a living: park in hlt, answer IPIs, and run the bounded */
 /* suite workloads when the BSP raises the mailbox.                           */
+/* v0.79: the points an AP can be sitting in, in the order the loop visits them.
+ * Printed by the [mcpre] diagnostic and by `smpstate`. */
+#define CPUW_BOOT      0   /* has not reached the scheduler loop yet          */
+#define CPUW_POP       1   /* draining its own queue / trying to steal        */
+#define CPUW_EXEC      2   /* inside cpu_exec_proc, running a ring-3 task     */
+#define CPUW_SCAN      3   /* idle housekeeping: futex/tcp timeout scans      */
+#define CPUW_WORK      4   /* running a suite work mode (xadd storm etc.)     */
+#define CPUW_PREHALT   5   /* decided to halt, has NOT halted yet <-- the window */
+#define CPUW_HALTED    6   /* in hlt, waiting for an interrupt                */
+
 static void __attribute__((noreturn)) ap_main(uint64_t idx) {
     /* the trampoline's private GDT got us here; switch to the KERNEL GDT so  */
     /* CS becomes the 0x08 the IDT gates name, then take the shared IDT.      */
@@ -11729,10 +11774,14 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
         /* from a busy sibling. No BSP mailbox: the BSP enqueues and this core */
         /* independently pulls, executes ring-3 tasks, and balances load.      */
         int p, picked = 0;
+        g_cpu[idx].dbg_where = CPUW_POP;
         while ((p = rq_pop((int)idx)) >= 0 || (p = rq_steal((int)idx)) >= 0) {
             picked = 1;
             g_cpu[idx].dbg_was_idle = 0;               /* leaving idle: reset the latch */
+            g_cpu[idx].dbg_where = CPUW_EXEC;
+            g_cpu[idx].dbg_last_run_tick = g_ticks;
             cpu_exec_proc((int)idx, p);
+            g_cpu[idx].dbg_where = CPUW_POP;
         }
         /* v0.61: this core found nothing to run. If a parked waiter's deadline
          * has passed, requeueing it here is what turns a lost wakeup into a
@@ -11741,7 +11790,7 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
          * the scan requeues, requeueing takes run-queue locks, and a timer
          * interrupt landing on a core that already holds its own rq_lock would
          * deadlock against itself. */
-        if (!picked) { futex_timeout_scan(); tcp_timer_scan(); }
+        if (!picked) { g_cpu[idx].dbg_where = CPUW_SCAN; futex_timeout_scan(); tcp_timer_scan(); }
         if (!picked && g_debug_smp_sched && !g_cpu[idx].dbg_was_idle) {
             g_cpu[idx].dbg_was_idle = 1;                /* log the TRANSITION once, not */
             kprintf("[dbgsmp ] cpu%u idle (queue drained, nothing to steal)\n", (uint64_t)idx);
@@ -11757,7 +11806,92 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
                 pjob_run((int)idx);
             g_cpu[idx].work_done = 1;
         }
-        __asm__ volatile("hlt");                          /* woken by IPIs     */
+        /* v0.79: THE WINDOW, MARKED BUT NOT YET CLOSED.
+         *
+         * This is a bare `hlt` with interrupts already enabled, reached after the
+         * queue was found empty above. A rq_push + IPI_PING landing between those
+         * two points is handled by smp_ipi_dispatch — which increments a counter,
+         * EOIs, and returns — and then this hlt sleeps on work that is already
+         * queued. The wake has been spent. Structurally identical to the futex
+         * check-vs-park window v0.78 closed, one layer down.
+         *
+         * The BSP's idle_fn already uses the race-free idiom (`sti; hlt`, whose
+         * one-instruction interrupt shadow makes the pair atomic). This loop does
+         * not, and the difference has never been reconciled.
+         *
+         * What bounds the damage today is the periodic LAPIC timer armed above:
+         * vector 51 fires, wakes this core, and the loop rechecks. So a lost ping
+         * costs one timer period — UNLESS the timer is not delivering, which is
+         * what CPU1_STALL_REPRO tests by masking it.
+         *
+         * The breadcrumb is set BEFORE the halt and cleared after, so a core
+         * found at CPUW_PREHALT was interrupted inside the window itself.
+         */
+        g_cpu[idx].dbg_where = CPUW_PREHALT;
+        g_cpu[idx].dbg_halts++;
+#ifdef CPU1_STALL_REPRO
+        /* Reproducer v2: WIDEN THE WINDOW, do not remove the rescue.
+         *
+         * v1 masked cpu1's LAPIC timer so a spent ping could not be recovered.
+         * It did not reproduce the stall — the probe still reached ring 3 in 0
+         * ticks — and it DID fail [slice], a suite that legitimately needs that
+         * timer. A reproducer that changes more than the path under test cannot
+         * attribute what it observes; v0.78 learned that and this repeated it.
+         *
+         * So: hold cpu1 in the pre-halt window instead, and leave every other
+         * mechanism alone. A push+ping arriving during this spin is consumed by
+         * a handler with nothing to do, and the halt below then sleeps on queued
+         * work — the exact sequence under test. The timer still rescues it, so
+         * the observable is not a hang but the probe's LATENCY, which the
+         * assertion already prints on the success path:
+         *
+         *   [mcpre  ] long probe reached ring 3 on cpu1 in N tick(s)
+         *
+         * 0 means the ping did its job. A jump to one timer period means the
+         * ping was spent and the timer did the work instead. Measuring beats
+         * waiting for a symptom that fires 1 boot in 8.
+         *
+         * A spin count, not a tick wait: g_ticks is advanced by the BSP timer
+         * and this core can be holding interrupts off, so a deadline here can
+         * fail to advance. Same reason as FUTEX_RACE_REPRO's widening.
+         */
+        if (idx == 1) { for (volatile int w = 0; w < 4000000; w++) __asm__ volatile("pause"); }
+#endif
+        /* v0.79: THE RACE-FREE IDLE. The check must happen with interrupts OFF,
+         * and the sti must be adjacent to the hlt.
+         *
+         * Replacing the bare `hlt` with `sti; hlt` alone would have changed
+         * NOTHING here, and it is worth saying why, because it looks like the
+         * fix and is not: cpu_exec_proc returns with interrupts already enabled,
+         * so the sti would be a no-op and the window would be exactly where it
+         * was. The interrupt shadow after sti only buys anything if the decision
+         * to sleep was made while interrupts were masked.
+         *
+         * With IF clear across the re-check, the two orderings are both safe:
+         *   producer pushed BEFORE our read -> we see rq_t moved and loop again
+         *   producer pushes AFTER our read  -> its IPI stays PENDING (IF=0) and
+         *                                      is delivered the instant sti/hlt
+         *                                      enables interrupts, waking us
+         * The unlocked read of rq_h/rq_t is deliberate and safe in that
+         * direction: it may say `work` when there is none (a wasted lap), never
+         * `no work` when a push has already landed.
+         *
+         * Stealing is not re-checked here. A sibling with work to steal is a
+         * transient we can afford to learn about on the next wake; a push aimed
+         * AT THIS CORE is not, because nothing else will re-announce it.
+         *
+         * NOTE ON SCOPE: this window is real and is now closed, but it is NOT
+         * what the [mcpre] failure was. That was work stealing in the test (see
+         * cmd_mcpre). Phase 1 of v0.79 hypothesised this window as the cause and
+         * the reproducer refuted it. Fixed here on its own merits, and claimed
+         * to fix nothing else. */
+        __asm__ volatile("cli");
+        if (g_cpu[idx].rq_h != g_cpu[idx].rq_t) {
+            __asm__ volatile("sti");
+            continue;                                     /* work arrived: no halt */
+        }
+        g_cpu[idx].dbg_where = CPUW_HALTED;
+        __asm__ volatile("sti; hlt");                     /* atomic: sti shadow covers hlt */
     }
 }
 
@@ -12478,7 +12612,46 @@ static void cmd_mcpre(void) {
     if (!es) { kputs("[mcpre  ] ELF load failed\n-- done --\n"); return; }
     kprocs[ps].entry = es;
 
-    uint32_t pc0 = g_cpu[1].preempt_count;
+    uint32_t pc0 = g_cpu[1].preempt_count, rs0 = g_cpu[1].resched;   /* v0.79 */
+    /* v0.79: PIN THE PROBE TO CPU1. This is not a hint, it is the precondition
+     * of the assertion below, which requires ran_on & 2 — that the probe ran ON
+     * CPU1 specifically.
+     *
+     * rq_push(1, pl) only puts the task on cpu1's QUEUE. rq_steal honours exactly
+     * two things, a task's affinity mask and its one-shot migrate_pin, and this
+     * probe carried neither — so any idle sibling was free to take it. When cpu1
+     * won the race the assertion passed; when cpu1 was slow enough that cpu2 or
+     * cpu3 got there first, the probe ran elsewhere, ran_on never gained bit 1,
+     * and the suite reported "long probe never started on cpu1" about a core
+     * that was perfectly healthy and had simply been beaten to the work.
+     *
+     * That is the whole of the intermittent [mcpre] failure seen in the v0.76 and
+     * v0.77 gates. It survived two milestones partly because the message names a
+     * stall, and partly because v0.77 read it as a wall-clock budget and raised
+     * the ceiling 500 -> 6000 ticks — which cannot help, since waiting longer
+     * does not un-steal a task. See ROADMAP-0.79.0.md.
+     *
+     * Queueing to a core is not running on that core in a scheduler with work
+     * stealing. The kernel has two mechanisms for saying otherwise, and the
+     * choice between them matters here:
+     *
+     *   affinity     a LIFETIME mask. Role 31 uses it because its threads must
+     *                only ever run on cpu 0.
+     *   migrate_pin  a ONE-SHOT home, consumed by the first dispatch
+     *                (cpu_exec_proc clears it on run).
+     *
+     * It must be migrate_pin. This suite's headline assertion is that the
+     * preempted context RESUMES ON ANOTHER CORE — "started on cpu1, finished on
+     * cpu2" — so a lifetime pin to cpu1 would forbid the very thing being
+     * tested. Tried first as `affinity = 1u << 1`: the probe then stayed on cpu1
+     * exactly as intended for the first dispatch, and the migration assertion
+     * duly failed. A pin that fixes the first half of a test by breaking the
+     * second half is not a fix.
+     *
+     * One shot is precisely the right lifetime: it guarantees cpu1 gets the
+     * FIRST run, which is all `ran_on & 2` requires, and is spent by the time the
+     * directed migration to cpu2 happens. */
+    kprocs[pl].migrate_pin = 1;
     rq_push(1, pl);
     lapic_ipi(g_cpu[1].apic_id, IPI_PING, 0);
     uint64_t t0 = g_ticks;                              /* wait until it's IN ring 3 */
@@ -12489,10 +12662,36 @@ static void cmd_mcpre(void) {
         /* Say WHY it gave up and what the machine looked like when it did. The
          * v0.76 occurrence of this line carried none of that, which is most of
          * why it stayed unexplained for two milestones. */
+        /* v0.79: say WHERE cpu1 was, not merely that it did not run.
+         *
+         * The v0.76 and v0.77 occurrences of this line carried the fact and none
+         * of the context, which is why two milestones of hypotheses about it were
+         * all equally unfalsifiable. dbg_where distinguishes the cases that
+         * matter and that previously looked identical from outside:
+         *
+         *   CPUW_HALTED  + ipi_ping unchanged -> the ping never arrived
+         *   CPUW_HALTED  + ipi_ping advanced  -> it arrived and was SPENT before
+         *                                        the halt: the lost-wake window
+         *   CPUW_PREHALT                      -> caught inside the window itself
+         *   CPUW_EXEC                         -> busy on something else entirely
+         *   CPUW_BOOT                         -> never reached the scheduler loop
+         *
+         * slices tells us whether cpu1's own LAPIC timer is delivering at all,
+         * which is the thing that would otherwise rescue a spent ping. */
+        static const char *WNAME[] = { "BOOT", "POP", "EXEC", "SCAN", "WORK",
+                                       "PREHALT", "HALTED" };
+        uint32_t w = g_cpu[1].dbg_where;
         kprintf("[mcpre  ] FAIL  long probe never started on cpu1 — DEADLINE after %u tick(s); "
                 "cpu1 rq depth %d, %u cpu(s) online\n",
                 t_start, (uint64_t)(int64_t)(g_cpu[1].rq_t - g_cpu[1].rq_h),
                 (uint64_t)g_ncpu_online);
+        kprintf("[mcpre  ]   cpu1 state=%s pings=%u slices=%u preempts=%u halts=%u "
+                "ran=%u stolen=%u last-dispatch@tick %u (now %u)\n",
+                (w < 7 ? WNAME[w] : "?"),
+                (uint64_t)g_cpu[1].ipi_ping, (uint64_t)g_cpu[1].slice_count,
+                (uint64_t)g_cpu[1].preempt_count, (uint64_t)g_cpu[1].dbg_halts,
+                (uint64_t)g_cpu[1].rq_ran, (uint64_t)g_cpu[1].rq_stolen,
+                g_cpu[1].dbg_last_run_tick, g_ticks);
         g_prfail++; goto done;
     }
     kprintf("[mcpre  ] long probe reached ring 3 on cpu1 in %u tick(s) (ceiling %u)\n",
@@ -12516,8 +12715,12 @@ static void cmd_mcpre(void) {
     current_proc_idx = save;
 
     int preempted = g_cpu[1].preempt_count > pc0;
-    kprintf("[mcpre  ] cpu1 preempt_count +%u; long: exit %u ran_on %x finish#%u | hi: exit %u ran_on %x finish#%u\n",
-            (uint64_t)(g_cpu[1].preempt_count - pc0),
+    /* v0.79: deferrals are printed because the "sender retries, statistically
+     * immediate" contract on smp_preempt_ipi's CPL0 path was asserted and never
+     * measured. A large count here means the probe is spending real time in the
+     * kernel and the retry loop is doing more work than the comment implies. */
+    kprintf("[mcpre  ] cpu1 preempt_count +%u (deferred at CPL0: %u); long: exit %u ran_on %x finish#%u | hi: exit %u ran_on %x finish#%u\n",
+            (uint64_t)(g_cpu[1].preempt_count - pc0), (uint64_t)(g_cpu[1].resched - rs0),
             kprocs[pl].exit_code, (uint64_t)kprocs[pl].ran_on, (uint64_t)kprocs[pl].finish_seq,
             kprocs[ps].exit_code, (uint64_t)kprocs[ps].ran_on, (uint64_t)kprocs[ps].finish_seq);
     prcheck("the cross-core IPI PREEMPTED the running ring-3 thread (context captured mid-loop)",
