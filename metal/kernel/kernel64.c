@@ -27,7 +27,7 @@
  * because release-version-check only ever compared the Makefile's VERSION against
  * the git tag. The string the KERNEL prints was never in the comparison. It is
  * now: see release-version-check in metal/Makefile, which greps this line. */
-#define KERNEL_VERSION "0.80.0-metal"
+#define KERNEL_VERSION "0.81.0-dev"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -6065,7 +6065,41 @@ static void udb_make_salt(uint8_t *out) {
 #define UDB_SCRYPT_SCRATCH (128u * UDB_SCRYPT_R * UDB_SCRYPT_N + \
                             128u * UDB_SCRYPT_R * UDB_SCRYPT_P + \
                             256u * UDB_SCRYPT_R)
-static uint8_t g_udb_scrypt_scratch[UDB_SCRYPT_SCRATCH];
+/* 16-byte aligned so the wipe below can store 8 bytes at a time. A plain
+ * uint8_t array has alignment 1 by the letter of the standard, and casting it
+ * to a 64-bit pointer would be undefined even where it happens to work. */
+static uint8_t g_udb_scrypt_scratch[UDB_SCRYPT_SCRATCH] __attribute__((aligned(16)));
+
+/* v0.81: WIPE THAT THE OPTIMISER MAY NOT REMOVE.
+ *
+ * The scrypt scratch holds password-derived material — V is the whole ROMix
+ * working set, and B starts life as PBKDF2 output over the password itself.
+ * v0.80 shipped without clearing it and said so in its changelog: "the obvious
+ * fix is a loop the compiler is entitled to delete, which is a real trap for
+ * exactly this kind of buffer".
+ *
+ * This is that fix, done the way that survives -O2. A plain cmemset() at the end
+ * of a function whose result nobody reads is a DEAD STORE, and a compiler is
+ * entitled to delete the whole loop — which is how buffers that are "obviously
+ * cleared" turn out, on inspection of the disassembly, never to be cleared at
+ * all. Two things prevent it here:
+ *
+ *   - the stores go through a VOLATILE pointer, which the compiler must emit;
+ *   - a memory clobber afterwards, so nothing is reordered across the wipe and
+ *     no later read is served from a register holding pre-wipe data.
+ *
+ * This does NOT defend against the material having been copied elsewhere by the
+ * hardware — cache lines, and on a real machine memory that was swapped or
+ * suspended. It clears the buffer this kernel owns, which is the part it can
+ * actually speak for. */
+static void secure_zero(void *p, uint64_t n) {
+    volatile uint64_t *q = (volatile uint64_t *)p;
+    uint64_t words = n / 8;
+    for (uint64_t i = 0; i < words; i++) q[i] = 0;
+    volatile uint8_t *b = (volatile uint8_t *)p + words * 8;
+    for (uint64_t i = 0; i < (n & 7u); i++) b[i] = 0;
+    __asm__ volatile("" ::: "memory");
+}
 
 /* v0.80: derive with the scheme a record was written under.
  *
@@ -6082,6 +6116,14 @@ static void udb_kdf_scheme(uint8_t scheme, const char *pw,
                         UDB_SCRYPT_N, UDB_SCRYPT_R, UDB_SCRYPT_P,
                         out, UDB_HASH_LEN,
                         g_udb_scrypt_scratch, sizeof g_udb_scrypt_scratch);
+        /* v0.81: wipe on EVERY exit from this branch, before anything can return.
+         *
+         * Placed once, here, rather than before each return: a wipe that has to
+         * be repeated at every exit is a wipe that will be missed the first time
+         * someone adds an exit. The failure path below matters as much as the
+         * success path — scrypt refusing does not mean it wrote nothing, and rc
+         * says nothing about how much of V it filled before deciding. */
+        secure_zero(g_udb_scrypt_scratch, sizeof g_udb_scrypt_scratch);
         if (rc == SCRYPT_OK) return;
         /* Cannot happen with compile-time constants and a compile-time buffer,
          * and is handled anyway: a KDF that silently produced a DIFFERENT digest
