@@ -356,6 +356,24 @@ release: release-iso release-verify
 # clean-logs is the explicit way to purge it, so discarding evidence is always
 # something someone typed, never a side effect of building.
 .PHONY: clean-logs gate-summary
+# v0.80: THE KDF PRIMITIVE IS VALIDATED BEFORE IT IS WIRED IN.
+#
+# crypto/scrypt.c is compiled and run HERE, on the host, against RFC 7914's
+# published vectors — no kernel, no boot, no scheduler, seconds not minutes.
+# The rule it serves was adopted after this project paid for its absence: a
+# primitive exercised only through the login path is a primitive whose
+# failures look like authentication bugs.
+#
+# It is a HOST build on purpose. The same source compiles freestanding into
+# the kernel (it allocates nothing and calls no libc); what differs is who
+# supplies scrypt_pbkdf2_sha256 — the test supplies a reference, the kernel
+# will supply its own already-verified HMAC.
+.PHONY: kdf-test
+kdf-test: | $(BUILD)
+	$(CC) -O2 -Wall -Wextra -o $(BUILD)/kdf_vector_test tools/kdf_vector_test.c crypto/scrypt.c
+	@echo ""
+	$(BUILD)/kdf_vector_test
+
 clean-logs:
 	rm -rf $(GATE_LOGS)
 	@echo "  purged $(GATE_LOGS) -- gate evidence; make clean never touches it"

@@ -151,6 +151,62 @@ Open question to answer before choosing: **Argon2id or scrypt.** Argon2id is the
 better primitive and the larger implementation; scrypt is smaller and composes
 from PBKDF2 plus Salsa20/8, one of which already exists here.
 
+## PHASE 2 RESULT — scrypt LANDED AND VERIFIED, NOT WIRED IN
+
+Full reasoning in `KDF-DESIGN.md`. The short version:
+
+**scrypt (RFC 7914), not Argon2id — and not because it is better.** Argon2id is
+the stronger primitive and the current recommendation. It is the wrong choice
+*here* for verification surface, not cryptography: it needs BLAKE2b (~250 lines,
+its own vector campaign) before the KDF can even begin, whereas scrypt composes
+from the SHA-256 and HMAC this tree already has and already verifies on every
+boot, plus one ~40-line permutation. scrypt is a genuine improvement over
+PBKDF2 — it is memory-hard, which PBKDF2 is not — and it is reachable now with a
+verification story this project can finish. That tradeoff is recorded as a
+tradeoff, not dressed up as a preference.
+
+**Landed as `crypto/scrypt.c` + `crypto/scrypt.h`**, containing only the new
+logic: Salsa20/8, BlockMix, ROMix, composition. It allocates nothing, calls no
+libc, takes no lock, and declares its PBKDF2 dependency rather than duplicating
+one that is already verified.
+
+**`make kdf-test` — host build, no kernel, no boot, seconds:**
+
+```
+  PASS  sha256("abc") — the scaffolding itself
+  PASS  scrypt(N=16 r=1 p=1)      [RFC 7914 vector 1]
+  PASS  scrypt(N=1024 r=8 p=16)   [RFC 7914 vector 2]
+  PASS  scrypt(N=16384 r=8 p=1)   [RFC 7914 vector 3]
+  PASS  N=15 refused (not a power of two)
+  PASS  short scratch refused
+-- RESULT: 6 passed, 0 failed --
+```
+
+All three runnable published vectors, first try. The scaffolding is checked
+before the thing under test, so a broken reference SHA-256 cannot masquerade as
+a broken scrypt, and the refusal cases are tested because the memory contract is
+part of the interface.
+
+**Two findings that change Phase 3's shape:**
+
+1. **The existing `pbkdf2_hmac_sha256()` cannot serve scrypt.** It emits exactly
+   one 32-byte block — its own comment says "INT_32_BE(1): the one and only
+   block" — and scrypt needs p·128·r bytes from the first call. Generalising it
+   is contained, but it changes a function every stored credential depends on,
+   so it needs re-validating in the same step.
+2. **There is no stored-format migration.** Every existing credential is a
+   PBKDF2 hash and the record format has no version field. Switching `udb_kdf()`
+   without one silently invalidates every account — including those created by
+   the `udbpersist` artefact the dirty-volume gate depends on. This was not on
+   the list before Phase 2 and is now the largest piece of Phase 3.
+
+**Measured, host, native:** 3.6 ms @ 1 MiB, 13.7 ms @ 4 MiB, 58.7 ms @ 16 MiB.
+Proposed interactive profile N=4096, r=8, p=1 (4 MiB). **Proposed, not fixed:**
+the guest is TCG-only and this tree has measured 10–50x host-to-guest before, so
+Phase 3 must measure in-guest before committing. Choosing from host timings alone
+would be a constant chosen on an idle machine, which is this project's
+most-repeated mistake.
+
 ## STILL OPEN (inherited)
 
 - **The `[mcpre]` fix is evidenced by its reproducer, not by the gate.** It fired
