@@ -375,6 +375,30 @@ reason `FORK_FUNNEL_REPRO`, `FORK_TIGHT_DEADLINE` and `FUTEX_RACE_REPRO` are
 kept: it is the instrument that proves this fix, and deleting it would oblige the
 next person who touches `rq_steal` to re-derive it.
 
+## PHASE 3 RESULT — `me->resched` AUDITED, AND THE RELEASE
+
+`me->resched` was written in exactly one place (the CPL0 path of
+`smp_preempt_ipi`), read **nowhere**, and never cleared — a field shaped like a
+mechanism that was not one. It is distinct from `g_need_resched`, the BSP-global
+flag, which is live and read on the timer path.
+
+**It is deliberately not wired into a yield check.** When the preempt IPI catches
+a core in the kernel there is nothing safe to yield to — that is the entire
+reason the path defers — and the real mechanism is the SENDER retrying until the
+IPI lands at CPL3, which `cmd_mcpre` does in a loop. Acting on the flag would
+either do nothing or preempt at exactly the point the code had just decided it
+must not.
+
+So it counts instead, and `mcpre` prints it. The path's comment claims deferral
+is "statistically immediate: the probes spend >99% of their time" in ring 3 — a
+plausible assertion nothing measured. The release gate now measures it:
+**`deferred at CPL0: 0`** in both SMP configurations. The claim holds, and the
+retry loop it depends on never had to retry.
+
+Version bumped to 0.79.0 (`VERSION` and `KERNEL_VERSION` both, with
+`release-version-check` covering the second since v0.78). Released — see
+`CHANGELOG-0.79.0.md` for the artefact, the matrix and the coverage gaps.
+
 ## STILL OPEN (inherited)
 
 - **`SYS_THREAD_JOIN` has no timeout argument.**

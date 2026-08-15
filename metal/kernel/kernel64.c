@@ -26,7 +26,7 @@
  * because release-version-check only ever compared the Makefile's VERSION against
  * the git tag. The string the KERNEL prints was never in the comparison. It is
  * now: see release-version-check in metal/Makefile, which greps this line. */
-#define KERNEL_VERSION "0.78.0-metal"
+#define KERNEL_VERSION "0.79.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -272,7 +272,24 @@ struct cpu_local {
     uint64_t cur_proc;                       /* the capability gate reads this */
     struct tss64 *tss;                       /* this CPU's own TSS            */
     volatile uint32_t online;
-    volatile uint32_t resched;               /* IPI asked this CPU to resched */
+    /* v0.79: a COUNT of deferred cross-core preemptions, not a pending flag.
+     *
+     * It was `resched = 1`, written by the CPL0 path of smp_preempt_ipi and read
+     * by nobody, ever, with nothing to clear it. An audit for v0.79 found it
+     * vestigial: a field shaped like a mechanism that was not one.
+     *
+     * It is deliberately NOT wired into a yield check. When the preempt IPI
+     * catches this core in the kernel there is nothing safe to yield to — that is
+     * the entire reason the path defers — and the real mechanism is the SENDER
+     * retrying until the IPI lands at CPL3 (see cmd_mcpre's retry loop). Acting
+     * on the flag would either do nothing or preempt at exactly the point the
+     * code just decided it must not.
+     *
+     * So it counts instead. The comment on that path claims deferral is
+     * "statistically immediate: the probes spend >99% of their time" in ring 3 —
+     * a plausible assertion that nothing measured. Now it is measured, and the
+     * mcpre summary prints it. */
+    volatile uint32_t resched;               /* deferred preempt IPIs (CPL0 hits) */
     volatile uint32_t ipi_ping;              /* pings received                */
     volatile uint32_t work_done;
     volatile uint64_t probe_val;             /* what this cpu read at g_probe_va */
@@ -11690,7 +11707,7 @@ static void smp_preempt_ipi(struct isr_frame *f) {
         return;
     }
     if ((f->cs & 3) != 3) {
-        me->resched = 1;                     /* in-kernel: defer, sender retries */
+        me->resched++;                       /* in-kernel: defer, sender retries (counted, v0.79) */
         lapic_eoi();
         return;
     }
@@ -12595,7 +12612,7 @@ static void cmd_mcpre(void) {
     if (!es) { kputs("[mcpre  ] ELF load failed\n-- done --\n"); return; }
     kprocs[ps].entry = es;
 
-    uint32_t pc0 = g_cpu[1].preempt_count;
+    uint32_t pc0 = g_cpu[1].preempt_count, rs0 = g_cpu[1].resched;   /* v0.79 */
     /* v0.79: PIN THE PROBE TO CPU1. This is not a hint, it is the precondition
      * of the assertion below, which requires ran_on & 2 — that the probe ran ON
      * CPU1 specifically.
@@ -12698,8 +12715,12 @@ static void cmd_mcpre(void) {
     current_proc_idx = save;
 
     int preempted = g_cpu[1].preempt_count > pc0;
-    kprintf("[mcpre  ] cpu1 preempt_count +%u; long: exit %u ran_on %x finish#%u | hi: exit %u ran_on %x finish#%u\n",
-            (uint64_t)(g_cpu[1].preempt_count - pc0),
+    /* v0.79: deferrals are printed because the "sender retries, statistically
+     * immediate" contract on smp_preempt_ipi's CPL0 path was asserted and never
+     * measured. A large count here means the probe is spending real time in the
+     * kernel and the retry loop is doing more work than the comment implies. */
+    kprintf("[mcpre  ] cpu1 preempt_count +%u (deferred at CPL0: %u); long: exit %u ran_on %x finish#%u | hi: exit %u ran_on %x finish#%u\n",
+            (uint64_t)(g_cpu[1].preempt_count - pc0), (uint64_t)(g_cpu[1].resched - rs0),
             kprocs[pl].exit_code, (uint64_t)kprocs[pl].ran_on, (uint64_t)kprocs[pl].finish_seq,
             kprocs[ps].exit_code, (uint64_t)kprocs[ps].ran_on, (uint64_t)kprocs[ps].finish_seq);
     prcheck("the cross-core IPI PREEMPTED the running ring-3 thread (context captured mid-loop)",
