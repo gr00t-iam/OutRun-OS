@@ -12964,10 +12964,42 @@ static void sys_yield_ring3(struct sysframe *sf) {
  * is already complete; the park itself still happens later, in cpu_exec_proc,
  * because until this core has finished unwinding the task is still RUNNING
  * here and a second core resuming it would put one task on two cores. */
+/* v0.78: as block_ring3, but the CALLER ALREADY HOLDS the futex lock, having
+ * made its decision to sleep while holding it. Releases the lock. Never returns.
+ *
+ * THIS EXISTS BECAUSE THE LOST WAKEUP WAS REAL, and it was in the gap between a
+ * caller's condition check and its arming. Both callers below took the lock,
+ * tested their condition, RELEASED the lock, and only then called block_ring3 —
+ * which takes the lock again to arm. A waker landing in that gap scans for
+ * `parked` or `wait_armed`, finds the waiter in NEITHER state, matches nobody,
+ * and spends its wake on empty air. The waiter then arms and parks against a
+ * wake that has already happened, and sleeps until the 200 s deadline.
+ *
+ * That is the mechanism behind `[pthreads_smp] exit 937` in the v0.76 and v0.78
+ * gate logs: both failing boots are short by exactly one wake (45/44, 46/45)
+ * where every passing boot balances. sys_futex_wait's own comment claimed the
+ * compare-and-park was "atomic against SYS_FUTEX_WAKE (both take the futex
+ * lock)" — the property was documented, believed, and not implemented.
+ *
+ * With the lock held across check-and-arm, the two orderings are:
+ *   waker acquires first  -> its state change precedes our check, we see it and
+ *                            do not sleep at all
+ *   waiter acquires first -> we are armed before the waker can scan, so it sees
+ *                            wait_armed and sets wake_pending
+ * Neither loses the wakeup, which is what the protocol comment above always
+ * said and now describes the code.
+ *
+ * No extra memory barriers are needed on x86-64: __sync_lock_test_and_set is a
+ * full barrier and __sync_lock_release is a release store, so the lock itself
+ * orders the publication of wait_key/wait_armed against every waker's scan.
+ * Adding smp_mb() around these fields would be cargo — the ordering was never
+ * the defect, the lock GAP was. */
 static void __attribute__((noreturn))
-block_ring3(struct sysframe *sf, int p, uint64_t key, uint64_t timeout) {
+block_ring3_locked(struct sysframe *sf, int p, uint64_t key, uint64_t timeout) {
+    /* Capture BEFORE arming, exactly as before: by the time another core can
+     * observe wait_armed the uctx must already be complete. Doing it under the
+     * lock costs a register-block copy of hold time and buys the atomicity. */
     uctx_from_sysframe(&kprocs[p].uctx, sf, WAIT_RV_OK);
-    futex_lock();
     kprocs[p].wait_restart  = 0;      /* returns from the call, does not repeat it */
     kprocs[p].wait_key      = key;
     kprocs[p].wait_deadline = g_ticks + timeout;
@@ -12982,6 +13014,19 @@ block_ring3(struct sysframe *sf, int p, uint64_t key, uint64_t timeout) {
     resume_kernel(RET_PREEMPTED);            /* cpu_exec_proc parks or requeues */
     for (;;) __asm__ volatile("hlt");        /* unreachable                     */
 }
+
+/* There is deliberately NO unconditional `block_ring3(...)` wrapper any more.
+ *
+ * It existed, both parkers used it, and its signature is precisely what caused
+ * the lost wakeup: it invites a caller to test its condition, drop the lock (or
+ * never take it), and then park — which is the window a waker falls into. Every
+ * caller must now hold the futex lock across its own decision and hand it over,
+ * so the dangerous shape is not merely discouraged, it is unavailable.
+ *
+ * Deleted rather than kept and marked unused, for the same reason v0.77 deleted
+ * the spin-budgeted cs_compile() instead of leaving it beside its replacement:
+ * the next person to add a parker copies whichever primitive their eye lands
+ * on. */
 
 /* v0.64 Phase 2: park exactly as block_ring3 does, but arrange for the task to
  * resume by RE-EXECUTING ITS SYSCALL instead of returning from it.
@@ -13047,6 +13092,17 @@ static int block_ring3_restart(struct sysframe *sf, int p, uint64_t key,
  * not the machine. */
 #define FUTEX_DEFAULT_TICKS 20000ull
 
+#ifdef FUTEX_RACE_REPRO
+/* v0.78 REPRODUCER ONLY: the shortened deadline applies to the JOIN park alone.
+ *
+ * The first version of this reproducer shortened FUTEX_DEFAULT_TICKS itself, and
+ * that was wrong — every park in the kernel uses it, so a 2 s global deadline
+ * perturbed subsystems that have nothing to do with the defect and wedged the
+ * boot 24 suites in. A reproducer that changes more than the path under test
+ * cannot attribute what it observes. Only the join deadline moves now. */
+#define FUTEX_REPRO_JOIN_TICKS 200ull
+#endif
+
 /* Can this context park at all? A Model-A pcb uthread cannot: it belongs to the
  * BSP thread scheduler, not to a run queue, so there is no RET_PREEMPTED path
  * to unwind through. Those callers fall back to yield-and-recheck, which is
@@ -13083,10 +13139,12 @@ static uint64_t sys_futex_wait(struct sysframe *sf, uint64_t uaddr, uint64_t val
         }
         return WAIT_RV_OK;
     }
+    /* v0.78: the lock is held ACROSS the compare and the arm. It used to be
+     * released here, between the two, which is the lost-wakeup window this
+     * function's own comment says cannot exist. See block_ring3_locked(). */
     futex_lock();
     if (*(volatile uint64_t *)uaddr != val) { futex_unlock(); return (uint64_t)-11; }
-    futex_unlock();
-    block_ring3(sf, p, key, timeout);         /* never returns */
+    block_ring3_locked(sf, p, key, timeout);  /* never returns; releases the lock */
 }
 
 /* SYS_EPOLL_WAIT(epfd, events, maxevents_and_timeout) -> ready count, or negative.
@@ -13229,12 +13287,64 @@ static uint64_t sys_thread_join(struct sysframe *sf, uint64_t tid, uint64_t out)
     }
     /* Already gone: answer from the leader's table. This is checked FIRST and
      * again on every retry, so a thread that exits between two calls is never
-     * waited on forever. */
+     * waited on forever.
+     *
+     * v0.78: and the check is now made UNDER THE FUTEX LOCK, held continuously
+     * until this task is armed. It was not, and that is the lost wakeup this
+     * suite has failed on twice. thread_exit sets thr_done and then calls
+     * futex_wake_key(JOIN_KEY_OF(L,t)), which needs this lock — so with the
+     * check and the arm inside one critical section, an exit either happens
+     * before our read (we see thr_done and never sleep) or after our arm (its
+     * wake finds wait_armed). Previously it could land between the two and
+     * match nothing at all, leaving the joiner parked until the 200 s deadline
+     * and surfacing in ring 3 as exit 937 — a join timeout, naming nothing
+     * about futexes and nothing about the thread that had already exited. */
+#ifdef FUTEX_RACE_REPRO
+    /* THE PRE-v0.78 SHAPE, RESTORED ON PURPOSE: test the condition with the lock
+     * NOT held, then arm separately. The delay between them only widens a window
+     * that was always there — it does not create one. Without the widening the
+     * race fires roughly 1 boot in 8, which is too rare to demonstrate anything;
+     * with it, every join that races an exit loses its wake.
+     *
+     * This is the control build for the fix in this commit. Never shipped. */
     if (kprocs[L].thr_done & (1u << tid)) {
         if (out) *(volatile uint64_t *)out = kprocs[L].thr_exit[tid];
         return WAIT_RV_OK;
     }
     if (!sf || !can_park()) {
+        uint64_t dl0 = g_ticks + FUTEX_REPRO_JOIN_TICKS;
+        while (!(kprocs[L].thr_done & (1u << tid))) {
+            if (g_ticks >= dl0) return WAIT_RV_TIMEDOUT;
+            krelax();
+        }
+        if (out) *(volatile uint64_t *)out = kprocs[L].thr_exit[tid];
+        return WAIT_RV_OK;
+    }
+    /* Widen the window with a SPIN COUNT, deliberately, and this is the one place
+     * in the tree where that is the correct instrument rather than the defect.
+     *
+     * The first attempt waited on g_ticks. That hangs: g_ticks is advanced by the
+     * BSP timer interrupt, and this runs inside a syscall on the BSP with
+     * interrupts masked, so the clock it waits for cannot move. The boot wedged
+     * with no output and no breadcrumb. What is wanted here is not a duration at
+     * all — it is "hold this core long enough for another to run", which is a
+     * quantity of execution, and a spin count measures exactly that. */
+    for (volatile int spin = 0; spin < 4000000; spin++) __asm__ volatile("pause");
+    futex_lock();
+    block_ring3_locked(sf, p, JOIN_KEY_OF(L, tid), FUTEX_REPRO_JOIN_TICKS);
+#endif
+    futex_lock();
+    if (kprocs[L].thr_done & (1u << tid)) {
+        uint64_t code = kprocs[L].thr_exit[tid];
+        futex_unlock();
+        /* The user-memory store happens OUTSIDE the lock: access_ok above says
+         * the page is present, but a raw leaf spinlock is not something to hold
+         * across a write to another address space's mapping. */
+        if (out) *(volatile uint64_t *)out = code;
+        return WAIT_RV_OK;
+    }
+    if (!sf || !can_park()) {
+        futex_unlock();
         uint64_t dl = g_ticks + FUTEX_DEFAULT_TICKS;
         while (!(kprocs[L].thr_done & (1u << tid))) {
             if (g_ticks >= dl) return WAIT_RV_TIMEDOUT;
@@ -13243,7 +13353,7 @@ static uint64_t sys_thread_join(struct sysframe *sf, uint64_t tid, uint64_t out)
         if (out) *(volatile uint64_t *)out = kprocs[L].thr_exit[tid];
         return WAIT_RV_OK;
     }
-    block_ring3(sf, p, JOIN_KEY_OF(L, tid), FUTEX_DEFAULT_TICKS);   /* never returns */
+    block_ring3_locked(sf, p, JOIN_KEY_OF(L, tid), FUTEX_DEFAULT_TICKS);  /* releases the lock */
 }
 
 /* SYS_SIGRETURN() — pop the frame sig_deliver pushed and resume the interrupted
@@ -25732,6 +25842,12 @@ static void shell_run(void) {
      * already been read as a clean baseline once in this project. */
     kputs("\n*** BUILT WITH FORK_FUNNEL_REPRO — fork enqueues to cpu0 unconditionally.\n");
     kputs("*** This is v0.75's DEFECT, restored on purpose. NOT a release kernel.\n");
+#endif
+#ifdef FUTEX_RACE_REPRO
+    kputs("\n*** BUILT WITH FUTEX_RACE_REPRO — thread_join tests thr_done OUTSIDE the\n");
+    kputs("*** futex lock and arms separately, with the window widened by 2 ticks, and\n");
+    kputs("*** the park deadline shortened to 2 s. This is the pre-v0.78 lost-wakeup\n");
+    kputs("*** defect, restored on purpose. NOT a release kernel.\n");
 #endif
     kputs("\nType 'help' for commands, 'demo' for the capability walk-through.\n");
     kputs("outrun> ");

@@ -180,15 +180,115 @@ its own, so **`make clean` when toggling either** — the same trap, twice over.
 
 ---
 
+## PHASE 2 RESULT — THE LOST WAKEUP, FOUND AND FIXED
+
+Phase 1 characterised it: both failing boots short by exactly one wake, every
+passing boot balanced. Phase 2 found the code.
+
+### The defect
+
+`sys_futex_wait` took the futex lock for its compare, **released it**, and then
+called `block_ring3`, which took the lock again to arm:
+
+```c
+futex_lock();
+if (*(volatile uint64_t *)uaddr != val) { futex_unlock(); return -11; }
+futex_unlock();                       /* <-- lock dropped between the two */
+block_ring3(sf, p, key, timeout);     /* <-- re-takes it to arm */
+```
+
+A waker landing between those two critical sections scans for `parked` or
+`wait_armed`, finds the waiter in **neither** state, matches nobody, and spends
+its wake on empty air. The waiter then arms and parks against a wake that has
+already happened, and sleeps until the deadline.
+
+Three lines above that code sat its own comment: *"The compare-and-park is
+atomic against SYS_FUTEX_WAKE (both take the futex lock), which is the whole
+reason a futex needs kernel help at all: without it, a wake landing between 'I
+read the value' and 'I am asleep' is lost."* The property was documented,
+believed, and not implemented — the third time in this milestone that a comment
+asserted an invariant the code did not have.
+
+`sys_thread_join` was worse: it tested `thr_done` under **no lock at all** and
+then parked. That is the path `pthreads_smp` exercises, and the one that failed.
+
+### The fix
+
+`block_ring3_locked()` requires the caller to hold the futex lock across its own
+decision and hands the lock off. Both orderings are now safe — a waker that
+acquires first has its state change precede our check, so we never sleep; a
+waiter that acquires first is armed before the waker can scan, so the waker sees
+`wait_armed`. The thread-exit path sets `thr_done` (with a barrier) *before*
+calling `futex_wake_key`, which is what makes the second half of that argument
+hold; it was checked, not assumed.
+
+**The unconditional `block_ring3()` wrapper is deleted, not kept.** Its signature
+is the footgun: it invites a caller to test a condition and then park. Removing
+it makes the dangerous shape unavailable rather than merely discouraged, for the
+same reason v0.77 deleted the spin-budgeted `cs_compile()`.
+
+**No memory barriers were added.** `__sync_lock_test_and_set` is a full barrier
+on x86-64 and `__sync_lock_release` is a release store, so the lock already
+orders publication of `wait_key`/`wait_armed` against every waker's scan. The
+ordering was never the defect; the lock GAP was. Barriers here would have looked
+like a fix and changed nothing.
+
+### The demonstration
+
+A passing gate cannot establish this, at a natural rate near 1 boot in 8. So the
+old shape was restored behind `EXTRA=-DFUTEX_RACE_REPRO` — test outside the
+lock, arm separately, window widened, join deadline shortened to 2 s so the boot
+still reaches the prompt to report itself.
+
+| `-smp 4`, smp4-bios | parked/woken | assertion | `pthreads_smp` |
+|---|---|---|---|
+| pre-v0.78 shape | 44 / **43** | **FAIL** | 5 passed, **2 failed**, exit 937 |
+| fixed | 44 / 45 | PASS | **7 passed, 0 failed** |
+
+The reproducer shows the exact signature of both natural failures, and it proves
+the new assertion is not vacuous: it fails when the defect is present and passes
+when it is not. Logs committed as `OUTRUN-0.78-futex-{repro,fixed}.log`, each
+md5-stamped and carrying the banner that says which build produced it.
+
+Note that wakes may legitimately EXCEED parks (44 parked, 45 woken in the fixed
+run): a wake can count a waiter caught in the arming window. The assertion is on
+`g_futex_timeouts`, not on the balance — a balance test would have failed that
+run spuriously, which is why the counter semantics were checked before the
+assertion was trusted.
+
+### Two reproducer mistakes, recorded
+
+1. **The first version shortened `FUTEX_DEFAULT_TICKS` globally.** Every park in
+   the kernel uses it, so a 2 s deadline perturbed subsystems unrelated to the
+   defect and wedged the boot 24 suites in. A reproducer that changes more than
+   the path under test cannot attribute what it observes. Only the join deadline
+   moves now.
+2. **The window was first widened by waiting on `g_ticks`.** That hangs: the BSP
+   timer interrupt advances `g_ticks`, and the delay runs inside a syscall on the
+   BSP with interrupts masked, so the clock it waits for cannot move. It is now a
+   spin count — the one place in this tree where a spin count is the correct
+   instrument, because what is wanted is "hold this core", a quantity of
+   execution, not a duration.
+
+### Not fixed
+
+`sys_epoll_wait` parks with the same check-then-arm shape. Closing it means
+holding the raw futex spinlock across an fd-table scan that takes
+`g_ofile_lock` (rank 1) — a new lock ordering, and trading an intermittent stall
+for a possible deadlock. Left alone deliberately; epoll re-executes its syscall
+on wake and re-scans readiness, so a lost wake there costs a bounded wait rather
+than a wrong answer.
+
 ## STILL OPEN
 
-- **`make clean` ate the first reproduction's boot logs** before they were
-  copied out of `build/`. The run was repeated and preserved; the incident is
-  recorded here because it is the third time in this project that evidence has
-  been lost to a working directory, and the lesson has still not been made
-  mechanical. A harness that produces evidence should write it somewhere
-  `clean` cannot reach.
-- **The lost wake behind the v0.76 `pthreads_smp` failure** — unexplained.
+- ~~`make clean` ate the first reproduction's boot logs~~ — **fixed.** Both gate
+  harnesses now write under `.logs/gate/` (gitignored, outside `$(BUILD)`), so a
+  routine build step can no longer destroy the record. Verified with a canary
+  file across `make clean`. What matters is still copied into `docs/`
+  deliberately; this only stops the accidental loss.
+- ~~The lost wake behind the v0.76 `pthreads_smp` failure~~ — **FOUND AND FIXED
+  in phase 2 above.** It was a check-vs-park window in `sys_futex_wait` and
+  `sys_thread_join`, reproduced on demand and closed.
 - **Why cpu1 stalled in the v0.77 `mcpre` failure** — unexplained; the budget
   is fixed and instrumented, the cause is not known.
 - **`SYS_THREAD_JOIN` still has no timeout argument.**

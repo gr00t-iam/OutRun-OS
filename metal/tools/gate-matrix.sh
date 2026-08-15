@@ -23,7 +23,7 @@
 set -u
 
 ISO=${1:?usage: gate-matrix.sh <iso> [workdir] [config ...]}
-WORK=${2:-build/gate-matrix}
+WORK=${2:-.logs/gate/matrix}
 shift 2 2>/dev/null || shift 1
 CONFIGS=${*:-"uniprocessor smp4-bios smp4-iommu"}
 CAP=${GATE_CAP:-900}
@@ -34,6 +34,11 @@ command -v qemu-system-x86_64 >/dev/null || { echo "gate-matrix: qemu-system-x86
 # A unique workdir per invocation, and a lock. Two concurrent runs sharing one
 # output directory once deleted each other's logs mid-run here, and the merged
 # log reported a PASS that belonged to neither run. See tools/gate-dirty.sh.
+#
+# v0.78: and it lives under .logs/, NOT under build/. `make clean` has now
+# destroyed harness evidence twice — a carryover-3 reproduction that had to be
+# re-run, and the only copy of an unexplained [mcpre] failure, which is simply
+# gone. Logs that a routine build step can delete are not records.
 rm -rf "$WORK"; mkdir -p "$WORK"
 exec 9>"$WORK/.lock"
 flock -n 9 || { echo "gate-matrix: another run holds $WORK"; exit 2; }

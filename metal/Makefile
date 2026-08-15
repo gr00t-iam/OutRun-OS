@@ -208,6 +208,18 @@ qemu-usb: $(ISO) $(VBLK_IMG)
 #   make gate-dirty                       3 boots, uniprocessor
 #   make gate-dirty-smp                   3 boots, -smp 4
 #   make gate-dirty GATE_DIRTY_BOOTS=5    longer run
+# v0.78: GATE EVIDENCE LIVES OUTSIDE build/.
+#
+# Every harness used to write its logs under $(BUILD), which `make clean`
+# removes. That has now cost this project real evidence twice: a carryover-3
+# reproduction had to be re-run because clean ate its logs, and the only copy of
+# the unexplained v0.76 [mcpre] failure is simply gone — its roadmap entry still
+# says "preserved at" a path that no longer exists anywhere.
+#
+# .logs/ is gitignored, so this is about surviving a build step, not about
+# committing everything: what matters gets copied into docs/ deliberately.
+GATE_LOGS ?= .logs/gate
+
 GATE_DIRTY_BOOTS ?= 3
 GATE_DIRTY_QEMU  ?=
 # The workdir carries the shell's PID so two invocations can never `rm -rf`
@@ -215,7 +227,7 @@ GATE_DIRTY_QEMU  ?=
 # while another run holds it — see the comment there for what happened without
 # these. The chosen path is printed in the run's own header.
 gate-dirty: $(ISO)
-	tools/gate-dirty.sh "$(ISO)" "$(GATE_DIRTY_BOOTS)" "$(GATE_DIRTY_QEMU)" "$(BUILD)/gate-dirty-$$$$"
+	tools/gate-dirty.sh "$(ISO)" "$(GATE_DIRTY_BOOTS)" "$(GATE_DIRTY_QEMU)" "$(GATE_LOGS)/dirty-$$$$"
 
 gate-dirty-smp: $(ISO)
 	$(MAKE) gate-dirty GATE_DIRTY_QEMU="-smp 4"
@@ -238,7 +250,7 @@ gate-dirty-smp: $(ISO)
 .PHONY: gate gate-all
 GATE_CONFIGS ?= uniprocessor smp4-bios smp4-iommu
 gate: $(ISO)
-	tools/gate-matrix.sh "$(ISO)" "$(BUILD)/gate-matrix-$$$$" $(GATE_CONFIGS)
+	tools/gate-matrix.sh "$(ISO)" "$(GATE_LOGS)/matrix-$$$$" $(GATE_CONFIGS)
 
 # The whole standing gate in one command, in the order that fails cheapest
 # first: a fresh-image break should not wait behind nine dirty boots.
