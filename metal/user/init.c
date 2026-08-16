@@ -488,7 +488,16 @@ static void mcsched_probe(void) {
  * ring 3 long enough to overlap its siblings, and the periodic SYS_GETPID
  * re-check is the sharp edge: every syscall crosses the per-CPU entry path,
  * and if any core's identity bled into another's capability gate, the pid
- * comes back wrong and we exit 999 — which the kernel-side suite FAILs on. */
+ * comes back wrong and we exit 999 — which the kernel-side suite FAILs on.
+ *
+ * v0.81: THIS ONE STAYS SHORT, AND IT IS NOT ONLY cmd_mcq's.
+ *
+ * cmd_mcpre spawns its HIGH-PRIORITY thread with role 7 as well, and asserts
+ * that it finishes BEFORE the long victim it preempted. Lengthening this
+ * function to fix cmd_mcq therefore broke cmd_mcpre: measured 4 failures of
+ * "completion order inverted" in 8 -smp 4 boots against 0 in 7 on the same
+ * tree without the change. Two suites, one payload, opposite requirements —
+ * so cmd_mcq got its own probe (role 52) instead. Keep this short. */
 static void mcq_probe(void) {
     u64 pid = sysc(SYS_GETPID, 0, 0, 0);
     volatile u64 acc = 0;
@@ -496,6 +505,52 @@ static void mcq_probe(void) {
         acc += i ^ pid;
         if ((i & 0xFFFFull) == 0 && sysc(SYS_GETPID, 0, 0, 0) != pid)
             sysc(SYS_EXIT, 999, 0, 0);       /* cross-core identity bleed */
+    }
+    sysc(SYS_EXIT, pid, 0, 0);
+}
+
+/* role 52: v0.81 RESIDENT concurrent scheduling probe — cmd_mcq's probe, and
+ * only cmd_mcq's.
+ *
+ * Identical to role 7 except that its residency is A DEADLINE RATHER THAN AN
+ * ITERATION COUNT, which is what CLAUDE.md requires of timing in this tree:
+ * QEMU here is TCG-only, so a fixed iteration count means a different duration
+ * on every host and at every -smp width.
+ *
+ * That was the direct cause of the two-cpu concurrency failure. Under
+ * round-robin TCG only one vCPU executes at a time, and a whole 3M-iteration
+ * probe fits inside a single vCPU quantum — so cpu1 could enter ring 3, finish,
+ * and exit before the BSP was scheduled back to enter at all. The logs showed
+ * exactly that: cpu1's probe at finish#2, the BSP's at finish#3, high-water 1.
+ * A tick target cannot be swallowed by a quantum, because g_ticks advances on
+ * timer interrupts — as real time passes, not as instructions retire. Whichever
+ * core arrives second still finds the first one there.
+ *
+ * The iteration ceiling is a BACKSTOP, not the budget. If SYS_SYSINFO ever
+ * failed, osysticks() returns 0 and the unsigned subtraction below would end
+ * the loop immediately; if instead ticks stopped advancing, an unbounded loop
+ * here would spin forever in ring 3 — and because the BSP runs its own probe
+ * through cpu_exec_proc(), which does not return until that probe exits, that
+ * would wedge the machine rather than fail an assertion. Invariant 4 forbids
+ * that trade, so this loop always terminates on its own. */
+#define MCQ_T_RESIDENT     10u          /* 0.1 s of ring-3 residency per probe  */
+#define MCQ_I_CEILING  50000000ull      /* backstop only; the tick target wins  */
+
+static u32 osysticks(void);             /* defined below, with the wait helpers */
+
+static void mcq_resident_probe(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    u32 t0 = osysticks();
+    volatile u64 acc = 0;
+    for (u64 i = 0; i < MCQ_I_CEILING; i++) {
+        acc += i ^ pid;
+        /* Sample the clock on the same stride as the identity re-check, so the
+         * probe does not spend its residency inside SYS_SYSINFO. */
+        if ((i & 0xFFFFull) == 0) {
+            if (sysc(SYS_GETPID, 0, 0, 0) != pid)
+                sysc(SYS_EXIT, 999, 0, 0);   /* cross-core identity bleed */
+            if (osysticks() - t0 >= MCQ_T_RESIDENT) break;
+        }
     }
     sysc(SYS_EXIT, pid, 0, 0);
 }
@@ -4557,6 +4612,7 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 49) { netepoll_stress_worker(); }      /* v0.65 non-blocking sockets multiplexed with epoll */
     if (role == 50) { mmapfile_stress_worker(); }      /* v0.66 file-backed mappings and writeback           */
     if (role == 51) { tcp_stress_worker(); }           /* v0.67 TCP: handshake, byte stream, FIN             */
+    if (role == 52) { mcq_resident_probe(); }          /* v0.81 tick-resident concurrency probe (cmd_mcq)    */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
     if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
     if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */
