@@ -20781,8 +20781,19 @@ static void cmd_users_stress(void) {
     } else {
         usercheck("a slot was available to test recycling", 0);
     }
-    /* setuid/setgid are exercised from ring 3 by role 52, which is the only
-     * place the one-way rule can be observed the way an application sees it. */
+    /* v0.82: this used to claim "setuid/setgid are exercised from ring 3 by
+     * role 52". Both halves were false and had been for some time: there is no
+     * ring-3 caller of SYS_SETUID/SYS_SETGID anywhere in user/init.c, and role
+     * 52 was unassigned when the claim was written. The one-way rule is checked
+     * here, from the kernel side, and nowhere else.
+     *
+     * Left as a note rather than deleted because it points at a real gap: the
+     * rule is NOT observed the way an application sees it, and a ring-3 worker
+     * that dropped privilege and then tried to regain it would be worth having.
+     *
+     * Role numbers as of v0.82: 52 is mcq_resident_probe (cmd_mcq's
+     * tick-resident concurrency probe), 53 is posix_orphan_worker (posixstrs'
+     * cross-generation orphan test). Neither touches setuid. */
 
     kprintf("[usersstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_userpass, (uint64_t)g_userfail);
     if (!g_userfail)
