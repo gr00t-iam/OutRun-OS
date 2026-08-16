@@ -21773,6 +21773,29 @@ static void cmd_apps_stress(void) {
     uint32_t viol0 = g_rank_violations;
     int base_wins = wm_count_used();
     uint64_t comp0 = g_wm_composes;
+
+    /* v0.81: RESET THE RING-3 HIGH-WATER, so the SMP assertion below measures
+     * THIS suite and not the one that ran an hour of log ago.
+     *
+     * g_inr3_max is global and is reset in exactly one place — cmd_mcq — which
+     * runs long before this (mcq at log line ~1100, appsstrs at ~5800). So the
+     * `|| g_inr3_max >= 2` fallback below was being satisfied by mcq's probes:
+     * this suite could report that APPS overlapped in ring 3 on the strength of
+     * a different suite's evidence. Since v0.81 made mcq reach 2 reliably at
+     * every -smp width, that fallback would otherwise have become permanently
+     * true and the assertion permanently unfalsifiable.
+     *
+     * A BASELINE COMPARISON WOULD NOT FIX IT. cmd_posix_stress used to sample
+     * `inr3_0 = g_inr3_max` and then assert `g_inr3_max >= (int)inr3_0`, but
+     * g_inr3_max only ever increases (the CAS in cpu_exec_proc never lowers it)
+     * and nothing reset it between the two — so that clause could not fail. It
+     * was the same class as a counter nothing prints, and it now resets too.
+     * Resetting is what actually scopes the measurement to one suite.
+     *
+     * Only the high-water is cleared, never g_inr3 itself: that one is the LIVE
+     * count of tasks in ring 3, and zeroing it under a running task would make
+     * the matching decrement drive it negative. */
+    g_inr3_max = 0;
     int cycles_ok = 1, wins_ok = 1, grants_ok = 1, concurrent_ok = 0, fault_ok = 1, surf_ok = 1;
     int windowed_ok = 1;
     int cyc;
@@ -22079,7 +22102,21 @@ static void cmd_posix_stress(void) {
     uint32_t viol0  = g_rank_violations;
     uint64_t fork0  = g_forks, exec0 = g_execs, thr0 = g_threads_made;
     uint64_t sdel0  = g_sig_delivered, sret0 = g_sig_returned, srai0 = g_sig_raised;
-    uint32_t inr3_0 = g_inr3_max;
+
+    /* v0.81: RESET THE RING-3 HIGH-WATER, exactly as cmd_apps_stress now does.
+     *
+     * This suite used to sample `inr3_0 = g_inr3_max` here and then assert
+     * `g_inr3_max >= (int)inr3_0` below. That clause COULD NOT FAIL: g_inr3_max
+     * only ever rises (the CAS in cpu_exec_proc never lowers it) and nothing
+     * reset it between the sample and the check, so it was a guard of the same
+     * class as a counter nothing prints. What it looked like it was doing —
+     * proving THIS suite drove the high-water — is what resetting actually
+     * does.
+     *
+     * Only the high-water is cleared, never g_inr3 itself: that is the LIVE
+     * count of tasks in ring 3, and zeroing it under a running task would make
+     * the matching decrement drive it negative. */
+    g_inr3_max = 0;
 
     /* role -> the exit code that means "every ring-3 assertion in me passed" */
     static const uint64_t want[7] = { 700, 800, 900, 950, 960, 980, 970 };
@@ -22250,8 +22287,10 @@ static void cmd_posix_stress(void) {
             g_sig_returned - sret0 >= (uint64_t)POSIXSTRESS_ROUNDS * 3);
 
     if (n > 1)
+        /* Suite-local now: the high-water was zeroed at entry, so reaching 2
+         * means THESE workers were in ring 3 together. */
         pxcheck("POSIX workers genuinely overlapped in ring 3 across cores (SMP)",
-                g_inr3_max >= 2 && g_inr3_max >= (int)inr3_0);
+                g_inr3_max >= 2);
     else
         kputs("[posixstrs] NOTE  uniprocessor: the workers are time-multiplexed through one core,\n"
               "[posixstrs]       so simultaneous ring-3 residency is not assertable here. The\n"
