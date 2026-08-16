@@ -3426,7 +3426,32 @@ static void posix_fd_worker(void) {
         sysc(SYS_EXIT, 42, 0, 0);
     }
     if (r < 0) sysc(SYS_EXIT, 965, 0, 0);
-    if (owaitpid((u32)r, 30000) != 42) sysc(SYS_EXIT, 963, 0, 0);
+    /* v0.81: a tick deadline, and a code of its own.
+     *
+     * This was `owaitpid((u32)r, 30000)` — a SPIN COUNT, the defect class v0.77
+     * fixed in langstrs/toolstrs/pipestrs and v0.78 fixed in role 29. v0.78's
+     * changelog said plainly what was left: "owaitpid(pid, spins) is still used
+     * throughout the tree; this change converted one driver, not the idiom."
+     * This is one of the four that remained, and it duly failed a -smp 4 gate
+     * under the KERNEL_DEBUG build — which adds work to every lock operation and
+     * is therefore exactly the slow-host lever a spin budget cannot survive.
+     *
+     * 963 was ALSO overloaded: it meant "the fd table was not inherited", a real
+     * defect, and "the wait expired", a slow host. Reporting both as one number
+     * sends a reader after an inheritance bug that does not exist — the same
+     * conflation v0.76 fixed for pipestrs (957) and v0.78 for role 29 (702).
+     * 972 is the deadline; 963 keeps its original meaning.
+     *
+     * WAIT_T_FORK (2000 ticks) rather than WAIT_T_RUN, because this wait sits
+     * inside a posixstrs round whose posix_drain watchdog is 3000 ticks: the
+     * inner deadline has to fire first or the round reports "not every task
+     * reached a terminal state" instead of naming the assertion. */
+    {
+        u32 spent = 0;
+        i64 wr = owaitpid_ticks((u32)r, WAIT_T_FORK, &spent);
+        if (wr == -11) sysc(SYS_EXIT, 972, 0, 0);      /* DEADLINE, not a defect */
+        if (wr != 42)  sysc(SYS_EXIT, 963, 0, 0);      /* ran, but the wrong answer */
+    }
 
     if (fd >= 3 && oclose(fd) != 0)   sysc(SYS_EXIT, 966, 0, 0);
     if (oclose(STDOUT_FILENO) == 0)   sysc(SYS_EXIT, 967, 0, 0);  /* stdout is not closable */
