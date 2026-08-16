@@ -88,6 +88,7 @@ green, and the release notes should say which were run and which were not:
 | `make gate-dirty` | 3 boots on ONE reused image, uniprocessor |
 | `make gate-dirty-smp` | 3 boots on ONE reused image, `-smp 4` |
 | `make gate-all` | `gate` + both dirty gates |
+| `make gate-selftest` | the gate's own run classifier, on synthetic logs (<1 s) |
 | `make release-verify` | the published artefact itself |
 
 `make gate` (v0.78, `tools/gate-matrix.sh`) runs uniprocessor, `-smp 4` SeaBIOS
@@ -99,6 +100,19 @@ exactly one person. That is a habit, not a gate.
 It also prints a **coverage line** naming what it did not test, and it counts
 failures twice — matching assertion lines against the suites' own `RESULT`
 tallies — with disagreement failing the gate on its own. See below for why.
+
+**A run that did not complete is not a verdict.** The classifier decides
+completeness before correctness: `TRUNCATED` (we killed it at `GATE_CAP`) and
+`NO-PROMPT` (it died on its own) outrank `FAIL`, and both are named in the
+coverage line as untested. Before v0.81 these were sequential assignments to one
+variable, so whichever fired last won — a boot cut off mid-`cas` at the 900 s cap
+was reported as `FAIL` naming `[vfiostrs]` and `[capdma]`, which had merely been
+the suites that reported before the kill. `make gate-selftest` pins that case;
+`make gate` runs it first.
+
+`GATE_CAP` defaults to 900 s. `smp4-iommu` needs more than that on a slow host —
+if it reports `TRUNCATED`, raise the cap and re-run rather than reading the
+assertions it printed.
 
 The single-configuration targets (`make qemu`, `make qemu-iommu`) still exist
 and are the right thing for interactive work; they do not check anything.

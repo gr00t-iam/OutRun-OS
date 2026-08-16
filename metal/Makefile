@@ -258,14 +258,24 @@ gate-dirty-smp: $(ISO)
 # gate-matrix.sh prints an explicit coverage line naming what it did NOT test,
 # because a gate whose gaps are invisible is how "verified" drifts away from
 # "measured".
-.PHONY: gate gate-all
+.PHONY: gate gate-all gate-selftest
+
+# v0.81: the gate's own reporting logic, tested before it is trusted.
+#
+# gate-matrix.sh needs a boot to say anything, so its reporting went three
+# releases untested and shipped a defect that labelled a truncated boot `FAIL`
+# and named suites that had merely reported before the kill. This runs in well
+# under a second on synthetic logs, and `gate` runs it FIRST — a harness that
+# cannot classify a run correctly has nothing useful to say about a kernel.
+gate-selftest:
+	tools/gate-classify-test.sh
 # v0.80: -smp 2 joins the matrix. Work stealing needs a thief, and at two
 # cores the only other core is the BSP running the suite -- so v0.79's
 # account of the [mcpre] failure predicts it cannot fail there. That
 # prediction was left unrun when v0.79 shipped; this makes it part of every
 # gate rather than a note in a roadmap.
 GATE_CONFIGS ?= uniprocessor smp2-bios smp4-bios smp4-iommu
-gate: $(ISO)
+gate: $(ISO) gate-selftest
 	tools/gate-matrix.sh "$(ISO)" "$(GATE_LOGS)/matrix-$$$$" $(GATE_CONFIGS)
 
 # The whole standing gate in one command, in the order that fails cheapest
