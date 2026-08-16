@@ -7788,7 +7788,7 @@ static int pipe_create_for(int owner, int *rfd, int *wfd) {
     *rfd = r; *wfd = w;
     return 0;
 }
-static int vfs_open_for(const char *name, int owner, int creat) {
+static int vfs_open_for(const char *name, int owner, int creat, int trunc) {
     if (path_has_prefix(name, "tmp/")) {
         const char *rest = name + 4;
         klock_acquire(&g_vfs_lock);
@@ -7845,12 +7845,46 @@ static int vfs_open_for(const char *name, int owner, int creat) {
         klock_release(&g_vfs_lock);
         return -13;                                            /* EACCES */
     }
+    /* v0.83: O_TRUNC. Length to zero, chunk map emptied, content hash cleared —
+     * the file becomes indistinguishable from one just created, which is what
+     * the caller asked for.
+     *
+     * This exists because v0.83 made SYS_WRITE_FILE POSITIONAL and
+     * tail-preserving. Until then a write REPLACED a file's entire contents,
+     * and since this kernel has no O_TRUNC and no ftruncate, that side effect
+     * WAS the only way to shorten or replace a file: "author a file" meant
+     * open(O_CREAT) followed by one whole-file write. Making writes overwrite
+     * in place without providing this would have left every re-authored file
+     * carrying the tail of whatever was longer before it — compilerstrs writes
+     * four different bodies through one path, so a shorter body after a longer
+     * one would have handed the compiler malformed source.
+     *
+     * Requires write permission, and is checked here rather than at the write:
+     * truncation destroys content at OPEN time, before any write is attempted,
+     * so a caller who may not write must not be able to empty the file by
+     * opening it. A file just created is skipped — its author is by
+     * construction entitled to it, and it is already empty. */
+    if (di >= 0 && trunc && !created) {
+        if (!vfs_permit(&DENTS[di], o_uid, o_gid, VFS_P_WRITE)) {
+            klock_release(&g_vfs_lock);
+            return -13;                                        /* EACCES */
+        }
+        DENTS[di].len = 0;
+        DENTS[di].nchunks = 0;
+        DENTS[di].file_hash = 0;
+        vfs_journal_commit();                  /* the directory change is durable */
+    }
     klock_release(&g_vfs_lock);                /* released BEFORE the fd claim  */
     if (di < 0) return -1;
     return ofile_claim(owner, VOL_ROOT, di);
 }
-static int vfs_open(const char *name) { return vfs_open_for(name, fd_owner(), 0); }
-static int vfs_open_creat(const char *name) { return vfs_open_for(name, fd_owner(), 1); }
+static int vfs_open(const char *name) { return vfs_open_for(name, fd_owner(), 0, 0); }
+static int vfs_open_creat(const char *name) { return vfs_open_for(name, fd_owner(), 1, 0); }
+/* v0.83: O_CREAT|O_TRUNC — what "author this file" means now that a write no
+ * longer replaces a file's whole contents. */
+static int vfs_open_creat_trunc(const char *name) { return vfs_open_for(name, fd_owner(), 1, 1); }
+/* O_TRUNC without O_CREAT: empty a file that must already exist. */
+static int vfs_open_trunc(const char *name) { return vfs_open_for(name, fd_owner(), 0, 1); }
 
 /* ===========================================================================
  * v0.48: SYS_VFS_UNLINK — zero the dirent, journal-commit the directory
@@ -14259,6 +14293,90 @@ static int64_t redirect_write_bytes(int fd, const void *data, uint32_t len) {
     return r < 0 ? (int64_t)r : (int64_t)n;
 }
 
+/* v0.83: a file's current length, under the VFS lock and nothing else. Exists so
+ * vfs_write_at can decide whether a write covers the whole file without pulling
+ * its contents into a buffer to find out — which is the very cost the unstaged
+ * path exists to avoid. */
+static uint32_t vfs_len_of(int di) {
+    if (di < 0 || di >= VFS_MAXFILES) return 0;
+    klock_acquire(&g_vfs_lock);
+    uint32_t n = DENTS[di].used ? DENTS[di].len : 0;
+    klock_release(&g_vfs_lock);
+    return n;
+}
+
+/* v0.83: WRITE AT AN OFFSET, tail preserved.
+ *
+ * The store is CONTENT-ADDRESSED, not block-indexed: vfs_write_by_dirent
+ * re-chunks and re-hashes a file's whole contents, and there is no
+ * vfs_write_range to pair with vfs_read_range. So a positional write is
+ * necessarily read-modify-write, exactly as the redirect append above already
+ * is — and it reuses that staging buffer rather than adding a second 32 KiB
+ * global, which also means it inherits the lock discipline that buffer already
+ * has: g_redir_lock is rank 0, acquired first and never beneath another.
+ *
+ * Three cases, all of them ordinary POSIX and none of them special-cased
+ * elsewhere:
+ *   - IN BOUNDS. The bytes at [off, off+len) are replaced and everything after
+ *     them is KEPT. This is the case the old whole-file write could not
+ *     express, and the reason O_TRUNC had to arrive with it: replacing a file
+ *     is now something a caller REQUESTS at open, not a side effect of writing.
+ *   - EXTENDING. off+len past the end simply makes the file longer.
+ *   - SPARSE. off past the end zero-fills the gap. POSIX says the hole reads as
+ *     zeroes, and since this filesystem stores whole contents there is no
+ *     cheaper representation to preserve — the zeroes are real bytes here.
+ *
+ * The size cap is the staging buffer's, and it fails with ENOSPC rather than
+ * writing a truncated file: a partial write-back would REPLACE the file with
+ * less than it had, which is the one outcome worse than refusing. */
+static int64_t vfs_write_at(int di, uint64_t off, const void *data, uint32_t len) {
+    if (!len) return 0;
+
+    /* THE UNSTAGED PATH, and it is not an optimisation — it is what keeps this
+     * function from imposing a 32 KiB ceiling on every file in the system.
+     *
+     * Staging is only needed to PRESERVE bytes the write does not cover. A
+     * write starting at 0 whose length reaches or passes the current end covers
+     * all of them, so there is nothing to preserve and the whole-file writer
+     * can take it directly — chunking arbitrarily large content exactly as it
+     * always did.
+     *
+     * Found by measurement, not foresight: routing every write through the
+     * staging buffer made occ fail to emit a 36,562-byte /bin/omake with
+     * ENOSPC, because the shipped compiler's output is larger than the buffer.
+     * The old whole-file write had no such limit, so capping it here would have
+     * been a silent size regression on the toolchain. */
+    uint32_t cur = vfs_len_of(di);
+    if (off == 0 && (uint64_t)len >= (uint64_t)cur) {
+        int r = vfs_write_by_dirent(di, data, len);
+        return r < 0 ? (int64_t)r : (int64_t)len;
+    }
+
+    /* Everything below genuinely has a tail to keep, and pays the buffer's cap
+     * for it — the same cap, and the same ENOSPC-rather-than-truncate rule,
+     * that the redirect append above has always had. */
+    if (off > (uint64_t)REDIR_STAGE_MAX || off + (uint64_t)len > (uint64_t)REDIR_STAGE_MAX)
+        return -28;                                         /* ENOSPC */
+
+    klock_acquire(&g_redir_lock);
+    int64_t have = vfs_read_file(di, g_redir_stage, REDIR_STAGE_MAX);
+    if (have < 0) have = 0;                                 /* empty or new file */
+    /* A file already at the cap cannot be safely rewritten: the read above is
+     * capped too, so writing back would silently shorten it. */
+    if ((uint32_t)have >= REDIR_STAGE_MAX && off + (uint64_t)len > (uint64_t)have) {
+        klock_release(&g_redir_lock);
+        return -28;                                         /* ENOSPC */
+    }
+    if (off > (uint64_t)have)                               /* the hole reads as zeroes */
+        cmemset(g_redir_stage + have, 0, (uint64_t)off - (uint64_t)have);
+    cmemcpy(g_redir_stage + off, data, len);
+    uint32_t nlen = (uint32_t)(off + (uint64_t)len);
+    if (nlen < (uint32_t)have) nlen = (uint32_t)have;       /* the tail SURVIVES */
+    int r = vfs_write_by_dirent(di, g_redir_stage, nlen);
+    klock_release(&g_redir_lock);
+    return r < 0 ? (int64_t)r : (int64_t)len;
+}
+
 static int64_t redirect_read_bytes(int fd, void *buf, uint32_t len) {
     int vol = VOL_ROOT;
     int di = ofile_deref(fd, &vol);
@@ -14359,8 +14477,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
          * kpstrs, ipcstrs, vfsstrs, posixstrs all failed identically and
          * intermittently). The fuzzer was right; the flags word was not
          * validated. */
-        if (a1 & ~1ull) return (uint64_t)-22;              /* EINVAL */
-        int fd = (a1 & 1) ? vfs_open_creat(name) : vfs_open(name);
+        /* v0.83: bit 1 is O_TRUNC. The rejection of unknown bits above is kept
+         * exactly as it was and is the reason a bit could be added safely at
+         * all — an ABI that ignores flags it does not understand can never
+         * grow one. O_TRUNC is meaningful with or without O_CREAT: with it,
+         * "author this file"; without it, "empty this existing file". */
+        if (a1 & ~3ull) return (uint64_t)-22;              /* EINVAL */
+        int fd = (a1 & 1) ? ((a1 & 2) ? vfs_open_creat_trunc(name) : vfs_open_creat(name))
+                          : ((a1 & 2) ? vfs_open_trunc(name)       : vfs_open(name));
         fs_witness_leave();
         return (uint64_t)(int64_t)fd;
     }
@@ -14459,8 +14583,31 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                 klock_acquire(&g_vfs_lock);
                 int ok = vfs_permit(&DENTS[di], cred_euid(L), cred_egid(L), VFS_P_WRITE);
                 klock_release(&g_vfs_lock);
-                r = ok ? vfs_write_by_dirent(di, (const void *)a1, len)     /* COW */
+                /* v0.83: POSITIONAL, and the cursor advances. This was
+                 * vfs_write_by_dirent(), which replaces a file's ENTIRE
+                 * contents — so every write started at byte 0 and truncated
+                 * whatever was longer, and ofile.off was as vestigial on this
+                 * path as it had been on the read path before v0.82.
+                 *
+                 * The offset is read and written under g_ofile_lock (rank 1) in
+                 * two short sections with the write BETWEEN them, never inside:
+                 * vfs_write_at takes g_redir_lock (rank 0) and the VFS lock
+                 * beneath that, and holding rank 1 across a call that takes
+                 * rank 0 would be an inversion outright. Not holding it at all
+                 * is the version that needs no argument. */
+                uint64_t woff = 0;
+                if (ok) {
+                    klock_acquire(&g_ofile_lock);
+                    woff = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
+                    klock_release(&g_ofile_lock);
+                }
+                r = ok ? vfs_write_at(di, woff, (const void *)a1, len)
                        : -13;                                              /* EACCES */
+                if (r > 0) {
+                    klock_acquire(&g_ofile_lock);
+                    if (g_ofiles[fd].used) g_ofiles[fd].off = woff + (uint64_t)r;
+                    klock_release(&g_ofile_lock);
+                }
             }
             else if (vol == VOL_TMP)  r = tmp_write_file(di, (const void *)a1, len);
             else if (vol == VOL_PIPE) r = pipe_write_fd(fd, (const void *)a1, len);        /* v0.59 */
@@ -18975,12 +19122,24 @@ static void cmd_vfs_stress(void) {
             ls == 1631               ? "SYS_PIPE failed, so the ESPIPE case could not be tested" :
             ls == 1632               ? "lseek on a PIPE was not refused with ESPIPE" :
             ls >= 1633 && ls <= 1636 ? "a forked child did not inherit the parent's file position" :
+            /* v0.83: the positional-write half. */
+            ls >= 1640 && ls <= 1645 ? "a mid-file positional write did not land, or changed the file's length" :
+            ls == 1646               ? "*** the mid-file write did not overwrite in place" :
+            ls == 1647               ? "*** the mid-file write DESTROYED THE TAIL — the write is still whole-file" :
+            ls >= 1648 && ls <= 1655 ? "sequential writes through one descriptor did not land end to end (the cursor is not advancing)" :
+            ls >= 1656 && ls <= 1661 ? "a write past EOF did not extend the file correctly" :
+            ls == 1662               ? "*** the sparse gap did not read back as zeroes" :
+            ls == 1663               ? "the bytes written past EOF are not where they were put" :
+            ls >= 1664 && ls <= 1666 ? "could not re-author the file with O_TRUNC" :
+            ls == 1667               ? "*** O_TRUNC did not empty the file — re-authoring left the old tail" :
+            ls == 1668               ? "the re-authored content is wrong" :
                                        "unknown";
         if (ls != LSEEK_WORKER_OK)
             kprintf("[vfsstrs] ring-3 lseek: worker exit %d — %s\n", (uint64_t)ls, why);
-        vfscheck("SYS_LSEEK moves a descriptor's position (rewind re-reads the same bytes, "
-                 "SEEK_SET/CUR/END all resolve, refusals leave the offset untouched, "
-                 "pipes are ESPIPE and a fork inherits the position)",
+        vfscheck("the file position drives BOTH reads and writes from ring 3 "
+                 "(rewind re-reads the same bytes; a mid-file write overwrites in place and "
+                 "keeps the tail; sequential writes advance the cursor; a write past EOF extends "
+                 "with a zero-filled hole; O_TRUNC empties on open; refusals leave the offset alone)",
                  ls == LSEEK_WORKER_OK);
     }
 
@@ -20880,7 +21039,7 @@ static void cmd_users_stress(void) {
          * claims are false and two assertions fail on every boot after the
          * first. Reset it so "newly created" is true again. */
         suite_fixture_reset("m72own");
-        int fa = vfs_open_for("m72own", alice, 1);          /* alice creates it */
+        int fa = vfs_open_for("m72own", alice, 1, 0);          /* alice creates it */
         if (fa >= 0) held[nheld++] = fa;
         int di = vfs_find("m72own");
         usercheck("a file created by a user is owned by that user",
@@ -20889,7 +21048,7 @@ static void cmd_users_stress(void) {
                   di >= 0 && vfs_mode_of(&DENTS[di]) == (uint32_t)VFS_MODE_DEFAULT);
 
         /* 0644: a stranger may read it. Permission is not ownership. */
-        int fb = vfs_open_for("m72own", bob, 0);
+        int fb = vfs_open_for("m72own", bob, 0, 0);
         if (fb >= 0) held[nheld++] = fb;
         usercheck("a stranger CAN open another user's 0644 file for reading", fb >= 0);
         usercheck("but the stranger has no write right to it",
@@ -20899,10 +21058,10 @@ static void cmd_users_stress(void) {
 
         /* Tighten it, and the stranger loses the descriptor it could have had. */
         if (di >= 0) { klock_acquire(&g_vfs_lock); DENTS[di].mode = 0600; klock_release(&g_vfs_lock); }
-        int fb2 = vfs_open_for("m72own", bob, 0);
+        int fb2 = vfs_open_for("m72own", bob, 0, 0);
         if (fb2 >= 0) held[nheld++] = fb2;
         usercheck("after chmod 0600 the stranger can no longer open it at all", fb2 == -13);
-        int fa2 = vfs_open_for("m72own", alice, 0);
+        int fa2 = vfs_open_for("m72own", alice, 0, 0);
         if (fa2 >= 0) held[nheld++] = fa2;
         usercheck("and the owner still can", fa2 >= 0);
         /* Root is not stopped by a mode that stops everybody else. */
@@ -20913,7 +21072,7 @@ static void cmd_users_stress(void) {
             kprocs[rooted].uid = 0; kprocs[rooted].gid = 0;
             kprocs[rooted].euid = 0; kprocs[rooted].egid = 0;   /* v0.74: in full, as above */
             kprocs[rooted].suid = 0; kprocs[rooted].sgid = 0;
-            fr = vfs_open_for("m72own", rooted, 0);
+            fr = vfs_open_for("m72own", rooted, 0, 0);
             usercheck("root opens a 0600 file it does not own", fr >= 0);
         }
         /* Give every slot back, and prove it: the descriptor table must be

@@ -639,6 +639,15 @@ static void cio_file_worker(void) {
         if ((i64)sysc(SYS_WRITE_FILE, (u64)fd, (u64)wb, CIO_LEN) != CIO_LEN)
                                                            sysc(SYS_EXIT, 710 + (u64)r, 0, 0);
         for (int i = 0; i < CIO_LEN; i++) rb[i] = 0;
+        /* v0.83: REWIND BEFORE READING BACK. The write above advanced this
+         * descriptor's position, so the read would otherwise start at EOF and
+         * return nothing. That is POSIX, and it is new here: until writes became
+         * positional they left the cursor at 0 and a read-back "just worked" —
+         * this loop was relying on that, and every suite that spawns role 9
+         * (cio, smpstrs, dmastrs, kpstrs) failed identically with exit 720 the
+         * moment it stopped being true. */
+        if ((i64)sysc(SYS_LSEEK, (u64)fd, 0, (u64)SEEK_SET) != 0)
+                                                           sysc(SYS_EXIT, 715 + (u64)r, 0, 0);
         if ((i64)sysc(SYS_READ, (u64)fd, (u64)rb, CIO_LEN) != CIO_LEN)
                                                            sysc(SYS_EXIT, 720 + (u64)r, 0, 0);
         for (int i = 0; i < CIO_LEN; i++)
@@ -653,6 +662,12 @@ static void cio_file_worker(void) {
         for (int i = 0; i < CIO_LEN; i++) wb[i] = (u8)(tag + (u64)i * 7);
         if ((i64)sysc(SYS_WRITE_FILE, (u64)sfd, (u64)wb, CIO_LEN) != CIO_LEN)
                                                            sysc(SYS_EXIT, 750 + (u64)r, 0, 0);
+        /* Same rewind, same reason — and here it matters for what the round is
+         * actually testing: the read must see ONE writer's whole image, so it
+         * has to start at byte 0 of that image and not wherever this process's
+         * own write happened to leave the cursor. */
+        if ((i64)sysc(SYS_LSEEK, (u64)sfd, 0, (u64)SEEK_SET) != 0)
+                                                           sysc(SYS_EXIT, 755 + (u64)r, 0, 0);
         if ((i64)sysc(SYS_READ, (u64)sfd, (u64)rb, CIO_LEN) != CIO_LEN)
                                                            sysc(SYS_EXIT, 760 + (u64)r, 0, 0);
         for (int i = 1; i < CIO_LEN; i++)
@@ -1813,6 +1828,10 @@ static void stdio_init(void) {
  * oopen() still fails on a missing name, which is what every pre-existing
  * "prove this file is gone" check depends on. */
 #define O_CREAT 1
+/* v0.83: O_TRUNC. Needed because SYS_WRITE_FILE became positional and
+ * tail-preserving in the same release — a write no longer replaces a file's
+ * whole contents, so "author this file" has to say so at open. */
+#define O_TRUNC 2
 static int oopen_flags(const char *path, u64 flags) {
     i64 k = (i64)sysc(SYS_OPEN, (u64)path, flags, 0);
     if (k < 0) return (int)k;
@@ -1821,7 +1840,20 @@ static int oopen_flags(const char *path, u64 flags) {
     return -24;                                          /* EMFILE */
 }
 static int oopen(const char *path)  { return oopen_flags(path, 0); }
-static int ocreat(const char *path) { return oopen_flags(path, O_CREAT); }
+/* v0.83: ocreat() now truncates, which RESTORES its previous effective
+ * behaviour rather than changing it. It always meant "author this file", and it
+ * got that for free while a write replaced the whole file. Now that writes are
+ * positional and preserve the tail, the truncation has to be asked for, or
+ * re-authoring a path with shorter content would leave the old tail behind.
+ * Callers that want to write INTO an existing file without emptying it want
+ * oopen() plus olseek(), which is the POSIX split. */
+static int ocreat(const char *path) { return oopen_flags(path, O_CREAT | O_TRUNC); }
+/* Create without emptying an existing file — the old ocreat() semantics, for a
+ * caller that means "ensure it exists" rather than "author it". Nothing needs
+ * it today; it is kept because O_CREAT-without-O_TRUNC is a real POSIX mode and
+ * the alternative is the next caller re-deriving the flag word by hand. */
+__attribute__((unused))
+static int ocreat_keep(const char *path) { return oopen_flags(path, O_CREAT); }
 static i64 owrite(int fd, const char *buf, u64 n) {
     if (fd < 0 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;          /* EBADF */
     if (g_ofd[fd] == OFD_CONSOLE) {
@@ -2575,6 +2607,80 @@ static void lseek_worker(void) {
       if (st != 80)  sysc(SYS_EXIT, 1636, 0, 0); }
 
     oclose(fd);
+
+    /* ==================================================================
+     * v0.83: POSITIONAL WRITES. Same descriptor cursor, now driving writes.
+     * ================================================================== */
+
+    /* (12) MID-FILE OVERWRITE, tail preserved. The bytes at [10,13) become
+     * "xyz" and everything after them must survive — that is the case the old
+     * whole-file write could not express at all. */
+    { int w = oopen(LS_PATH);
+      if (w < 0) sysc(SYS_EXIT, 1640, 0, 0);
+      if (olseek(w, 10, SEEK_SET) != 10)        sysc(SYS_EXIT, 1641, 0, 0);
+      if (owrite(w, "xyz", 3) != 3)             sysc(SYS_EXIT, 1642, 0, 0);
+      if (olseek(w, 0, SEEK_CUR) != 13)         sysc(SYS_EXIT, 1643, 0, 0);  /* cursor advanced */
+      oclose(w); }
+    { int v = oopen(LS_PATH);
+      if (v < 0) sysc(SYS_EXIT, 1644, 0, 0);
+      char c[LS_N + 8];
+      i64 got = oread(v, c, sizeof c);
+      if (got != LS_N)                          sysc(SYS_EXIT, 1645, 0, 0);  /* length UNCHANGED */
+      if (c[9] != 'J' || c[10] != 'x' || c[11] != 'y' || c[12] != 'z')
+                                                sysc(SYS_EXIT, 1646, 0, 0);  /* overwrote in place */
+      if (c[13] != 'N' || c[LS_N - 1] != 'Z')   sysc(SYS_EXIT, 1647, 0, 0);  /* THE TAIL SURVIVED */
+      oclose(v); }
+
+    /* (13) SEQUENTIAL writes through ONE descriptor. Three calls with no seek
+     * between them must land end to end, which is only true if each advanced
+     * the cursor — before v0.83 each would have replaced the file. */
+    { int w = ocreat("/lseek-seq");
+      if (w < 0) sysc(SYS_EXIT, 1648, 0, 0);
+      if (owrite(w, "aaa", 3) != 3)             sysc(SYS_EXIT, 1649, 0, 0);
+      if (owrite(w, "bbb", 3) != 3)             sysc(SYS_EXIT, 1650, 0, 0);
+      if (owrite(w, "ccc", 3) != 3)             sysc(SYS_EXIT, 1651, 0, 0);
+      if (olseek(w, 0, SEEK_CUR) != 9)          sysc(SYS_EXIT, 1652, 0, 0);
+      oclose(w); }
+    { int v = oopen("/lseek-seq");
+      if (v < 0) sysc(SYS_EXIT, 1653, 0, 0);
+      char c[16];
+      if (oread(v, c, sizeof c) != 9)           sysc(SYS_EXIT, 1654, 0, 0);
+      if (c[0] != 'a' || c[3] != 'b' || c[6] != 'c' || c[8] != 'c')
+                                                sysc(SYS_EXIT, 1655, 0, 0);
+      oclose(v); }
+
+    /* (14) SEEK PAST EOF, then write: the file EXTENDS and the hole reads as
+     * zeroes. Writing at 12 in a 9-byte file leaves [9,12) as a gap. */
+    { int w = oopen("/lseek-seq");
+      if (w < 0) sysc(SYS_EXIT, 1656, 0, 0);
+      if (olseek(w, 12, SEEK_SET) != 12)        sysc(SYS_EXIT, 1657, 0, 0);
+      if (owrite(w, "ZZ", 2) != 2)              sysc(SYS_EXIT, 1658, 0, 0);
+      oclose(w); }
+    { int v = oopen("/lseek-seq");
+      if (v < 0) sysc(SYS_EXIT, 1659, 0, 0);
+      char c[24];
+      for (int i = 0; i < 24; i++) c[i] = 0x7F;
+      if (oread(v, c, sizeof c) != 14)          sysc(SYS_EXIT, 1660, 0, 0);  /* 12 + 2 */
+      if (c[8] != 'c')                          sysc(SYS_EXIT, 1661, 0, 0);  /* original kept */
+      if (c[9] || c[10] || c[11])               sysc(SYS_EXIT, 1662, 0, 0);  /* HOLE reads zero */
+      if (c[12] != 'Z' || c[13] != 'Z')         sysc(SYS_EXIT, 1663, 0, 0);
+      oclose(v); }
+
+    /* (15) O_TRUNC is what "author this file" means now. Re-authoring the
+     * 14-byte file with 2 bytes must leave 2 bytes, not 2 followed by the old
+     * tail — the property that made O_TRUNC necessary in this release. */
+    { int w = ocreat("/lseek-seq");
+      if (w < 0) sysc(SYS_EXIT, 1664, 0, 0);
+      if (owrite(w, "hi", 2) != 2)              sysc(SYS_EXIT, 1665, 0, 0);
+      oclose(w); }
+    { int v = oopen("/lseek-seq");
+      if (v < 0) sysc(SYS_EXIT, 1666, 0, 0);
+      char c[24];
+      if (oread(v, c, sizeof c) != 2)           sysc(SYS_EXIT, 1667, 0, 0);  /* NOT 14 */
+      if (c[0] != 'h' || c[1] != 'i')           sysc(SYS_EXIT, 1668, 0, 0);
+      oclose(v); }
+
+    ounlink("/lseek-seq");
     ounlink(LS_PATH);
     sysc(SYS_EXIT, 42, 0, 0);
 }
