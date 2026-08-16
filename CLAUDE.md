@@ -179,6 +179,38 @@ one.
 
 ---
 
+## Verified baseline — v0.82 development
+
+**Commit `2a83086`** (`user/init & kernel: add Role 54 setuid/setgid ring-3
+privilege drop worker`, #93), image md5 `2eeeba2aaf9b9c42c8616dbcf6800564`,
+measured 2026-08-16. Every tier below reached the shell prompt with zero failing
+assertions, zero lock-rank violations, zero underflow/mismatch and zero panics.
+
+| tier | boots | assertions | result |
+|---|---|---|---|
+| `uniprocessor` | 1 | 495 | PASS (300 s) |
+| `smp2-bios` | 1 | 505 | PASS (225 s) |
+| `smp4-bios` | 1 | 511 | PASS (220 s) |
+| `smp4-iommu` (q35 + VT-d, `intremap=on`) | 1 | 524 / 47 suites | PASS (225 s) |
+| `gate-dirty` (one reused image, uniprocessor) | 3 | 495 each | PASS |
+| `gate-dirty-smp` (one reused image, `-smp 4`) | 3 | 511 each | PASS |
+
+**5,053 assertions, 0 failed**, across 10 boots and ~43 minutes of guest time.
+The clean rebuild emitted no compiler warnings or errors.
+
+Two things this baseline does **not** say, recorded because a baseline whose
+gaps are invisible is how "verified" drifts from "measured":
+
+- It is one boot per fresh configuration and three per dirty configuration. It
+  cannot see an intermittent below roughly 1 in 10 boots.
+- No release ISO was built or `release-verify`'d — `2a83086` is a development
+  baseline, not a tag. `VERSION` reads `0.82.0-dev`.
+
+`smp4-iommu` needs `GATE_CAP=2400` on the reference host; at the 900 s default it
+is cut off before the prompt and reports `TRUNCATED`.
+
+---
+
 ## Ring-3 worker roles
 
 A ring-3 test worker is selected by number, not by name. The kernel sets
