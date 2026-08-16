@@ -20625,6 +20625,20 @@ static void usercheck(const char *n, int c) {
     else   { g_userfail++; kprintf("[usersstrs]  FAIL  %s\n", n); }
 }
 
+/* v0.82: the ring-3 privilege-drop round runs through the same spawn/load/drain
+ * helper the pipestrs rounds use. It is defined further down the file — it
+ * predates this call site — so it is DECLARED here rather than copied. A second
+ * spawn-and-drain loop is precisely the kind of duplicate that drifts out of
+ * step with the first one and then has to be debugged twice. */
+static int64_t pipe_run_role(const char *label, uint64_t caps, uint64_t role,
+                             uint64_t watchdog);
+
+/* The worker is setuid_privdrop_worker() in user/init.c; every exit code below
+ * is decoded at the call site. 42 is its only success value. */
+#define SETUID_WORKER_ROLE  54u
+#define SETUID_WORKER_OK    42
+#define SETUID_WORKER_T   3000u   /* 30 s: a dozen syscalls and one fork       */
+
 static void cmd_users_stress(void) {
     kputs("-- USERSSTRS: process credentials, file ownership and permission --\n");
     g_userpass = g_userfail = 0;
@@ -20781,19 +20795,55 @@ static void cmd_users_stress(void) {
     } else {
         usercheck("a slot was available to test recycling", 0);
     }
-    /* v0.82: this used to claim "setuid/setgid are exercised from ring 3 by
-     * role 52". Both halves were false and had been for some time: there is no
-     * ring-3 caller of SYS_SETUID/SYS_SETGID anywhere in user/init.c, and role
-     * 52 was unassigned when the claim was written. The one-way rule is checked
-     * here, from the kernel side, and nowhere else.
+    /* ---- v0.82: THE ONE-WAY RULE, OBSERVED FROM RING 3 -------------------
      *
-     * Left as a note rather than deleted because it points at a real gap: the
-     * rule is NOT observed the way an application sees it, and a ring-3 worker
-     * that dropped privilege and then tried to regain it would be worth having.
+     * Everything above reads kprocs[] directly. That proves the credential
+     * state machine and cannot prove the property an attacker needs to be
+     * false: that a process which has dropped privilege cannot get it back BY
+     * ASKING, through the syscall boundary, the way a real program would.
      *
-     * Role numbers as of v0.82: 52 is mcq_resident_probe (cmd_mcq's
-     * tick-resident concurrency probe), 53 is posix_orphan_worker (posixstrs'
-     * cross-generation orphan test). Neither touches setuid. */
+     * This comment previously claimed ring 3 already did that, naming "role
+     * 52". Both halves were false and had been for releases: role 52 was
+     * unassigned when the claim was written (v0.81 later gave it to
+     * mcq_resident_probe), and there was no ring-3 caller of SYS_SETUID or
+     * SYS_SETGID anywhere in user/init.c. The claim survived because nothing
+     * checks that a comment's subject exists.
+     *
+     * Role 54 is that caller. It starts as root, drops the GROUP first and the
+     * user second — that order is load-bearing; see the worker — and then tries
+     * four separate routes back to 0. setuid(0) and setgid(0) are the obvious
+     * two. seteuid(0)/setegid(0) are the sharper pair: a privileged setuid()
+     * moves the SAVED id as well, and if it did not, the reversible setter
+     * would legally climb back and the "permanent" drop would be a loan. It
+     * then forks, because a child that came back up as root is the same leak by
+     * another route through six hand-copied fields. */
+    {
+        int64_t pd = pipe_run_role("u-privdrop", PCAP_CONSOLE,
+                                   SETUID_WORKER_ROLE, SETUID_WORKER_T);
+        const char *why =
+            pd == -1                ? "the worker never started, or the round hit its deadline" :
+            pd == 900 || pd == 901  ? "it did not START as root (uid/euid were not 0)" :
+            pd == 902 || pd == 903  ? "it did not start with gid/egid 0" :
+            pd == 904               ? "privileged setgid() was REFUSED" :
+            pd == 905 || pd == 906  ? "setgid() did not move the real/effective gid" :
+            pd == 907               ? "privileged setuid() was REFUSED" :
+            pd == 908 || pd == 909  ? "setuid() did not move the real/effective uid" :
+            pd == 910               ? "*** setuid(0) SUCCEEDED after the drop — ROOT REGAINED" :
+            pd == 913               ? "*** seteuid(0) SUCCEEDED — the permanent drop left a saved uid to climb back to" :
+            pd == 916               ? "*** setgid(0) SUCCEEDED after the drop — ROOT GROUP REGAINED" :
+            pd == 919               ? "*** setegid(0) SUCCEEDED — the permanent drop left a saved gid to climb back to" :
+            (pd >= 911 && pd <= 921) ? "a REFUSED setter still moved an id (the error return was not the whole story)" :
+            pd == 922               ? "fork() failed in the inheritance half" :
+            pd == 923               ? "the child's wait DEADLINE expired (slow host, not a credential defect)" :
+            pd == 924               ? "*** the CHILD of a dropped process did not inherit the drop" :
+                                      "unknown";
+        if (pd != SETUID_WORKER_OK)
+            kprintf("[usersstrs] ring-3 privilege drop: worker exit %d — %s\n",
+                    (uint64_t)pd, why);
+        usercheck("a ring-3 process drops gid then uid and CANNOT climb back "
+                  "(setuid/seteuid/setgid/setegid all refused, and its fork inherits the drop)",
+                  pd == SETUID_WORKER_OK);
+    }
 
     kprintf("[usersstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_userpass, (uint64_t)g_userfail);
     if (!g_userfail)

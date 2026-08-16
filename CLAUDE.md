@@ -176,3 +176,34 @@ The common trap: helpers that take `g_ofile_lock` (rank 1) look harmless but
 cannot be called while holding `g_net_lock` (rank 9). Validate against state the
 lock you already hold protects, rather than re-deriving it through a lower-ranked
 one.
+
+---
+
+## Ring-3 worker roles
+
+A ring-3 test worker is selected by number, not by name. The kernel sets
+`kprocs[p].role = N` before `elf_load`, and `user/init.c`'s dispatch table runs
+whichever `if (role == N)` matches. **The two halves are matched by nothing but
+the integer**, which makes the numbering a shared namespace with the same
+hazards as the lock ranks above.
+
+Highest assigned: **54**. Recent: 52 `mcq_resident_probe` (cmd_mcq), 53
+`posix_orphan_worker` (posixstrs), 54 `setuid_privdrop_worker` (usersstrs).
+
+Two failures in v0.81/v0.82, both cheap to avoid:
+
+- **Check for a free number before adding one.** `cmd_mcq` and `cmd_mcpre` shared
+  role 7 for two suites with opposite requirements — mcq wanted a long-resident
+  probe, mcpre's high-priority thread had to finish *first*. Making role 7
+  resident to fix mcq broke mcpre in 4 of 8 `-smp 4` boots. Grep both
+  `\.role = ` in the kernel and `role == ` in `init.c`; they can disagree.
+- **A comment naming a role is not evidence the role exists.** usersstrs claimed
+  for several releases that "setuid/setgid are exercised from ring 3 by role 52"
+  when role 52 was unassigned and no ring-3 caller of `SYS_SETUID` existed at
+  all. Nothing checks that a comment's subject is real — v0.82 added role 54 to
+  make the claim true rather than deleting it.
+
+A worker reports by **exit code**, decoded at its call site: pick one success
+sentinel and give every failure point a distinct code, so a suite can name which
+rule broke instead of reporting that the worker failed. Keep deadline expiry on
+its own code — a slow host must never be decoded as a defect.
