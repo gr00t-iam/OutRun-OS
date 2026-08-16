@@ -2782,8 +2782,14 @@ static void shm_stress_worker(void) {
         if (cow_probe != 0x2222) sysc(SYS_EXIT, 102, 0, 0);
         sysc(SYS_EXIT, 100, 0, 0);
     }
-    i64 st = owaitpid((u32)f, 400000);
-    if (st != 100)          sysc(SYS_EXIT, 972, 0, 0);
+    /* v0.81: tick deadline, and a code of its own. 972 meant BOTH "the COW
+     * child exited wrong" and "the wait expired" — a slow host reported as a
+     * COW defect, which is the conflation v0.76/v0.78/v0.81 have each fixed
+     * elsewhere. 980 is the deadline; 972 keeps its meaning. */
+    u32 tw1 = 0;
+    i64 st = owaitpid_ticks((u32)f, WAIT_T_FORK, &tw1);
+    if (st == -11)          sysc(SYS_EXIT, 980, 0, 0);   /* DEADLINE          */
+    if (st != 100)          sysc(SYS_EXIT, 972, 0, 0);   /* ran, wrong answer */
     if (cow_probe != 0x1111) sysc(SYS_EXIT, 973, 0, 0);        /* child leaked through */
 
     /* (2) Zero-copy shared memory between two distinct processes. */
@@ -2807,8 +2813,12 @@ static void shm_stress_worker(void) {
         cp[1] = 0xBEEFBEEF;                                    /* reply, zero copy     */
         sysc(SYS_EXIT, 110, 0, 0);
     }
-    st = owaitpid((u32)g, 400000);
-    if (st != 110)            sysc(SYS_EXIT, 978, 0, 0);
+    /* v0.81: as above. 981 is the deadline; 978 keeps "the sharing child
+     * exited wrong (it could not see the segment)". */
+    u32 tw2 = 0;
+    st = owaitpid_ticks((u32)g, WAIT_T_FORK, &tw2);
+    if (st == -11)            sysc(SYS_EXIT, 981, 0, 0);   /* DEADLINE          */
+    if (st != 110)            sysc(SYS_EXIT, 978, 0, 0);   /* ran, wrong answer */
     if (sp[1] != 0xBEEFBEEF)  sysc(SYS_EXIT, 979, 0, 0);      /* child's write unseen */
     sysc(SYS_EXIT, 970, 0, 0);
 }
@@ -3017,7 +3027,13 @@ static void mmapfile_stress_worker(void) {
         sysc(SYS_EXIT, 60, 0, 0);
     }
     if (r < 0) sysc(SYS_EXIT, 1520, 0, 0);
-    if (owaitpid((u32)r, 400000) != 60) sysc(SYS_EXIT, 1521, 0, 0);
+    /* v0.81: the last raw spin site. 1521 meant both "the child could not see
+     * the shared file mapping" and "the wait expired"; 1533 is the deadline. */
+    {   u32 tw3 = 0;
+        i64 wr3 = owaitpid_ticks((u32)r, WAIT_T_FORK, &tw3);
+        if (wr3 == -11) sysc(SYS_EXIT, 1533, 0, 0);   /* DEADLINE          */
+        if (wr3 != 60)  sysc(SYS_EXIT, 1521, 0, 0);   /* ran, wrong answer */
+    }
     if (sp[2] != 0xC3)                  sysc(SYS_EXIT, 1522, 0, 0);  /* NOT shared */
 
     /* (5) Unmapping a shared writable mapping flushes it — a process that

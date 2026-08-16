@@ -12868,6 +12868,30 @@ static void cmd_mcq(void) {
         __sync_synchronize();
         lapic_ipi(0, IPI_PING, 1);                          /* broadcast wake        */
     }
+    /* v0.81: A ONE-SIDED BARRIER HERE WAS TRIED AND DISPROVEN. Do not re-add it.
+     *
+     * The idea was: at n == 2, spin while g_inr3 < 1 so the BSP enters ring 3
+     * only once cpu1 is already there, making the high-water mark reach 2 and
+     * letting the assertion below be restored from n >= 3 to n >= 2.
+     *
+     * Measured over 24 fresh-image -smp 2 boots: WITHOUT the barrier, 1 failure
+     * in 8; WITH it, 5 in 16 — and the barrier expired in every one of those 5.
+     * It never converted a failure into a pass. (Those two rates are not
+     * statistically distinguishable at that n; the claim is that it does not
+     * fix the failure, not that it worsens it.)
+     *
+     * Why it cannot work: g_inr3 < 1 is a LEVEL test on a TRANSIENT condition.
+     * It cannot tell "cpu1 has not started yet" — where waiting helps — from
+     * "cpu1 already ran and exited", where waiting is for an event in the past.
+     * The logs show the second is the actual failure mode: cpu1's probe reaches
+     * finish#2 before the BSP's own reaches finish#3. So the BSP burns the whole
+     * 5 s deadline and then enters alone, which is the original failure plus a
+     * five-second stall.
+     *
+     * The binding constraint is the PROBE'S DURATION, not the AP wake latency.
+     * cmd_mcpre below solves the same problem correctly, with a probe that stays
+     * in ring 3 long enough to still be there when the other core arrives. Any
+     * future fix should follow that pattern rather than synchronising the entry. */
     kputs("[mcq    ] BSP entering ring 3 CONCURRENTLY with the APs...\n");
     cpu_exec_proc(0, procs[0]);                             /* BSP runs its own probe */
     current_proc_idx = save;
@@ -12926,6 +12950,12 @@ static void cmd_mcq(void) {
      * A negative control on v0.79.0 passed 4 of 4 at -smp 2, which at a 1-in-4
      * rate has roughly a 1-in-3 chance of missing the failure — so it does NOT
      * establish this is new, and nothing in v0.80 touches scheduling. */
+    /* v0.81: STILL GATED AT >= 3, and now with a measurement behind it rather
+     * than an estimate. An attempt to restore this to n >= 2 (see the disproven
+     * barrier above) was run over 24 fresh -smp 2 boots and left the assertion
+     * failing 5 times in 16. Gating a true property because it is hard to
+     * observe remains a last resort — but the way out is to make the overlap
+     * real, not to move the threshold and hope. */
     if (n >= 3)
         qcheck("two or more cores were IN RING 3 SIMULTANEOUSLY (the v0.39 headline)",
                g_inr3_max >= 2);
@@ -23154,6 +23184,11 @@ static void cmd_shm_stress(void) {
         R.code[0] == 977 ? "fork failed before the sharing round" :
         R.code[0] == 978 ? "the sharing child exited wrong (it could not see the segment)" :
         R.code[0] == 979 ? "THE CHILD'S WRITE WAS NOT VISIBLE — the mapping is not shared" :
+        /* v0.81: deadlines, distinct from the defects they used to share a
+         * code with. A slow host must never be reported as a COW or sharing
+         * failure — that sends a reader after a memory bug that is not there. */
+        R.code[0] == 980 ? "the COW child's wait DEADLINE expired (slow host, not a COW defect)" :
+        R.code[0] == 981 ? "the sharing child's wait DEADLINE expired (slow host, not a sharing defect)" :
                            "unknown";
     if (R.code[0] != 970) kprintf("[shmstrs] driver exit %u — %s\n", R.code[0], why);
 
@@ -23530,7 +23565,9 @@ static void cmd_mmapfile_stress(void) {
         R.code[0] == 1518 ? "reading the file back failed" :
         R.code[0] == 1519 ? "MSYNC DID NOT WRITE BACK — the file still holds the old bytes" :
         R.code[0] == 1520 ? "fork failed" :
-        R.code[0] == 1521 ? "the child did not see the parent's shared mapping (exit 61) or died" :
+        R.code[0] == 1521 ? "the child did not see the parent's shared mapping (exit 61)" :
+        /* v0.81: "or died" used to cover the wait expiring too; 1533 is that. */
+        R.code[0] == 1533 ? "the file-mapping child's wait DEADLINE expired (slow host, not a mapping defect)" :
         R.code[0] == 1522 ? "THE CHILD'S WRITE WAS INVISIBLE TO THE PARENT — pages are not shared" :
         R.code[0] == 1523 ? "munmap of the shared mapping failed" :
         R.code[0] == 1524 ? "reopening after munmap failed" :
