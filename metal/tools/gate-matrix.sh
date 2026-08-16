@@ -22,6 +22,51 @@
 # printing red text and succeeding.
 set -u
 
+# ===========================================================================
+# v0.81: RUN CLASSIFICATION, WITH DELIBERATE PRECEDENCE
+# ===========================================================================
+# These checks used to be six sequential assignments to $st, so whichever fired
+# LAST won. A boot killed at the cap before it ever reached the shell prompt was
+# therefore labelled `FAIL`, carrying whatever suites had managed to report
+# before the kill — a timeout wearing the costume of a suite failure.
+#
+# That is not hypothetical. An smp4-iommu run cut off mid-`cas` at the 900 s cap
+# was reported as `FAIL ... failed=2`, naming [vfiostrs] and [capdma]. It had
+# never reached the prompt, so it was not a verdict on anything; a reader who
+# trusted the label would have gone looking for a vfiostrs defect that the run
+# had produced no evidence for. `st=FAIL` had simply overwritten `st=NO-PROMPT`
+# two lines later.
+#
+# So COMPLETENESS is now decided before CORRECTNESS. A run that did not finish
+# is not a verdict on the build — it is an invalid run, and the label says so.
+# TRUNCATED and NO-PROMPT are distinguished because they are different events:
+# the first means we stopped the guest, the second means the guest stopped.
+#
+# Kept as a function so it can be exercised without booting anything:
+#   GATE_LIB_ONLY=1 . tools/gate-matrix.sh
+# defines these and runs nothing. See tools/gate-classify-test.sh, which pins
+# the truncation case above as a regression test.
+classify_run() {
+    _log=$1; _suites=$2; _fails=$3; _tally=$4; _ranks=$5; _worst=$6; _elapsed=$7; _cap=$8
+    if   grep -aq 'system halted' "$_log" 2>/dev/null;                then echo HALTED
+    elif ! grep -aq "Type 'help' for commands" "$_log" 2>/dev/null;   then
+        # We stopped it, or it stopped itself? Both are invalid; only one is ours.
+        if [ "$_elapsed" -ge "$_cap" ]; then echo TRUNCATED; else echo NO-PROMPT; fi
+    elif [ "$_suites" -eq 0 ];                                        then echo NO-SUITES
+    elif [ "$_fails" -ne "$_tally" ];                                 then echo COUNTER-SPLIT
+    elif [ "$_ranks" -ne 0 ];                                         then echo RANK-FAULT
+    elif [ "$_worst" -ne 0 ];                                         then echo FAIL
+    else                                                                   echo OK
+    fi
+}
+
+# Only these three statuses mean "the boot ran to completion and we can read its
+# assertions as a verdict". Everything else is an invalid run, whatever its
+# assertion counts happen to say.
+run_is_verdict() { case "$1" in OK|FAIL|RANK-FAULT) return 0 ;; *) return 1 ;; esac; }
+
+if [ -n "${GATE_LIB_ONLY:-}" ]; then return 0 2>/dev/null || exit 0; fi
+
 ISO=${1:?usage: gate-matrix.sh <iso> [workdir] [config ...]}
 WORK=${2:-.logs/gate/matrix}
 shift 2 2>/dev/null || shift 1
@@ -85,6 +130,7 @@ echo "=============================================================="
 
 rc=0
 ran=""
+invalid=""
 for CFG in $CONFIGS; do
     LOG=$WORK/$CFG.log
     IMG=$WORK/$CFG.img
@@ -143,20 +189,36 @@ for CFG in $CONFIGS; do
     ranks=$(grep -acE 'rank violations=[1-9]|underflow=[1-9]|mismatch=[1-9]' "$LOG")
     worst=$fails; [ "$tally" -gt "$worst" ] && worst=$tally
 
-    st=OK
-    grep -aq "Type 'help' for commands" "$LOG" || { st=NO-PROMPT; rc=1; }
-    grep -aq 'system halted' "$LOG" && { st=HALTED; rc=1; }
-    [ "$suites" -gt 0 ] || { st=NO-SUITES; rc=1; }
-    [ "$fails" -eq "$tally" ] || {
+    st=$(classify_run "$LOG" "$suites" "$fails" "$tally" "$ranks" "$worst" "$e" "$CAP")
+    [ "$st" = OK ] || rc=1
+    [ "$st" = COUNTER-SPLIT ] && {
         echo "  !! $CFG: failure counters DISAGREE (lines=$fails tally=$tally)"
-        echo "  !! that is a defect in this harness, not a verdict on the boot"
-        st=COUNTER-SPLIT; rc=1; }
-    [ "$worst" -eq 0 ] || { st=FAIL; rc=1; }
-    [ "$ranks" -eq 0 ] || { st=RANK-FAULT; rc=1; }
+        echo "  !! that is a defect in this harness, not a verdict on the boot"; }
 
     printf '%-13s %-13s suites=%-3s passed=%-4s failed=%-3s ranks=%-2s (%ss)\n' \
         "$CFG" "$st" "$suites" "$passed" "$worst" "$ranks" "$e"
+    # An incomplete boot's assertions are still printed — they may be the only
+    # clue why it died — but never bare, because a bare list of FAIL lines reads
+    # as a verdict no matter what the status column says.
+    run_is_verdict "$st" || {
+        echo "      ^^ INVALID RUN ($st) — NOT a verdict on the build."
+        case "$st" in
+        TRUNCATED)
+            echo "         We killed it at GATE_CAP=${CAP}s before it reached the prompt."
+            echo "         Any assertions below are only those that reported before the"
+            echo "         kill. Raise GATE_CAP and re-run; do not read them as failures." ;;
+        NO-PROMPT)
+            echo "         The guest stopped on its own before reaching the prompt. Any"
+            echo "         assertions below are only those that reported before it died." ;;
+        NO-SUITES)
+            echo "         It reached the prompt, but no suite emitted a RESULT line —"
+            echo "         so this boot tested nothing, however green it looks." ;;
+        COUNTER-SPLIT)
+            echo "         The two failure counters disagree, so neither can be trusted."
+            echo "         That is a harness defect; fix it before reading this boot." ;;
+        esac; }
     [ "$worst" -eq 0 ] || grep -aoE "$FAILRE" "$LOG" | sed 's/^/      /'
+    run_is_verdict "$st" || invalid="$invalid $CFG($st)"
     ran="$ran $CFG"
 done
 
@@ -165,6 +227,13 @@ done
 echo
 echo "---- coverage ----"
 echo "ran            :$ran (1 boot each, fresh image per boot)"
+# An invalid run tested NOTHING, so it belongs in the coverage line and not only
+# in the status column. A gate that says "ran: smp4-iommu" about a boot that was
+# killed before the prompt has overstated its own coverage.
+[ -z "$invalid" ] || \
+echo "DID NOT COMPLETE:$invalid — these configurations are UNTESTED by this run,"
+[ -z "$invalid" ] || \
+echo "                 whatever assertion counts appear above."
 echo "NOT covered    : dirty-volume reuse (make gate-dirty / gate-dirty-smp),"
 echo "                 bare metal and Proxmox, soak/repeat runs, and any"
 echo "                 intermittent whose rate is below ~1 in 1 boot per config."
