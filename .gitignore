@@ -6,3 +6,9 @@ metal/iso/boot/user_init.elf
 # so `make clean` cannot destroy the logs that say what happened — which it has
 # now done to a reproduction and to an unexplained failure, in that order.
 metal/.logs/
+
+# v0.82: Claude Code's per-project directory — local settings, and the
+# scratch worktrees it creates. An orphaned 120 MB copy of the tree sat here
+# untracked for several releases because nothing ignored it and nothing
+# pruned it; `git worktree prune` removes the REGISTRATION, never the files.
+.claude/
