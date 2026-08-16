@@ -3210,19 +3210,56 @@ struct klock {
     uint8_t          *rank_st;               /* the stack it was pushed on     */
     uint8_t          *rank_spp;              /* that stack's depth cursor      */
     uint8_t           rank_idx;              /* the index it was pushed at     */
+#ifdef KERNEL_DEBUG
+    /* v0.81: OWNERSHIP AND CONTEXT, under -DKERNEL_DEBUG.
+     *
+     * The rank machinery answers "is the ORDER right"; none of it answers "who
+     * holds this" or "can the holder be interrupted by someone who wants it".
+     * Those are different bugs and the second one hangs the machine silently.
+     *
+     * `owner` stores cpu_idx() + 1 so that zero means free — every klock in this
+     * tree is initialised with positional zeroes, and a plain cpu index would
+     * make "free" indistinguishable from "held by cpu 0".
+     *
+     * These are the LAST fields deliberately, so appending them zero-initialises
+     * correctly in every existing positional initialiser.
+     *
+     * That is true for CORRECTNESS and false for the build: -Wextra's
+     * -Wmissing-field-initializers fires on all thirteen of them, and this tree
+     * builds -Werror. The first version of this comment claimed "no initialiser
+     * has to change" and the compiler disproved it immediately. Hence
+     * KLOCK_DBG_INIT below — the initialisers carry the trailing zeroes
+     * explicitly, and they vanish with the fields when KERNEL_DEBUG is off. */
+    volatile uint32_t owner;                 /* cpu_idx()+1 of the holder, 0 free */
+    volatile uint32_t depth;                 /* nested acquisitions by that cpu   */
+    volatile uint8_t  ctx_seen;              /* 1 = taken with IF on, 2 = with IF off */
+#endif
 };
-static struct klock g_ofile_lock = { 0, "ofile", 1, 0, 0, 0, 0, 0 };
-static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0, 0, 0, 0 };
-static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0, 0, 0, 0 };
-static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0, 0, 0, 0 };
-static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0, 0, 0, 0 };
+/* v0.81: the trailing zeroes for the KERNEL_DEBUG fields, so every positional
+ * klock initialiser stays -Wextra clean and none of them need an #ifdef. */
+#ifdef KERNEL_DEBUG
+#define KLOCK_DBG_INIT , 0, 0, 0
+#else
+#define KLOCK_DBG_INIT
+#endif
+static struct klock g_ofile_lock = { 0, "ofile", 1, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
 /* v0.66. Rank 12: ABOVE every lock this ever needs, because it is never held
  * across one. Filling a page reads the VFS and flushing one writes it, and
  * both happen with this released — collect under the lock, do the I/O outside
  * it, re-check on the way back in. Holding it across g_vfs_lock (rank 2) would
  * be a real inversion, not a bookkeeping nicety. */
-static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0, 0, 0, 0 };
+static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
 static volatile uint32_t g_rank_violations = 0;
+#ifdef KERNEL_DEBUG
+/* v0.81: counted so a boot can report ZERO rather than merely not printing.
+ * A check whose only output is silence cannot be distinguished from a check
+ * that was compiled out, which is how this project has been misled before. */
+static volatile uint32_t g_lock_selfdeadlock = 0, g_lock_mixed_ctx = 0;
+#endif
 
 /* Back off without monopolizing the core that must make our progress: the BSP
  * runs its scheduler (the lock holder may be a parked sibling thread), an AP
@@ -3392,12 +3429,110 @@ static void klock_acquire(struct klock *l) {
                 (uint64_t)(int64_t)st[4], (uint64_t)(int64_t)st[5],
                 (uint64_t)(int64_t)st[6], (uint64_t)(int64_t)st[7]);
     }                                                  /* resumes THIS thread   */
+#ifdef KERNEL_DEBUG
+    /* v0.81: SELF-DEADLOCK, CAUGHT BEFORE THE SPIN.
+     *
+     * A klock is not recursive. Acquiring one this cpu already holds spins
+     * forever on a value only this cpu can clear — the machine stops with no
+     * output, which is the single worst failure mode this project has (invariant
+     * 4: a lost wake must cost a failed assertion, not the machine).
+     *
+     * The rank check above does NOT cover it in general. Re-acquiring the same
+     * lock trips `st[*sp-1] >= l->rank` only when that lock is the TOP of the
+     * held stack; acquire ofile, then net, then ofile again and the rank check
+     * sees rank 1 under rank 9 and reports an inversion — true, but it names the
+     * wrong bug and the machine still hangs.
+     *
+     * This is also the ISR case the hardening exists for. If a thread on this cpu
+     * holds a klock and an interrupt handler on the SAME cpu asks for it, `owner`
+     * already names this cpu and the report fires instead of the hang. That is
+     * why the check is on owner == me rather than on the interrupt flag: this
+     * kernel deliberately acquires klocks with IF in whatever state the caller
+     * had (see klock_irq_save's note), so "IF must be off here" is not an
+     * invariant of this design and asserting it would fire on nearly every
+     * acquire while catching nothing.
+     *
+     * Reported, not halted: the caller address makes it resolvable with
+     * addr2line, and a machine that keeps running prints the rest of the boot. */
+    if (l->v && l->owner == cpu_idx() + 1) {
+        __sync_fetch_and_add(&g_lock_selfdeadlock, 1);
+        kprintf("[klock  ] SELF-DEADLOCK: cpu%u re-acquiring '%s' (rank %d) it already holds "
+                "at depth %u | caller=%X\n",
+                (uint64_t)cpu_idx(), l->name, (uint64_t)l->rank, (uint64_t)l->depth,
+                (uint64_t)__builtin_return_address(0));
+    }
+#endif
     klock_irq_restore(rf);                             /* check done: reopen IF */
     if (__sync_lock_test_and_set(&l->v, 1)) {
         __sync_fetch_and_add(&l->contended, 1);
         do { krelax(); } while (l->v || __sync_lock_test_and_set(&l->v, 1));
     }
     l->acq++;                                          /* under the lock        */
+#ifdef KERNEL_DEBUG
+    /* Held now, so these have exactly one writer until release. */
+    l->owner = cpu_idx() + 1;
+    l->depth++;
+    /* v0.81: WHICH CONTEXTS THIS LOCK IS TAKEN FROM.
+     *
+     * A lock acquired sometimes with interrupts enabled and sometimes with them
+     * disabled is the classic ISR deadlock waiting to happen: the IF-on acquirer
+     * can be interrupted on its own cpu by the IF-off one. Recording both bits
+     * and reporting the FIRST time a lock is seen in both is a standing audit of
+     * that property, and it costs one byte and a branch.
+     *
+     * It is a warning, not a verdict — several locks here are legitimately taken
+     * from softirq context on cpu 0 by design (see the rank_ctx note). What it
+     * gives is a list of exactly which locks have that shape, which nothing in
+     * this kernel could previously answer. */
+    {
+        /* v0.81: WHAT THIS ACTUALLY MEASURES, after two wrong guesses.
+         *
+         * The intent was an ISR-deadlock audit: a lock held with interrupts
+         * enabled, which an interrupt handler on the same cpu then wants, is a
+         * self-deadlock. Recording the IF state at acquire looked like the way to
+         * find candidates. It is not, in this kernel, and the data said so twice.
+         *
+         * First guess: "11 of 13 locks are mixed" must be early boot, since all
+         * of it runs with interrupts off. Gating on g_sched_on changed the count
+         * by zero.
+         *
+         * Second, from the caller addresses — cas_put, ofile_claim,
+         * syscall_dispatch, syscall_trap — the real cause: cpu_syscall_arm sets
+         * SFMASK to 0x200, so SYSCALL entry clears IF for the ENTIRE duration of
+         * every syscall. Any lock taken while serving a syscall therefore has IF
+         * off, and the same lock taken from a kernel thread or from boot has it
+         * on. Eleven locks match because eleven locks are used from both, which
+         * is the design working.
+         *
+         * So this flag distinguishes SYSCALL context from thread context — not
+         * interrupt context from thread context. It is kept because that
+         * distinction is real and nothing else in the kernel reports it, and it
+         * is NAMED for what it measures rather than for what it was meant to
+         * catch. A lock acquired with IF off cannot be interrupted on that cpu,
+         * so this population is the SAFE direction; the dangerous one needs the
+         * ISR-side counter described below.
+         *
+         * A true ISR audit needs an in-ISR depth counter, and the obstacle is
+         * concrete: smp_preempt_ipi's CPL3 path never returns — it unwinds
+         * through resume_kernel — so a naive increment/decrement pair leaks and
+         * the counter is wrong forever after the first preemption. Left as
+         * follow-up rather than half-built and misleading. */
+        uint8_t bit = (rf & 0x200ull) ? 1u : (g_sched_on ? 2u : 0u);
+        uint8_t was = l->ctx_seen;
+        if (!bit) goto ctx_done;
+        if (!(was & bit)) {
+            l->ctx_seen = (uint8_t)(was | bit);
+            if ((uint8_t)(was | bit) == 3u) {
+                __sync_fetch_and_add(&g_lock_mixed_ctx, 1);
+                kprintf("[klock  ] SYSCALL+THREAD: '%s' (rank %d) is taken both inside a syscall "
+                        "(IF off, per SFMASK) and outside one | caller=%X cpu=%u\n",
+                        l->name, (uint64_t)l->rank,
+                        (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx());
+            }
+        }
+    ctx_done: ;
+    }
+#endif
     rf = klock_irq_save();                             /* v0.75: atomic push    */
     /* v0.75: bind the slot to the LOCK. Everything below runs with the lock
      * held, so these three fields have exactly one writer. `st`/`sp` are the
@@ -3441,6 +3576,21 @@ static void klock_acquire(struct klock *l) {
  * entry can never be stranded, which is the failure that produced hundreds of
  * phantom violations from two underflows. */
 static void klock_release(struct klock *l) {
+#ifdef KERNEL_DEBUG
+    /* v0.81: releasing a lock this cpu does not own is either a release of
+     * someone else's lock or a double release, and both corrupt the ownership
+     * record for every later check. Reported before the record is cleared. */
+    if (l->owner != cpu_idx() + 1) {
+        __sync_fetch_and_add(&g_lock_selfdeadlock, 1);
+        kprintf("[klock  ] WRONG-OWNER RELEASE: cpu%u releasing '%s' (rank %d) owned by "
+                "cpu%d | caller=%X\n",
+                (uint64_t)cpu_idx(), l->name, (uint64_t)l->rank,
+                (uint64_t)(int64_t)((int)l->owner - 1),
+                (uint64_t)__builtin_return_address(0));
+    } else if (--l->depth == 0) {
+        l->owner = 0;                                  /* free: no owner        */
+    }
+#endif
     uint64_t rf  = klock_irq_save();                   /* v0.75: atomic pop     */
     uint8_t *st  = l->rank_st;
     uint8_t *spp = l->rank_spp;
@@ -5903,7 +6053,7 @@ static struct udbent g_udb[UDB_MAX];
  * complaint through a null pointer. It never fired, because every acquisition
  * here happens with no other lock held — which is exactly the kind of latent
  * fault that surfaces years later when someone adds the first caller that does. */
-static struct klock  g_udb_lock = { 0, "udb", 13, 0, 0, 0, 0, 0 };
+static struct klock  g_udb_lock = { 0, "udb", 13, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
 static volatile uint64_t g_auth_ok = 0, g_auth_bad = 0, g_auth_lockouts = 0;
 /* v0.80: accounts migrated from PBKDF2 to scrypt, counted because a silent
  * migration is indistinguishable from one that never happened. */
@@ -7864,7 +8014,7 @@ static struct ipc_shmem g_ipc_shm[MAX_IPC_SHMEM];
  * unrelated raw spinlock, not part of this ranked array — no actual
  * collision, just two independent numbering schemes that happen to reuse
  * the same next integer.) */
-static struct klock g_ipc_lock = { 0, "ipc", 6, 0, 0, 0, 0, 0 };
+static struct klock g_ipc_lock = { 0, "ipc", 6, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
 
 static void ipc_queue_clear(int idx) {
     struct ipc_queue *q = &g_ipc_q[idx];
@@ -8157,7 +8307,7 @@ struct vgpu_resource_unref {
     uint32_t resource_id, padding;
 } __attribute__((packed));
 
-static struct klock g_gpu_lock = { 0, "gpu", 7, 0, 0, 0, 0, 0 };
+static struct klock g_gpu_lock = { 0, "gpu", 7, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
 static volatile uint8_t *g_gpu_common = 0, *g_gpu_notify = 0;
 static uint32_t          g_gpu_notify_mul = 0;
 static struct vq         g_gpu_ctrl;
@@ -8834,7 +8984,7 @@ struct virtio_snd_pcm_set_params {
 struct virtio_snd_pcm_status { uint32_t status, latency_bytes; } __attribute__((packed));
 struct virtio_snd_pcm_xfer   { uint32_t stream_id; } __attribute__((packed));
 
-static struct klock g_audio_lock = { 0, "audio", 8, 0, 0, 0, 0, 0 };
+static struct klock g_audio_lock = { 0, "audio", 8, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
 static volatile uint8_t *g_snd_common = 0, *g_snd_notify = 0;
 static uint32_t g_snd_notify_mul = 0;
 /* g_snd_isr / snd_isr_drain() are forward-declared above, right before
@@ -9279,7 +9429,7 @@ static void sock_slot_wipe(int si) {
     g_sock[si].gen = g + 1;
 }
 static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len); /* fwd: v0.67 */
-static struct klock g_net_lock = { 0, "net", 9, 0, 0, 0, 0, 0 };
+static struct klock g_net_lock = { 0, "net", 9, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
 static volatile uint64_t g_net_tx_frames = 0;
 static volatile uint64_t g_net_loop_deliveries = 0;
 /* v0.65: the numbers the suite cannot see from ring 3. An EAGAIN count that
@@ -10208,7 +10358,7 @@ static int wg_focused(int wi) {
     return k;
 }
 static uint64_t g_wm_pagetab[NWMWIN][WIN_SURF_MAXPG];   /* phys of each window's surface pages */
-static struct klock g_wm_lock = { 0, "wm", 10, 0, 0, 0, 0, 0 };
+static struct klock g_wm_lock = { 0, "wm", 10, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
 static int g_wm_focus = -1;              /* window index with keyboard focus, or -1     */
 static int g_wm_znext = 1;               /* monotonically increasing z stamp            */
 static int g_wm_drag = -1, g_wm_drag_dx = 0, g_wm_drag_dy = 0;   /* window being dragged */
@@ -13968,7 +14118,7 @@ static void posix_sigcheck_on_return(struct sysframe *sf, uint64_t rv) {
  * could not fully read. */
 #define REDIR_STAGE_MAX 32768
 static uint8_t g_redir_stage[REDIR_STAGE_MAX];
-static struct klock g_redir_lock = { 0, "redir", 0, 0, 0, 0, 0, 0 };
+static struct klock g_redir_lock = { 0, "redir", 0, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
 
 static int64_t redirect_write_bytes(int fd, const void *data, uint32_t len) {
     int vol = VOL_ROOT;
@@ -21966,6 +22116,11 @@ static void cmd_posix_stress(void) {
                 if (roles[i] == 29 && R.code[i] == 703)
                     kprintf("[posixstrs]   ^ the child RAN and exited with the wrong status — "
                             "a real defect, not a deadline\n");
+                /* v0.81: role 34's wait was a spin count sharing exit 963 with a
+                 * genuine inheritance failure. 972 is now the deadline alone. */
+                if (roles[i] == 34 && R.code[i] == 972)
+                    kprintf("[posixstrs]   ^ the fd-table child's wait DEADLINE expired — not "
+                            "an inheritance defect; compare the fork dispatch latency below\n");
                 codes_ok = 0;
             }
             /* The thread group must be fully accounted for: nthreads back to 0
@@ -26448,6 +26603,17 @@ static void shell_run(void) {
      * them from the absence of warnings. All three must be 0. */
     kprintf("[klock  ] rank violations=%u underflow=%u mismatch=%u\n",
             g_rank_violations, g_rank_underflow, g_rank_mismatch);
+#ifdef KERNEL_DEBUG
+    /* v0.81: the ownership checks report their totals for the same reason the
+     * rank counters do — so a run states ZERO rather than merely not printing a
+     * warning. Without this line a build with the checks compiled OUT and a build
+     * with them compiled in and clean produce identical logs, and this project
+     * has already been misled once by grepping for a string no code could emit. */
+    kprintf("[klock  ] KERNEL_DEBUG: self-deadlock/wrong-owner=%u syscall+thread locks=%u\n",
+            g_lock_selfdeadlock, g_lock_mixed_ctx);
+#else
+    kputs("[klock  ] KERNEL_DEBUG off: ownership and context checks NOT compiled in\n");
+#endif
     /* v0.75: the sys_connect counters. apyield is COVERAGE — how often an AP
      * actually entered the retransmit loop, so a run reporting 0 has not
      * exercised the AP path and its clean result says nothing about it. stale
