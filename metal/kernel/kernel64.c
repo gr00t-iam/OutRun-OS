@@ -12853,7 +12853,12 @@ static void cmd_mcq(void) {
     for (int i = 0; i < n; i++) {
         int p = kproc_spawn("mcq-probe", 0);
         if (p < 0) { kputs("[mcq    ] spawn failed\n-- done --\n"); return; }
-        kprocs[p].role = 7;
+        /* v0.81: role 52, not 7. Role 7 is ALSO cmd_mcpre's high-priority
+         * thread, which must finish FIRST to prove the priority inversion —
+         * so it has to stay short, while this suite needs the opposite. They
+         * shared a payload until making this one resident broke that suite in
+         * 4 of 8 -smp 4 boots. */
+        kprocs[p].role = 52;
         uint64_t entry = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
         current_proc_idx = save;
         if (!entry) { kputs("[mcq    ] ELF load failed\n-- done --\n"); return; }
@@ -12889,9 +12894,13 @@ static void cmd_mcq(void) {
      * five-second stall.
      *
      * The binding constraint is the PROBE'S DURATION, not the AP wake latency.
-     * cmd_mcpre below solves the same problem correctly, with a probe that stays
-     * in ring 3 long enough to still be there when the other core arrives. Any
-     * future fix should follow that pattern rather than synchronising the entry. */
+     *
+     * RESOLVED in v0.81 by fixing that instead: mcq_probe (user/init.c, role 7)
+     * now holds ring 3 for a tick target rather than a fixed iteration count, so
+     * whichever core arrives second still finds the first one there. The entry
+     * is deliberately left unsynchronised — this comment stays because the next
+     * person to see a concurrency high-water of 1 will reach for a barrier here,
+     * and it does not work. */
     kputs("[mcq    ] BSP entering ring 3 CONCURRENTLY with the APs...\n");
     cpu_exec_proc(0, procs[0]);                             /* BSP runs its own probe */
     current_proc_idx = save;
@@ -12950,18 +12959,25 @@ static void cmd_mcq(void) {
      * A negative control on v0.79.0 passed 4 of 4 at -smp 2, which at a 1-in-4
      * rate has roughly a 1-in-3 chance of missing the failure — so it does NOT
      * establish this is new, and nothing in v0.80 touches scheduling. */
-    /* v0.81: STILL GATED AT >= 3, and now with a measurement behind it rather
-     * than an estimate. An attempt to restore this to n >= 2 (see the disproven
-     * barrier above) was run over 24 fresh -smp 2 boots and left the assertion
-     * failing 5 times in 16. Gating a true property because it is hard to
-     * observe remains a last resort — but the way out is to make the overlap
-     * real, not to move the threshold and hope. */
-    if (n >= 3)
+    /* v0.81: LIVE AT TWO CPUS AGAIN — because the overlap was made real, not
+     * because the threshold was moved.
+     *
+     * v0.80 gated this at n >= 3 after it failed roughly 1 boot in 4 at -smp 2.
+     * The cause was the probe payload: a fixed 3,000,000-iteration loop fits
+     * inside one round-robin TCG vCPU quantum, so cpu1 could enter ring 3 and
+     * leave again before the BSP was scheduled back in. Nothing was wrong with
+     * the property; the probes simply were not resident long enough to be seen
+     * together. Synchronising the entry instead was tried and disproven (above).
+     *
+     * mcq_probe now holds ring 3 for a TICK target rather than an iteration
+     * count, which a quantum cannot swallow. Measured over 16 fresh -smp 2
+     * boots with this assertion still skipped, so the number was observed and
+     * not asserted into existence: the high-water read 2 in 16 of 16. Against
+     * the short probe's pooled 6-in-24 failure rate, a clean 16 lands at
+     * p ~ 0.01. */
+    if (n >= 2)
         qcheck("two or more cores were IN RING 3 SIMULTANEOUSLY (the v0.39 headline)",
                g_inr3_max >= 2);
-    else if (n == 2)
-        kprintf("[mcq    ]  SKIP  concurrency high-water at 2 cpus is a race (one AP wake "
-                "vs one short probe); observed %u at once\n", (uint64_t)g_inr3_max);
     else
         kputs("[mcq    ]  SKIP  concurrency high-water needs >= 2 cpus (uniprocessor boot)\n");
     if (n >= 3) {
