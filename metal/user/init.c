@@ -556,18 +556,46 @@ static void mcq_resident_probe(void) {
 }
 
 /* role 8: v0.39 long-running PREEMPTIBLE probe (Stage 3). Same identity fuzz,
- * ~10x the work: long enough for another core to preempt it mid-loop, requeue
- * its captured context on a DIFFERENT cpu, and resume it there. If the
- * capture/resume or the migration corrupted anything — registers, stack,
- * identity — the checksum loop or the pid check breaks and the exit code
- * betrays it. */
+ * but long enough for another core to preempt it mid-loop, requeue its captured
+ * context on a DIFFERENT cpu, and resume it there. If the capture/resume or the
+ * migration corrupted anything — registers, stack, identity — the checksum loop
+ * or the pid check breaks and the exit code betrays it.
+ *
+ * v0.81: A DEADLINE, LIKE EVERYTHING ELSE THAT MEASURES TIME HERE.
+ *
+ * This was 30,000,000 iterations — the last fixed-iteration budget in the
+ * concurrency and preemption suites, and the same pattern CLAUDE.md rules out
+ * for this TCG-only tree, where an iteration count means a different duration
+ * on every host and at every -smp width.
+ *
+ * THE BUDGET IS NOT ARBITRARY: it must stay comfortably LONGER than the
+ * high-priority thread that preempts it. cmd_mcpre queues that thread (role 7,
+ * a short ~3M-iteration probe) once this one is mid-loop, and then asserts the
+ * completion order INVERTED — hi finishing before this one. If this probe ever
+ * became the shorter of the two, that assertion fails, which is exactly how
+ * v0.81 broke the suite once already by lengthening role 7 underneath it. The
+ * deadline below is roughly an order of magnitude beyond role 7's runtime, and
+ * the ordering is verified by boot, not by arithmetic.
+ *
+ * The iteration ceiling is a backstop against ticks not advancing, never the
+ * budget. It is also deliberately generous: if a host is fast enough to reach
+ * it before the deadline, the probe is merely shorter than intended — still far
+ * longer than role 7, so the ordering the suite asserts is preserved either
+ * way. */
+#define MCPRE_T_LONG        40u          /* 0.4 s of preemptible residency      */
+#define MCPRE_I_CEILING 100000000ull     /* backstop only; the deadline wins    */
+
 static void mcpre_long(void) {
     u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+    u32 t0 = osysticks();
     volatile u64 acc = 0;
-    for (u64 i = 0; i < 30000000ull; i++) {
+    for (u64 i = 0; i < MCPRE_I_CEILING; i++) {
         acc += i ^ pid;
-        if ((i & 0x3FFFFull) == 0 && sysc(SYS_GETPID, 0, 0, 0) != pid)
-            sysc(SYS_EXIT, 999, 0, 0);
+        if ((i & 0x3FFFFull) == 0) {
+            if (sysc(SYS_GETPID, 0, 0, 0) != pid)
+                sysc(SYS_EXIT, 999, 0, 0);
+            if (osysticks() - t0 >= MCPRE_T_LONG) break;
+        }
     }
     sysc(SYS_EXIT, pid, 0, 0);
 }
