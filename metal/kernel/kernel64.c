@@ -14383,7 +14383,49 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
              * wrong object is worse than one that fails, because nothing
              * downstream can tell. Every volume now names itself, and anything
              * unrecognised is an error rather than the last branch. */
-            if (vol == VOL_ROOT)      n = vfs_read_file(di, (void *)a1, len);
+            if (vol == VOL_ROOT) {
+                /* v0.82: POSITIONAL. This called vfs_read_file(), which — as its
+                 * own comment says — "only ever reads from the start". The
+                 * descriptor's `off` was therefore vestigial on this path: it
+                 * existed in struct ofile, was inherited across fork and reset
+                 * on close, and NOTHING on an ordinary read ever consulted or
+                 * advanced it. Two consecutive reads of one file through one
+                 * descriptor returned the same bytes twice.
+                 *
+                 * That is why SYS_LSEEK could not simply be added beside it. A
+                 * seek that moved a field no reader consults would have been an
+                 * inert syscall returning correct-looking offsets — the exact
+                 * shape of defect this tree has recorded before, where the
+                 * evidence looks right because nothing it describes is reached.
+                 *
+                 * vfs_read_range() already existed for demand paging, walks the
+                 * same chunk map and honours the same "stop rather than lie"
+                 * rule on a missing chunk, so this is wiring rather than new
+                 * machinery.
+                 *
+                 * The offset is read and written under g_ofile_lock (rank 1) in
+                 * two short sections with the range read BETWEEN them, never
+                 * inside: vfs_read_range takes g_vfs_lock (rank 2) itself, and
+                 * while 1 -> 2 is the declared order, holding a lock across a
+                 * call that takes another is how the orders in this tree get
+                 * argued about. Not holding it needs no argument. */
+                uint64_t off;
+                klock_acquire(&g_ofile_lock);
+                off = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
+                klock_release(&g_ofile_lock);
+                n = vfs_read_range(di, off, (void *)a1, len);
+                if (n > 0) {
+                    klock_acquire(&g_ofile_lock);
+                    if (g_ofiles[fd].used) g_ofiles[fd].off = off + (uint64_t)n;
+                    klock_release(&g_ofile_lock);
+                }
+            }
+            /* v0.82: VOL_TMP is deliberately NOT positional yet — tmp has no
+             * range reader, and inventing one is a separate change with its own
+             * evidence. SYS_LSEEK on a tmp descriptor therefore moves an offset
+             * its reads still ignore. Named here rather than left to be
+             * discovered, because that is precisely the inert-syscall trap this
+             * change exists to remove from VOL_ROOT. */
             else if (vol == VOL_TMP)  n = tmp_read_file(di, (void *)a1, len);
             else if (vol == VOL_PIPE) n = pipe_read_fd(fd, (void *)a1, len);   /* v0.59 */
             else if (vol == VOL_EVFD) n = evfd_read_fd(fd, (void *)a1, len);   /* v0.64 */
@@ -17073,6 +17115,72 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                     kprocs[me].pid, a0, m, (uint64_t)kprocs[me].sig_mask);
         return old;
     }
+    case 100: {  /* v0.82: SYS_LSEEK(fd, offset, whence) -> new absolute offset,
+                  * or negative on error.
+                  *
+                  * The POSITION ALREADY EXISTED — struct ofile carries `off`,
+                  * every read and write advances it, fork aliases it into the
+                  * child's descriptor and close resets it. What was missing was
+                  * any way for ring 3 to MOVE it, so a program could read a file
+                  * forwards exactly once and never rewind, re-read a header, or
+                  * skip a section. That is the gap this closes; no new state is
+                  * introduced, which is why it is a small change rather than a
+                  * subsystem.
+                  *
+                  * NOT SEEKABLE, and each for its own reason: a pipe has no
+                  * addressable position at all, an epoll set and an eventfd are
+                  * counters wearing a descriptor, and a socket's position is the
+                  * peer's business. POSIX spells all four ESPIPE, so they are
+                  * refused as a class rather than falling through to a dirent
+                  * index that would be -1 anyway. Refusing them explicitly is
+                  * what makes the -1 dirent unreachable rather than merely
+                  * unlikely.
+                  *
+                  * LOCK RANK. Everything below runs under g_ofile_lock (rank 1)
+                  * and calls NOTHING — the only read of shared state inside the
+                  * critical section is DENTS[di].len, a direct field read, the
+                  * same way SYS_STAT reads it. No helper is invoked, so no lock
+                  * of any rank can be taken while this one is held and the
+                  * section cannot invert anything. That is deliberate: the
+                  * documented trap in this tree is exactly a rank-1 helper
+                  * called from under a higher rank, and the cheapest way not to
+                  * have that argument is not to call anything.
+                  *
+                  * A negative resulting offset is EINVAL, as POSIX requires.
+                  * Seeking PAST the end is explicitly legal and is not an error
+                  * — that is how sparse writes are expressed — so it is allowed
+                  * here even though this filesystem's writer may not yet use it.
+                  * The offset is computed in int64_t and only then checked, so
+                  * an overflowing SEEK_END + huge offset cannot wrap into a
+                  * small positive value and look valid. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM))
+            return (uint64_t)-13;                          /* EACCES            */
+        int fd = (int)(int64_t)a0;
+        int64_t rel = (int64_t)a1;
+        int whence = (int)(int64_t)a2;
+        if (fd < 0 || fd >= 16)          return (uint64_t)-9;    /* EBADF       */
+        if (whence < 0 || whence > 2)    return (uint64_t)-22;   /* EINVAL      */
+
+        int64_t rc;
+        klock_acquire(&g_ofile_lock);
+        if (!g_ofiles[fd].used ||
+            !(g_ofiles[fd].owner_mask & (1ull << fd_owner()))) {
+            rc = -9;                                             /* EBADF       */
+        } else if (g_ofiles[fd].pipe >= 0 || g_ofiles[fd].ep >= 0 ||
+                   g_ofiles[fd].efd  >= 0 || g_ofiles[fd].sock >= 0) {
+            rc = -29;                                            /* ESPIPE      */
+        } else {
+            int di = g_ofiles[fd].dirent;
+            int64_t base = whence == 0 ? 0
+                         : whence == 1 ? (int64_t)g_ofiles[fd].off
+                         : (di >= 0 ? (int64_t)DENTS[di].len : 0);  /* SEEK_END */
+            int64_t want = base + rel;
+            if (want < 0) rc = -22;                              /* EINVAL      */
+            else { g_ofiles[fd].off = (uint64_t)want; rc = want; }
+        }
+        klock_release(&g_ofile_lock);
+        return (uint64_t)rc;
+    }
     case 67:     /* SYS_GETTID() -> this THREAD's own id.
                   * 0 for a process that never called SYS_THREAD_CREATE, so
                   * single-threaded code sees a stable, meaningful value rather
@@ -18548,6 +18656,21 @@ static int vfs_tmp_in_use(void) {
     return n;
 }
 
+/* v0.82: the ring-3 rounds in this file (vfsstrs' lseek round, usersstrs'
+ * privilege-drop round) run through the same spawn/load/drain helper the
+ * pipestrs rounds use. It is defined further down — it predates all three call
+ * sites — so it is DECLARED once here rather than copied. A second
+ * spawn-and-drain loop is precisely the kind of duplicate that drifts out of
+ * step with the first and then has to be debugged twice. */
+static int64_t pipe_run_role(const char *label, uint64_t caps, uint64_t role,
+                             uint64_t watchdog);
+
+/* The worker is lseek_worker() in user/init.c; 42 is its only success value and
+ * every other code is decoded at the call site. */
+#define LSEEK_WORKER_ROLE  55u
+#define LSEEK_WORKER_OK    42
+#define LSEEK_WORKER_T   3000u   /* 30 s: a small file, a pipe and one fork    */
+
 static void cmd_vfs_stress(void) {
     kputs("-- VFS STRESS: journaling, unlink/reclamation, multi-volume mounts, driver churn --\n");
     g_vfspass = g_vfsfail = 0;
@@ -18816,6 +18939,50 @@ static void cmd_vfs_stress(void) {
     vfscheck("a simulated reboot's cas_mount() automatically recovers the pending commit", recovered_ok);
     vfscheck("the recovered directory reloads with correct content (post-recovery read matches what was written)",
              reload_ok);
+
+    /* ---- v0.82: SYS_LSEEK, from ring 3 ---------------------------------
+     *
+     * Everything above drives the VFS from kernel context. The file POSITION,
+     * though, is a property of a descriptor — it only exists for a process
+     * holding one — so it can only be tested from the side that holds it.
+     *
+     * Until v0.82 there was no way to move it. struct ofile has carried `off`
+     * for many releases and every read advances it, but nothing exposed it, so
+     * a ring-3 program could read a file forwards once and never rewind to
+     * re-read a header, skip a section, or size a file without reading it all.
+     * The state was there; the verb was missing.
+     *
+     * The worker's load-bearing case is the rewind: read, seek to 0, read
+     * again, and compare the bytes. If lseek moved the offset but reads ignored
+     * it, every arithmetic check would still pass and only that comparison
+     * would fail. */
+    {
+        int64_t ls = pipe_run_role("v-lseek", PCAP_FILESYSTEM | PCAP_CONSOLE,
+                                   LSEEK_WORKER_ROLE, LSEEK_WORKER_T);
+        const char *why =
+            ls == -1                 ? "the worker never started, or the round hit its deadline" :
+            ls == 1600 || ls == 1601 ? "could not author the probe file" :
+            ls == 1602               ? "could not reopen the probe file" :
+            ls == 1603 || ls == 1606 ? "SEEK_CUR+0 did not report the current position" :
+            ls == 1607 || ls == 1608 ? "the REWIND to offset 0 was refused" :
+            ls == 1609               ? "*** rewound, but the re-read returned DIFFERENT bytes — reads ignore the offset" :
+            ls >= 1610 && ls <= 1612 ? "SEEK_SET to an interior offset landed in the wrong place" :
+            ls >= 1613 && ls <= 1615 ? "SEEK_CUR with a negative delta landed in the wrong place" :
+            ls >= 1616 && ls <= 1620 ? "SEEK_END did not resolve against the file's length" :
+            ls == 1621 || ls == 1622 ? "seeking PAST the end was refused (POSIX allows it)" :
+            ls >= 1623 && ls <= 1629 ? "a refused seek returned the wrong errno, or moved the offset anyway" :
+            ls == 1630               ? "lseek on an unopened descriptor was not EBADF" :
+            ls == 1631               ? "SYS_PIPE failed, so the ESPIPE case could not be tested" :
+            ls == 1632               ? "lseek on a PIPE was not refused with ESPIPE" :
+            ls >= 1633 && ls <= 1636 ? "a forked child did not inherit the parent's file position" :
+                                       "unknown";
+        if (ls != LSEEK_WORKER_OK)
+            kprintf("[vfsstrs] ring-3 lseek: worker exit %d — %s\n", (uint64_t)ls, why);
+        vfscheck("SYS_LSEEK moves a descriptor's position (rewind re-reads the same bytes, "
+                 "SEEK_SET/CUR/END all resolve, refusals leave the offset untouched, "
+                 "pipes are ESPIPE and a fork inherits the position)",
+                 ls == LSEEK_WORKER_OK);
+    }
 
     kprintf("[vfsstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_vfspass, (uint64_t)g_vfsfail);
     if (!g_vfsfail)
@@ -20624,14 +20791,6 @@ static void usercheck(const char *n, int c) {
     if (c) { g_userpass++; kprintf("[usersstrs]  PASS  %s\n", n); }
     else   { g_userfail++; kprintf("[usersstrs]  FAIL  %s\n", n); }
 }
-
-/* v0.82: the ring-3 privilege-drop round runs through the same spawn/load/drain
- * helper the pipestrs rounds use. It is defined further down the file — it
- * predates this call site — so it is DECLARED here rather than copied. A second
- * spawn-and-drain loop is precisely the kind of duplicate that drifts out of
- * step with the first one and then has to be debugged twice. */
-static int64_t pipe_run_role(const char *label, uint64_t caps, uint64_t role,
-                             uint64_t watchdog);
 
 /* The worker is setuid_privdrop_worker() in user/init.c; every exit code below
  * is decoded at the call site. 42 is its only success value. */

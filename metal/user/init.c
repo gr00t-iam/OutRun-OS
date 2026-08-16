@@ -156,6 +156,14 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_SETEGID             97          /* v0.74 */
 #define SYS_AUTH                98          /* v0.74: (name, password) -> uid, or negative */
 #define SYS_USERADD             99          /* v0.74: (name, password, (gid<<32)|uid) */
+#define SYS_LSEEK              100          /* v0.82: (fd, offset, whence) -> new off  */
+
+/* v0.82: the three POSIX whence values, in POSIX's order and with POSIX's
+ * numbers. They are not an internal encoding to be chosen freely — a ring-3
+ * program written against any C library expects 0/1/2 to mean exactly this. */
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
 
 /* v0.70: widget kinds, mirroring the kernel's table. */
 #define WG_LABEL                1
@@ -1848,6 +1856,16 @@ static int okfd(int fd) {
     if (fd < 0 || fd >= OFD_MAX) return -1;
     return g_ofd[fd];
 }
+
+/* v0.82: move a descriptor's file position. Returns the new absolute offset, or
+ * a negative errno. The console is refused here rather than passed down: fd 0/1/2
+ * map to OFD_CONSOLE, which is not a kernel descriptor at all, so handing it to
+ * the kernel would have it interpret the sentinel as an fd number. */
+static i64 olseek(int fd, i64 off, int whence) {
+    if (fd < 0 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;      /* EBADF  */
+    if (g_ofd[fd] == OFD_CONSOLE)                   return -29;     /* ESPIPE */
+    return (i64)sysc(SYS_LSEEK, (u64)g_ofd[fd], (u64)off, (u64)(i64)whence);
+}
 static int oclose(int fd) {
     if (fd < 3 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;  /* std three are not closable */
     sysc(SYS_CLOSE, (u64)g_ofd[fd], 0, 0);
@@ -2435,6 +2453,130 @@ static void posix_orphan_child(void) {
         if (osysticks() - t0 >= ORPH_T_WATCH) sysc(SYS_EXIT, 47, 0, 0);  /* INCONCLUSIVE */
         oyield();
     }
+}
+
+/* role 55: v0.82 SYS_LSEEK — the file position, exercised from ring 3.
+ *
+ * The position always existed (struct ofile carries `off`, and every read
+ * advances it); what did not exist was any way to MOVE it. So a ring-3 program
+ * could read a file forwards exactly once and could never rewind to re-read a
+ * header, skip a section, or size a file without reading all of it. This worker
+ * is the test for closing that.
+ *
+ * The REWIND is the load-bearing case. Everything else here checks arithmetic
+ * and error returns, but step (3) is the one that was impossible before: read
+ * some bytes, seek back to 0, and get the SAME bytes again. If lseek moved the
+ * offset but reads ignored it, every arithmetic check below would still pass
+ * and only the re-read would fail — which is why the re-read is compared byte
+ * for byte rather than merely counted.
+ *
+ * The error cases are checked with the same weight as the successes, and each
+ * one re-reads the position afterwards: a refused seek that still moved the
+ * offset is a defect even though it returned the right errno, and nothing in
+ * the return value alone would show it.
+ *
+ * Exit 42 on full success; each failure point has its own code. */
+#define LS_PATH "/lseek-probe"
+#define LS_N    26
+
+/* Defined with the other VFS helpers further down; declared here because this
+ * worker removes its own probe file. The dirty-volume gate reuses one image
+ * across three boots, so a suite that leaves litter behind changes the state
+ * the next boot starts from. */
+static int ounlink(const char *path);
+
+static void lseek_worker(void) {
+    static const char alpha[LS_N] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    char buf[LS_N];
+
+    /* (1) Author a file of known content. */
+    { int fd = ocreat(LS_PATH);
+      if (fd < 0) sysc(SYS_EXIT, 1600, 0, 0);
+      if (owrite(fd, alpha, LS_N) != LS_N) sysc(SYS_EXIT, 1601, 0, 0);
+      oclose(fd); }
+
+    int fd = oopen(LS_PATH);
+    if (fd < 0) sysc(SYS_EXIT, 1602, 0, 0);
+
+    /* (2) A fresh descriptor starts at 0, and SEEK_CUR+0 is how you ask where
+     * you are without moving. */
+    if (olseek(fd, 0, SEEK_CUR) != 0)          sysc(SYS_EXIT, 1603, 0, 0);
+    if (oread(fd, buf, 5) != 5)                sysc(SYS_EXIT, 1604, 0, 0);
+    if (buf[0] != 'A' || buf[4] != 'E')        sysc(SYS_EXIT, 1605, 0, 0);
+    if (olseek(fd, 0, SEEK_CUR) != 5)          sysc(SYS_EXIT, 1606, 0, 0);  /* read advanced it */
+
+    /* (3) THE REWIND — the operation that did not exist. Same bytes, twice. */
+    if (olseek(fd, 0, SEEK_SET) != 0)          sysc(SYS_EXIT, 1607, 0, 0);
+    for (int i = 0; i < LS_N; i++) buf[i] = 0;
+    if (oread(fd, buf, 5) != 5)                sysc(SYS_EXIT, 1608, 0, 0);
+    for (int i = 0; i < 5; i++)
+        if (buf[i] != alpha[i])                sysc(SYS_EXIT, 1609, 0, 0);
+
+    /* (4) SEEK_SET to an interior offset. */
+    if (olseek(fd, 10, SEEK_SET) != 10)        sysc(SYS_EXIT, 1610, 0, 0);
+    if (oread(fd, buf, 3) != 3)                sysc(SYS_EXIT, 1611, 0, 0);
+    if (buf[0] != 'K' || buf[2] != 'M')        sysc(SYS_EXIT, 1612, 0, 0);
+
+    /* (5) SEEK_CUR backwards. Position is 13 after the read above; -2 -> 11. */
+    if (olseek(fd, -2, SEEK_CUR) != 11)        sysc(SYS_EXIT, 1613, 0, 0);
+    if (oread(fd, buf, 1) != 1)                sysc(SYS_EXIT, 1614, 0, 0);
+    if (buf[0] != 'L')                         sysc(SYS_EXIT, 1615, 0, 0);
+
+    /* (6) SEEK_END. Offset 0 from the end is the file's length — which is how a
+     * program sizes a file without reading it. */
+    if (olseek(fd, 0, SEEK_END) != LS_N)       sysc(SYS_EXIT, 1616, 0, 0);
+    if (oread(fd, buf, 1) != 0)                sysc(SYS_EXIT, 1617, 0, 0);  /* at EOF */
+    if (olseek(fd, -4, SEEK_END) != LS_N - 4)  sysc(SYS_EXIT, 1618, 0, 0);
+    if (oread(fd, buf, 4) != 4)                sysc(SYS_EXIT, 1619, 0, 0);
+    if (buf[0] != 'W' || buf[3] != 'Z')        sysc(SYS_EXIT, 1620, 0, 0);
+
+    /* (7) Seeking PAST the end is legal, and must not be mistaken for an error.
+     * A read there returns 0 bytes rather than failing. */
+    if (olseek(fd, 1000, SEEK_SET) != 1000)    sysc(SYS_EXIT, 1621, 0, 0);
+    if (oread(fd, buf, 4) != 0)                sysc(SYS_EXIT, 1622, 0, 0);
+
+    /* (8) REFUSALS. Each is checked for the right errno AND for having left the
+     * position alone — a refusal that still moved the offset is a defect the
+     * return value cannot show. */
+    if (olseek(fd, 0, SEEK_SET) != 0)          sysc(SYS_EXIT, 1623, 0, 0);  /* known state */
+    if (olseek(fd, -1, SEEK_SET) != -22)       sysc(SYS_EXIT, 1624, 0, 0);  /* EINVAL      */
+    if (olseek(fd, 0, SEEK_CUR) != 0)          sysc(SYS_EXIT, 1625, 0, 0);  /* unmoved     */
+    if (olseek(fd, -100, SEEK_CUR) != -22)     sysc(SYS_EXIT, 1626, 0, 0);
+    if (olseek(fd, 0, SEEK_CUR) != 0)          sysc(SYS_EXIT, 1627, 0, 0);  /* unmoved     */
+    if (olseek(fd, 0, 99) != -22)              sysc(SYS_EXIT, 1628, 0, 0);  /* bad whence  */
+    if (olseek(fd, 0, SEEK_CUR) != 0)          sysc(SYS_EXIT, 1629, 0, 0);  /* unmoved     */
+
+    /* (9) A descriptor that was never opened is EBADF, not a silent 0. */
+    if (olseek(OFD_MAX - 1, 0, SEEK_SET) != -9) sysc(SYS_EXIT, 1630, 0, 0);
+
+    /* (10) A PIPE has no position. POSIX says ESPIPE, and the kernel refuses
+     * the whole non-seekable class rather than falling through to a dirent. */
+    { i64 pv[2];
+      if ((i64)sysc(SYS_PIPE, (u64)(void *)pv, 0, 0) != 0) sysc(SYS_EXIT, 1631, 0, 0);
+      i64 pr = (i64)sysc(SYS_LSEEK, (u64)pv[0], 0, (u64)SEEK_SET);
+      if (pr != -29)                           sysc(SYS_EXIT, 1632, 0, 0);  /* ESPIPE */
+      sysc(SYS_CLOSE, (u64)pv[0], 0, 0);
+      sysc(SYS_CLOSE, (u64)pv[1], 0, 0); }
+
+    /* (11) The position is a property of the DESCRIPTION, so a fork's child
+     * inherits where the parent had seeked to. */
+    if (olseek(fd, 7, SEEK_SET) != 7)          sysc(SYS_EXIT, 1633, 0, 0);
+    { i64 c = ofork();
+      if (c < 0) sysc(SYS_EXIT, 1634, 0, 0);
+      if (c == 0) {
+          if (olseek(fd, 0, SEEK_CUR) != 7)    sysc(SYS_EXIT, 81, 0, 0);
+          char cb[2];
+          if (oread(fd, cb, 1) != 1)           sysc(SYS_EXIT, 82, 0, 0);
+          if (cb[0] != 'H')                    sysc(SYS_EXIT, 83, 0, 0);
+          sysc(SYS_EXIT, 80, 0, 0);
+      }
+      i64 st = owaitpid_ticks((u32)c, WAIT_T_FORK, 0);
+      if (st == -11) sysc(SYS_EXIT, 1635, 0, 0);   /* DEADLINE, not a defect */
+      if (st != 80)  sysc(SYS_EXIT, 1636, 0, 0); }
+
+    oclose(fd);
+    ounlink(LS_PATH);
+    sysc(SYS_EXIT, 42, 0, 0);
 }
 
 /* role 54: v0.82 RING-3 ONE-WAY PRIVILEGE DROP.
@@ -3730,8 +3872,32 @@ static void posix_fd_worker(void) {
         if (fd >= 3) {
             char b2[64];
             if (g_ofd[fd] < 0) sysc(SYS_EXIT, 963, 0, 0);        /* table not inherited */
+            /* v0.82 CORRECTED THE EXPECTATION, not just the code.
+             *
+             * This used to read the inherited fd and assert it returned THE
+             * SAME BYTES the parent read, calling that POSIX. It is the
+             * opposite of POSIX. fork shares the file DESCRIPTION, and the
+             * offset lives in the description — so a child reads on from where
+             * the parent stopped. Getting the same bytes twice is what you get
+             * from a SECOND open(), which has its own position.
+             *
+             * The old assertion held only because SYS_READ ignored the offset
+             * and always read from the start. Once reads became positional it
+             * failed, which is the correct outcome: the test had been encoding
+             * the kernel's behaviour rather than the standard's, and passing
+             * for the wrong reason.
+             *
+             * So: the parent already read to EOF, therefore this read must
+             * return 0. That IS the evidence the offset is shared rather than
+             * copied — a stronger claim than the old one, and one the previous
+             * kernel could not have made. */
+            if (oread(fd, b2, sizeof b2 - 1) != 0) sysc(SYS_EXIT, 969, 0, 0);
+            /* And now the child rewinds the shared description and reads
+             * exactly what the parent read — the same assertion as before, but
+             * earned rather than assumed. */
+            if (olseek(fd, 0, SEEK_SET) != 0) sysc(SYS_EXIT, 968, 0, 0);
             i64 cn = oread(fd, b2, sizeof b2 - 1);
-            if (cn != pn) sysc(SYS_EXIT, 969, 0, 0);   /* inherited fd must READ, and read the same */
+            if (cn != pn) sysc(SYS_EXIT, 969, 0, 0);
             for (i64 k = 0; k < cn; k++)
                 if (b2[k] != buf[k]) sysc(SYS_EXIT, 969, 0, 0);
         }
@@ -4859,6 +5025,7 @@ int main(int argc, const char **argv, const char **envp) {
      * spawn was renumbered to match. */
     if (role == 53) { posix_orphan_worker(); }         /* v0.77 cross-generation orphan: getppid() after a slot recycle */
     if (role == 54) { setuid_privdrop_worker(); }      /* v0.82 one-way privilege drop, observed from ring 3          */
+    if (role == 55) { lseek_worker(); }                /* v0.82 SYS_LSEEK: the file position, from ring 3             */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
     if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
     if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */
