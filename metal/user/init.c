@@ -2437,6 +2437,101 @@ static void posix_orphan_child(void) {
     }
 }
 
+/* role 54: v0.82 RING-3 ONE-WAY PRIVILEGE DROP.
+ *
+ * usersstrs has always checked the credential rules from the KERNEL side, by
+ * reaching into kprocs[] and reading the six id fields directly. That proves
+ * the state machine, and it cannot prove the thing an attacker actually needs
+ * to be false: that a process which has dropped privilege cannot get it back by
+ * asking, through the syscall boundary, the way a real program would. A comment
+ * in usersstrs claimed for several releases that ring 3 exercised this. Nothing
+ * did — there was no ring-3 caller of SYS_SETUID or SYS_SETGID anywhere in this
+ * file. This worker is that caller.
+ *
+ * THE ORDER OF THE TWO DROPS IS LOAD-BEARING, and is not the order the obvious
+ * reading of "drop uid, then drop gid" would give. Privilege here is euid == 0,
+ * never uid == 0 and never egid == 0 — a process with egid 0 but a non-zero
+ * euid is NOT privileged and must not be able to hand itself an arbitrary gid.
+ * So setuid(1000) first would leave euid == 1000, and the following setgid(1000)
+ * would then be REFUSED — correctly, because 1000 is not among that process's
+ * real/effective/saved gids. Testing in that order would prove nothing about
+ * dropping and would quietly conflate a correct refusal with a failure to drop.
+ * Group first, while still privileged; user second, because it is the one that
+ * closes the door.
+ *
+ * setuid() from a privileged process moves all three ids — real, effective AND
+ * saved — which is what makes the drop irrevocable: it overwrites the very id a
+ * return would have been authorised against. So the escalation attempts below
+ * include seteuid(0)/setegid(0), not just setuid(0)/setgid(0). The reversible
+ * setter is the sharper test: if `saved` had been left at 0 by the permanent
+ * drop, seteuid(0) would legally succeed and the "permanent" drop would be a
+ * loan. Checking only setuid(0) would miss that entirely.
+ *
+ * Exit 42 on full success; every failure point has its own code so the kernel
+ * side can name which rule broke rather than reporting "the worker failed". */
+#define PD_UID   1000u
+#define PD_GID   1000u
+
+static void setuid_privdrop_worker(void) {
+    /* (0) The premise. A freshly spawned process inherits nothing: kproc_reset
+     * memsets the slot, so all six ids are 0. If that is ever untrue the rest of
+     * this worker is measuring the wrong starting state, so it is asserted
+     * rather than assumed. */
+    if (sysc(SYS_GETUID,  0, 0, 0) != 0) sysc(SYS_EXIT, 900, 0, 0);
+    if (sysc(SYS_GETEUID, 0, 0, 0) != 0) sysc(SYS_EXIT, 901, 0, 0);
+    if (sysc(SYS_GETGID,  0, 0, 0) != 0) sysc(SYS_EXIT, 902, 0, 0);
+    if (sysc(SYS_GETEGID, 0, 0, 0) != 0) sysc(SYS_EXIT, 903, 0, 0);
+
+    /* (1) Drop the GROUP first — see the note above on why this cannot come
+     * second. Privileged setgid() moves real, effective and saved together. */
+    if ((i64)sysc(SYS_SETGID, PD_GID, 0, 0) != 0) sysc(SYS_EXIT, 904, 0, 0);
+    if (sysc(SYS_GETGID,  0, 0, 0) != PD_GID)     sysc(SYS_EXIT, 905, 0, 0);
+    if (sysc(SYS_GETEGID, 0, 0, 0) != PD_GID)     sysc(SYS_EXIT, 906, 0, 0);
+
+    /* (2) Drop the USER. After this the process is unprivileged by definition,
+     * because privilege is euid == 0 and euid is now PD_UID. */
+    if ((i64)sysc(SYS_SETUID, PD_UID, 0, 0) != 0) sysc(SYS_EXIT, 907, 0, 0);
+    if (sysc(SYS_GETUID,  0, 0, 0) != PD_UID)     sysc(SYS_EXIT, 908, 0, 0);
+    if (sysc(SYS_GETEUID, 0, 0, 0) != PD_UID)     sysc(SYS_EXIT, 909, 0, 0);
+
+    /* (3) THE POINT OF THE WORKER. Four ways back to root, all of which must be
+     * refused, and after each one the ids must be UNCHANGED — a refusal that
+     * still moved an id is a failure even though it returned an error. */
+    if ((i64)sysc(SYS_SETUID, 0, 0, 0) >= 0)  sysc(SYS_EXIT, 910, 0, 0);  /* REGAINED root uid */
+    if (sysc(SYS_GETUID,  0, 0, 0) != PD_UID) sysc(SYS_EXIT, 911, 0, 0);
+    if (sysc(SYS_GETEUID, 0, 0, 0) != PD_UID) sysc(SYS_EXIT, 912, 0, 0);
+
+    if ((i64)sysc(SYS_SETEUID, 0, 0, 0) >= 0) sysc(SYS_EXIT, 913, 0, 0);  /* saved id leaked   */
+    if (sysc(SYS_GETUID,  0, 0, 0) != PD_UID) sysc(SYS_EXIT, 914, 0, 0);
+    if (sysc(SYS_GETEUID, 0, 0, 0) != PD_UID) sysc(SYS_EXIT, 915, 0, 0);
+
+    if ((i64)sysc(SYS_SETGID, 0, 0, 0) >= 0)  sysc(SYS_EXIT, 916, 0, 0);  /* REGAINED root gid */
+    if (sysc(SYS_GETGID,  0, 0, 0) != PD_GID) sysc(SYS_EXIT, 917, 0, 0);
+    if (sysc(SYS_GETEGID, 0, 0, 0) != PD_GID) sysc(SYS_EXIT, 918, 0, 0);
+
+    if ((i64)sysc(SYS_SETEGID, 0, 0, 0) >= 0) sysc(SYS_EXIT, 919, 0, 0);  /* saved gid leaked  */
+    if (sysc(SYS_GETGID,  0, 0, 0) != PD_GID) sysc(SYS_EXIT, 920, 0, 0);
+    if (sysc(SYS_GETEGID, 0, 0, 0) != PD_GID) sysc(SYS_EXIT, 921, 0, 0);
+
+    /* (4) The drop must survive a fork. A child that came back up as root would
+     * be the same leak by another route, and fork() copies six fields by hand. */
+    { i64 c = ofork();
+      if (c < 0) sysc(SYS_EXIT, 922, 0, 0);
+      if (c == 0) {
+          if (sysc(SYS_GETUID,  0, 0, 0) != PD_UID) sysc(SYS_EXIT, 71, 0, 0);
+          if (sysc(SYS_GETEUID, 0, 0, 0) != PD_UID) sysc(SYS_EXIT, 72, 0, 0);
+          if (sysc(SYS_GETGID,  0, 0, 0) != PD_GID) sysc(SYS_EXIT, 73, 0, 0);
+          if ((i64)sysc(SYS_SETUID, 0, 0, 0) >= 0)  sysc(SYS_EXIT, 74, 0, 0);
+          sysc(SYS_EXIT, 70, 0, 0);
+      }
+      i64 st = owaitpid_ticks((u32)c, WAIT_T_FORK, 0);
+      if (st == -11) sysc(SYS_EXIT, 923, 0, 0);       /* DEADLINE, not a defect */
+      if (st != 70)  sysc(SYS_EXIT, 924, 0, 0);       /* child saw the wrong ids */
+    }
+
+    sysc(SYS_EXIT, 42, 0, 0);
+}
+
 static void posix_orphan_worker(void) {
     i64 p = ofork();
     if (p < 0) sysc(SYS_EXIT, 1751, 0, 0);
@@ -4763,6 +4858,7 @@ int main(int argc, const char **argv, const char **envp) {
      * gave 52 to mcq_resident_probe. Renumbered to 53 here; the kernel-side
      * spawn was renumbered to match. */
     if (role == 53) { posix_orphan_worker(); }         /* v0.77 cross-generation orphan: getppid() after a slot recycle */
+    if (role == 54) { setuid_privdrop_worker(); }      /* v0.82 one-way privilege drop, observed from ring 3          */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
     if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
     if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */
