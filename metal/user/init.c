@@ -2358,6 +2358,124 @@ static void posix_fork_worker(void) {
     sysc(SYS_EXIT, 700, 0, 0);
 }
 
+/* --- role 52: v0.77 carryover 3 — THE CROSS-GENERATION ORPHAN --------------
+ *
+ * What role 29 above cannot test, and why this exists.
+ *
+ * v0.75 defect B was that ppid_live() resolved a parent link by testing the
+ * parent slot's `used` flag alone. Slots are recycled, so `used` is also true
+ * when the slot has been handed to a completely different process — and
+ * getppid() then returned a stranger's pid. The fix pins the link to a (slot,
+ * generation) pair.
+ *
+ * Role 29's child calls getppid() immediately after fork(), while its parent is
+ * still sitting in waitpid(). The parent therefore cannot have exited, its slot
+ * cannot have been recycled, and the generation compare has nothing to
+ * disagree with. Built with -DFORK_RACE_REPRO — which reverts that compare and
+ * nothing else — a full boot reported ZERO stale resolutions and posixstrs
+ * passed 12/12. That is not evidence the fix works. It is evidence the suite
+ * never asked: exit 44 was unreachable in that shape at any core count.
+ *
+ * So this role constructs the shape the defect needs, deliberately:
+ *
+ *     W ──fork──> P ──fork──> C      C's parent link names P's SLOT
+ *     │           (exits at once)
+ *     └──fork──> throwaway           which lands on P's vacated slot and
+ *                                    bumps that slot's generation, while C
+ *                                    is still pointing at it
+ *
+ * WHAT THIS FOUND, on its first run. Not a confirmation: the normal build —
+ * generation compare compiled in, no -DFORK_RACE_REPRO — failed exactly as the
+ * reverted build did, C reading its parent as pid 647 when its parent had been
+ * pid 645. v0.75 defect B was still live in the shipped kernel, because
+ * kproc_reset's v0.72 cmemset backstop zeroed `gen` before the `p->gen++` at
+ * the bottom of the same function, pinning every slot's generation at 1 and
+ * making the compare 1 == 1 forever. See kproc_reset() in kernel64.c. The fix
+ * is there; this role is what could see it.
+ *
+ * The recycle is ARRANGED, not waited for. kproc_spawn hands out the LOWEST
+ * torn-down slot, so W gets a lower slot than P and P a lower one than C. Once
+ * P has exited — proven, because W's waitpid() on it returned — P's slot is the
+ * lowest torn-down slot in the table: W's own is below it and still alive, and
+ * everything below W's was alive when W was allocated. W's next fork therefore
+ * takes P's slot by construction, bumping its generation while C still points
+ * at it. No timing window, no polling for luck.
+ *
+ * C then asks getppid() what its parent is. There are exactly three answers:
+ *
+ *   0            correct. The link was pinned to a generation that no longer
+ *                matches, so C reads as the orphan it is. Also the POSITIVE
+ *                CONTROL: seeing it proves the recycle really happened, so a
+ *                pass cannot be a test that quietly did nothing.
+ *   a stranger   DEFECT B. Only reachable when the generation compare is gone.
+ *   P's pid      not yet recycled; keep looking until the deadline.
+ *
+ * C learns P's identity from INHERITED MEMORY, not from getppid(): the call
+ * under test must not also be the source of ground truth.                    */
+#define ORPH_CHURN    4u      /* forks W makes to drive the recycle; 1 suffices */
+#define ORPH_T_STEP  600u     /* 6 s: ceiling on any single wait in this role   */
+#define ORPH_T_WATCH 900u     /* 9 s: C's deadline for observing the recycle    */
+
+/* Written by P before it forks C; C inherits the page and reads it there. */
+static volatile u32 g_orph_parent_pid = 0;
+
+static void posix_orphan_child(void) {
+    u32 p0 = g_orph_parent_pid;
+    if (!p0) sysc(SYS_EXIT, 1750, 0, 0);         /* fork did not carry the page */
+    u32 t0 = osysticks();
+    for (;;) {
+        u32 pp = ogetppid();
+        if (pp == 0)  sysc(SYS_EXIT, 42, 0, 0);  /* orphaned, correctly         */
+        /* The stranger's pid travels out in the exit code. "getppid() returned
+         * the wrong thing" is not a finding; WHICH wrong thing it returned is
+         * what separates a kernel defect from a defective test. */
+        if (pp != p0) sysc(SYS_EXIT, 2000000 + (u64)pp, 0, 0);   /* A STRANGER  */
+        /* A deadline, not a spin count: this role is meant to run at 1 vCPU and
+         * at 4, and an iteration budget means different durations at each. */
+        if (osysticks() - t0 >= ORPH_T_WATCH) sysc(SYS_EXIT, 47, 0, 0);  /* INCONCLUSIVE */
+        oyield();
+    }
+}
+
+static void posix_orphan_worker(void) {
+    i64 p = ofork();
+    if (p < 0) sysc(SYS_EXIT, 1751, 0, 0);
+    if (p == 0) {                                     /* ---- P: doomed parent ---- */
+        g_orph_parent_pid = ogetpid();
+        i64 c = ofork();
+        if (c < 0)  sysc(SYS_EXIT, 1752, 0, 0);
+        if (c == 0) posix_orphan_child();             /* never returns              */
+        /* P's exit code carries C's pid outward. W cannot waitpid() a grandchild,
+         * and the kernel half needs C's pid to find its verdict in the reap log.
+         * Offset so a pid can never be mistaken for one of P's failure sentinels
+         * above — pids here reach the high hundreds, and a channel whose values
+         * overlap its own error codes is one bad boot away from reporting a
+         * failure as a successful result. */
+        sysc(SYS_EXIT, 3000000 + (u64)c, 0, 0);
+    }
+
+    /* ---- W ---- */
+    i64 rp = owaitpid_ticks((u32)p, ORPH_T_STEP, 0);
+    if (rp == -11)      sysc(SYS_EXIT, 1753, 0, 0);   /* P never exited             */
+    if (rp <  3000000)  sysc(SYS_EXIT, 1754, 0, 0);   /* P failed before forking C  */
+    u64 cpid = (u64)rp - 3000000;
+
+    /* P has exited, so its slot is now the lowest recyclable one. Each fork here
+     * claims it, bumps its generation, and hands it straight back — which is all
+     * the experiment needs, because a generation only ever increases. */
+    for (u32 i = 0; i < ORPH_CHURN; i++) {
+        i64 t = ofork();
+        if (t < 0)  sysc(SYS_EXIT, 1755, 0, 0);
+        if (t == 0) sysc(SYS_EXIT, 42, 0, 0);
+        if (owaitpid_ticks((u32)t, ORPH_T_STEP, 0) != 42) sysc(SYS_EXIT, 1756, 0, 0);
+    }
+    /* W exits without lingering for C on purpose. The generation has already
+     * been bumped and generations never go backwards, so C's answer no longer
+     * depends on anything W does — and a "wait a while for the other process"
+     * step is exactly the kind of timing assumption this role exists to remove. */
+    sysc(SYS_EXIT, 1000000 + cpid, 0, 0);
+}
+
 /* --- role 30: signals ------------------------------------------------------*/
 static volatile int g_segv_hits = 0, g_int_hits = 0, g_alrm_hits = 0;
 static struct ojmp  g_segv_jb;
@@ -4641,6 +4759,10 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 50) { mmapfile_stress_worker(); }      /* v0.66 file-backed mappings and writeback           */
     if (role == 51) { tcp_stress_worker(); }           /* v0.67 TCP: handshake, byte stream, FIN             */
     if (role == 52) { mcq_resident_probe(); }          /* v0.81 tick-resident concurrency probe (cmd_mcq)    */
+    /* Rebase note: this worker was written as role 52 against v0.77, but v0.81
+     * gave 52 to mcq_resident_probe. Renumbered to 53 here; the kernel-side
+     * spawn was renumbered to match. */
+    if (role == 53) { posix_orphan_worker(); }         /* v0.77 cross-generation orphan: getppid() after a slot recycle */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
     if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
     if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */

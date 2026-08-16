@@ -2115,6 +2115,15 @@ static int n_kproc = 0;
  * counter handing out identities without atomicity is a bug on its own terms,
  * not because it was the one being hunted. See ROADMAP-0.75.0.md. */
 static volatile uint64_t g_next_pid = 1;
+/* v0.77 carryover 3: how often the FORK_RACE_REPRO build's reverted ppid_live()
+ * resolved a parent link whose slot had been recycled — i.e. handed the caller
+ * a stranger. Zero in a normal build, because the generation compare rejects
+ * those before they get here. */
+static volatile uint64_t g_reproc_stale_ppid = 0;
+/* v0.77 carryover 3 follow-up: how often ppid_live() found a parent link whose
+ * slot had been recycled. Counted in EVERY build — see ppid_live(). This is the
+ * number that says whether the guard was exercised at all. */
+static volatile uint64_t g_ppid_gen_mismatch = 0;
 
 /* The only way to obtain a pid. A single atomic RMW — no lock needed, and none
  * of the callers hold one.
@@ -2144,12 +2153,50 @@ static uint64_t pid_alloc(void) {
  * Returning -1 collapses three cases readers already had to handle the same way
  * — never had a parent, parent's slot out of range, parent died and its slot
  * was reused — into one answer: this process is an orphan. */
+/* v0.77 carryover 3: FORK_RACE_REPRO reverts the generation compare — and ONLY
+ * the generation compare — to the pre-v0.75 shape, so the defect can be shown to
+ * produce the v0.74 symptom rather than argued to.
+ *
+ * Opt-in at build time (`make EXTRA=-DFORK_RACE_REPRO`), never in a release
+ * build, following the EXTRA=-DPOSIX_ITER precedent. Defect A's fix stays in
+ * place in BOTH builds on purpose: the duplicate-pid detector is the control,
+ * and it must read zero in the reproducing build. A run that produces exit 44
+ * with zero duplicate pids separates B's contribution from A's, which is the
+ * whole point — v0.75 already measured A out ("zero collisions across a full
+ * failing boot") and this must not quietly reintroduce it as a confounder. */
 static int ppid_live(int c) {
     if (c < 0 || c >= n_kproc) return -1;
     int par = kprocs[c].ppid_slot;
     if (par < 0 || par >= n_kproc) return -1;
     if (!kprocs[par].used) return -1;
-    if (kprocs[par].gen != kprocs[c].ppid_gen) return -1;   /* slot recycled */
+    if (kprocs[par].gen != kprocs[c].ppid_gen) {
+        /* v0.77 carryover 3 follow-up: DETECTION is counted in every build,
+         * including the shipping one. Previously the only counter here lived
+         * inside the #ifdef, so a released kernel incremented nothing and its
+         * zero meant "no code can make this non-zero" rather than "no stale
+         * link was resolved" — the same shape as the counter this project
+         * already burned itself on by grepping logs for a string no code could
+         * emit. A non-zero value here is positive evidence that the guard is
+         * live and doing work on this boot.
+         *
+         * Read the two numbers as a pair:
+         *   detected  > 0 and resolved == 0   the guard fired and held (fixed)
+         *   detected  > 0 and resolved  > 0   stale links resolved anyway (bug)
+         *   detected == 0                     INCONCLUSIVE — the workload never
+         *                                     produced a recycled parent, so
+         *                                     this boot tested nothing here. */
+        __sync_fetch_and_add(&g_ppid_gen_mismatch, 1);
+#ifndef FORK_RACE_REPRO
+        return -1;                                          /* slot recycled */
+#else
+        /* The pre-v0.75 test: `used` alone. True for a recycled slot holding a
+         * different process entirely, which is exactly the bug. Counted so the
+         * log says how often the reverted path returned a stranger. Note this
+         * increment is still build-gated, so `resolved == 0` is TRIVIALLY true
+         * in a normal build — it is not the evidence. `detected` is. */
+        __sync_fetch_and_add(&g_reproc_stale_ppid, 1);
+#endif
+    }
     return par;
 }
 
@@ -2335,6 +2382,23 @@ static void panic_dump(struct isr_frame *f) {
  * That audit is a snapshot; this line is the invariant.                    */
 static void cmemset(void *d, int v, uint64_t n);   /* fwd: defined with the string helpers */
 static void kproc_reset(struct kproc *p) {
+    /* v0.77 carryover 3: `gen` is the ONE field that must SURVIVE this function,
+     * so it is saved across the backstop below and restored, incremented, at the
+     * end. Everything else here describes a slot's next occupant; `gen` counts
+     * how many occupants the slot has had, and a counter zeroed on every reset
+     * counts nothing.
+     *
+     * This is not hypothetical. The v0.72 cmemset backstop below zeroed `gen`
+     * before the `p->gen++` at the bottom ran, so EVERY slot read gen == 1 on
+     * EVERY recycle, for every release from v0.72 onward. ppid_live()'s
+     * generation compare therefore always found 1 == 1 and degenerated to the
+     * `used`-only test it was written in v0.75 to replace — v0.75 defect B was
+     * live in the shipped kernel the whole time. The comment on the increment
+     * already warned that "a memset here would silently reinstate the bug"; the
+     * memset that did it was thirty lines above the warning, added earlier, and
+     * no test could see the difference because no test outlived a parent. See
+     * role 53 in init.c, which is what finally measured it. */
+    uint32_t gen_keep = p->gen;
     cmemset(p, 0, sizeof *p);
     p->pid = 0;
     p->name[0] = 0;
@@ -2367,8 +2431,12 @@ static void kproc_reset(struct kproc *p) {
      * still pointing at it as a parent must stop resolving. Incremented, never
      * blanked — the counter's value is the whole point, and a memset here would
      * silently reinstate the bug. Wraps at 2^32 recycles of one slot, which at
-     * this kernel's spawn rate is not reachable in a boot. */
-    p->gen++;
+     * this kernel's spawn rate is not reachable in a boot.
+     *
+     * v0.77 carryover 3: carried across the backstop rather than read out of the
+     * struct, because the struct's copy was zeroed at the top of this function.
+     * See the note there. */
+    p->gen = gen_keep + 1;
     p->nthreads = 1; p->ustack_next = 0; p->argc = 0; p->exit_authoritative = 0;
     /* v0.61: a fresh slot is its OWN thread-group leader. kproc_spawn fixes up
      * tg_leader to the real index right after this returns (kproc_reset takes a
@@ -20713,8 +20781,19 @@ static void cmd_users_stress(void) {
     } else {
         usercheck("a slot was available to test recycling", 0);
     }
-    /* setuid/setgid are exercised from ring 3 by role 52, which is the only
-     * place the one-way rule can be observed the way an application sees it. */
+    /* v0.82: this used to claim "setuid/setgid are exercised from ring 3 by
+     * role 52". Both halves were false and had been for some time: there is no
+     * ring-3 caller of SYS_SETUID/SYS_SETGID anywhere in user/init.c, and role
+     * 52 was unassigned when the claim was written. The one-way rule is checked
+     * here, from the kernel side, and nowhere else.
+     *
+     * Left as a note rather than deleted because it points at a real gap: the
+     * rule is NOT observed the way an application sees it, and a ring-3 worker
+     * that dropped privilege and then tried to regain it would be worth having.
+     *
+     * Role numbers as of v0.82: 52 is mcq_resident_probe (cmd_mcq's
+     * tick-resident concurrency probe), 53 is posix_orphan_worker (posixstrs'
+     * cross-generation orphan test). Neither touches setuid. */
 
     kprintf("[usersstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_userpass, (uint64_t)g_userfail);
     if (!g_userfail)
@@ -22092,6 +22171,66 @@ static int posix_drain(int *procs, int nproc, struct px_round *R, uint64_t watch
     }
 }
 
+/* ===========================================================================
+ * v0.77 carryover 3: THE CROSS-GENERATION ORPHAN PHASE
+ * ===========================================================================
+ * Runs once, after the rounds, as its own phase rather than as an eighth
+ * worker. Two reasons, both structural rather than stylistic:
+ *
+ *  - The thing under test is a SLOT RECYCLE, and role 53 arranges one by
+ *    relying on kproc_spawn's first-fit ordering (see the role's comment in
+ *    init.c). Six other workers forking concurrently would leave that ordering
+ *    to chance, and an experiment whose premise holds only sometimes reports
+ *    "inconclusive" as if it were "pass".
+ *
+ *  - The process whose answer matters — C — is a GRANDCHILD of the worker, so
+ *    px_sample() does not discover it (it matches direct children of the seven
+ *    workers only) and posix_drain() would therefore not wait for it. Rather
+ *    than widen that discovery and change what every other round counts, this
+ *    phase drains on its own predicate: role 53 is inherited across fork and
+ *    cleared by kproc_reset, so "no live slot carries role 53" is an exact
+ *    statement that the whole tree is terminal.
+ *
+ * The verdict travels outward by pid: W's exit code is 1000000 + C's pid, and
+ * C's own exit code is read from the reap log — which is keyed on pid precisely
+ * because the kproc table is not a reliable place to look once a slot has been
+ * recycled, and this phase recycles one on purpose. */
+/* Rebase note: written as 52 against v0.77; v0.81 gave 52 to
+ * mcq_resident_probe (see cmd_mcq), so this is 53. */
+#define PX_ORPH_ROLE  53
+#define PX_ORPH_BASE  1000000ull
+
+static int px_orphan_live(void) {
+    int n = 0;
+    for (int i = 0; i < n_kproc; i++)
+        if (kprocs[i].used && !kprocs[i].exited && kprocs[i].role == PX_ORPH_ROLE) n++;
+    return n;
+}
+
+/* Drain until W's status is latched AND nothing in its tree is still running.
+ * Returns 0 on the watchdog, which the caller must report as a failure and not
+ * as an absent result. */
+static int px_orphan_drain(uint32_t wpid, uint64_t *wcode, uint64_t watchdog) {
+    uint64_t t0 = g_ticks, lastlog = g_ticks, spins = 0;
+    int got = 0;
+    for (;;) {
+        if (!got && posix_reap_lookup(wpid, wcode, 0)) got = 1;
+        if (got && px_orphan_live() == 0) return 1;
+        if (g_ticks - t0 >= watchdog) return 0;
+        int q = rq_pop(0);
+        if (q >= 0) { cpu_exec_proc(0, q); sched_yield(); continue; }
+        futex_timeout_scan();
+        if (++spins & 1) sched_yield();
+        if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);
+        if (g_ticks - lastlog >= 200) {
+            lastlog = g_ticks;
+            kprintf("[posixstrs] .. orphan phase waiting ticks=%u latched=%d live=%d\n",
+                    g_ticks - t0, (uint64_t)got, (uint64_t)(int64_t)px_orphan_live());
+        }
+        __asm__ volatile("pause");
+    }
+}
+
 static void cmd_posix_stress(void) {
     kputs("-- POSIX STRESS: fork/exec chains, signal frames, pthread mutexes --\n");
     g_pxpass = g_pxfail = 0;
@@ -22242,8 +22381,76 @@ static void cmd_posix_stress(void) {
         }
     }
 
+    /* v0.77 carryover 3: the cross-generation orphan. See px_orphan_drain(). */
+    int orph_ran = 0, orph_recycled = 0, orph_nostranger = 0;
+    {
+        uint64_t wcode = 0, ccode = 0;
+        int w = kproc_spawn("posix-orph", PCAP_FILESYSTEM);
+        if (w < 0) kputs("[posixstrs] orphan phase: kproc_spawn failed\n");
+        else {
+            kprocs[w].role = PX_ORPH_ROLE;
+            uint64_t e = elf_load(w, g_user_elf, g_user_elf_end - g_user_elf);
+            current_proc_idx = save;
+            if (!e) kputs("[posixstrs] orphan phase: the worker's ELF did not load\n");
+            else {
+                kprocs[w].entry = e;
+                uint32_t wpid = kprocs[w].pid;
+                rq_push(0, w);
+                __sync_synchronize();
+                if (n > 1) lapic_ipi(0, IPI_PING, 1);
+                int drained = px_orphan_drain(wpid, &wcode, 3000);
+                current_proc_idx = save;
+                if (!drained)
+                    kprintf("[posixstrs] orphan phase WATCHDOG: worker pid %u, %d task(s) still live\n",
+                            wpid, (uint64_t)(int64_t)px_orphan_live());
+                else if (wcode < PX_ORPH_BASE)
+                    kprintf("[posixstrs] orphan phase: worker pid %u FAILED its own assertions: exit %u\n",
+                            wpid, wcode);
+                else {
+                    uint32_t cpid = (uint32_t)(wcode - PX_ORPH_BASE);
+                    if (!posix_reap_lookup(cpid, &ccode, 0))
+                        kprintf("[posixstrs] orphan phase: the orphan (pid %u) left no reap-log entry\n", cpid);
+                    else {
+                        orph_ran = 1;
+                        kprintf("[posixstrs] orphan phase: orphan pid %u exited %u\n", cpid, ccode);
+                        /* 42 is the ONLY code that also proves the premise: C
+                         * exits 42 exactly when it observed getppid() go to 0,
+                         * which cannot happen until the generation moved. */
+                        if (ccode == 42) orph_recycled = 1;
+                        if (ccode >= 2000000)
+                            kprintf("[posixstrs] orphan phase: orphan pid %u got STRANGER pid %u from getppid()\n",
+                                    cpid, ccode - 2000000);
+                        else orph_nostranger = 1;
+                        if (ccode == 47)
+                            kputs("[posixstrs] orphan phase: the parent's slot was never recycled — result is INCONCLUSIVE, not a pass\n");
+                    }
+                }
+            }
+        }
+    }
+
     pxcheck("every round ran all 7 POSIX workers to a terminal state (no watchdog timeout)",
             rnd == POSIXSTRESS_ROUNDS && rounds_ok);
+    /* Three separate assertions on purpose. The middle one is the positive
+     * control: without it, a build in which the recycle never happened would
+     * report the same clean pass as one in which it happened and was handled
+     * correctly — which is exactly how the -DFORK_RACE_REPRO baseline managed
+     * to read 12/12 while testing nothing. */
+    pxcheck("the cross-generation orphan experiment ran end to end (worker, doomed parent and orphan all terminal)",
+            orph_ran);
+    pxcheck("the doomed parent's slot really was recycled while the orphan still pointed at it (positive control)",
+            orph_recycled);
+    pxcheck("getppid() across that recycle answered orphan (0), never a stranger's pid",
+            orph_ran && orph_nostranger);
+    /* The kernel-side counterpart, and the reason it is two checks rather than
+     * one: `detected > 0` is the load-bearing claim (the guard ran and found
+     * something this boot), while `resolved == 0` is trivially true in a build
+     * whose only increment site is compiled out. Asserting the trivial one
+     * alone is how a suite reports "verified" about code it never reached. */
+    pxcheck("ppid_live()'s generation guard was actually exercised this boot (stale links detected > 0)",
+            g_ppid_gen_mismatch > 0);
+    pxcheck("no stale parent link was ever resolved to a live slot",
+            g_reproc_stale_ppid == 0);
     pxcheck("every worker's ring-3 assertions passed (exit code == its success sentinel)", codes_ok);
     pxcheck("fork() produced real children: distinct pid AND distinct cr3 from the parent", ppid_ok);
     pxcheck("every forked child ran its own image and exited 42", child_ok && nchild_total > 0);
@@ -22310,6 +22517,33 @@ static void cmd_posix_stress(void) {
     pxcheck("free-frame count reconciles (g_frame_free_depth == lifetime freed - reused)",
             g_frame_free_depth == g_frames_freed - g_frames_reused);
     pxcheck("no lock-rank violation anywhere in the POSIX paths", g_rank_violations == viol0);
+    /* v0.77 carryover 3. The duplicate-pid detector v0.75 used to clear defect A
+     * was removed once it had done its job, so it is re-created here as the
+     * CONTROL for the defect-B experiment: if exit 44 appears while this reads
+     * zero, the symptom cannot be blamed on duplicate pids.
+     *
+     * Honest about its strength: this is a point-in-time scan of the live table,
+     * not the per-spawn check v0.75 ran, so it can miss a duplicate that existed
+     * and was reaped earlier in the boot. It is adequate here only because
+     * pid_alloc() is a single atomic RMW in BOTH builds, which makes duplicates
+     * structurally impossible rather than merely unobserved — the scan confirms
+     * that reasoning rather than carrying the argument alone. */
+    { int dup = 0;
+      for (int i = 0; i < n_kproc; i++) {
+          if (!kprocs[i].used || !kprocs[i].pid) continue;
+          for (int j = i + 1; j < n_kproc; j++)
+              if (kprocs[j].used && kprocs[j].pid == kprocs[i].pid) dup++;
+      }
+      kprintf("[posixstrs] CONTROL duplicate-pid pairs now live = %d\n", (uint64_t)(int64_t)dup);
+      kprintf("[posixstrs] stale parent links DETECTED (all builds) = %u\n",
+              g_ppid_gen_mismatch);
+      kprintf("[posixstrs] stale parent links RESOLVED ANYWAY (the bug) = %u\n",
+              g_reproc_stale_ppid);
+#ifdef FORK_RACE_REPRO
+      kputs("[posixstrs] *** BUILT WITH FORK_RACE_REPRO — defect B's generation "
+            "compare is REVERTED. This build is a reproducer, not a kernel.\n");
+#endif
+    }
     kprintf("[posixstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_pxpass, (uint64_t)g_pxfail);
     if (!g_pxfail)
         kputs("[posixstrs] POSIX STRESS VERIFIED — fork/exec/waitpid, signal frames and pthread mutexes leak-free\n");
