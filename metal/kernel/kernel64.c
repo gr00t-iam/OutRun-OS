@@ -7201,6 +7201,44 @@ static int path_has_prefix(const char *name, const char *prefix) {
     return 1;
 }
 
+/* v0.83: read a BYTE RANGE of a tmp file — the counterpart to vfs_read_range,
+ * and the last thing standing between tmp descriptors and the parity the root
+ * volume got in v0.82.
+ *
+ * tmp storage is a flat buffer with a length rather than a chunk map, so this
+ * needs no walk: the range is a bounds check and one copy. `off` at or past the
+ * end is END OF FILE and returns 0, which is what makes a read loop terminate;
+ * returning an error there would make an ordinary end-of-file look like a
+ * fault.
+ *
+ * The copy happens under g_vfs_lock (rank 2), exactly as the whole-file reader
+ * has always done — the tmp buffer is shared state and a concurrent write must
+ * not tear it. The caller reads the descriptor offset under rank 1 and RELEASES
+ * it before calling here, so rank 1 is never held across this copy. */
+/* A tmp file's current length, under the VFS lock and nothing else — the tmp
+ * counterpart of vfs_len_of, so SEEK_END can ask the volume that actually owns
+ * the descriptor instead of indexing DENTS with a tmp index. */
+static uint32_t tmp_len_of(int ti) {
+    if (ti < 0 || ti >= TMP_MAXFILES) return 0;
+    klock_acquire(&g_vfs_lock);
+    uint32_t n = g_tmpfiles[ti].used ? g_tmpfiles[ti].len : 0;
+    klock_release(&g_vfs_lock);
+    return n;
+}
+
+static int64_t tmp_read_range(int ti, uint64_t off, void *buf, uint32_t max) {
+    if (ti < 0 || ti >= TMP_MAXFILES) return -1;
+    klock_acquire(&g_vfs_lock);
+    if (!g_tmpfiles[ti].used) { klock_release(&g_vfs_lock); return -1; }
+    uint32_t flen = g_tmpfiles[ti].len;
+    if (off >= (uint64_t)flen) { klock_release(&g_vfs_lock); return 0; }   /* EOF */
+    uint32_t n = flen - (uint32_t)off;
+    if (n > max) n = max;
+    cmemcpy(buf, g_tmpfiles[ti].data + off, n);
+    klock_release(&g_vfs_lock);
+    return (int64_t)n;
+}
+
 static int64_t tmp_read_file(int ti, void *buf, uint32_t max) {
     if (ti < 0 || ti >= TMP_MAXFILES) return -1;
     klock_acquire(&g_vfs_lock);            /* reuses rank 2: VFS-adjacent, not CAS state */
@@ -14544,13 +14582,31 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                     klock_release(&g_ofile_lock);
                 }
             }
-            /* v0.82: VOL_TMP is deliberately NOT positional yet — tmp has no
-             * range reader, and inventing one is a separate change with its own
-             * evidence. SYS_LSEEK on a tmp descriptor therefore moves an offset
-             * its reads still ignore. Named here rather than left to be
-             * discovered, because that is precisely the inert-syscall trap this
-             * change exists to remove from VOL_ROOT. */
-            else if (vol == VOL_TMP)  n = tmp_read_file(di, (void *)a1, len);
+            /* v0.83: VOL_TMP is positional too, closing the parity gap v0.82
+             * opened and named here. Same shape as the root path above and for
+             * the same reason: the offset is read under g_ofile_lock (rank 1)
+             * and that lock is RELEASED before tmp_read_range is called, so
+             * rank 1 is never held across the copy or across the rank-2 lock
+             * that guards the tmp buffer.
+             *
+             * NOTE THE REMAINING ASYMMETRY, deliberately not fixed here: tmp
+             * WRITES are still whole-file and still ignore the cursor. Seeking a
+             * tmp descriptor and writing replaces the file rather than
+             * overwriting at the offset. Reads and writes on tmp therefore
+             * disagree about what the position means, and that is exactly the
+             * kind of half-migration this comment existed to flag last time. */
+            else if (vol == VOL_TMP) {
+                uint64_t toff;
+                klock_acquire(&g_ofile_lock);
+                toff = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
+                klock_release(&g_ofile_lock);
+                n = tmp_read_range(di, toff, (void *)a1, len);
+                if (n > 0) {
+                    klock_acquire(&g_ofile_lock);
+                    if (g_ofiles[fd].used) g_ofiles[fd].off = toff + (uint64_t)n;
+                    klock_release(&g_ofile_lock);
+                }
+            }
             else if (vol == VOL_PIPE) n = pipe_read_fd(fd, (void *)a1, len);   /* v0.59 */
             else if (vol == VOL_EVFD) n = evfd_read_fd(fd, (void *)a1, len);   /* v0.64 */
             else if (vol == VOL_DEV)  n = dev_read_file((void *)a1, len);
@@ -17308,23 +17364,54 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (fd < 0 || fd >= 16)          return (uint64_t)-9;    /* EBADF       */
         if (whence < 0 || whence > 2)    return (uint64_t)-22;   /* EINVAL      */
 
+        /* v0.83: TWO PHASES, and SEEK_END now asks the right volume.
+         *
+         * The single-section version read DENTS[di].len for SEEK_END. That is
+         * correct for a root descriptor and WRONG for a tmp one, because
+         * ofile.dirent holds a TMP INDEX for VOL_TMP — so SEEK_END on a tmp file
+         * returned the length of whatever unrelated root dirent shared that
+         * number. It could not be observed while tmp reads ignored the offset
+         * entirely; making them positional is what gave it teeth, which is the
+         * usual way a latent bug becomes a live one.
+         *
+         * Resolving a length can therefore mean touching tmp state under
+         * g_vfs_lock (rank 2), and rather than nest that inside rank 1 — legal
+         * by rank, but an argument nobody should have to re-derive — the
+         * descriptor is snapshotted, the lock released, the length resolved,
+         * and the lock retaken to store. The fd is re-validated on the way back
+         * in because it could have been closed in between. */
+        int snap_vol, snap_di;
+        uint64_t snap_off;
         int64_t rc;
+
         klock_acquire(&g_ofile_lock);
         if (!g_ofiles[fd].used ||
             !(g_ofiles[fd].owner_mask & (1ull << fd_owner()))) {
-            rc = -9;                                             /* EBADF       */
-        } else if (g_ofiles[fd].pipe >= 0 || g_ofiles[fd].ep >= 0 ||
-                   g_ofiles[fd].efd  >= 0 || g_ofiles[fd].sock >= 0) {
-            rc = -29;                                            /* ESPIPE      */
-        } else {
-            int di = g_ofiles[fd].dirent;
-            int64_t base = whence == 0 ? 0
-                         : whence == 1 ? (int64_t)g_ofiles[fd].off
-                         : (di >= 0 ? (int64_t)DENTS[di].len : 0);  /* SEEK_END */
-            int64_t want = base + rel;
-            if (want < 0) rc = -22;                              /* EINVAL      */
-            else { g_ofiles[fd].off = (uint64_t)want; rc = want; }
+            klock_release(&g_ofile_lock);
+            return (uint64_t)-9;                                 /* EBADF       */
         }
+        if (g_ofiles[fd].pipe >= 0 || g_ofiles[fd].ep >= 0 ||
+            g_ofiles[fd].efd  >= 0 || g_ofiles[fd].sock >= 0) {
+            klock_release(&g_ofile_lock);
+            return (uint64_t)-29;                                /* ESPIPE      */
+        }
+        snap_vol = g_ofiles[fd].volume;
+        snap_di  = g_ofiles[fd].dirent;
+        snap_off = g_ofiles[fd].off;
+        klock_release(&g_ofile_lock);
+
+        int64_t base;
+        if (whence == 0)      base = 0;
+        else if (whence == 1) base = (int64_t)snap_off;
+        else                  base = (snap_vol == VOL_TMP) ? (int64_t)tmp_len_of(snap_di)
+                                   : (snap_di >= 0 ? (int64_t)vfs_len_of(snap_di) : 0);
+        int64_t want = base + rel;
+        if (want < 0) return (uint64_t)-22;                      /* EINVAL      */
+
+        klock_acquire(&g_ofile_lock);
+        if (!g_ofiles[fd].used ||
+            !(g_ofiles[fd].owner_mask & (1ull << fd_owner()))) rc = -9;
+        else { g_ofiles[fd].off = (uint64_t)want; rc = want; }
         klock_release(&g_ofile_lock);
         return (uint64_t)rc;
     }
@@ -19133,13 +19220,23 @@ static void cmd_vfs_stress(void) {
             ls >= 1664 && ls <= 1666 ? "could not re-author the file with O_TRUNC" :
             ls == 1667               ? "*** O_TRUNC did not empty the file — re-authoring left the old tail" :
             ls == 1668               ? "the re-authored content is wrong" :
+            /* v0.83: the VOL_TMP positional-read half. */
+            ls == 1670 || ls == 1671 ? "could not author the tmp probe file" :
+            ls == 1672               ? "could not reopen the tmp probe file" :
+            ls >= 1673 && ls <= 1677 ? "*** sequential tmp reads did not advance — both returned the same bytes" :
+            ls >= 1678 && ls <= 1681 ? "a mid-file partial read on tmp landed or truncated wrongly" :
+            ls == 1682 || ls == 1684 ? "a tmp read past EOF did not return 0" :
+            ls == 1683               ? "seeking past the end of a tmp file was refused" :
+            ls == 1685 || ls == 1686 ? "*** SEEK_END on a TMP descriptor resolved against the wrong volume" :
+            ls >= 1687 && ls <= 1691 ? "a tmp rewind or end-relative read returned the wrong bytes" :
                                        "unknown";
         if (ls != LSEEK_WORKER_OK)
             kprintf("[vfsstrs] ring-3 lseek: worker exit %d — %s\n", (uint64_t)ls, why);
-        vfscheck("the file position drives BOTH reads and writes from ring 3 "
+        vfscheck("the file position drives reads and writes on BOTH volumes from ring 3 "
                  "(rewind re-reads the same bytes; a mid-file write overwrites in place and "
                  "keeps the tail; sequential writes advance the cursor; a write past EOF extends "
-                 "with a zero-filled hole; O_TRUNC empties on open; refusals leave the offset alone)",
+                 "with a zero-filled hole; O_TRUNC empties on open; tmp reads advance, bound at "
+                 "EOF and resolve SEEK_END against their own volume; refusals leave the offset alone)",
                  ls == LSEEK_WORKER_OK);
     }
 

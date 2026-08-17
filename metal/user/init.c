@@ -2680,6 +2680,65 @@ static void lseek_worker(void) {
       if (c[0] != 'h' || c[1] != 'i')           sysc(SYS_EXIT, 1668, 0, 0);
       oclose(v); }
 
+    /* ==================================================================
+     * v0.83: VOL_TMP POSITIONAL READS — descriptor parity with the root
+     * volume. tmp is a flat RAM buffer on a different code path, so none of
+     * the coverage above says anything about it.
+     * ================================================================== */
+    /* REUSES tmp/scratch rather than claiming a new name, and that is a
+     * constraint rather than a preference: TMP_MAXFILES is 4, all four slots
+     * are already spoken for (scratch, redir.txt, one.txt, two.txt), and a tmp
+     * slot can never be released — vfs_unlink resolves through DENTS and has no
+     * tmp path at all. Claiming a fifth name starved vsh of the one it needed
+     * and failed pipestrs with "cannot create tmp/two.txt". scratch is already
+     * scratch by name and purpose, and every suite that uses it authors it
+     * fresh before reading, so reusing it costs nothing. */
+    { int t = ocreat("tmp/scratch");
+      if (t < 0) sysc(SYS_EXIT, 1670, 0, 0);
+      if (owrite(t, alpha, LS_N) != LS_N) sysc(SYS_EXIT, 1671, 0, 0);
+      oclose(t); }
+
+    { int t = oopen("tmp/scratch");
+      if (t < 0) sysc(SYS_EXIT, 1672, 0, 0);
+      char b[LS_N + 8];
+
+      /* SEQUENTIAL ADVANCEMENT: two reads with no seek must return DIFFERENT,
+       * consecutive halves. Before v0.83 both returned the opening bytes, and
+       * a tmp read loop could never reach EOF. */
+      if (oread(t, b, 5) != 5)                  sysc(SYS_EXIT, 1673, 0, 0);
+      if (b[0] != 'A' || b[4] != 'E')           sysc(SYS_EXIT, 1674, 0, 0);
+      if (olseek(t, 0, SEEK_CUR) != 5)          sysc(SYS_EXIT, 1675, 0, 0);
+      if (oread(t, b, 5) != 5)                  sysc(SYS_EXIT, 1676, 0, 0);
+      if (b[0] != 'F' || b[4] != 'J')           sysc(SYS_EXIT, 1677, 0, 0);
+
+      /* Arbitrary offset, and a MID-FILE PARTIAL read: 10 bytes asked for at
+       * offset 20 of a 26-byte file must return the 6 that exist, not 10 and
+       * not an error. */
+      if (olseek(t, 20, SEEK_SET) != 20)        sysc(SYS_EXIT, 1678, 0, 0);
+      if (oread(t, b, 10) != 6)                 sysc(SYS_EXIT, 1679, 0, 0);
+      if (b[0] != 'U' || b[5] != 'Z')           sysc(SYS_EXIT, 1680, 0, 0);
+      if (olseek(t, 0, SEEK_CUR) != LS_N)       sysc(SYS_EXIT, 1681, 0, 0);  /* landed at EOF */
+
+      /* READ PAST EOF is 0 bytes, not an error — that is what ends a loop. */
+      if (oread(t, b, 4) != 0)                  sysc(SYS_EXIT, 1682, 0, 0);
+      if (olseek(t, 100, SEEK_SET) != 100)      sysc(SYS_EXIT, 1683, 0, 0);
+      if (oread(t, b, 4) != 0)                  sysc(SYS_EXIT, 1684, 0, 0);
+
+      /* SEEK_END on a TMP descriptor. This is the one that was quietly wrong:
+       * ofile.dirent holds a tmp INDEX, so resolving the end through DENTS[]
+       * returned an unrelated root file's length. Invisible while tmp reads
+       * ignored the offset; load-bearing now. */
+      if (olseek(t, 0, SEEK_END) != LS_N)       sysc(SYS_EXIT, 1685, 0, 0);
+      if (olseek(t, -6, SEEK_END) != LS_N - 6)  sysc(SYS_EXIT, 1686, 0, 0);
+      if (oread(t, b, 6) != 6)                  sysc(SYS_EXIT, 1687, 0, 0);
+      if (b[0] != 'U' || b[5] != 'Z')           sysc(SYS_EXIT, 1688, 0, 0);
+
+      /* And the rewind, so a tmp file can be re-read like any other. */
+      if (olseek(t, 0, SEEK_SET) != 0)          sysc(SYS_EXIT, 1689, 0, 0);
+      if (oread(t, b, 3) != 3)                  sysc(SYS_EXIT, 1690, 0, 0);
+      if (b[0] != 'A' || b[2] != 'C')           sysc(SYS_EXIT, 1691, 0, 0);
+      oclose(t); }
+
     ounlink("/lseek-seq");
     ounlink(LS_PATH);
     sysc(SYS_EXIT, 42, 0, 0);
