@@ -7190,7 +7190,13 @@ static void udb_load(void) {
 #define F_SETFL       4
 #define SOCK_NONBLOCK 0x800   /* OR into SYS_SOCKET's `type`, as Linux has it */
 
-#define TMP_MAXFILES 4                 /* small, ephemeral, RAM-only scratch area */
+/* v0.83: 4 -> 8. Headroom, not a fix: the fix is that vfs_unlink can now
+ * release a tmp slot at all. Four slots with no way to free one meant the
+ * volume was permanently full the moment four names existed, and the four in
+ * use (scratch, redir.txt, one.txt, two.txt) were exactly four. Doubling costs
+ * 2 KiB of BSS and buys room for a test to claim a name without deciding
+ * whether vsh gets to run. */
+#define TMP_MAXFILES 8                 /* small, ephemeral, RAM-only scratch area */
 #define TMP_MAXBYTES 512
 struct tmpfile { char name[VFS_NAME_MAX]; int used; uint32_t len; uint8_t data[TMP_MAXBYTES]; };
 static struct tmpfile g_tmpfiles[TMP_MAXFILES];
@@ -7248,6 +7254,44 @@ static int64_t tmp_read_file(int ti, void *buf, uint32_t max) {
     klock_release(&g_vfs_lock);
     return (int64_t)n;
 }
+/* v0.83: WRITE AT AN OFFSET into a tmp file, tail preserved — the counterpart
+ * of vfs_write_at, and what finally makes reads and writes on a tmp descriptor
+ * agree about what the position means.
+ *
+ * Simpler than the root version in one important way: tmp storage IS the
+ * buffer, so there is no read-modify-write and no staging. The bytes are
+ * overwritten in place under the same rank-2 lock that guards every other tmp
+ * mutation, and the length only moves when the write actually reaches past the
+ * old end. A write wholly inside the file leaves len alone, which is what keeps
+ * the tail.
+ *
+ * The 512-byte capacity is a hard wall rather than a truncation: a write that
+ * would run past it is refused with ENOSPC and NOTHING is copied, because a
+ * partial write here would leave the file holding a mixture of old and new
+ * bytes with a length that describes neither. Clamping len to the capacity and
+ * copying what fits was the other option and is worse — it reports success for
+ * a write that silently lost its tail.
+ *
+ * Sparse gaps are zero-filled for the same reason they are on the root volume:
+ * POSIX says a hole reads as zeroes, and since tmp keeps whole contents in a
+ * flat buffer there is no cheaper representation to preserve. */
+static int64_t tmp_write_at(int ti, uint64_t off, const void *data, uint32_t len) {
+    if (ti < 0 || ti >= TMP_MAXFILES) return -1;
+    if (!len) return 0;
+    if (off + (uint64_t)len > (uint64_t)TMP_MAXBYTES) return -28;   /* ENOSPC */
+
+    klock_acquire(&g_vfs_lock);
+    if (!g_tmpfiles[ti].used) { klock_release(&g_vfs_lock); return -1; }
+    uint32_t flen = g_tmpfiles[ti].len;
+    if (off > (uint64_t)flen)                                       /* the hole reads as zeroes */
+        cmemset(g_tmpfiles[ti].data + flen, 0, (uint32_t)(off - (uint64_t)flen));
+    cmemcpy(g_tmpfiles[ti].data + off, data, len);
+    uint32_t nlen = (uint32_t)(off + (uint64_t)len);
+    if (nlen > flen) g_tmpfiles[ti].len = nlen;                     /* else the TAIL SURVIVES */
+    klock_release(&g_vfs_lock);
+    return (int64_t)len;
+}
+
 static int tmp_write_file(int ti, const void *data, uint32_t len) {
     if (ti < 0 || ti >= TMP_MAXFILES) return -1;
     if (len > TMP_MAXBYTES) len = TMP_MAXBYTES;
@@ -7833,10 +7877,22 @@ static int vfs_open_for(const char *name, int owner, int creat, int trunc) {
         int ti = -1;
         for (int i = 0; i < TMP_MAXFILES; i++)
             if (g_tmpfiles[i].used && streq_n(g_tmpfiles[i].name, rest, VFS_NAME_MAX)) { ti = i; break; }
+        /* NOTE: tmp open auto-creates regardless of O_CREAT, and that is
+         * long-standing behaviour other callers rely on — SYS_OPEN("tmp/scratch",
+         * 0) expects a usable descriptor. Left exactly as it was; only the
+         * truncation below is new. */
         if (ti < 0) for (int i = 0; i < TMP_MAXFILES; i++) if (!g_tmpfiles[i].used) {
             ti = i; g_tmpfiles[i].used = 1; g_tmpfiles[i].len = 0;
             kstrcpy_n(g_tmpfiles[i].name, rest, VFS_NAME_MAX); break;
         }
+        /* v0.83: O_TRUNC applies to tmp as well, and it has to. Until this
+         * release a tmp write replaced the whole file, so "author this" needed
+         * no flag; now that tmp writes are POSITIONAL and preserve the tail,
+         * re-authoring an existing name would leave the old bytes past the new
+         * end. Length only — the data below it is overwritten by the write that
+         * follows, and zeroing 512 bytes on every open would be work nobody
+         * asked for. */
+        if (ti >= 0 && trunc) g_tmpfiles[ti].len = 0;
         klock_release(&g_vfs_lock);
         if (ti < 0) return -1;
         return ofile_claim(owner, VOL_TMP, ti);
@@ -7934,6 +7990,44 @@ static int vfs_open_trunc(const char *name) { return vfs_open_for(name, fd_owner
  * chunk_hash via dedup), so freeing them here could silently corrupt a
  * different, still-live file. Disclosed as a scope boundary, not fixed here.  */
 static int vfs_unlink(const char *name) {
+    /* v0.83: TMP PATHS RESOLVE HERE TOO, and until now they did not.
+     *
+     * This function only ever consulted DENTS, so `tmp/x` fell through
+     * vfs_find() and returned -1 — a tmp slot, once claimed, could never be
+     * released for the lifetime of the boot. With TMP_MAXFILES at 4 and four
+     * names already in use (scratch, redir.txt, one.txt, two.txt) the volume
+     * sat at exactly 100% capacity, and the next consumer to want a name
+     * starved vsh. That failure does not announce itself as "out of tmp slots":
+     * it surfaces as `vsh: cannot create tmp/two.txt` and a pipestrs assertion
+     * about shell pipelines, which is a long way from the cause.
+     *
+     * The slot is fully zeroed rather than just marked unused. tmpfile carries
+     * its name, length and 512 bytes of data inline, and a slot released with
+     * its bytes intact would hand the next claimant whatever the last file
+     * held — a leak of content across an allocation boundary, which is the same
+     * class of defect kproc_reset()'s memset backstop exists to prevent. */
+    if (path_has_prefix(name, "tmp/")) {
+        const char *rest = name + 4;
+        klock_acquire(&g_vfs_lock);
+        int ti = -1;
+        for (int i = 0; i < TMP_MAXFILES; i++)
+            if (g_tmpfiles[i].used && streq_n(g_tmpfiles[i].name, rest, VFS_NAME_MAX)) { ti = i; break; }
+        if (ti < 0) { klock_release(&g_vfs_lock); return -1; }
+        cmemset(&g_tmpfiles[ti], 0, sizeof g_tmpfiles[ti]);   /* name, len AND data */
+        klock_release(&g_vfs_lock);
+
+        /* Same "regardless of how it got there" teardown the root path does
+         * below: a descriptor still naming this slot must stop resolving, or it
+         * would read the next file to claim the index. Separate, non-nested
+         * section — rank 2 released before rank 1 is taken. */
+        klock_acquire(&g_ofile_lock);
+        for (int fd = 0; fd < 16; fd++)
+            if (g_ofiles[fd].used && g_ofiles[fd].volume == VOL_TMP && g_ofiles[fd].dirent == ti)
+                { g_ofiles[fd].used = 0; g_ofiles[fd].owner_mask = 0; }
+        klock_release(&g_ofile_lock);
+        return 0;
+    }
+
     klock_acquire(&g_vfs_lock);
     int idx = vfs_find(name);
     if (idx < 0) { klock_release(&g_vfs_lock); return -1; }
@@ -14589,12 +14683,9 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
              * rank 1 is never held across the copy or across the rank-2 lock
              * that guards the tmp buffer.
              *
-             * NOTE THE REMAINING ASYMMETRY, deliberately not fixed here: tmp
-             * WRITES are still whole-file and still ignore the cursor. Seeking a
-             * tmp descriptor and writing replaces the file rather than
-             * overwriting at the offset. Reads and writes on tmp therefore
-             * disagree about what the position means, and that is exactly the
-             * kind of half-migration this comment existed to flag last time. */
+             * v0.83 closed the asymmetry this comment used to flag: tmp WRITES
+             * are positional too (tmp_write_at), so reads and writes on a tmp
+             * descriptor finally agree about what the position means. */
             else if (vol == VOL_TMP) {
                 uint64_t toff;
                 klock_acquire(&g_ofile_lock);
@@ -14665,7 +14756,22 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                     klock_release(&g_ofile_lock);
                 }
             }
-            else if (vol == VOL_TMP)  r = tmp_write_file(di, (const void *)a1, len);
+            /* v0.83: positional, exactly as VOL_ROOT above. The offset is read
+             * under g_ofile_lock (rank 1), that lock RELEASED, and only then
+             * does tmp_write_at take g_vfs_lock (rank 2) to touch the buffer —
+             * rank 1 is never held across the copy. */
+            else if (vol == VOL_TMP) {
+                uint64_t toff;
+                klock_acquire(&g_ofile_lock);
+                toff = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
+                klock_release(&g_ofile_lock);
+                r = tmp_write_at(di, toff, (const void *)a1, len);
+                if (r > 0) {
+                    klock_acquire(&g_ofile_lock);
+                    if (g_ofiles[fd].used) g_ofiles[fd].off = toff + (uint64_t)r;
+                    klock_release(&g_ofile_lock);
+                }
+            }
             else if (vol == VOL_PIPE) r = pipe_write_fd(fd, (const void *)a1, len);        /* v0.59 */
             else if (vol == VOL_EVFD) r = evfd_write_fd(fd, (const void *)a1, len);        /* v0.64 */
             else if (vol == VOL_DEV)  r = -13;   /* read-only volume: capability-style denial */
@@ -15005,11 +15111,25 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
         char name[64];
         if (copy_user_str(kprocs[current_proc_idx].cr3, a0, name, sizeof name) < 0) return (uint64_t)-14;
-        if (path_has_prefix(name, "tmp/") || path_has_prefix(name, "dev/")) return (uint64_t)-1;  /* ROOT-only */
+        /* dev/ has nothing to unlink: it is a live VIEW of the device registry
+         * built fresh on every read, not a file. tmp/ USED to be refused here
+         * too, which is what made a tmp slot unreclaimable for the life of a
+         * boot — the kernel-side handler could resolve the name, but ring 3
+         * could never ask it to. v0.83 lets tmp through. */
+        if (path_has_prefix(name, "dev/")) return (uint64_t)-1;
         /* v0.72: removing a file is a WRITE to it. Checked before the witness
          * is entered so a refused unlink is not recorded as a filesystem
-         * mutation that never happened. */
-        {
+         * mutation that never happened.
+         *
+         * SKIPPED FOR TMP, and that is a disclosed boundary rather than an
+         * oversight: a tmpfile carries a name, a length and its bytes, with no
+         * uid, gid or mode to judge — there is nothing for vfs_permit to
+         * consult, and running the check anyway would resolve the name through
+         * DENTS and test an unrelated ROOT file's permissions. So any holder of
+         * PCAP_FILESYSTEM may unlink any tmp name. The volume is a shared
+         * ephemeral scratch area with no ownership model at all; giving unlink
+         * one while open, read and write have none would be theatre. */
+        if (!path_has_prefix(name, "tmp/")) {
             int L = tg_of((int)current_proc_idx);
             klock_acquire(&g_vfs_lock);
             int ui = vfs_find(name);
@@ -19229,6 +19349,16 @@ static void cmd_vfs_stress(void) {
             ls == 1683               ? "seeking past the end of a tmp file was refused" :
             ls == 1685 || ls == 1686 ? "*** SEEK_END on a TMP descriptor resolved against the wrong volume" :
             ls >= 1687 && ls <= 1691 ? "a tmp rewind or end-relative read returned the wrong bytes" :
+            /* v0.83: tmp positional writes and tmp unlink. */
+            ls >= 1692 && ls <= 1698 ? "a mid-file positional write on TMP did not land, or changed the length" :
+            ls == 1699               ? "*** the tmp mid-file write did not overwrite in place" :
+            ls == 1700               ? "*** the tmp mid-file write DESTROYED THE TAIL" :
+            ls >= 1701 && ls <= 1705 ? "a tmp write past EOF did not extend the file correctly" :
+            ls == 1706               ? "*** the tmp sparse gap did not read back as zeroes" :
+            ls == 1707               ? "the bytes written past the tmp EOF are not where they were put" :
+            ls == 1708 || ls == 1711 ? "*** unlinking a tmp path FAILED — the slot cannot be reclaimed" :
+            ls == 1709 || ls == 1710 ? "*** the reclaimed tmp slot came back with the dead file's contents" :
+            ls == 1712               ? "unlinking a tmp name that never existed reported success" :
                                        "unknown";
         if (ls != LSEEK_WORKER_OK)
             kprintf("[vfsstrs] ring-3 lseek: worker exit %d — %s\n", (uint64_t)ls, why);

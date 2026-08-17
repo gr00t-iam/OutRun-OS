@@ -881,6 +881,11 @@ static void vfs_driver(void) {
     u8 tpat[8]; for (int i = 0; i < 8; i++) tpat[i] = (u8)(pid >> (8 * i)) ^ 0x7C;
     if ((i64)sysc(SYS_WRITE_FILE, (u64)tfd, (u64)tpat, 8) != 8) sysc(SYS_EXIT, 1007, 0, 0);
     u8 trb[8];
+    /* v0.83: rewind before reading back. tmp writes became POSITIONAL in this
+     * release, so the write above left this descriptor at byte 8 and the read
+     * would otherwise start at EOF — the same correction role 9 needed on the
+     * root volume when writes there stopped resetting to zero. */
+    if ((i64)sysc(SYS_LSEEK, (u64)tfd, 0, (u64)SEEK_SET) != 0) sysc(SYS_EXIT, 1012, 0, 0);
     if ((i64)sysc(SYS_READ, (u64)tfd, (u64)trb, 8) != 8) sysc(SYS_EXIT, 1008, 0, 0);
     for (int i = 0; i < 8; i++) if (trb[i] != tpat[i]) sysc(SYS_EXIT, 1008, 0, 0);
     sysc(SYS_CLOSE, (u64)tfd, 0, 0);
@@ -2738,6 +2743,49 @@ static void lseek_worker(void) {
       if (oread(t, b, 3) != 3)                  sysc(SYS_EXIT, 1690, 0, 0);
       if (b[0] != 'A' || b[2] != 'C')           sysc(SYS_EXIT, 1691, 0, 0);
       oclose(t); }
+
+    /* (16) TMP POSITIONAL WRITES. Same three cases the root volume gets, on the
+     * volume that until v0.83 replaced its whole contents on every write. */
+    { int t = oopen("tmp/scratch");
+      if (t < 0) sysc(SYS_EXIT, 1692, 0, 0);
+      /* Mid-file overwrite: [10,13) becomes "xyz", length unchanged, tail kept. */
+      if (olseek(t, 10, SEEK_SET) != 10)        sysc(SYS_EXIT, 1693, 0, 0);
+      if (owrite(t, "xyz", 3) != 3)             sysc(SYS_EXIT, 1694, 0, 0);
+      if (olseek(t, 0, SEEK_CUR) != 13)         sysc(SYS_EXIT, 1695, 0, 0);  /* cursor advanced */
+      if (olseek(t, 0, SEEK_END) != LS_N)       sysc(SYS_EXIT, 1696, 0, 0);  /* length UNCHANGED */
+      if (olseek(t, 9, SEEK_SET) != 9)          sysc(SYS_EXIT, 1697, 0, 0);
+      char b[LS_N + 8];
+      if (oread(t, b, 6) != 6)                  sysc(SYS_EXIT, 1698, 0, 0);
+      if (b[0] != 'J' || b[1] != 'x' || b[3] != 'z')
+                                                sysc(SYS_EXIT, 1699, 0, 0);  /* overwrote in place */
+      if (b[4] != 'N')                          sysc(SYS_EXIT, 1700, 0, 0);  /* THE TAIL SURVIVED */
+
+      /* Extension past the old end, with a zero-filled hole before it. */
+      if (olseek(t, LS_N + 2, SEEK_SET) != LS_N + 2) sysc(SYS_EXIT, 1701, 0, 0);
+      if (owrite(t, "QQ", 2) != 2)              sysc(SYS_EXIT, 1702, 0, 0);
+      if (olseek(t, 0, SEEK_END) != LS_N + 4)   sysc(SYS_EXIT, 1703, 0, 0);  /* file EXTENDED */
+      if (olseek(t, LS_N, SEEK_SET) != LS_N)    sysc(SYS_EXIT, 1704, 0, 0);
+      if (oread(t, b, 4) != 4)                  sysc(SYS_EXIT, 1705, 0, 0);
+      if (b[0] || b[1])                         sysc(SYS_EXIT, 1706, 0, 0);  /* HOLE reads zero */
+      if (b[2] != 'Q' || b[3] != 'Q')           sysc(SYS_EXIT, 1707, 0, 0);
+      oclose(t); }
+
+    /* (17) TMP UNLINK, and the slot it frees. Before v0.83 vfs_unlink resolved
+     * only through DENTS, so a tmp name could never be removed and its slot was
+     * gone for the boot. The unlink must report success, the name must stop
+     * resolving as an EXISTING file, and — the part that matters — the freed
+     * slot must be reusable. */
+    { if (ounlink("tmp/scratch") != 0)          sysc(SYS_EXIT, 1708, 0, 0);
+      /* A tmp open auto-creates, so "is it gone" is asked by LENGTH: a fresh
+       * slot is empty, whereas the file just unlinked held LS_N + 4 bytes. */
+      int t = oopen("tmp/scratch");
+      if (t < 0)                                sysc(SYS_EXIT, 1709, 0, 0);
+      if (olseek(t, 0, SEEK_END) != 0)          sysc(SYS_EXIT, 1710, 0, 0);  /* empty, not stale */
+      oclose(t);
+      if (ounlink("tmp/scratch") != 0)          sysc(SYS_EXIT, 1711, 0, 0);
+      /* Unlinking a name that does not exist must FAIL rather than quietly
+       * succeed — otherwise nothing distinguishes "removed" from "never was". */
+      if (ounlink("tmp/never-existed") == 0)    sysc(SYS_EXIT, 1712, 0, 0); }
 
     ounlink("/lseek-seq");
     ounlink(LS_PATH);
