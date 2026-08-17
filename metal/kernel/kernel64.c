@@ -901,6 +901,11 @@ static uint64_t kernel_cr3 = 0;
 /* ---- Polyglot boundary: functions compiled from Rust and C++ -------------- */
 /* rust/cap_engine.rs (no_core Rust) — content hashing + the capability gate.  */
 extern uint64_t rust_cas_hash(uint64_t base, uint64_t len);
+/* v0.84: the same FNV-1a, resumable. Lets a file that exists only as a chunk
+ * map be hashed in slices and still produce the value the whole-buffer call
+ * would have. See vfs_write_at_locked(). */
+extern uint64_t rust_cas_hash_cont(uint64_t seed, uint64_t base, uint64_t len);
+#define FNV1A_SEED 0xcbf29ce484222325ull
 extern uint32_t rust_cap_check(uint64_t caps, uint64_t required);
 /* cpp/ipc_ring.cpp (freestanding C++) — zero-copy SPSC ring buffer.           */
 extern void     cpp_ring_init(void);
@@ -6593,6 +6598,46 @@ static uint64_t vfs_chunk_hash_at(const struct dirent *d, uint32_t i) {
     return blk[j % VFS_IND_PER_BLK];
 }
 
+/* v0.84: write a chunk-hash array into a dirent's direct and indirect map.
+ *
+ * Factored out of vfs_write_locked so the whole-file writer and the positional
+ * writer share ONE map builder. Two copies of this — direct slots, then a
+ * single-indirect block, then a double-indirect tree — is precisely the kind of
+ * duplicate that stays correct until one of them learns about a third level.
+ *
+ * Returns 0 if any cas_put failed; the CALLER owns the rollback, because only
+ * the caller knows what the dirent looked like before. */
+static int vfs_build_map_locked(struct dirent *d, const uint64_t *ch, uint32_t nch) {
+    int ok = 1;
+    for (uint32_t i = 0; i < nch && i < VFS_MAX_CHUNKS; i++) d->chunk_hash[i] = ch[i];
+    if (nch > VFS_MAX_CHUNKS) {                            /* single-indirect     */
+        uint64_t blk[VFS_IND_PER_BLK];
+        for (uint32_t k = 0; k < VFS_IND_PER_BLK; k++) {
+            uint32_t src = VFS_MAX_CHUNKS + k;
+            blk[k] = (src < nch) ? ch[src] : 0;
+        }
+        d->ind1_hash = cas_put(blk, sizeof blk);
+        if (!d->ind1_hash) ok = 0;
+    }
+    if (nch > VFS_CHUNKS_L1) {                             /* double-indirect     */
+        uint64_t l1[VFS_IND_PER_BLK], top[VFS_IND_PER_BLK];
+        uint32_t rem = nch - VFS_CHUNKS_L1;
+        uint32_t nl1 = (rem + VFS_IND_PER_BLK - 1) / VFS_IND_PER_BLK;
+        for (uint32_t g = 0; g < VFS_IND_PER_BLK; g++) {
+            if (g >= nl1) { top[g] = 0; continue; }
+            for (uint32_t k = 0; k < VFS_IND_PER_BLK; k++) {
+                uint32_t src = VFS_CHUNKS_L1 + g * VFS_IND_PER_BLK + k;
+                l1[k] = (src < nch) ? ch[src] : 0;
+            }
+            top[g] = cas_put(l1, sizeof l1);
+            if (!top[g]) ok = 0;
+        }
+        d->ind2_hash = cas_put(top, sizeof top);
+        if (!d->ind2_hash) ok = 0;
+    }
+    return ok;
+}
+
 static int vfs_write_locked(int idx, const char *name, const void *data, uint32_t len) {
     /* v0.56: refuse an oversized write instead of silently truncating it. The
      * old code clamped nchunks to 16 but still recorded the FULL len, so a
@@ -6624,32 +6669,7 @@ static int vfs_write_locked(int idx, const char *name, const void *data, uint32_
         ch[i] = cas_put(p + i * 512, cl);                  /* CAS stores each block */
         if (!ch[i]) put_failed = 1;                        /* 0 == "could not store" */
     }
-    for (uint32_t i = 0; i < nch && i < VFS_MAX_CHUNKS; i++) d->chunk_hash[i] = ch[i];
-    if (nch > VFS_MAX_CHUNKS) {                            /* single-indirect     */
-        uint64_t blk[VFS_IND_PER_BLK];
-        for (uint32_t k = 0; k < VFS_IND_PER_BLK; k++) {
-            uint32_t src = VFS_MAX_CHUNKS + k;
-            blk[k] = (src < nch) ? ch[src] : 0;
-        }
-        d->ind1_hash = cas_put(blk, sizeof blk);
-        if (!d->ind1_hash) put_failed = 1;
-    }
-    if (nch > VFS_CHUNKS_L1) {                             /* double-indirect     */
-        uint64_t l1[VFS_IND_PER_BLK], top[VFS_IND_PER_BLK];
-        uint32_t rem = nch - VFS_CHUNKS_L1;
-        uint32_t nl1 = (rem + VFS_IND_PER_BLK - 1) / VFS_IND_PER_BLK;
-        for (uint32_t g = 0; g < VFS_IND_PER_BLK; g++) {
-            if (g >= nl1) { top[g] = 0; continue; }
-            for (uint32_t k = 0; k < VFS_IND_PER_BLK; k++) {
-                uint32_t src = VFS_CHUNKS_L1 + g * VFS_IND_PER_BLK + k;
-                l1[k] = (src < nch) ? ch[src] : 0;
-            }
-            top[g] = cas_put(l1, sizeof l1);
-            if (!top[g]) put_failed = 1;
-        }
-        d->ind2_hash = cas_put(top, sizeof top);
-        if (!d->ind2_hash) put_failed = 1;
-    }
+    if (!vfs_build_map_locked(d, ch, nch)) put_failed = 1;
     if (put_failed) {
         *d = prev;                     /* the previous file survives untouched */
         kprintf("[vfs    ] reject '%s': the CAS could not store every chunk "
@@ -6684,6 +6704,111 @@ static int vfs_write_by_dirent(int di, const void *data, uint32_t len) {
     int r = vfs_write_locked(di, name, data, len);
     klock_release(&g_vfs_lock);
     return r;
+}
+
+/* v0.84: A POSITIONAL WRITE THROUGH THE CHUNK MAP, at any size.
+ *
+ * v0.83 implemented this by staging: read the whole file into a 32 KiB buffer,
+ * patch it, write it back. That worked and imposed a ceiling — a
+ * tail-preserving write anywhere in a file larger than REDIR_STAGE_MAX returned
+ * ENOSPC, so the only large writes the system could do were whole-file ones
+ * from offset 0. The ceiling was the buffer's, not the filesystem's.
+ *
+ * It goes away by not staging CONTENT at all. A file already IS an array of
+ * 512-byte CAS chunks, so a write touches only the chunks its byte range covers
+ * and every other chunk keeps the hash it already had. The largest thing this
+ * function holds is one 512-byte chunk.
+ *
+ * Which chunks are rebuilt:
+ *   - any chunk the write overlaps (head and tail partials are read, patched
+ *     and re-stored; fully covered ones are stored straight from the caller's
+ *     bytes);
+ *   - any chunk in the SPARSE GAP between the old end and `off`, stored as
+ *     zeroes, because POSIX says a hole reads as zeroes and this store has no
+ *     cheaper representation for one;
+ *   - the old final chunk when the file grows past it, since a 300-byte tail
+ *     chunk must become a full 512-byte chunk once bytes follow it.
+ * Everything else is REUSED by hash, which is what makes the cost proportional
+ * to the write rather than to the file.
+ *
+ * file_hash is recomputed by streaming the finished file back through the map
+ * with rust_cas_hash_cont(). Hashing the chunk-hash array would have been
+ * cheaper and wrong: the same bytes would then hash differently depending on
+ * which write path produced them, and SYS_STAT, omake's staleness check and the
+ * journal-recovery comparison all assume one identity per content.
+ *
+ * Rollback is the caller's dirent snapshot, exactly as vfs_write_locked does
+ * it: a half-built map is worse than a refused write, because the old file is
+ * already gone by then.
+ *
+ * Called with g_vfs_lock HELD. */
+static uint64_t g_wa_ch[VFS_MAX_FILE_BYTES / 512];   /* under g_vfs_lock */
+
+static int vfs_write_at_locked(int di, uint64_t off, const void *data, uint32_t len) {
+    struct dirent *d = &DENTS[di];
+    if (!d->used) return -1;
+    uint32_t oldlen = d->len;
+    uint64_t end = off + (uint64_t)len;
+    if (end > (uint64_t)VFS_MAX_FILE_BYTES) return -28;          /* ENOSPC */
+    uint32_t newlen = (uint32_t)(end > (uint64_t)oldlen ? end : (uint64_t)oldlen);
+    uint32_t nch    = (newlen + 511) / 512;
+    uint32_t oldnch = (oldlen + 511) / 512;
+
+    struct dirent prev = *d;
+    const uint8_t *src = (const uint8_t *)data;
+    uint8_t blk[512];
+    int put_failed = 0;
+
+    for (uint32_t i = 0; i < nch; i++) {
+        uint64_t cstart = (uint64_t)i * 512;
+        uint64_t cend   = cstart + 512;
+        uint32_t clen   = (newlen - (uint32_t)cstart) < 512 ? (newlen - (uint32_t)cstart) : 512;
+
+        /* REUSE: this chunk is untouched by the write AND was already a whole
+         * chunk of the old file, so its hash still describes its bytes. */
+        int overlaps = !(cend <= off || cstart >= end);
+        int was_whole = (cstart + 512 <= (uint64_t)oldlen);
+        if (!overlaps && was_whole && i < oldnch) {
+            g_wa_ch[i] = vfs_chunk_hash_at(&prev, i);
+            if (!g_wa_ch[i]) put_failed = 1;                     /* a hole where content was */
+            continue;
+        }
+
+        /* REBUILD: start from what the chunk already held, or zeroes if it is
+         * past the old end (a gap, or fresh growth). */
+        for (uint32_t k = 0; k < 512; k++) blk[k] = 0;
+        if (i < oldnch && cstart < (uint64_t)oldlen) {
+            uint64_t oh = vfs_chunk_hash_at(&prev, i);
+            if (oh) cas_get(oh, blk, 512);      /* short/absent -> the zeroes stand */
+        }
+        if (overlaps) {                          /* overlay the caller's bytes */
+            uint64_t s = off   > cstart ? off   : cstart;
+            uint64_t e = end   < cend   ? end   : cend;
+            for (uint64_t b = s; b < e; b++) blk[b - cstart] = src[b - off];
+        }
+        g_wa_ch[i] = cas_put(blk, clen);
+        if (!g_wa_ch[i]) put_failed = 1;
+    }
+
+    cmemset(d->chunk_hash, 0, sizeof d->chunk_hash);
+    d->ind1_hash = 0; d->ind2_hash = 0;
+    d->len = newlen; d->nchunks = nch;
+    if (!vfs_build_map_locked(d, g_wa_ch, nch)) put_failed = 1;
+    if (put_failed) { *d = prev; return -1; }
+
+    /* Identity, streamed: FNV-1a folded chunk by chunk gives exactly what
+     * hashing the whole file in one buffer would. */
+    uint64_t h = FNV1A_SEED;
+    for (uint32_t i = 0; i < nch; i++) {
+        uint32_t clen = (newlen - i * 512) < 512 ? (newlen - i * 512) : 512;
+        uint64_t hh = vfs_chunk_hash_at(d, i);
+        for (uint32_t k = 0; k < 512; k++) blk[k] = 0;
+        if (hh) cas_get(hh, blk, 512);
+        h = rust_cas_hash_cont(h, (uint64_t)blk, clen);
+    }
+    d->file_hash = newlen ? h : 0;
+    vfs_journal_commit();
+    return (int)len;
 }
 static int64_t vfs_read_file(int idx, void *buf, uint32_t max);   /* fwd: v0.66 */
 static void thread_tlb_release(uint64_t va, uint32_t pages);      /* fwd: v0.66 */
@@ -14484,29 +14609,24 @@ static int64_t vfs_write_at(int di, uint64_t off, const void *data, uint32_t len
         return r < 0 ? (int64_t)r : (int64_t)len;
     }
 
-    /* Everything below genuinely has a tail to keep, and pays the buffer's cap
-     * for it — the same cap, and the same ENOSPC-rather-than-truncate rule,
-     * that the redirect append above has always had. */
-    if (off > (uint64_t)REDIR_STAGE_MAX || off + (uint64_t)len > (uint64_t)REDIR_STAGE_MAX)
-        return -28;                                         /* ENOSPC */
-
-    klock_acquire(&g_redir_lock);
-    int64_t have = vfs_read_file(di, g_redir_stage, REDIR_STAGE_MAX);
-    if (have < 0) have = 0;                                 /* empty or new file */
-    /* A file already at the cap cannot be safely rewritten: the read above is
-     * capped too, so writing back would silently shorten it. */
-    if ((uint32_t)have >= REDIR_STAGE_MAX && off + (uint64_t)len > (uint64_t)have) {
-        klock_release(&g_redir_lock);
-        return -28;                                         /* ENOSPC */
-    }
-    if (off > (uint64_t)have)                               /* the hole reads as zeroes */
-        cmemset(g_redir_stage + have, 0, (uint64_t)off - (uint64_t)have);
-    cmemcpy(g_redir_stage + off, data, len);
-    uint32_t nlen = (uint32_t)(off + (uint64_t)len);
-    if (nlen < (uint32_t)have) nlen = (uint32_t)have;       /* the tail SURVIVES */
-    int r = vfs_write_by_dirent(di, g_redir_stage, nlen);
-    klock_release(&g_redir_lock);
-    return r < 0 ? (int64_t)r : (int64_t)len;
+    /* v0.84: everything below genuinely has a tail to keep, and now goes through
+     * the CHUNK MAP rather than a staging buffer.
+     *
+     * This used to read the whole file into g_redir_stage (32 KiB), patch it and
+     * write it back, which meant a tail-preserving write into any file larger
+     * than that buffer returned ENOSPC. The limit was the buffer's, not the
+     * filesystem's — VFS_MAX_FILE_BYTES is 256 KiB — so large files could only
+     * ever be replaced whole, never edited. vfs_write_at_locked touches only the
+     * chunks the write covers and holds one 512-byte block at a time.
+     *
+     * g_redir_lock (rank 0) is no longer taken here at all: there is no shared
+     * staging buffer left to protect on this path. Only g_vfs_lock (rank 2) is
+     * held, and the caller has already released g_ofile_lock (rank 1), so
+     * nothing is nested. */
+    klock_acquire(&g_vfs_lock);
+    int64_t r = (int64_t)vfs_write_at_locked(di, off, data, len);
+    klock_release(&g_vfs_lock);
+    return r;
 }
 
 static int64_t redirect_read_bytes(int fd, void *buf, uint32_t len) {
@@ -19359,6 +19479,17 @@ static void cmd_vfs_stress(void) {
             ls == 1708 || ls == 1711 ? "*** unlinking a tmp path FAILED — the slot cannot be reclaimed" :
             ls == 1709 || ls == 1710 ? "*** the reclaimed tmp slot came back with the dead file's contents" :
             ls == 1712               ? "unlinking a tmp name that never existed reported success" :
+            /* v0.84: positional writes past the old 32 KiB staging ceiling. */
+            ls == 1721 || ls == 1726 || ls == 1741
+                                     ? "*** ENOSPC on a positional write past 32 KiB — the staging ceiling is back" :
+            ls >= 1720 && ls <= 1724 ? "could not build the 40 KiB probe file" :
+            ls >= 1725 && ls <= 1729 ? "a mid-file write past 32 KiB did not land, or changed the length" :
+            ls >= 1730 && ls <= 1733 ? "the >32 KiB mid-file write did not read back" :
+            ls == 1734 || ls == 1735 ? "*** the >32 KiB write DESTROYED THE TAIL behind it" :
+            ls >= 1736 && ls <= 1738 ? "*** a chunk reused by hash came back with the wrong bytes" :
+            ls >= 1739 && ls <= 1745 ? "extending a file past 32 KiB failed" :
+            ls == 1746               ? "*** the sparse hole past 32 KiB did not read back as zeroes" :
+            ls == 1747               ? "the bytes written past 45000 are not where they were put" :
                                        "unknown";
         if (ls != LSEEK_WORKER_OK)
             kprintf("[vfsstrs] ring-3 lseek: worker exit %d — %s\n", (uint64_t)ls, why);

@@ -2516,6 +2516,13 @@ static void posix_orphan_child(void) {
 #define LS_PATH "/lseek-probe"
 #define LS_N    26
 
+/* v0.84: 10 x 4 KiB = 40 KiB, comfortably past the old 32 KiB staging ceiling
+ * and well under VFS_MAX_FILE_BYTES. The buffer is file-scope rather than on
+ * the stack because a ring-3 worker's stack is not the place for 4 KiB. */
+#define LSB_CHUNK 4096
+#define LSB_N     10
+static u8 g_lsb[LSB_CHUNK];
+
 /* Defined with the other VFS helpers further down; declared here because this
  * worker removes its own probe file. The dirty-volume gate reuses one image
  * across three boots, so a suite that leaves litter behind changes the state
@@ -2786,6 +2793,79 @@ static void lseek_worker(void) {
       /* Unlinking a name that does not exist must FAIL rather than quietly
        * succeed — otherwise nothing distinguishes "removed" from "never was". */
       if (ounlink("tmp/never-existed") == 0)    sysc(SYS_EXIT, 1712, 0, 0); }
+
+    /* ==================================================================
+     * v0.84: POSITIONAL WRITES PAST THE OLD 32 KiB STAGING CEILING.
+     *
+     * Until this release a tail-preserving write was staged through a 32 KiB
+     * buffer, so any positional write whose range ended beyond that returned
+     * ENOSPC (-28) — large files could be replaced whole but never edited. The
+     * assertions below all sit past 32768 on purpose; every one of them would
+     * have failed with -28 before the chunk-map rewrite.
+     * ================================================================== */
+    { int f = ocreat("/lseek-big");
+      if (f < 0) sysc(SYS_EXIT, 1720, 0, 0);
+      /* Build 40 KiB with sequential 4 KiB writes. The later ones already run
+       * past the old ceiling, so this loop is itself the first assertion. */
+      for (int i = 0; i < LSB_N; i++) {
+          for (int k = 0; k < LSB_CHUNK; k++) g_lsb[k] = (u8)(i * 7 + k);
+          i64 w = owrite(f, (const char *)g_lsb, LSB_CHUNK);
+          if (w == -28) sysc(SYS_EXIT, 1721, 0, 0);   /* ENOSPC: the ceiling is back */
+          if (w != LSB_CHUNK) sysc(SYS_EXIT, 1722, 0, 0);
+      }
+      if (olseek(f, 0, SEEK_END) != LSB_N * LSB_CHUNK) sysc(SYS_EXIT, 1723, 0, 0);
+      oclose(f); }
+
+    { int f = oopen("/lseek-big");
+      if (f < 0) sysc(SYS_EXIT, 1724, 0, 0);
+      /* A mid-file overwrite at 36000 — past the old ceiling, and deliberately
+       * NOT on a 512-byte chunk boundary, so it straddles two chunks and
+       * exercises both partial-chunk rebuilds. */
+      if (olseek(f, 36000, SEEK_SET) != 36000)  sysc(SYS_EXIT, 1725, 0, 0);
+      i64 w = owrite(f, "OUTRUN84", 8);
+      if (w == -28)                             sysc(SYS_EXIT, 1726, 0, 0);  /* ENOSPC */
+      if (w != 8)                               sysc(SYS_EXIT, 1727, 0, 0);
+      if (olseek(f, 0, SEEK_CUR) != 36008)      sysc(SYS_EXIT, 1728, 0, 0);
+      if (olseek(f, 0, SEEK_END) != LSB_N * LSB_CHUNK) sysc(SYS_EXIT, 1729, 0, 0); /* length UNCHANGED */
+      oclose(f); }
+
+    { int f = oopen("/lseek-big");
+      if (f < 0) sysc(SYS_EXIT, 1730, 0, 0);
+      char c[16];
+      if (olseek(f, 36000, SEEK_SET) != 36000)  sysc(SYS_EXIT, 1731, 0, 0);
+      if (oread(f, c, 8) != 8)                  sysc(SYS_EXIT, 1732, 0, 0);
+      if (c[0] != 'O' || c[7] != '4')           sysc(SYS_EXIT, 1733, 0, 0);
+      /* THE TAIL, past the write and past the old ceiling, must be the original
+       * pattern: byte p was written as (u8)(p/4096 * 7 + p%4096). */
+      if (oread(f, c, 8) != 8)                  sysc(SYS_EXIT, 1734, 0, 0);
+      for (int j = 0; j < 8; j++) {
+          int p = 36008 + j;
+          if ((u8)c[j] != (u8)((p / LSB_CHUNK) * 7 + (p % LSB_CHUNK)))
+                                                sysc(SYS_EXIT, 1735, 0, 0);
+      }
+      /* And a byte far BEFORE the write is equally untouched — the chunks that
+       * were reused by hash rather than rebuilt. */
+      if (olseek(f, 1000, SEEK_SET) != 1000)    sysc(SYS_EXIT, 1736, 0, 0);
+      if (oread(f, c, 1) != 1)                  sysc(SYS_EXIT, 1737, 0, 0);
+      if ((u8)c[0] != (u8)((1000 / LSB_CHUNK) * 7 + (1000 % LSB_CHUNK)))
+                                                sysc(SYS_EXIT, 1738, 0, 0);
+      oclose(f); }
+
+    { int f = oopen("/lseek-big");
+      if (f < 0) sysc(SYS_EXIT, 1739, 0, 0);
+      /* EXTENSION past the old ceiling, with a sparse hole before it. */
+      if (olseek(f, 45000, SEEK_SET) != 45000)  sysc(SYS_EXIT, 1740, 0, 0);
+      i64 w = owrite(f, "ZZZZ", 4);
+      if (w == -28)                             sysc(SYS_EXIT, 1741, 0, 0);  /* ENOSPC */
+      if (w != 4)                               sysc(SYS_EXIT, 1742, 0, 0);
+      if (olseek(f, 0, SEEK_END) != 45004)      sysc(SYS_EXIT, 1743, 0, 0);
+      char c[8];
+      if (olseek(f, 44996, SEEK_SET) != 44996)  sysc(SYS_EXIT, 1744, 0, 0);
+      if (oread(f, c, 8) != 8)                  sysc(SYS_EXIT, 1745, 0, 0);
+      if (c[0] || c[1] || c[2] || c[3])         sysc(SYS_EXIT, 1746, 0, 0);  /* HOLE reads zero */
+      if (c[4] != 'Z' || c[7] != 'Z')           sysc(SYS_EXIT, 1747, 0, 0);
+      oclose(f); }
+    ounlink("/lseek-big");
 
     ounlink("/lseek-seq");
     ounlink(LS_PATH);

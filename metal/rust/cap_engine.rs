@@ -43,11 +43,20 @@ impl BitAnd for u64   { type Output = u64;   fn bitand(self, r: u64) -> u64 { se
 impl PartialEq for usize { fn eq(&self, o: &usize) -> bool { *self == *o } fn ne(&self, o: &usize) -> bool { *self != *o } }
 impl PartialEq for u64   { fn eq(&self, o: &u64)   -> bool { *self == *o } fn ne(&self, o: &u64)   -> bool { *self != *o } }
 
-/// FNV-1a over a byte range addressed purely by integer arithmetic (no pointer
-/// helper methods, which live in core). This is the CAS block hash.
+/// FNV-1a CONTINUED from an existing state, so a hash can be folded over a file
+/// that is never contiguous in memory.
+///
+/// v0.84: positional writes rebuild a file through its 512-byte chunk map and
+/// therefore never hold the whole content at once, but `dirent.file_hash` is the
+/// identity SYS_STAT reports and the journal-recovery check compares. Hashing
+/// the chunk-hash array instead was the obvious shortcut and is wrong: the same
+/// bytes would then hash differently depending on which write path produced
+/// them. FNV-1a folds one byte at a time, so streaming it in slices gives a
+/// result IDENTICAL to hashing the whole buffer — the property that lets both
+/// paths agree.
 #[no_mangle]
-pub extern "C" fn rust_cas_hash(base: usize, len: usize) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
+pub extern "C" fn rust_cas_hash_cont(seed: u64, base: usize, len: usize) -> u64 {
+    let mut h: u64 = seed;
     let mut i: usize = 0;
     while i != len {
         let b: u8 = unsafe { *((base + i) as *const u8) };
@@ -55,6 +64,17 @@ pub extern "C" fn rust_cas_hash(base: usize, len: usize) -> u64 {
         i = i + 1;
     }
     h
+}
+
+/// FNV-1a over a byte range addressed purely by integer arithmetic (no pointer
+/// helper methods, which live in core). This is the CAS block hash.
+///
+/// Defined in terms of the continuation above so there is ONE copy of the
+/// mixing step: two hand-written FNV loops that must agree forever is exactly
+/// the kind of duplicate that drifts.
+#[no_mangle]
+pub extern "C" fn rust_cas_hash(base: usize, len: usize) -> u64 {
+    rust_cas_hash_cont(0xcbf29ce484222325, base, len)
 }
 
 /// Capability gate: returns 1 iff `caps` holds every bit in `required`.
