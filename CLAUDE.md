@@ -206,8 +206,9 @@ gaps are invisible is how "verified" drifts from "measured":
 - No release ISO was built or `release-verify`'d for `2a83086` itself — it was a
   development baseline, not a tag. **v0.82.0 was tagged later** from `701b5fe`,
   on artefact `outrun-os-0.82.0.iso` (md5 `0a077f3660a68674e4a78b18842abaa2`),
-  which did pass `release-verify`; see that tag for its own gate table. The tree
-  is now open on `0.83.0-dev`.
+  which did pass `release-verify`; see that tag for its own gate table. v0.83.0
+  followed the same way — each tag carries its own artefact and gate table, so
+  read the tag rather than this section for anything but the v0.82 baseline.
 
 `smp4-iommu` needs `GATE_CAP=2400` on the reference host; at the 900 s default it
 is cut off before the prompt and reports `TRUNCATED`.
