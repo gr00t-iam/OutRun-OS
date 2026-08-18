@@ -7323,7 +7323,12 @@ static void udb_load(void) {
  * whether vsh gets to run. */
 #define TMP_MAXFILES 8                 /* small, ephemeral, RAM-only scratch area */
 #define TMP_MAXBYTES 512
-struct tmpfile { char name[VFS_NAME_MAX]; int used; uint32_t len; uint8_t data[TMP_MAXBYTES]; };
+/* v0.84: `uid` is the EFFECTIVE uid of whoever created the slot. It is the only
+ * ownership this volume has — there is no gid and no mode, because tmp has no
+ * permission model for open, read or write either and inventing a partial one
+ * would be theatre. It exists for exactly one decision: who may unlink. */
+struct tmpfile { char name[VFS_NAME_MAX]; int used; uint32_t len; uint32_t uid;
+                 uint8_t data[TMP_MAXBYTES]; };
 static struct tmpfile g_tmpfiles[TMP_MAXFILES];
 
 static int path_has_prefix(const char *name, const char *prefix) {
@@ -8008,6 +8013,13 @@ static int vfs_open_for(const char *name, int owner, int creat, int trunc) {
          * truncation below is new. */
         if (ti < 0) for (int i = 0; i < TMP_MAXFILES; i++) if (!g_tmpfiles[i].used) {
             ti = i; g_tmpfiles[i].used = 1; g_tmpfiles[i].len = 0;
+            /* v0.84: the creator owns the slot. EFFECTIVE uid, not real, for the
+             * reason the root volume uses the effective pair: a setuid program's
+             * whole purpose is that what it creates belongs to the identity it
+             * assumed. Recorded only at CREATION — an open of an existing tmp
+             * file never re-stamps it, or the last opener would silently become
+             * the owner. */
+            g_tmpfiles[i].uid = (owner >= 0 && owner < n_kproc) ? cred_euid(owner) : 0;
             kstrcpy_n(g_tmpfiles[i].name, rest, VFS_NAME_MAX); break;
         }
         /* v0.83: O_TRUNC applies to tmp as well, and it has to. Until this
@@ -8138,7 +8150,32 @@ static int vfs_unlink(const char *name) {
         for (int i = 0; i < TMP_MAXFILES; i++)
             if (g_tmpfiles[i].used && streq_n(g_tmpfiles[i].name, rest, VFS_NAME_MAX)) { ti = i; break; }
         if (ti < 0) { klock_release(&g_vfs_lock); return -1; }
-        cmemset(&g_tmpfiles[ti], 0, sizeof g_tmpfiles[ti]);   /* name, len AND data */
+        /* v0.84: OWNER OR ROOT. Until now any holder of PCAP_FILESYSTEM could
+         * unlink any tmp name, because the volume recorded no owner to consult.
+         *
+         * Checked HERE, under the lock that resolved the slot, rather than in
+         * SYS_VFS_UNLINK beside the root volume's check. The root path looks the
+         * dirent up, releases the lock, and lets vfs_unlink look it up a second
+         * time — a window in which the name could become a different file. There
+         * is no reason to reproduce that: resolve once, decide, remove, all
+         * under one acquisition.
+         *
+         * Kernel-context callers (the self-tests unlinking paths under /bin)
+         * never reach this branch, and would pass the root override anyway.
+         *
+         * EACCES rather than the -1 the brief suggested, and deliberately: -1 is
+         * already this function's "no such tmp file", so returning it here would
+         * make "you may not" indistinguishable from "it was never there" — the
+         * same conflation of a refusal with an absence that this tree has fixed
+         * repeatedly elsewhere. -13 is what the root volume's unlink already
+         * returns for exactly this decision. */
+        int cp = (int)current_proc_idx;
+        uint32_t ceuid = (cp >= 0 && cp < n_kproc) ? cred_euid(cp) : 0;
+        if (ceuid != 0 && ceuid != g_tmpfiles[ti].uid) {
+            klock_release(&g_vfs_lock);
+            return -13;                                       /* EACCES */
+        }
+        cmemset(&g_tmpfiles[ti], 0, sizeof g_tmpfiles[ti]);   /* name, len, uid AND data */
         klock_release(&g_vfs_lock);
 
         /* Same "regardless of how it got there" teardown the root path does
@@ -15241,14 +15278,16 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
          * is entered so a refused unlink is not recorded as a filesystem
          * mutation that never happened.
          *
-         * SKIPPED FOR TMP, and that is a disclosed boundary rather than an
-         * oversight: a tmpfile carries a name, a length and its bytes, with no
-         * uid, gid or mode to judge — there is nothing for vfs_permit to
-         * consult, and running the check anyway would resolve the name through
-         * DENTS and test an unrelated ROOT file's permissions. So any holder of
-         * PCAP_FILESYSTEM may unlink any tmp name. The volume is a shared
-         * ephemeral scratch area with no ownership model at all; giving unlink
-         * one while open, read and write have none would be theatre. */
+         * SKIPPED FOR TMP HERE, but no longer unchecked: running vfs_permit on a
+         * tmp path would resolve the name through DENTS and test an unrelated
+         * ROOT file's mode, which is worse than useless. v0.84 gave tmpfile a
+         * creator uid, and vfs_unlink enforces owner-or-root under the same lock
+         * that resolves the slot — closer to the removal than this check is to
+         * its own, and without the lookup-release-lookup window this one has.
+         *
+         * Still no gid and no mode: tmp open, read and write have no permission
+         * model, and a volume where only unlink is guarded would invite the
+         * assumption that the rest is too. */
         if (!path_has_prefix(name, "tmp/")) {
             int L = tg_of((int)current_proc_idx);
             klock_acquire(&g_vfs_lock);
@@ -19490,6 +19529,16 @@ static void cmd_vfs_stress(void) {
             ls >= 1739 && ls <= 1745 ? "extending a file past 32 KiB failed" :
             ls == 1746               ? "*** the sparse hole past 32 KiB did not read back as zeroes" :
             ls == 1747               ? "the bytes written past 45000 are not where they were put" :
+            /* v0.84: tmp unlink ownership. The child's own codes are folded into
+             * 1754..1762 by the parent so each names one broken rule. */
+            ls >= 1750 && ls <= 1753 ? "could not set up the tmp ownership experiment" :
+            ls == 1754 || ls == 1755 ? "the child could not drop privilege (setgid/setuid refused)" :
+            ls == 1756               ? "the child's euid was not 1000 after the drop" :
+            ls == 1757               ? "*** an UNPRIVILEGED caller unlinked root's tmp file, or was refused with the wrong errno" :
+            ls == 1758 || ls == 1759 ? "*** the refused unlink removed or truncated the file anyway" :
+            ls >= 1760 && ls <= 1762 ? "*** a non-root OWNER could not unlink its own tmp file" :
+            ls == 1763               ? "the child failed for an unrecognised reason" :
+            ls == 1764               ? "*** ROOT could not unlink a tmp file it owns" :
                                        "unknown";
         if (ls != LSEEK_WORKER_OK)
             kprintf("[vfsstrs] ring-3 lseek: worker exit %d — %s\n", (uint64_t)ls, why);

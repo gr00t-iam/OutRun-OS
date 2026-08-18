@@ -2867,6 +2867,56 @@ static void lseek_worker(void) {
       oclose(f); }
     ounlink("/lseek-big");
 
+    /* ==================================================================
+     * v0.84: TMP UNLINK IS OWNER-OR-ROOT. Until this release the volume
+     * recorded no owner, so any holder of PCAP_FILESYSTEM could remove any
+     * tmp name. A refusal is only meaningful if someone can actually be
+     * refused, so the negative case runs from a process that has genuinely
+     * dropped privilege rather than from this root worker.
+     * ================================================================== */
+    { /* Root creates a slot it owns. */
+      int t = ocreat("tmp/owned");
+      if (t < 0) sysc(SYS_EXIT, 1750, 0, 0);
+      if (owrite(t, "own", 3) != 3) sysc(SYS_EXIT, 1751, 0, 0);
+      oclose(t);
+
+      i64 c = ofork();
+      if (c < 0) sysc(SYS_EXIT, 1752, 0, 0);
+      if (c == 0) {
+          /* Drop to an unprivileged identity. Group first, user second — see
+           * setuid_privdrop_worker for why that order is load-bearing. */
+          if ((i64)sysc(SYS_SETGID, 1000, 0, 0) != 0) sysc(SYS_EXIT, 90, 0, 0);
+          if ((i64)sysc(SYS_SETUID, 1000, 0, 0) != 0) sysc(SYS_EXIT, 91, 0, 0);
+          if (sysc(SYS_GETEUID, 0, 0, 0) != 1000)     sysc(SYS_EXIT, 92, 0, 0);
+
+          /* THE REFUSAL: root's tmp file, and this caller is not root. EACCES,
+           * and specifically NOT the -1 that means "no such tmp file" — a
+           * refusal that cannot be told from an absence is not a refusal. */
+          if (ounlink("tmp/owned") != -13)            sysc(SYS_EXIT, 93, 0, 0);
+          /* And it really is still there: a check that passed because the file
+           * had already vanished would prove nothing. */
+          { int v = oopen("tmp/owned");
+            if (v < 0)                                sysc(SYS_EXIT, 94, 0, 0);
+            if (olseek(v, 0, SEEK_END) != 3)          sysc(SYS_EXIT, 95, 0, 0);
+            oclose(v); }
+
+          /* The owner path with a NON-ROOT uid, so the rule is shown to be
+           * "owner or root" rather than "root only": this process creates its
+           * own tmp file and removes it. */
+          { int m = ocreat("tmp/mine");
+            if (m < 0)                                sysc(SYS_EXIT, 96, 0, 0);
+            if (owrite(m, "m", 1) != 1)               sysc(SYS_EXIT, 97, 0, 0);
+            oclose(m);
+            if (ounlink("tmp/mine") != 0)             sysc(SYS_EXIT, 98, 0, 0); }
+          sysc(SYS_EXIT, 89, 0, 0);
+      }
+      i64 st = owaitpid_ticks((u32)c, WAIT_T_FORK, 0);
+      if (st == -11) sysc(SYS_EXIT, 1753, 0, 0);      /* DEADLINE, not a defect */
+      if (st != 89)  sysc(SYS_EXIT, 1754 + (u64)(st >= 90 && st <= 98 ? st - 90 : 9), 0, 0);
+
+      /* ROOT OVERRIDE: the same file the unprivileged child could not touch. */
+      if (ounlink("tmp/owned") != 0) sysc(SYS_EXIT, 1764, 0, 0); }
+
     ounlink("/lseek-seq");
     ounlink(LS_PATH);
     sysc(SYS_EXIT, 42, 0, 0);
