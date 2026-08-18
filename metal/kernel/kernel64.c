@@ -23703,6 +23703,24 @@ static void cmd_thread_stress(void) {
     uint32_t waits0 = g_futex_waits, wakes0 = g_futex_wakes;
     uint32_t tmo0   = g_futex_timeouts, races0 = g_futex_lost_races;
     g_thr_ran_mask = 0; g_thr_released = 0; g_thr_stk_pages = 0;
+    /* v0.84: RESET THE RING-3 CONCURRENCY HIGH-WATER, so the SMP assertion far
+     * below measures THIS suite's threads.
+     *
+     * g_inr3_max is global and, until now, this was the one suite that read it
+     * without clearing it first — cmd_mcq, cmd_apps_stress and cmd_posix_stress
+     * all do. threadstrs runs after all three, so "at least two cores were
+     * inside ring 3 simultaneously" was being satisfied by whichever of them
+     * last drove the counter up, not by the threads this suite creates. The
+     * assertion could not fail here, which made it decoration.
+     *
+     * Only the high-water is cleared, never g_inr3 itself: that is the LIVE
+     * count of tasks in ring 3, and zeroing it while one is running would make
+     * the matching decrement drive it negative.
+     *
+     * Everything else this suite measures was already scoped — frames and futex
+     * counters are baselined into freed0/reused0/waits0/... and compared as
+     * deltas, and its own stack-page accounting is reset on the line above. */
+    g_inr3_max = 0;
 
     int p = kproc_spawn("threadstr", PCAP_FILESYSTEM);
     if (p < 0) { utcheck("kproc_spawn never fails", 0);
