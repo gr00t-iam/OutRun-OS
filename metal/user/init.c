@@ -2413,7 +2413,12 @@ static void posix_fork_worker(void) {
     sysc(SYS_EXIT, 700, 0, 0);
 }
 
-/* --- role 52: v0.77 carryover 3 — THE CROSS-GENERATION ORPHAN --------------
+/* --- role 53: v0.77 carryover 3 — THE CROSS-GENERATION ORPHAN --------------
+ *
+ * Numbered 52 when it was written against v0.77; v0.81 gave 52 to
+ * mcq_resident_probe, so it dispatches at 53 (see PX_ORPH_ROLE in kernel64.c,
+ * which carries the same rebase note). This heading said 52 until v0.84 — the
+ * exact hazard CLAUDE.md names, a comment whose subject nothing checks.
  *
  * What role 29 above cannot test, and why this exists.
  *
