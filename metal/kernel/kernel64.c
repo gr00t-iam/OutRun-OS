@@ -23850,21 +23850,32 @@ static void cmd_thread_stress(void) {
      * intermittent and all guarded at n > 1. The guard was the wrong threshold,
      * not the assertion.
      *
-     * SKIPPED, NOT DELETED, and the SKIP prints what was actually observed — a
-     * property that is not asserted should still be visible, or the next person
-     * cannot tell a degraded run from a skipped one. Making this deterministic
-     * at two cores (synchronise the participants rather than widen the guard) is
-     * recorded in ROADMAP-0.80.0.md as follow-up. */
-    if (n >= 3) {
+     * It was SKIPPED rather than deleted, and the SKIP printed what was actually
+     * observed — a property that is not asserted should still be visible, or the
+     * next person cannot tell a degraded run from a skipped one. That visibility
+     * is what made v0.84's fix measurable: the printed number is how the
+     * rendezvous was shown to work, and how a first attempt at it was shown NOT
+     * to. ROADMAP-0.80.0.md recorded the follow-up as "synchronise the
+     * participants rather than widen the guard"; that is what happened, and the
+     * SKIP is gone because the guard no longer needs to be there. */
+    /* v0.84: LIVE AT TWO CPUS. The n == 2 case was skipped as "a race (one pool,
+     * one AP wake)" and it genuinely was — the workers reached ring 3 whenever
+     * the scheduler got to them and then contended on g_tw_mutex, and a futex
+     * that blocks PARKS, so the suite's own workload pushed them apart again.
+     *
+     * The workers now rendezvous and then HOLD ring 3 for a tick target before
+     * touching the mutex, so the overlap comes from residency rather than from
+     * luck. Measured over 8 fresh -smp 2 boots with this assertion still
+     * skipped: the rendezvous completed and the high-water read 2 in 8 of 8.
+     * Only then was the threshold moved — the same order v0.81 used on cmd_mcq
+     * and v0.83 on appsstrs, and the opposite of the one that produced a
+     * phantom barrier here two attempts ago. */
+    if (n >= 2) {
         /* THE POINT OF THE MILESTONE. Before v0.61 a ring-3 thread was a BSP
          * scheduler thread and could only ever be dispatched on cpu 0, so this
          * mask was always exactly 1. */
         utcheck("threads were dispatched on MORE THAN ONE core", cores_used >= 2);
         utcheck("at least two cores were inside ring 3 simultaneously", g_inr3_max >= 2);
-    } else if (n == 2) {
-        kprintf("[threadstrs]  SKIP  multi-core dispatch at 2 cpus is a race (one pool, one "
-                "AP wake); observed %d core(s), %u in ring 3 at once\n",
-                (uint64_t)(int64_t)cores_used, (uint64_t)g_inr3_max);
     } else {
         utcheck("on a uniprocessor every thread ran on cpu 0", g_thr_ran_mask == 1u);
     }

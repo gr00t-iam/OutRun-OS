@@ -3201,6 +3201,43 @@ static volatile u64 g_tw_passed  = 0;    /* the gate thread's observation       
 static volatile u64 g_tw_pid_bad = 0;    /* a thread saw a getpid() != the group's */
 static volatile u64 g_tw_pid     = 0;    /* the group's pid, sampled by main       */
 
+/* v0.84: THE STARTUP RENDEZVOUS.
+ *
+ * Every worker announces itself, then holds until main releases them all at
+ * once. Without it the threads reached ring 3 whenever the scheduler got to
+ * them and immediately contended on g_tw_mutex — and a futex that blocks PARKS,
+ * which takes the thread out of ring 3. So the suite's own workload pushed the
+ * threads apart, and simultaneous residency was luck rather than design.
+ *
+ * THE ARRIVAL WAIT YIELDS; THE HOLD SPINS. That split is not stylistic, and the
+ * first attempt got it wrong in a way only measurement caught: waiting with a
+ * bare spin made the rendezvous time out on every -smp 2 boot, because a
+ * spinning worker keeps its core and the remaining workers can only get in on a
+ * preemption. Main then released on the deadline rather than on the fact, and
+ * the barrier was decoration — the overlap that showed up came entirely from
+ * the HOLD below.
+ *
+ * So arrival yields, which is free: nothing is being measured yet. Residency is
+ * created afterwards by the HOLD, which spins, because FUTEX_WAIT and oyield()
+ * both leave ring 3 and a hold built from either would measure its own absence.
+ * osysticks() is a syscall but does NOT leave ring 3 — g_inr3 is decremented in
+ * cpu_exec_proc when a task's excursion ENDS, not on every trap.
+ *
+ * Both waits are BOUNDED and non-fatal. If the rendezvous never completes the
+ * threads proceed anyway and the assertion fails with its diagnostics, which is
+ * the trade invariant 4 requires: a barrier that hangs converts a failed
+ * assertion into a wedged machine. v0.81 learned that on cmd_mcq's disproven
+ * barrier and the lesson is the same one.
+ *
+ * The HOLD after release is what v0.81 established on cmd_mcq: overlap has to
+ * come from residency, not from arriving together. Threads released together
+ * would otherwise dive straight back into the mutex and park again. */
+#define TW_T_BARRIER 300u        /* 3 s ceiling on the rendezvous              */
+#define TW_T_HOLD      6u        /* 60 ms of guaranteed ring-3 residency       */
+#define TW_I_CEIL 50000000ull    /* backstop; the tick target wins             */
+static volatile u64 g_tw_arrived = 0;    /* workers that reached the barrier       */
+static volatile u64 g_tw_start   = 0;    /* main opens this to release them all    */
+
 static u64 tw_body(u64 id) {
     __sync_fetch_and_or(&g_tw_ran, 1ull << id);
     /* POSIX: one pid per thread group, a distinct tid per thread. Both halves
@@ -3208,6 +3245,21 @@ static u64 tw_body(u64 id) {
      * make the answer depend on which thread asked. */
     if (sysc(SYS_GETPID, 0, 0, 0) != g_tw_pid) g_tw_pid_bad = 1;
     if (sysc(SYS_GETTID, 0, 0, 0) != id)       g_tw_pid_bad = 1;
+
+    /* v0.84: arrive, then wait to be released — spinning, so ring-3 residency
+     * is not surrendered while waiting for it to be measured. */
+    __sync_fetch_and_add(&g_tw_arrived, 1);
+    { u32 b0 = osysticks();
+      while (!g_tw_start && (osysticks() - b0) < TW_T_BARRIER) oyield(); }
+
+    /* Released. Stay in ring 3 long enough for the overlap to be observable
+     * rather than instantaneous, then get on with the real work. */
+    { u32 h0 = osysticks(); volatile u64 acc = 0;
+      for (u64 k = 0; k < TW_I_CEIL; k++) {
+          acc += k ^ id;
+          if ((k & 0xFFFFull) == 0 && (osysticks() - h0) >= TW_T_HOLD) break;
+      } }
+
     for (int i = 0; i < TW_BUMPS; i++) {
         fmutex_lock(&g_tw_mutex);
         u64 v = g_tw_counter;
@@ -3254,6 +3306,28 @@ static void thread_stress_worker(void) {
          * a mismatch would silently join the wrong thread. */
         if (t[i] < 0 || t[i] != i) sysc(SYS_EXIT, 962, 0, 0);
     }
+
+    /* v0.84: hold until every worker has ARRIVED, then release them together.
+     *
+     * Waiting on the count rather than on a delay is the whole point: a sleep
+     * long enough to "probably" cover thread startup is the same guess the
+     * suite was already making implicitly. This waits for the fact.
+     *
+     * Bounded and non-fatal — if a worker never arrives the release happens
+     * anyway and the round proceeds to fail its assertions with diagnostics,
+     * rather than hanging the machine.
+     *
+     * Yielding rather than spinning, for the reason the workers do: main holding
+     * a core while waiting is exactly what stopped the workers from reaching the
+     * barrier at all on two cpus. Main's own residency does not need protecting
+     * here — the overlap is created after the release, not during the wait. */
+    { u32 w0 = osysticks();
+      while (g_tw_arrived < (u64)TW_THREADS && (osysticks() - w0) < TW_T_BARRIER) oyield();
+      if (g_tw_arrived < (u64)TW_THREADS)
+          oputs("  [thr:r3] rendezvous incomplete; releasing anyway\n");
+      g_tw_start = 1;
+      __sync_synchronize(); }
+
     for (int i = 0; i < TW_THREADS; i++) {
         u64 code = 0;
         if (kthread_join(t[i], &code) != 0) sysc(SYS_EXIT, 963, 0, 0);
