@@ -2521,7 +2521,8 @@ static void posix_orphan_child(void) {
  * the stack because a ring-3 worker's stack is not the place for 4 KiB. */
 #define LSB_CHUNK 4096
 #define LSB_N     10
-static u8 g_lsb[LSB_CHUNK];
+#define LSB_TOTAL (LSB_CHUNK * LSB_N)     /* 40 KiB, past the old 32 KiB ceiling */
+static u8 g_lsb[LSB_TOTAL];
 
 /* Defined with the other VFS helpers further down; declared here because this
  * worker removes its own probe file. The dirty-volume gate reuses one image
@@ -2805,15 +2806,23 @@ static void lseek_worker(void) {
      * ================================================================== */
     { int f = ocreat("/lseek-big");
       if (f < 0) sysc(SYS_EXIT, 1720, 0, 0);
-      /* Build 40 KiB with sequential 4 KiB writes. The later ones already run
-       * past the old ceiling, so this loop is itself the first assertion. */
-      for (int i = 0; i < LSB_N; i++) {
-          for (int k = 0; k < LSB_CHUNK; k++) g_lsb[k] = (u8)(i * 7 + k);
-          i64 w = owrite(f, (const char *)g_lsb, LSB_CHUNK);
-          if (w == -28) sysc(SYS_EXIT, 1721, 0, 0);   /* ENOSPC: the ceiling is back */
-          if (w != LSB_CHUNK) sysc(SYS_EXIT, 1722, 0, 0);
-      }
-      if (olseek(f, 0, SEEK_END) != LSB_N * LSB_CHUNK) sysc(SYS_EXIT, 1723, 0, 0);
+      /* Build 40 KiB in ONE write at offset 0.
+       *
+       * Deliberately the whole-file path, not ten sequential positional writes.
+       * A positional write recomputes file_hash by streaming the finished file
+       * back through the chunk map, so building this way costs O(n) per write
+       * and O(n^2) overall -- about 220 KiB of chunk reads for a 40 KiB file.
+       * That intermittently blew the round's 30 s watchdog on a REUSED volume,
+       * where the CAS index is already populated: gate-dirty-smp boot 2 timed
+       * out at exit -1 while boots 1 and 3 passed. Cursor advance across
+       * sequential writes is already covered by /lseek-seq above; what this file
+       * exists to test is positional work PAST 32 KiB, and that is unchanged
+       * below. */
+      for (int k = 0; k < LSB_TOTAL; k++) g_lsb[k] = (u8)((k / LSB_CHUNK) * 7 + (k % LSB_CHUNK));
+      { i64 w = owrite(f, (const char *)g_lsb, LSB_TOTAL);
+        if (w == -28) sysc(SYS_EXIT, 1721, 0, 0);   /* ENOSPC: the ceiling is back */
+        if (w != LSB_TOTAL) sysc(SYS_EXIT, 1722, 0, 0); }
+      if (olseek(f, 0, SEEK_END) != LSB_TOTAL) sysc(SYS_EXIT, 1723, 0, 0);
       oclose(f); }
 
     { int f = oopen("/lseek-big");
@@ -2826,7 +2835,7 @@ static void lseek_worker(void) {
       if (w == -28)                             sysc(SYS_EXIT, 1726, 0, 0);  /* ENOSPC */
       if (w != 8)                               sysc(SYS_EXIT, 1727, 0, 0);
       if (olseek(f, 0, SEEK_CUR) != 36008)      sysc(SYS_EXIT, 1728, 0, 0);
-      if (olseek(f, 0, SEEK_END) != LSB_N * LSB_CHUNK) sysc(SYS_EXIT, 1729, 0, 0); /* length UNCHANGED */
+      if (olseek(f, 0, SEEK_END) != LSB_TOTAL) sysc(SYS_EXIT, 1729, 0, 0); /* length UNCHANGED */
       oclose(f); }
 
     { int f = oopen("/lseek-big");

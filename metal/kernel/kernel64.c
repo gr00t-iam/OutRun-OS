@@ -6797,7 +6797,22 @@ static int vfs_write_at_locked(int di, uint64_t off, const void *data, uint32_t 
     if (put_failed) { *d = prev; return -1; }
 
     /* Identity, streamed: FNV-1a folded chunk by chunk gives exactly what
-     * hashing the whole file in one buffer would. */
+     * hashing the whole file in one buffer would.
+     *
+     * THIS IS O(FILE), NOT O(WRITE), and it is the one place this function is
+     * not proportional to the work asked of it. FNV-1a is sequential, so a byte
+     * changed in the middle invalidates every fold after it and there is no
+     * incremental update short of storing per-chunk intermediate states. A file
+     * built by N sequential positional writes therefore costs O(N^2) in chunk
+     * reads. Measured, not theorised: building a 40 KiB file that way blew a
+     * 30 s round watchdog on a reused volume where the CAS index is already
+     * populated (gate-dirty-smp boot 2, exit -1, while boots 1 and 3 passed).
+     *
+     * A whole-file write from offset 0 avoids it entirely by taking the
+     * unstaged path above, which hashes the caller's contiguous buffer in one
+     * pass — so the cheap way to author a file is still the obvious way. What
+     * pays this cost is editing an existing large file, which is exactly the
+     * operation that could not be done at all before v0.84. */
     uint64_t h = FNV1A_SEED;
     for (uint32_t i = 0; i < nch; i++) {
         uint32_t clen = (newlen - i * 512) < 512 ? (newlen - i * 512) : 512;
