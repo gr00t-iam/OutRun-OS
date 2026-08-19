@@ -2909,27 +2909,148 @@ static void lseek_worker(void) {
           if (ounlink("tmp/owned") != -13)            sysc(SYS_EXIT, 93, 0, 0);
           /* And it really is still there: a check that passed because the file
            * had already vanished would prove nothing. */
-          { int v = oopen("tmp/owned");
-            if (v < 0)                                sysc(SYS_EXIT, 94, 0, 0);
-            if (olseek(v, 0, SEEK_END) != 3)          sysc(SYS_EXIT, 95, 0, 0);
-            oclose(v); }
+          /* v0.84: this used to REOPEN the file and measure it, to show the
+           * refused unlink had not removed it. It cannot any more — open on
+           * this volume is now owner-or-root too — and it MUST NOT be replaced
+           * by "the open was refused" either, however tempting: that would make
+           * an assertion about the UNLINK rule depend on the OPEN rule, so a
+           * build with the open check reverted would report "the refused unlink
+           * removed the file" about an unlink that was refused correctly. An
+           * experiment that names the wrong guard when it fails is worse than
+           * one that tests less.
+           *
+           * So the child proves only what it can prove without the open guard:
+           * that the refusal is STABLE rather than a one-shot that half-did
+           * something. Whether the three bytes survived is checked by the
+           * parent, which owns the file and may simply read it. */
+          if (ounlink("tmp/owned") != -13)            sysc(SYS_EXIT, 94, 0, 0);
 
           /* The owner path with a NON-ROOT uid, so the rule is shown to be
            * "owner or root" rather than "root only": this process creates its
            * own tmp file and removes it. */
           { int m = ocreat("tmp/mine");
-            if (m < 0)                                sysc(SYS_EXIT, 96, 0, 0);
-            if (owrite(m, "m", 1) != 1)               sysc(SYS_EXIT, 97, 0, 0);
+            if (m < 0)                                sysc(SYS_EXIT, 95, 0, 0);
+            if (owrite(m, "m", 1) != 1)               sysc(SYS_EXIT, 96, 0, 0);
             oclose(m);
-            if (ounlink("tmp/mine") != 0)             sysc(SYS_EXIT, 98, 0, 0); }
+            if (ounlink("tmp/mine") != 0)             sysc(SYS_EXIT, 97, 0, 0); }
           sysc(SYS_EXIT, 89, 0, 0);
       }
       i64 st = owaitpid_ticks((u32)c, WAIT_T_FORK, 0);
       if (st == -11) sysc(SYS_EXIT, 1753, 0, 0);      /* DEADLINE, not a defect */
-      if (st != 89)  sysc(SYS_EXIT, 1754 + (u64)(st >= 90 && st <= 98 ? st - 90 : 9), 0, 0);
+      if (st != 89)  sysc(SYS_EXIT, 1754 + (u64)(st >= 90 && st <= 97 ? st - 90 : 8), 0, 0);
+
+      /* The bytes the child could neither read nor remove are still the bytes
+       * root wrote. Checked from the owner, because the refused party is now
+       * refused the read as well — and checked at all because a refusal that
+       * had quietly truncated the file would satisfy every return-value
+       * assertion above. */
+      { int v = oopen("tmp/owned");
+        if (v < 0)                                   sysc(SYS_EXIT, 1765, 0, 0);
+        if (olseek(v, 0, SEEK_END) != 3)             sysc(SYS_EXIT, 1765, 0, 0);
+        oclose(v); }
 
       /* ROOT OVERRIDE: the same file the unprivileged child could not touch. */
       if (ounlink("tmp/owned") != 0) sysc(SYS_EXIT, 1764, 0, 0); }
+
+    /* ==================================================================
+     * v0.84: TMP OPEN, READ AND WRITE ARE OWNER-OR-ROOT TOO.
+     *
+     * The unlink rule above shipped earlier in this release and guarded
+     * removal alone, which left the larger hole open: any holder of
+     * PCAP_FILESYSTEM could still READ or OVERWRITE another user's scratch
+     * file, having merely been unable to delete it.
+     *
+     * THE DESCRIPTOR IS OPENED BEFORE THE FORK AND DELIBERATELY LEFT OPEN.
+     * That is not incidental setup — it is the only way the read and write
+     * checks are reachable at all. Once open is owner-or-root, an
+     * unprivileged process cannot obtain a descriptor on someone else's tmp
+     * file by asking for one, so a test that only called oopen() would
+     * exercise a single guard and leave the other two unreachable. An
+     * INHERITED descriptor is the real case those guards exist for, and it
+     * is the same case the root volume's write check was written for: a
+     * process may hold a perfectly valid descriptor it is not entitled to
+     * use.
+     * ================================================================== */
+    { int t = ocreat("tmp/rperm");
+      if (t < 0)                       sysc(SYS_EXIT, 1766, 0, 0);
+      if (owrite(t, "abc", 3) != 3)    sysc(SYS_EXIT, 1767, 0, 0);
+
+      i64 c = ofork();
+      if (c < 0)                       sysc(SYS_EXIT, 1768, 0, 0);
+      if (c == 0) {
+          /* Group first, user second — see setuid_privdrop_worker for why the
+           * order is load-bearing: after setuid(1000) the process can no
+           * longer change its group. */
+          if ((i64)sysc(SYS_SETGID, 1000, 0, 0) != 0) sysc(SYS_EXIT, 110, 0, 0);
+          if ((i64)sysc(SYS_SETUID, 1000, 0, 0) != 0) sysc(SYS_EXIT, 111, 0, 0);
+          if (sysc(SYS_GETEUID, 0, 0, 0) != 1000)     sysc(SYS_EXIT, 112, 0, 0);
+
+          /* THE THREE REFUSALS, REPORTED AS A BITMASK RATHER THAN AS THE FIRST
+           * ONE TO FAIL.
+           *
+           * Exiting at the first failure is the pattern everywhere else in this
+           * file and is right when the checks are steps in a sequence. These
+           * are not steps; they are three independent guards over the same
+           * file, and the build that reverts them reverts all three at once. A
+           * first-failure exit would report only `read` and leave `write` and
+           * `open` untested in the very run whose job is to show they can fail
+           * — which is how a guard ends up believed rather than measured.
+           *
+           * bit 0 read, bit 1 write, bit 2 open. 0 means all three refused. */
+          { int bad = 0;
+            char b[4];
+            /* SEEK_SET first, so the read happens at a known offset. lseek
+             * moves an offset and consults no content, so it is deliberately
+             * NOT permission-checked and must still succeed for a caller that
+             * may not read — asserted here so that stays a decision rather
+             * than an accident. */
+            if (olseek(t, 0, SEEK_SET) != 0)          sysc(SYS_EXIT, 113, 0, 0);
+            if (oread(t, b, 3) != -13)                bad |= 1;
+            if (owrite(t, "XYZ", 3) != -13)           bad |= 2;
+            /* A fresh open by name, so the inherited descriptor is not merely a
+             * loophole beside a guarded front door. Closed when it wrongly
+             * succeeds: a reproducing build must not also leak a descriptor and
+             * fail later for an unrelated reason. */
+            { int u = oopen("tmp/rperm");
+              if (u != -13) { bad |= 4; if (u >= 0) oclose(u); } }
+            if (bad) sysc(SYS_EXIT, 130 + (u64)bad, 0, 0); }
+
+          /* THE RULE IS OWNER-OR-ROOT, NOT "unprivileged processes may not use
+           * tmp". This caller's OWN file must remain fully usable — create,
+           * write, rewind, read back, remove. Without this the whole block
+           * would still pass if the kernel simply refused uid 1000 everything,
+           * which is a different and much worse rule. */
+          { int m = ocreat("tmp/rmine");
+            if (m < 0)                                sysc(SYS_EXIT, 117, 0, 0);
+            if (owrite(m, "q", 1) != 1)               sysc(SYS_EXIT, 118, 0, 0);
+            if (olseek(m, 0, SEEK_SET) != 0)          sysc(SYS_EXIT, 119, 0, 0);
+            { char z[2];
+              if (oread(m, z, 1) != 1 || z[0] != 'q') sysc(SYS_EXIT, 120, 0, 0); }
+            oclose(m);
+            if (ounlink("tmp/rmine") != 0)            sysc(SYS_EXIT, 121, 0, 0); }
+          sysc(SYS_EXIT, 109, 0, 0);
+      }
+      i64 st = owaitpid_ticks((u32)c, WAIT_T_FORK, 0);
+      if (st == -11) sysc(SYS_EXIT, 1769, 0, 0);      /* DEADLINE, not a defect */
+      if (st != 109) {
+          /* The refusal mask gets its own range so the decoded line can name
+           * WHICH of the three guards let the caller through, rather than
+           * reporting that "the permission test failed". */
+          u64 e = (st >= 131 && st <= 137) ? 1810 + (u64)(st - 130)
+                : (st >= 110 && st <= 121) ? 1790 + (u64)(st - 110)
+                : 1802;
+          sysc(SYS_EXIT, e, 0, 0);
+      }
+
+      /* THE BYTES ARE UNTOUCHED. The refusals above were all return values; a
+       * kernel that refused the caller and mutated the file anyway would pass
+       * every one of them. This is the check that makes them mean something. */
+      { char b[4]; b[0] = b[1] = b[2] = 0;
+        if (olseek(t, 0, SEEK_SET) != 0)              sysc(SYS_EXIT, 1803, 0, 0);
+        if (oread(t, b, 3) != 3)                      sysc(SYS_EXIT, 1804, 0, 0);
+        if (b[0] != 'a' || b[1] != 'b' || b[2] != 'c') sysc(SYS_EXIT, 1805, 0, 0); }
+      oclose(t);
+      if (ounlink("tmp/rperm") != 0)                  sysc(SYS_EXIT, 1806, 0, 0); }
 
     ounlink("/lseek-seq");
     ounlink(LS_PATH);

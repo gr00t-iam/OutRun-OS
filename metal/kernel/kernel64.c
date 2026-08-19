@@ -7338,18 +7338,123 @@ static void udb_load(void) {
  * whether vsh gets to run. */
 #define TMP_MAXFILES 8                 /* small, ephemeral, RAM-only scratch area */
 #define TMP_MAXBYTES 512
-/* v0.84: `uid` is the EFFECTIVE uid of whoever created the slot. It is the only
- * ownership this volume has — there is no gid and no mode, because tmp has no
- * permission model for open, read or write either and inventing a partial one
- * would be theatre. It exists for exactly one decision: who may unlink. */
+/* v0.84: `uid` and `gid` are the EFFECTIVE pair of whoever created the slot.
+ *
+ * When the uid arrived earlier this release it guarded exactly one decision —
+ * who may unlink — and said so, because a volume where only unlink is checked
+ * would invite the assumption that the rest is checked too. That assumption is
+ * now true: open, read, write and truncate are all judged by tmp_permit_locked()
+ * below, so the ownership recorded here is consulted on every access rather
+ * than on removal alone.
+ *
+ * There is still NO MODE. The rule on this volume is owner-or-root, not the
+ * root volume's nine-bit triple, so there is nothing for a mode to vary: a
+ * tmpfile is private to its creator and root, full stop. That is a real
+ * difference from the root volume and is named here rather than left to be
+ * discovered — a tmpfile cannot be shared with a group or made world-readable,
+ * because this volume has no way to say so.
+ *
+ * `gid` is stamped for the same reason the root volume records one — the
+ * effective pair is what a setuid program's creations must belong to — and is
+ * reported in the refusal diagnostic below. It is NOT part of the decision,
+ * because owner-or-root does not consult a group. Recorded and printed rather
+ * than silently absent, so the next person to add a group rule has the identity
+ * it needs and does not have to guess what a live slot's group was. */
 struct tmpfile { char name[VFS_NAME_MAX]; int used; uint32_t len; uint32_t uid;
-                 uint8_t data[TMP_MAXBYTES]; };
+                 uint32_t gid; uint8_t data[TMP_MAXBYTES]; };
 static struct tmpfile g_tmpfiles[TMP_MAXFILES];
+
+/* v0.84: the two numbers that say whether the tmp permission rule was EXERCISED
+ * on a boot, not merely present in the source.
+ *
+ * Read them as a PAIR, exactly as ppid_live()'s detected/resolved counters are
+ * read (see the note there, and CLAUDE.md's "a counter nothing increments is
+ * not evidence either"):
+ *
+ *   checks > 0, refusals > 0    the rule ran and refused someone — the boot
+ *                               genuinely tested it
+ *   checks > 0, refusals == 0   the rule ran and nobody was ever refused; the
+ *                               suite exercised no negative case
+ *   checks == 0                 INCONCLUSIVE. No tmp access was judged at all,
+ *                               so this boot proves nothing about the rule,
+ *                               and a suite asserting only "no bad access
+ *                               succeeded" would be green having tested nothing
+ *
+ * `refusals` counts decisions the RULE refused, in every build. Under
+ * -DTMP_PERM_REPRO the refusal is counted and then deliberately not honoured,
+ * which is what makes that build a reproducer rather than a kernel: the counter
+ * still describes what the rule decided, and the ring-3 assertions are what
+ * detect that the decision was ignored. */
+static volatile uint64_t g_tmp_permit_checks   = 0;
+static volatile uint64_t g_tmp_permit_refusals = 0;
 
 static int path_has_prefix(const char *name, const char *prefix) {
     int i = 0;
     while (prefix[i]) { if (name[i] != prefix[i]) return 0; i++; }
     return 1;
+}
+
+/* v0.84: may `euid` touch tmp slot `ti`? OWNER OR ROOT — the whole rule.
+ *
+ * THE CALLER MUST ALREADY HOLD g_vfs_lock (rank 2). That is not an incidental
+ * convenience: every caller resolves the slot, decides, and acts under ONE
+ * acquisition, so there is no window in which the name could become a different
+ * file between the decision and the access. vfs_unlink's tmp branch established
+ * that shape earlier this release — it deliberately did not reuse the root
+ * volume's lookup-release-lookup pattern — and the access paths follow it for
+ * the same reason. A tmp slot is a recycled index (ofile.dirent holds a TMP
+ * INDEX, not a name), and this tree has spent a whole carryover on what a stale
+ * index resolves to when nothing pins it.
+ *
+ * uid 0 bypasses, which is what root means here and is stated in one place for
+ * the reason vfs_permit states it in one place.
+ *
+ * An unused or out-of-range slot is NOT judged and NOT counted: there is no
+ * owner to compare against, the caller's own "no such file" handling is what
+ * should answer, and counting a decision that was never made would corrupt the
+ * only evidence that says this rule ran. */
+static int tmp_owner_ok_locked(int ti, uint32_t euid) {
+    if (ti < 0 || ti >= TMP_MAXFILES || !g_tmpfiles[ti].used) return 1;
+    __sync_fetch_and_add(&g_tmp_permit_checks, 1);
+    if (euid == 0 || euid == g_tmpfiles[ti].uid) return 1;
+    __sync_fetch_and_add(&g_tmp_permit_refusals, 1);
+    return 0;
+}
+
+/* The same decision, as the ACCESS paths ask it — and the one place the v0.84
+ * reproducer reverts.
+ *
+ * Split from the predicate above so `make EXTRA=-DTMP_PERM_REPRO` is SURGICAL.
+ * The reproducer must revert the open/read/write/truncate checks this release
+ * adds and nothing else: vfs_unlink's rule shipped earlier in v0.84 with its own
+ * ring-3 assertion, and a reproducer that turned that red too would leave the
+ * log unable to say which guard the failing assertions belonged to. Reverting
+ * one thing at a time is what made the FORK_RACE_REPRO result readable, and it
+ * is the same discipline here.
+ *
+ * The refusal is still COUNTED in the reproducing build — only the enforcement
+ * is dropped. So the log reports a rule that decided to refuse and was
+ * overruled, which is exactly what a reproducer is, and the ring-3 assertions
+ * are what notice. A guard whose test has never been watched to fail has not
+ * passed; see CLAUDE.md. Opt-in at build time, never in a release build. */
+static int tmp_permit_locked(int ti, uint32_t euid) {
+    int ok = tmp_owner_ok_locked(ti, euid);
+#ifdef TMP_PERM_REPRO
+    (void)ok;
+    return 1;                          /* pre-v0.84: no owner was ever consulted */
+#else
+    return ok;
+#endif
+}
+
+/* The effective uid of whoever is making the current syscall. Reads
+ * current_proc_idx exactly as vfs_unlink's tmp branch does; cred_euid()
+ * resolves the thread-group leader, so a thread and its process always answer
+ * identically. Kernel-context callers resolve to uid 0 and take the root
+ * bypass, which is the same answer they got before this rule existed. */
+static uint32_t tmp_caller_euid(void) {
+    int cp = (int)current_proc_idx;
+    return (cp >= 0 && cp < n_kproc) ? cred_euid(cp) : 0;
 }
 
 /* v0.83: read a BYTE RANGE of a tmp file — the counterpart to vfs_read_range,
@@ -7381,6 +7486,17 @@ static int64_t tmp_read_range(int ti, uint64_t off, void *buf, uint32_t max) {
     if (ti < 0 || ti >= TMP_MAXFILES) return -1;
     klock_acquire(&g_vfs_lock);
     if (!g_tmpfiles[ti].used) { klock_release(&g_vfs_lock); return -1; }
+    /* v0.84: owner or root, judged under the lock that resolved the slot. The
+     * open path refuses a descriptor on someone else's tmp file, so the usual
+     * way to reach this refusal is an INHERITED descriptor: a process opens a
+     * file it owns, forks, and the child drops privilege. That is precisely the
+     * case the root volume's write check exists for, and it is the case the
+     * ring-3 test drives — a check reachable only through a path no caller can
+     * take would be a check that cannot fail. */
+    if (!tmp_permit_locked(ti, tmp_caller_euid())) {
+        klock_release(&g_vfs_lock);
+        return -13;                                            /* EACCES */
+    }
     uint32_t flen = g_tmpfiles[ti].len;
     if (off >= (uint64_t)flen) { klock_release(&g_vfs_lock); return 0; }   /* EOF */
     uint32_t n = flen - (uint32_t)off;
@@ -7394,6 +7510,13 @@ static int64_t tmp_read_file(int ti, void *buf, uint32_t max) {
     if (ti < 0 || ti >= TMP_MAXFILES) return -1;
     klock_acquire(&g_vfs_lock);            /* reuses rank 2: VFS-adjacent, not CAS state */
     if (!g_tmpfiles[ti].used) { klock_release(&g_vfs_lock); return -1; }
+    /* v0.84: guarded like every other tmp access. This is the whole-file reader
+     * the SHELL REDIRECTION path uses, and leaving it open while the positional
+     * reader is checked would mean `< tmp/x` could read what read() may not. */
+    if (!tmp_permit_locked(ti, tmp_caller_euid())) {
+        klock_release(&g_vfs_lock);
+        return -13;                                            /* EACCES */
+    }
     uint32_t n = g_tmpfiles[ti].len; if (n > max) n = max;
     cmemcpy(buf, g_tmpfiles[ti].data, n);
     klock_release(&g_vfs_lock);
@@ -7427,6 +7550,14 @@ static int64_t tmp_write_at(int ti, uint64_t off, const void *data, uint32_t len
 
     klock_acquire(&g_vfs_lock);
     if (!g_tmpfiles[ti].used) { klock_release(&g_vfs_lock); return -1; }
+    /* v0.84: owner or root, decided BEFORE a single byte moves. A refused write
+     * must leave the file exactly as it was — the ring-3 test re-reads the
+     * bytes afterwards, because a refusal that still mutated the file would
+     * satisfy a test that only checked the return value. */
+    if (!tmp_permit_locked(ti, tmp_caller_euid())) {
+        klock_release(&g_vfs_lock);
+        return -13;                                                 /* EACCES */
+    }
     uint32_t flen = g_tmpfiles[ti].len;
     if (off > (uint64_t)flen)                                       /* the hole reads as zeroes */
         cmemset(g_tmpfiles[ti].data + flen, 0, (uint32_t)(off - (uint64_t)flen));
@@ -7442,6 +7573,12 @@ static int tmp_write_file(int ti, const void *data, uint32_t len) {
     if (len > TMP_MAXBYTES) len = TMP_MAXBYTES;
     klock_acquire(&g_vfs_lock);
     if (!g_tmpfiles[ti].used) { klock_release(&g_vfs_lock); return -1; }
+    /* v0.84: the redirection writer, guarded like the positional one above. An
+     * unguarded `> tmp/x` would be a way to write what write() may not. */
+    if (!tmp_permit_locked(ti, tmp_caller_euid())) {
+        klock_release(&g_vfs_lock);
+        return -13;                                            /* EACCES */
+    }
     cmemcpy(g_tmpfiles[ti].data, data, len);
     g_tmpfiles[ti].len = len;
     klock_release(&g_vfs_lock);
@@ -8026,16 +8163,44 @@ static int vfs_open_for(const char *name, int owner, int creat, int trunc) {
          * long-standing behaviour other callers rely on — SYS_OPEN("tmp/scratch",
          * 0) expects a usable descriptor. Left exactly as it was; only the
          * truncation below is new. */
+        int tcreated = 0;
         if (ti < 0) for (int i = 0; i < TMP_MAXFILES; i++) if (!g_tmpfiles[i].used) {
             ti = i; g_tmpfiles[i].used = 1; g_tmpfiles[i].len = 0;
-            /* v0.84: the creator owns the slot. EFFECTIVE uid, not real, for the
-             * reason the root volume uses the effective pair: a setuid program's
-             * whole purpose is that what it creates belongs to the identity it
-             * assumed. Recorded only at CREATION — an open of an existing tmp
-             * file never re-stamps it, or the last opener would silently become
-             * the owner. */
+            /* v0.84: the creator owns the slot. EFFECTIVE pair, not real, for
+             * the reason the root volume uses the effective pair: a setuid
+             * program's whole purpose is that what it creates belongs to the
+             * identity it assumed. Recorded only at CREATION — an open of an
+             * existing tmp file never re-stamps it, or the last opener would
+             * silently become the owner, and the permission rule below would
+             * hand ownership to whoever touched the file most recently. */
             g_tmpfiles[i].uid = (owner >= 0 && owner < n_kproc) ? cred_euid(owner) : 0;
-            kstrcpy_n(g_tmpfiles[i].name, rest, VFS_NAME_MAX); break;
+            g_tmpfiles[i].gid = (owner >= 0 && owner < n_kproc) ? cred_egid(owner) : 0;
+            kstrcpy_n(g_tmpfiles[i].name, rest, VFS_NAME_MAX);
+            tcreated = 1; break;
+        }
+        /* v0.84: OPENING AN EXISTING TMP FILE NEEDS OWNERSHIP. Until now this
+         * volume handed a descriptor to anyone holding PCAP_FILESYSTEM, so
+         * another user's scratch file could be read or overwritten at will —
+         * a leak of AUTHORITY, and the half of the asymmetry v0.84's unlink
+         * check left open.
+         *
+         * A file THIS OPEN JUST CREATED is skipped, exactly as the root volume
+         * skips its own freshly-created dirent: its author is by construction
+         * entitled to it, and judging it here would ask whether the creator may
+         * touch what it created one instruction ago.
+         *
+         * Placed BEFORE the truncation below, and that ordering is the whole of
+         * the O_TRUNC guard. Truncation destroys content at OPEN time, before
+         * any write is attempted, so a caller who may not have the file must not
+         * be able to empty it by opening it. A second, identical test beside the
+         * truncation would be unreachable — this one has already returned — and
+         * an assertion that cannot fail is not a guard. */
+        if (ti >= 0 && !tcreated) {
+            uint32_t oe = (owner >= 0 && owner < n_kproc) ? cred_euid(owner) : 0;
+            if (!tmp_permit_locked(ti, oe)) {
+                klock_release(&g_vfs_lock);
+                return -13;                                    /* EACCES */
+            }
         }
         /* v0.83: O_TRUNC applies to tmp as well, and it has to. Until this
          * release a tmp write replaced the whole file, so "author this" needed
@@ -8184,9 +8349,12 @@ static int vfs_unlink(const char *name) {
          * same conflation of a refusal with an absence that this tree has fixed
          * repeatedly elsewhere. -13 is what the root volume's unlink already
          * returns for exactly this decision. */
-        int cp = (int)current_proc_idx;
-        uint32_t ceuid = (cp >= 0 && cp < n_kproc) ? cred_euid(cp) : 0;
-        if (ceuid != 0 && ceuid != g_tmpfiles[ti].uid) {
+        /* v0.84: routed through the shared predicate once the access paths
+         * needed the same decision. Deliberately tmp_owner_ok_locked() and NOT
+         * tmp_permit_locked() — this rule is not what -DTMP_PERM_REPRO reverts,
+         * so it stays enforced there and its assertion stays green while the
+         * access assertions go red. Same rule, same counters, one definition. */
+        if (!tmp_owner_ok_locked(ti, tmp_caller_euid())) {
             klock_release(&g_vfs_lock);
             return -13;                                       /* EACCES */
         }
@@ -15300,9 +15468,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
          * that resolves the slot — closer to the removal than this check is to
          * its own, and without the lookup-release-lookup window this one has.
          *
-         * Still no gid and no mode: tmp open, read and write have no permission
-         * model, and a volume where only unlink is guarded would invite the
-         * assumption that the rest is too. */
+         * v0.84 (later in the same release): tmp open, read, write and truncate
+         * are now judged too, by tmp_permit_locked() at each access. The warning
+         * this comment used to carry — that a volume where only unlink is
+         * guarded invites the assumption that the rest is guarded too — is no
+         * longer a warning but a description. Still no MODE: the rule on this
+         * volume is owner-or-root, so there are no bits to vary. */
         if (!path_has_prefix(name, "tmp/")) {
             int L = tg_of((int)current_proc_idx);
             klock_acquire(&g_vfs_lock);
@@ -19550,10 +19721,32 @@ static void cmd_vfs_stress(void) {
             ls == 1754 || ls == 1755 ? "the child could not drop privilege (setgid/setuid refused)" :
             ls == 1756               ? "the child's euid was not 1000 after the drop" :
             ls == 1757               ? "*** an UNPRIVILEGED caller unlinked root's tmp file, or was refused with the wrong errno" :
-            ls == 1758 || ls == 1759 ? "*** the refused unlink removed or truncated the file anyway" :
-            ls >= 1760 && ls <= 1762 ? "*** a non-root OWNER could not unlink its own tmp file" :
-            ls == 1763               ? "the child failed for an unrecognised reason" :
+            ls == 1758               ? "*** the unlink refusal was not stable — asking a second time was not refused" :
+            ls >= 1759 && ls <= 1761 ? "*** a non-root OWNER could not unlink its own tmp file" :
+            ls == 1762               ? "the child failed for an unrecognised reason" :
             ls == 1764               ? "*** ROOT could not unlink a tmp file it owns" :
+            ls == 1765               ? "*** the refused unlink REMOVED OR TRUNCATED the file — the owner no longer reads its 3 bytes" :
+            /* v0.84: tmp OPEN/READ/WRITE ownership. Child setup codes 110..121
+             * fold into 1790..1801; the three REFUSALS are reported as a bitmask
+             * (bit 0 read, bit 1 write, bit 2 open) folded into 1811..1817, so
+             * one reverted boot names every guard that let the caller through
+             * instead of only the first. */
+            ls >= 1766 && ls <= 1769 ? "could not set up the tmp access-permission experiment" :
+            ls == 1790 || ls == 1791 ? "the child could not drop privilege for the access test (setgid/setuid refused)" :
+            ls == 1792               ? "the child's euid was not 1000 after the drop" :
+            ls == 1793               ? "SEEK_SET on the inherited tmp descriptor was refused — lseek must not be permission-checked" :
+            ls >= 1797 && ls <= 1801 ? "*** a non-root caller could not use its OWN tmp file — the rule is root-only, not owner-or-root" :
+            ls == 1802               ? "the child failed for an unrecognised reason" :
+            ls == 1803 || ls == 1804 ? "the owner could not re-read its own tmp file after the refusals" :
+            ls == 1805               ? "*** the REFUSED read/write CHANGED the file's bytes anyway" :
+            ls == 1806               ? "*** ROOT could not unlink the tmp file it owns" :
+            ls == 1811               ? "*** an UNPRIVILEGED caller READ another user's tmp file through an inherited descriptor" :
+            ls == 1812               ? "*** an UNPRIVILEGED caller WROTE another user's tmp file through an inherited descriptor" :
+            ls == 1813               ? "*** an UNPRIVILEGED caller READ AND WROTE another user's tmp file through an inherited descriptor" :
+            ls == 1814               ? "*** an UNPRIVILEGED caller OPENED another user's tmp file by name" :
+            ls == 1815               ? "*** an UNPRIVILEGED caller READ and OPENED another user's tmp file" :
+            ls == 1816               ? "*** an UNPRIVILEGED caller WROTE and OPENED another user's tmp file" :
+            ls == 1817               ? "*** tmp ownership is NOT ENFORCED AT ALL — read, write and open all let an unprivileged caller through" :
                                        "unknown";
         if (ls != LSEEK_WORKER_OK)
             kprintf("[vfsstrs] ring-3 lseek: worker exit %d — %s\n", (uint64_t)ls, why);
@@ -19564,6 +19757,45 @@ static void cmd_vfs_stress(void) {
                  "EOF and resolve SEEK_END against their own volume; refusals leave the offset alone)",
                  ls == LSEEK_WORKER_OK);
     }
+
+    /* v0.84: THE TMP OWNERSHIP RULE, AND WHETHER THIS BOOT ACTUALLY ASKED IT.
+     *
+     * Printed on every boot, in every build, for the reason CLAUDE.md gives:
+     * a counter nothing prints is not instrumentation, and a counter nothing
+     * increments is not evidence either. `decisions` is the load-bearing
+     * number — it says the rule was reached — and it is asserted SEPARATELY
+     * from the refusals so that a workload which never touched another user's
+     * tmp file reports INCONCLUSIVE rather than passing on a path it never
+     * ran.
+     *
+     * The live slots are listed with their owning pair because the gid is
+     * recorded but is NOT part of the owner-or-root decision. Printing it is
+     * what keeps it honest: a field no code reads and no log shows is exactly
+     * the shape this project has been burned by, so it is either evidence or
+     * it should not exist. */
+    { int nlive = 0;
+      klock_acquire(&g_vfs_lock);
+      for (int i = 0; i < TMP_MAXFILES; i++) if (g_tmpfiles[i].used) {
+          kprintf("[vfsstrs] tmp slot %d '%s' uid %u gid %u len %u\n",
+                  (uint64_t)(int64_t)i, g_tmpfiles[i].name,
+                  (uint64_t)g_tmpfiles[i].uid, (uint64_t)g_tmpfiles[i].gid,
+                  (uint64_t)g_tmpfiles[i].len);
+          nlive++;
+      }
+      klock_release(&g_vfs_lock);
+      kprintf("[vfsstrs] tmp ownership: %d live slot(s), %u permission decision(s), %u refusal(s)\n",
+              (uint64_t)(int64_t)nlive, g_tmp_permit_checks, g_tmp_permit_refusals);
+#ifdef TMP_PERM_REPRO
+      kputs("[vfsstrs] *** BUILT WITH TMP_PERM_REPRO — the tmp open/read/write "
+            "ownership checks are REVERTED. This build is a reproducer, not a kernel.\n");
+#endif
+    }
+    vfscheck("the tmp ownership rule was exercised this boot (permission decisions > 0; "
+             "zero would make every tmp permission claim below INCONCLUSIVE)",
+             g_tmp_permit_checks > 0);
+    vfscheck("the rule refused at least one access (refusals > 0: a boot in which nobody "
+             "was ever refused has not tested a refusal)",
+             g_tmp_permit_refusals > 0);
 
     kprintf("[vfsstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_vfspass, (uint64_t)g_vfsfail);
     if (!g_vfsfail)
