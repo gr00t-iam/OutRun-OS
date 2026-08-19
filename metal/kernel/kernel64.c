@@ -19445,6 +19445,101 @@ static void cmd_vfs_stress(void) {
         vfscheck("a write past the file ceiling is refused, not silently truncated", rej < 0);
     }
 
+    /* ===== v0.84 Phase 1: THE DEDUP NEGATIVE CONTROL =======================
+     *
+     * WRITTEN BEFORE THE FIX IT EXISTS TO GUARD, and that ordering is the
+     * point rather than a preference.
+     *
+     * v0.48 declined to reclaim CAS blocks on unlink and said exactly why:
+     *
+     *     "there is no reference counting across dirents (two files can share
+     *      a chunk_hash via dedup), so freeing them here could silently
+     *      corrupt a different, still-live file."
+     *
+     * That hazard only exists when two dirents actually share a chunk. On any
+     * workload where nothing is shared, a reclamation that ignores sharing
+     * behaves identically to one that honours it — so a suite that never
+     * builds the sharing case would go green against either, and would keep
+     * going green right up until real content happened to collide. An absent
+     * refcount and a working refcount are indistinguishable unless the test
+     * MAKES them differ. This block makes them differ.
+     *
+     * Two different names, one identical payload: every 512-byte chunk hashes
+     * the same, so B stores no new blocks and both dirents point at the same
+     * CAS objects. Sharing is then PROVEN — hash equality, pairwise, plus a
+     * used_blocks total that did not move for B — rather than assumed from the
+     * fact that dedup exists. A control whose premise is unverified is how this
+     * tree has twice believed a test that was measuring nothing.
+     *
+     * On the UNFIXED kernel every assertion here passes and the stranding is
+     * reported as a NUMBER, not a failure: nothing is reclaimed today, which is
+     * the documented behaviour and not a defect to flag. The number is the
+     * baseline the fix has to move. The reclamation ASSERTION arrives with the
+     * fix, because an assertion that fails for the whole of Phase 1 trains
+     * everyone to ignore a red suite. */
+    {
+#define CASREC_CHUNKS 4u
+#define CASREC_LEN    (CASREC_CHUNKS * 512u)
+        static uint8_t reca[CASREC_LEN], recb[CASREC_LEN];
+        /* Distinctive per byte AND per chunk, so the four hashes are unique to
+         * this test and cannot dedup against content the volume already holds —
+         * which would make the used_blocks arithmetic below describe someone
+         * else's blocks. */
+        for (uint32_t i = 0; i < CASREC_LEN; i++)
+            reca[i] = (uint8_t)((i * 131u + (i / 512u) * 17u + 0xC5u) & 0xFF);
+
+        uint64_t used0 = SB->used_blocks, ded0 = SB->dedup_hits;
+        int ai = vfs_write_file("casrec-a", reca, CASREC_LEN);
+        uint64_t used_a = SB->used_blocks;
+        int bi = vfs_write_file("casrec-b", reca, CASREC_LEN);
+        uint64_t used_b = SB->used_blocks;
+
+        int shared = (ai >= 0 && bi >= 0 && ai != bi);
+        uint32_t nsh = 0;
+        if (shared)
+            for (uint32_t c = 0; c < CASREC_CHUNKS; c++) {
+                uint64_t ha = vfs_chunk_hash_at(&DENTS[ai], c);
+                uint64_t hb = vfs_chunk_hash_at(&DENTS[bi], c);
+                if (!ha || ha != hb) { shared = 0; break; }
+                nsh++;
+            }
+        kprintf("[vfsstrs] casrec: dirents A=%d B=%d, %u shared chunk hash(es), "
+                "used_blocks %u -> %u -> %u, +%u dedup hit(s)\n",
+                (uint64_t)(int64_t)ai, (uint64_t)(int64_t)bi, (uint64_t)nsh,
+                used0, used_a, used_b, SB->dedup_hits - ded0);
+        vfscheck("two files with identical content SHARE every CAS chunk and the second "
+                 "stores no new blocks (the premise this control rests on)",
+                 shared && nsh == CASREC_CHUNKS && used_b == used_a);
+
+        /* THE CONTROL ITSELF: remove A, and B must be untouched. */
+        int ur = vfs_unlink("casrec-a");
+        uint64_t used_afterA = SB->used_blocks;
+        for (uint32_t i = 0; i < CASREC_LEN; i++) recb[i] = 0;
+        int64_t rg = (bi >= 0) ? vfs_read_file(bi, recb, CASREC_LEN) : -1;
+        int intact = (ur == 0) && (rg == (int64_t)CASREC_LEN);
+        uint32_t badat = 0;
+        for (uint32_t i = 0; i < CASREC_LEN && intact; i++)
+            if (recb[i] != reca[i]) { intact = 0; badat = i; }
+        if (!intact)
+            kprintf("[vfsstrs] casrec: B DIVERGED at byte %u of chunk %u "
+                    "(unlink -> %d, read -> %d)\n",
+                    (uint64_t)badat, (uint64_t)(badat / 512u), (uint64_t)(int64_t)ur, rg);
+        vfscheck("unlinking one of two files that share EVERY chunk leaves the other "
+                 "byte-for-byte readable (the corruption v0.48 declined to risk)",
+                 intact);
+
+        /* Now remove B as well. With NO dirent referencing them, the four
+         * blocks are unreachable by any live file — the case a reclaiming
+         * kernel must return to the free pool and today's kernel keeps
+         * forever. Printed, not asserted, until the fix lands. */
+        int br = vfs_unlink("casrec-b");
+        uint64_t used_end = SB->used_blocks;
+        kprintf("[vfsstrs] casrec: used_blocks after unlink A = %u, after unlink B = %u; "
+                "%u of %u chunk block(s) STILL HELD with no file referencing them\n",
+                used_afterA, used_end, used_end - used0, (uint64_t)CASREC_CHUNKS);
+        vfscheck("both halves of the dedup control unlink cleanly", ur == 0 && br == 0);
+    }
+
     /* ===== v0.56 Stage B: HIERARCHICAL PATH NAMES ==========================
      * Names are paths now. The checks below are chosen so a half-done widening
      * cannot pass: the third one uses two names that are IDENTICAL for their
