@@ -1,13 +1,15 @@
 # OutRun OS v0.84.0-metal — roadmap
 
-Milestone 84. `main` is at `c492efc`; `VERSION` reads `0.84.0-dev` and **no
-v0.84 tag exists yet** — this milestone is open.
+Milestone 84. `main` is at `6e2e23b`; `VERSION` reads `0.84.0` and
+`KERNEL_VERSION` reads `0.84.0-metal`. **The tag does not exist yet** — see
+"Before tagging" at the end, which is the part of the Release Protocol this
+commit does NOT satisfy.
 
-This file is written mid-cycle rather than at its start, and the reason is worth
-recording: **milestones 0.81 through 0.83 have no roadmap or changelog in the
-tree at all.** Their release notes exist only in annotated git tags. That is not
-fatal — the tags are thorough, and each carries its artefact md5, its gate table
-and a KNOWN, NOT FIXED list — but it means the only way to learn what is open is
+This file was written mid-cycle rather than at its start, and the reason is worth
+keeping: **milestones 0.81 through 0.83 have no roadmap or changelog in the tree
+at all.** Their release notes exist only in annotated git tags. That is not fatal
+— the tags are thorough, and each carries its artefact md5, its gate table and a
+KNOWN, NOT FIXED list — but it means the only way to learn what is open is
 `git tag -n200`, which nobody thinks to run. A v0.84 session was handed a
 carryover-3 status that had been superseded three milestones earlier and nearly
 re-implemented work that had already landed; see
@@ -16,121 +18,179 @@ the cheap half of preventing that.
 
 ---
 
-## WHAT THIS CYCLE HAS SHIPPED
+## WHAT THIS CYCLE SHIPPED
+
+Thirteen commits, `0e042cb..6e2e23b`. The theme is one subsystem taken to
+completion: the VFS learned what a file POSITION means in v0.82/0.83, and this
+milestone finished the consequences of that — writes at any size, a volume that
+can give storage back, an ownership model on the scratch volume, and the two
+POSIX operations the positional work had named as missing.
 
 | commit | what |
 |---|---|
-| `44e1051` | chunk-iterating positional writes, no staging ceiling |
+| `44e1051` | chunk-iterating positional writes — the 32 KiB staging ceiling is gone |
 | `bb34d39` | reset `g_inr3_max` on threadstrs entry |
 | `c8f8e07` | VOL_TMP creator uid + owner/root **unlink** check |
 | `8c412b3` | threadstrs worker startup sync; smp2 SKIP retired |
 | `c372ecf` | build the >32 KiB lseek probe with one whole-file write |
 | `886750d` | carryover 3 re-verified at the tip; stale role heading fixed |
 | `c492efc` | VOL_TMP permission model completed: open, read, write, truncate |
+| `46978f2` | this roadmap |
+| `f118112` | the dedup negative control for CAS reclamation, **before** the fix |
+| `a881542` | CAS blocks reclaimed on unlink and O_TRUNC, reference-counted |
+| `a48ed1c` | the unreferenced-block residual root-caused and made measurable |
+| `6e2e23b` | `ftruncate` and `O_APPEND` |
 
-**Every KNOWN, NOT FIXED item from the v0.82 and v0.83 tags is now closed.**
+**Every KNOWN, NOT FIXED item from the v0.81, v0.82 and v0.83 tags is closed**,
+and so is every item this roadmap listed as open when it was written.
 
-- v0.83's *"a tail-preserving positional write beyond REDIR_STAGE_MAX still
-  returns ENOSPC"* → `44e1051`.
-- v0.83's *"tmp unlink is NOT permission-checked"* → `c8f8e07`, and the larger
-  asymmetry it disclosed → `c492efc`.
-- v0.82's and v0.81's *"threadstrs still reads the shared ring-3 high-water
-  without resetting its own"* → `bb34d39` / `8c412b3`.
+### The four that mattered
+
+**Positional writes past the staging ceiling** (`44e1051`). A tail-preserving
+write anywhere in a file larger than `REDIR_STAGE_MAX` returned ENOSPC, so the
+only large writes the system could do were whole-file ones from offset 0. The
+ceiling was the staging buffer's, not the filesystem's, and it went away by not
+staging content at all.
+
+**VOL_TMP ownership** (`c8f8e07`, then `c492efc`). The uid arrived guarding
+unlink alone, and its own commit named what that left open: any holder of
+`PCAP_FILESYSTEM` could still read or overwrite another user's scratch file,
+having merely been unable to delete it — a leak of AUTHORITY. Open, read, write
+and truncate are now judged too. Still no mode and no group: the rule is
+owner-or-root, so a tmpfile cannot be shared. That is a real difference from the
+root volume, and it is named in the struct rather than left to be discovered.
+
+**CAS block reclamation** (`f118112`, `a881542`, `a48ed1c`). Since v0.48 unlink
+had stranded every block a file used — the volume could only fill — and v0.48
+said why: dedup lets two dirents share a chunk, so freeing without reference
+counting corrupts a live file. Counts are now DERIVED from the live directory at
+mount rather than stored on disk, because `cas_islot` is a 16-byte packed record
+whose size *is* `CAS_SLOTS_PER_BLOCK`; deriving also cannot drift from the
+directory or be left stale by a crash. See
+`OUTRUN-0.84-cas-block-reclamation.md`.
+
+**`ftruncate` and `O_APPEND`** (`6e2e23b`). Named as absent by v0.83's own
+O_TRUNC comment. The append offset is resolved inside the lock that performs the
+write — read-then-write would let two appenders choose the same place and lose
+one of them.
+
+### What the process cost, and what it caught
+
+Three defects in this milestone's own work were caught by the harness rather
+than by review, and all three are recorded where they happened:
+
+- **A double-release of CAS blocks**, from an O_TRUNC handler that released a
+  chunk map but left the map's hashes in the dirent. The four FRESH tiers passed
+  while it was live; only `gate-dirty` — three boots on one reused image — saw
+  it, as `new=2` then `new=1` growing across boots. Anyone running `make gate`
+  instead of `make gate-all` would have shipped it.
+- **An assertion weaker than claimed.** `underflow == 0` was described as the
+  double-release detector and read zero throughout that failing run, because an
+  intervening dedup had restored the count. It catches double release only when
+  nothing re-references the block in between.
+- **Dead code with a false explanation.** `vfs_truncate_locked` zeroed a boundary
+  chunk's tail and a comment called it load-bearing; the reproducer built to
+  prove that PASSED without it. `cas_put`'s length bound already discards the
+  tail. Removed, comment corrected.
 
 ## VERIFIED BASELINE
 
-**Commit `c492efc`**, six-tier gate on image
-`fc7595b88864e8c901a7bf55fcbee797`, measured 2026-08-18. Ten boots, zero failing
-assertions, zero rank violations, zero underflow/mismatch, zero panics.
+**Commit `6e2e23b`**, six-tier gate on image
+`46a405e4bafc70e87250883221dd5505`, measured 2026-08-20. Ten boots, zero failing
+assertions, zero rank violations, zero underflow/mismatch, zero panics. Clean
+rebuild with no warnings under `-Wall -Wextra`.
 
 | tier | boots | assertions | result |
 |---|---|---|---|
-| `uniprocessor` | 1 | 498 | PASS (320 s) |
-| `smp2-bios` | 1 | 510 | PASS (250 s) |
-| `smp4-bios` | 1 | 514 | PASS (245 s) |
-| `smp4-iommu` (q35 + VT-d, `intremap=on`) | 1 | 527 / 47 suites | PASS (250 s) |
+| `uniprocessor` | 1 | 507 | PASS (350 s) |
+| `smp2-bios` | 1 | 519 | PASS (280 s) |
+| `smp4-bios` | 1 | 523 | PASS (285 s) |
+| `smp4-iommu` (q35 + VT-d, `intremap=on`) | 1 | 536 / 47 suites | PASS (285 s) |
 | `gate-dirty` (one reused image, uniprocessor) | 3 | 0 failing each | PASS |
 | `gate-dirty-smp` (one reused image, `-smp 4`) | 3 | 0 failing each | PASS |
 
-Post-merge sanity on `main` (`c492efc`, image
-`8c697ae2ab80cd2a92e428bbb7dbefe0`): uniprocessor 45 suites, 498 passed, 0
-failed, ranks 0. The tmp counters read 77 decisions / 5 refusals — identical to
-the branch measurement, which is what says integration changed nothing.
+Both dirty tiers reported empty consecutive-boot assertion diffs and intact
+durable artefacts at both widths.
 
-`smp4-iommu` ran at 250 s here. It is **host-speed sensitive** (v0.81's tag
-records 1080–2065 s with failures on a degraded host, at unmodified HEAD): run a
-control before blaming a change, and raise `GATE_CAP` rather than reading the
-assertions of a `TRUNCATED` boot.
-
-What this baseline does **not** say: one boot per fresh configuration and three
+**What this baseline does not say.** One boot per fresh configuration and three
 per dirty configuration, so it cannot see an intermittent below roughly 1 in 10
-boots. No release ISO was built or `release-verify`'d — this is a development
-baseline, not a tag.
+boots. **No release ISO has been built or `release-verify`'d** — this is a
+development baseline measured on `outrun-os-0.84.0-dev.iso`, not on the artefact
+a tag would publish. The version strings changed after it was taken, so the
+published image must be measured on its own terms.
+
+`smp4-iommu` ran at 285 s here. It is host-speed sensitive (v0.81's tag records
+1080–2065 s with failures on a degraded host, at unmodified HEAD): run a control
+before blaming a change, and raise `GATE_CAP` rather than reading the assertions
+of a `TRUNCATED` boot.
 
 ---
 
-## NEXT: CAS BLOCKS ARE NEVER RECLAIMED ON UNLINK
+## STILL OPEN
 
-The largest disclosed gap left in this subsystem, and it is disclosed in the
-code rather than inferred (`vfs_unlink`, `kernel64.c`):
+Nothing here blocks the tag; all of it should be written into the release notes
+as KNOWN, NOT FIXED.
 
-> Deliberately NOT reclaiming the CAS blocks/index slots the file's chunks used:
-> there is no reference counting across dirents (two files can share a
-> chunk_hash via dedup), so freeing them here could silently corrupt a
-> different, still-live file. Disclosed as a scope boundary, not fixed here.
-
-**The state today.** `cas_put()` and `cas_get()` exist; there is no `cas_free()`,
-no refcount on a CAS chunk, and no collector. Frames are refcounted
-(`frame_refs()`); CAS blocks are not. So every unlink — and every O_TRUNC, which
-empties a dirent's chunk map — permanently strands the blocks the file used. The
-volume can only fill.
-
-**Why it is the right next target.** It is a real resource leak with a *named*
-cause, in the subsystem this milestone has been working all cycle, and the thing
-that blocks it (no refcounting under dedup) is a design question rather than a
-missing line. It is also the gap most likely to be discovered the worst way: as
-a volume that mysteriously fills after enough churn, on the dirty-volume gate,
-long after the change that made the churn.
-
-**The trap, stated up front.** Dedup means two dirents may name the same
-`chunk_hash`. Freeing on unlink without refcounting corrupts a live file, which
-is precisely why v0.48 declined to do it. Any fix must survive a test in which
-file A and file B share a chunk, A is unlinked, and B is then read back byte for
-byte.
-
-**Verification strategy, in the shape this tree now uses:**
-
-- Count and print reclaimed blocks and index slots. A reclamation nothing
-  reports is not evidence.
-- Assert the volume's used-block count *returns to its pre-write value* after
-  authoring and unlinking, rather than asserting merely that unlink returned 0.
-- **The dedup negative control is the load-bearing test**, and it must be
-  written before the fix: A and B share a chunk, A is unlinked, B still reads
-  correctly. Without it, a refcount that is simply absent looks identical to one
-  that works, on any workload where no chunk is shared.
-- Paired falsifiability, per CLAUDE.md: an `EXTRA=-D…` build that frees without
-  consulting the refcount must corrupt B and be *watched* doing it.
-- The dirty-volume gate is where this genuinely bites, because it is the only
-  configuration that reuses an image across boots.
-
-### Also open, smaller
-
-- **`ftruncate` and `O_APPEND`.** The O_TRUNC comment names both as absent.
-  O_TRUNC now covers "empty it at open"; shortening an open file, and atomic
-  append, still have no expression.
+- **`O_APPEND` atomicity is argued, not measured.** The offset is resolved inside
+  the write lock, which is the correct construction, but there is no concurrent
+  multi-writer test that would fail if it were not.
+- **Reference-count underflow cannot see a masked double release** (above). Not
+  fixable by a counter; the dirty-volume tier is the thing that catches it.
+- **VOL_TMP has no mode and no group.** Deliberate — owner-or-root is the whole
+  rule — so a tmpfile cannot be shared. Revisit only if something needs it.
 - **`lseek`/`SEEK_END` on another user's tmp descriptor** reports that file's
-  length. Metadata, not content, and it matches the root volume — named in
-  `OUTRUN-0.84-tmp-permission-model.md` rather than fixed.
-- **VOL_TMP has no mode and no group.** Owner-or-root is the whole rule, so a
-  tmpfile cannot be shared. Deliberate; revisit only if something needs it.
+  length. Metadata, not content, and it matches the root volume.
+- **CAS reclamation completeness is not asserted.** `blocks freed > 0` says it
+  ran and the dedup control says it is correct for the shared case; nothing
+  asserts that every unreferenced block is eventually returned.
+- **No crash injection between a free's two writes.** The existing crash test
+  covers puts, not frees.
 - **Changelogs for 0.81–0.84 do not exist in the tree.** The tags carry the
-  content; writing them out is bookkeeping this milestone should finish.
+  content. Writing them out remains bookkeeping this project should finish.
+
+---
 
 ## BEFORE TAGGING v0.84.0
 
-The Release Protocol in `CLAUDE.md` is mandatory and is not satisfied by any of
-the above: bump `VERSION` and `KERNEL_VERSION` and commit **before** tagging,
-`make release-iso` from a clean tree, `make release-verify` on the exact
-published image, and record the MD5 and SHA-256 in the release notes. `v0.75.0`
-was tagged with `VERSION` still reading `0.74.0`; the protocol exists so that
-cannot complete silently.
+The Release Protocol in `CLAUDE.md` is mandatory and **this commit satisfies
+only its first step**. `VERSION` is `0.84.0` and `KERNEL_VERSION` is
+`0.84.0-metal`, committed before any tag exists — which is the step v0.75.0 got
+wrong, tagging while `VERSION` still read `0.74.0` so every image for that
+release was named `outrun-os-0.74.0.iso`.
+
+Remaining, in order:
+
+1. `make release-iso` — clean rebuild, checksums, manifest into
+   `build/release/`.
+2. `make release-verify` — boot the exact published image from a fresh volume;
+   it fails unless the prompt is reached with zero failing assertions and no
+   rank fault.
+3. Record the MD5 **and** SHA-256 beside the tag. An image whose checksum is not
+   written down cannot later be shown to be the one that was tested.
+4. Re-run `make gate-all` on the release commit if any source changed after the
+   baseline above, and state in the notes which tiers were run and which were
+   not.
+
+`make release` does steps 1 and 2 in that order. `make release-version-check`
+confirms the banner matches `VERSION`; it now expects `0.84.0-metal` and will
+warn loudly if the two disagree.
+
+**Cut the release from the MAIN CHECKOUT, not from a linked worktree.**
+`release-version-check` has two halves, and only one of them survives a worktree
+here. The banner half reads `kernel64.c` directly and works anywhere. The git
+half runs `git rev-parse --git-dir` first, and in a linked worktree that fails
+under WSL — the worktree's `.git` file records a Windows-style absolute path
+(`C:/Users/...`) which git-in-WSL concatenates onto its own cwd. The recipe then
+prints `*** CANNOT VERIFY VERSION: git did not answer here` and, correctly, says
+that is NOT a pass. Measured 2026-08-20: the same command in the main checkout
+answers `v0.83.0` and the check runs properly.
+
+So a release cut from a worktree would publish an artefact whose name nothing
+cross-checked, while printing a message most people would read as noise. That is
+the shape of a check that cannot fail, and it is avoided by building the release
+where git can answer.
+
+Note also that the git half will WARN until the tag exists — it compares
+`git describe --tags --abbrev=0` (today `v0.83.0`) against `v$(VERSION)`
+(`v0.84.0`). Pre-tag that mismatch is the expected state, not a defect; it
+resolves when `v0.84.0` is created.
