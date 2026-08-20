@@ -5417,6 +5417,37 @@ static void cas_ref_inc_block(uint64_t b) {
     if (b >= CAS_REF_MAX) return;
     if (g_cas_refs[b] < CAS_REF_PIN) g_cas_refs[b]++;
 }
+
+/* v0.84: how many ALLOCATED data blocks does no live dirent name?
+ *
+ * This exists because the number was previously only obtainable by hand, by
+ * subtracting two figures printed on different lines of a boot log — and a
+ * quantity nobody can read directly is a quantity nobody checks. The v0.84
+ * reclamation work recorded a "2-block residual" derived exactly that way, and
+ * the derivation could not distinguish a leak from an accounting artefact.
+ *
+ * A non-zero result is NOT automatically a leak. cas_put() is reachable without
+ * any VFS involvement, and the boot suites use it that way on purpose: cmd_cas
+ * stores two strings to demonstrate content addressing, and the validation
+ * matrix stores a 512-byte blob to prove a put/get round-trip. None of those is
+ * named by a dirent, so none can ever be referenced, and the reference model —
+ * which counts dirent references and nothing else — correctly reports them as
+ * unreferenced. They are content the CAS holds on its own account.
+ *
+ * What the number is good for is CHANGE. It is stable across boots on a reused
+ * volume (identical content dedups to the same blocks), so a value that GROWS
+ * boot over boot is a real leak in a way a bare non-zero value is not.
+ *
+ * Caller holds g_cas_lock. Blocks at or beyond CAS_REF_MAX are counted as
+ * unreferenced because that is what they are — untracked, and never reclaimed. */
+static uint64_t cas_unreferenced_locked(void) {
+    uint64_t n = 0;
+    for (uint64_t b = SB->data_start; b < SB->total_blocks; b++) {
+        if (!bm_get(b)) continue;
+        if (b >= CAS_REF_MAX || g_cas_refs[b] == 0) n++;
+    }
+    return n;
+}
 /* fwd: defined with the chunk-map walkers whose enumeration it shares, and
  * called from BOTH cas_format() and cas_mount() so every path that establishes
  * a directory also establishes the counts derived from it. */
@@ -6870,13 +6901,25 @@ static void cas_refs_rebuild(void) {
         nf++;
     }
     g_cas_refs_ready = 1;
-    uint64_t tracked = 0;
+    uint64_t tracked = 0, alloc = 0, unref;
     klock_acquire(&g_cas_lock);
     for (uint64_t i = 0; i < CAS_REF_MAX; i++) if (g_cas_refs[i]) tracked++;
+    for (uint64_t b = SB->data_start; b < SB->total_blocks; b++) if (bm_get(b)) alloc++;
+    unref = cas_unreferenced_locked();
     klock_release(&g_cas_lock);
-    kprintf("[cas    ] refcounts derived from %d live file(s): %u block(s) referenced, "
-            "%u of %u in use\n",
-            (uint64_t)(int64_t)nf, tracked, SB->used_blocks, SB->total_blocks);
+    /* All four numbers on one line, on purpose. The v0.84 "2-block residual"
+     * was obtained by subtracting figures from two different log lines and a
+     * hand-carried data_start, and that arithmetic was ambiguous enough to be
+     * recorded as unexplained. Printing the difference directly removes the
+     * subtraction, and with it the ambiguity. */
+    kprintf("[cas    ] refcounts derived from %d live file(s): %u data block(s) allocated, "
+            "%u referenced, %u UNREFERENCED; volume %u/%u\n",
+            (uint64_t)(int64_t)nf, alloc, tracked, unref,
+            SB->used_blocks, SB->total_blocks);
+    if (unref)
+        kputs("[cas    ]   unreferenced != leaked: cas_put() is reachable without a dirent, "
+              "and the boot suites use it that way (cmd_cas, the validation matrix). "
+              "A value that GROWS across boots on one volume is the leak signal.\n");
 }
 
 /* v0.84: write a chunk-hash array into a dirent's direct and indirect map.
@@ -20266,6 +20309,38 @@ static void cmd_vfs_stress(void) {
     vfscheck("the free-block accounting still reconciles after reclamation "
              "(used_blocks agrees with the bitmap)",
              SB->used_blocks <= SB->total_blocks);
+
+    /* v0.84: THE RESIDUAL, MEASURED RATHER THAN DERIVED.
+     *
+     * The reclamation work recorded an unexplained "2-block residual" computed
+     * by subtracting two figures from different lines of a boot log. Root-caused
+     * here: cas_put() is reachable with no VFS involvement, and three boot-suite
+     * call sites use it that way deliberately — cmd_cas stores two strings to
+     * demonstrate content addressing, and the validation matrix stores a
+     * 512-byte blob to prove a put/get round-trip. No dirent names any of them,
+     * so the reference model reports them unreferenced, correctly. They are not
+     * a leak; they are CAS content held on the CAS's own account.
+     *
+     * The bound is asserted, not the exact value. An equality against today's
+     * count would encode the current demo suites' behaviour and go red the first
+     * time any suite adds or removes a direct put — a test that fails for being
+     * out of date teaches people to edit the number rather than read it. What is
+     * worth defending is that the figure stays SMALL and BOUNDED: an unreferenced
+     * count climbing into the hundreds is a genuine reclamation leak, which is
+     * the failure this assertion exists to catch. */
+#define CAS_UNREF_BUDGET 32u
+    { uint64_t unref;
+      klock_acquire(&g_cas_lock);
+      unref = cas_unreferenced_locked();
+      klock_release(&g_cas_lock);
+      kprintf("[vfsstrs] cas residual: %u allocated data block(s) unreferenced by any live "
+              "file (budget %u; direct cas_put callers with no dirent — cmd_cas, validation)\n",
+              unref, (uint64_t)CAS_UNREF_BUDGET);
+      vfscheck("blocks allocated but named by no live file stay within a small fixed budget "
+               "(a climbing count is a reclamation leak; a small steady one is the boot "
+               "suites' own direct CAS content)",
+               unref <= CAS_UNREF_BUDGET);
+    }
 
     vfscheck("the tmp ownership rule was exercised this boot (permission decisions > 0; "
              "zero would make every tmp permission claim below INCONCLUSIVE)",

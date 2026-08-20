@@ -218,14 +218,13 @@ false — safe by a caller's accident rather than by the dirent's own state.
 
 ## Not covered, and one residual
 
-- **Two blocks are allocated but unreferenced at the crash-test remount.** The
-  fixed boot reports `refcounts derived from 47 live file(s): 457 block(s)
-  referenced, 1107 of 8192 in use` against 648 blocks of fixed metadata — 459
-  data blocks allocated, 457 referenced. The direction is a LEAK, not an
-  over-free (underflow is 0 everywhere), and it is two blocks rather than a
-  growing number, but it is not explained. Most likely a block put by an
-  operation that was rolled back or never committed its dirent. Named because a
-  residual nobody wrote down is a residual nobody investigates.
+- ~~**Two blocks are allocated but unreferenced at the crash-test remount.**~~
+  **ROOT-CAUSED — see `OUTRUN-0.84-cas-unreferenced-residual.md`. It is not a
+  leak.** `cas_put()` is reachable with no VFS involvement, and `cmd_cas` uses it
+  that way to demonstrate content addressing: two distinct strings, `+2 blocks`,
+  named by no dirent and therefore correctly reported as unreferenced by a model
+  that counts dirent references. The guess recorded here — "a block put by an
+  operation that was rolled back" — was wrong.
 - Reclamation is not asserted to be complete — `blocks freed > 0` says it ran,
   and the casrec pair says it is correct for the shared case. There is no
   assertion that every unreferenced block is eventually returned.
