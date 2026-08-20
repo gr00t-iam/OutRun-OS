@@ -5363,6 +5363,65 @@ static void bm_free(uint64_t b) {
     if (SB->used_blocks) SB->used_blocks--;
 }
 
+/* ===========================================================================
+ * v0.84: CAS BLOCK REFERENCE COUNTS
+ * ===========================================================================
+ * v0.48 declined to reclaim blocks on unlink, for a reason that was correct
+ * then and is still correct: "two files can share a chunk_hash via dedup, so
+ * freeing them here could silently corrupt a different, still-live file."
+ * Reclamation therefore needs to know how many dirents name each block.
+ *
+ * WHY THE COUNT IS IN MEMORY AND DERIVED, NOT ON DISK. `struct cas_islot` is a
+ * 16-byte PACKED ON-DISK record and CAS_SLOTS_PER_BLOCK is literally
+ * `CAS_BS / sizeof(struct cas_islot)` == 32. Adding a field changes that
+ * divisor, which changes which slot every hash probes to, which makes every
+ * existing volume's index unreadable — a version bump and a reformat, and the
+ * dirty-volume gate exists precisely to assert that durable artefacts survive
+ * across boots. So the count is derived instead: cas_refs_rebuild() walks the
+ * live directory at mount and counts what actually references each block.
+ *
+ * Derivation is not a workaround, it is the stronger property. A count computed
+ * from the (journaled) directory cannot drift out of step with it, cannot be
+ * left stale by a crash between two writes, and heals any miscount a previous
+ * boot managed to introduce. An on-disk counter would have to be journaled in
+ * lockstep with both the bitmap and the directory to make the same claim.
+ *
+ * NOT ATOMICS, DELIBERATELY. Every mutation here happens under g_cas_lock
+ * (rank 3), the same lock that already serialises the bitmap, the superblock
+ * counters and the shared staging sectors. A refcount reaching zero must remove
+ * an index entry, free a bitmap bit and decrement used_blocks as ONE indivisible
+ * step; an atomic on the counter alone would make the counter itself race-free
+ * while leaving the thing it guards inconsistent. The lock is what makes the
+ * group atomic, which is the property that matters.
+ *
+ * The table is indexed by BLOCK, not by hash: the block is what gets returned
+ * to the pool, and two hashes can never name one block. Blocks at or beyond
+ * CAS_REF_MAX are simply never reclaimed — a volume larger than the bitmap can
+ * describe is out of scope here, and "leaks exactly as it did before" is the
+ * right failure mode for out-of-range rather than a wrong free. */
+#define CAS_REF_MAX ((uint64_t)sizeof(g_bitmap) * 8u)   /* == the bitmap's capacity */
+#define CAS_REF_PIN 0xFFFFu        /* saturated: too many refs to track, never free */
+#define CAS_TOMB    0xFFFFFFFFu    /* index tombstone; see cas_index_remove()       */
+static uint16_t g_cas_refs[CAS_REF_MAX];
+static int      g_cas_refs_ready = 0;   /* 0 until the first rebuild: never free */
+/* Printed by vfsstrs every boot. A reclamation nothing reports is not evidence,
+ * and `underflow` is the one that would say this scheme is WRONG rather than
+ * merely idle: a decrement of an already-zero count means something was
+ * released twice, which is the corruption path itself. */
+static uint64_t g_cas_blocks_freed = 0;
+static uint64_t g_cas_ref_drops    = 0;
+static uint64_t g_cas_ref_underflow = 0;
+
+/* Caller holds g_cas_lock. */
+static void cas_ref_inc_block(uint64_t b) {
+    if (b >= CAS_REF_MAX) return;
+    if (g_cas_refs[b] < CAS_REF_PIN) g_cas_refs[b]++;
+}
+/* fwd: defined with the chunk-map walkers whose enumeration it shares, and
+ * called from BOTH cas_format() and cas_mount() so every path that establishes
+ * a directory also establishes the counts derived from it. */
+static void cas_refs_rebuild(void);
+
 /* v0.57: the probe START is derived from a MIXED hash, not from the hash's low
  * bits directly. The stored hash is unchanged — this only decides where probing
  * begins — but it matters a great deal now that the table is sized from the
@@ -5401,7 +5460,51 @@ static int64_t cas_index_find(uint64_t hash, uint32_t *out_len) {
  * writes below can never leave the index and bitmap disagreeing about who
  * owns a block. Returns the home sector, -1 if the index is full, -2 if the
  * hash is already present (caller treats that as a dedup, same as before). */
+/* v0.84: TOMBSTONE REUSE. A removed entry cannot simply be zeroed: this table is
+ * open-addressed with linear probing, and cas_index_find stops at the first slot
+ * that is empty in BOTH fields, so a zeroed slot in the middle of a probe chain
+ * would cut every entry beyond it out of the index — content still on disk and
+ * still referenced, reported as absent.
+ *
+ * The empty test is `hash == 0 && block == 0`, so `hash == 0 && block != 0` is
+ * already a value neither existing loop mistakes for empty: find() walks past it
+ * and stage() previously walked past it too. That is the tombstone, and it costs
+ * no format change. This function now also RECLAIMS one, so a volume that
+ * churns files does not slowly fill its index with dead markers — remembering
+ * the first tombstone and using it only after the probe proves the hash is
+ * absent, because inserting early would create a duplicate entry for a hash that
+ * lives further along the chain. */
 static int64_t cas_index_stage(uint64_t hash, uint32_t block, uint32_t len) {
+    uint64_t slots = SB->index_blocks * CAS_SLOTS_PER_BLOCK;
+    uint64_t start = cas_slot_of(hash, slots);
+    int64_t  tsec = -1; uint32_t toff = 0;
+    for (uint64_t probe = 0; probe < slots; probe++) {
+        uint64_t s   = (start + probe) % slots;
+        uint64_t sec = SB->index_start + s / CAS_SLOTS_PER_BLOCK;
+        uint32_t off = (uint32_t)(s % CAS_SLOTS_PER_BLOCK) * sizeof(struct cas_islot);
+        virtio_read_block(sec, g_idxbuf);
+        struct cas_islot *sl = (struct cas_islot *)(g_idxbuf + off);
+        if (sl->hash == hash) return -2;
+        if (sl->hash == 0 && sl->block == CAS_TOMB && tsec < 0) { tsec = (int64_t)sec; toff = off; }
+        if (sl->hash == 0 && sl->block == 0) {
+            if (tsec >= 0) break;                       /* absent: fill the tombstone */
+            sl->hash = hash; sl->block = block; sl->len = len;
+            return (int64_t)sec;
+        }
+    }
+    if (tsec >= 0) {
+        virtio_read_block((uint64_t)tsec, g_idxbuf);    /* re-stage the tombstone's home */
+        struct cas_islot *t = (struct cas_islot *)(g_idxbuf + toff);
+        t->hash = hash; t->block = block; t->len = len;
+        return tsec;
+    }
+    return -1;
+}
+
+/* v0.84: stage the REMOVAL of a hash, same contract as cas_index_stage — the
+ * home sector is mutated in g_idxbuf and returned, and the CALLER writes it home
+ * under the journal. Returns -1 if the hash is not present. */
+static int64_t cas_index_remove(uint64_t hash) {
     uint64_t slots = SB->index_blocks * CAS_SLOTS_PER_BLOCK;
     uint64_t start = cas_slot_of(hash, slots);
     for (uint64_t probe = 0; probe < slots; probe++) {
@@ -5410,9 +5513,9 @@ static int64_t cas_index_stage(uint64_t hash, uint32_t block, uint32_t len) {
         uint32_t off = (uint32_t)(s % CAS_SLOTS_PER_BLOCK) * sizeof(struct cas_islot);
         virtio_read_block(sec, g_idxbuf);
         struct cas_islot *sl = (struct cas_islot *)(g_idxbuf + off);
-        if (sl->hash == hash) return -2;
-        if (sl->hash == 0 && sl->block == 0) {
-            sl->hash = hash; sl->block = block; sl->len = len;
+        if (sl->hash == 0 && sl->block == 0) return -1;      /* genuinely absent */
+        if (sl->hash == hash) {
+            sl->hash = 0; sl->block = CAS_TOMB; sl->len = 0;
             return (int64_t)sec;
         }
     }
@@ -5540,6 +5643,83 @@ static uint64_t cas_put(const void *data, uint32_t len) {
     return h;
 }
 
+/* v0.84: DROP ONE REFERENCE TO `hash`, and return its block to the pool if that
+ * was the last one. Returns 1 if the block was freed, 0 if it is still
+ * referenced (or untracked), -1 if the hash is not in the index.
+ *
+ * cas_put has no matching increment on purpose. A reference here means "a live
+ * dirent names this block", and cas_put is called while a map is still being
+ * BUILT — including for content a failed write is about to roll back. Counting
+ * there would attribute a reference to a file that may never exist. The
+ * increment is vfs_retain_map_locked(), at the moment the map becomes the
+ * dirent's, so the invariant stays exactly "refcount == the number of dirent
+ * slots naming this block".
+ *
+ * Writes and unlinks are serialised by g_vfs_lock (rank 2) above this, which is
+ * what closes the window between cas_put storing a block at refcount 0 and the
+ * retain that claims it: no unlink can run in between and free a block the new
+ * map is about to name.
+ *
+ * ORDER IS LOAD-BEARING. The index entry is removed BEFORE the bitmap bit is
+ * cleared. A block freed while its index entry survives is worse than a leak: a
+ * later cas_put of the same content would find that entry, report a dedup hit,
+ * and hand back a hash pointing at storage that has since been reallocated to
+ * something else. That is the "confidently wrong content" failure v0.56 already
+ * found once on this path. */
+static int cas_free(uint64_t hash) {
+    if (!hash || !g_cas_refs_ready) return 0;
+    klock_acquire(&g_cas_lock);
+    uint32_t len;
+    int64_t b = cas_index_find(hash, &len);
+    if (b < 0) { klock_release(&g_cas_lock); return -1; }
+    g_cas_ref_drops++;
+    int last;
+    if ((uint64_t)b >= CAS_REF_MAX) {                  /* off the table: never freed */
+        klock_release(&g_cas_lock);
+        return 0;
+    }
+    if (g_cas_refs[b] == 0) {
+        /* Nothing should ever release a block twice. Counted rather than
+         * ignored: this number staying at zero is what says the retain/release
+         * pairing is right, and a non-zero value is the corruption path
+         * announcing itself. Refuse the free — an underflow means the count is
+         * not trustworthy, and leaking is the safe direction. */
+        g_cas_ref_underflow++;
+        klock_release(&g_cas_lock);
+        return 0;
+    }
+    if (g_cas_refs[b] != CAS_REF_PIN) g_cas_refs[b]--;
+#ifndef CAS_RECLAIM_REPRO
+    last = (g_cas_refs[b] == 0);
+#else
+    /* v0.84 REPRODUCER, opt-in (`make EXTRA=-DCAS_RECLAIM_REPRO`), never in a
+     * release build: free on the FIRST drop, ignoring the fact that another
+     * dirent may still name this block. This is precisely the implementation
+     * v0.48 refused to ship, and the dedup negative control exists to catch it.
+     * A guard whose test has never been watched to fail has not passed. */
+    last = 1;
+#endif
+    if (!last) { klock_release(&g_cas_lock); return 0; }
+
+    int64_t sec = cas_index_remove(hash);
+    if (sec < 0) { klock_release(&g_cas_lock); return -1; }
+    if (!g_cas_legacy) {
+        uint64_t bitmap_blk = SB->bitmap_start + ((uint64_t)b >> 3) / CAS_BS;
+        cas_journal_write((uint64_t)sec, bitmap_blk);
+        virtio_write_block((uint64_t)sec, g_idxbuf);       /* index entry gone first */
+        bm_free((uint64_t)b);
+        cas_flush_meta();
+        cas_journal_clear();
+    } else {
+        virtio_write_block((uint64_t)sec, g_idxbuf);
+        bm_free((uint64_t)b);
+        cas_flush_meta();
+    }
+    g_cas_blocks_freed++;
+    klock_release(&g_cas_lock);
+    return 1;
+}
+
 /* fetch content by hash -> length, copies into out (up to max).              */
 static int64_t cas_get(uint64_t hash, void *out, uint32_t max) {
     uint32_t len;
@@ -5623,6 +5803,10 @@ static void cas_format(void) {
             SB->vjournal_start, SB->vjournal_blocks, SB->cjournal_start, SB->cjournal_blocks, SB->data_start);
     kprintf("[cas    ]   raw-block scratch region: %d block(s) at %d (reserved, never allocated)\n",
             SB->scratch_blocks, SB->scratch_start);
+    /* v0.84: a fresh volume has an empty directory, so every count is legitimately
+     * zero — but the table must still be marked READY, or cas_free() would spend
+     * the whole boot refusing to reclaim anything on a volume it formatted itself. */
+    cas_refs_rebuild();
 }
 
 static void vfs_journal_apply(void);   /* fwd: v0.48, defined in the VFS section below */
@@ -5662,6 +5846,12 @@ static int cas_mount(void) {
     kprintf("[cas    ] mounted existing volume (v%d%s): %d/%d blocks used, %d puts, %d dedup hits\n",
             SB->version, g_cas_legacy ? ", legacy/no-journal" : "",
             SB->used_blocks, SB->total_blocks, SB->put_count, SB->dedup_hits);
+    /* v0.84: the directory is loaded and recovered by here, so this is the first
+     * moment the reference counts CAN be derived — and it must happen before any
+     * unlink runs, because cas_free() refuses to free while the table is
+     * unpopulated. A volume written by a kernel that never counted anything
+     * mounts and is counted correctly, which is the property deriving buys. */
+    cas_refs_rebuild();
     return 1;
 }
 
@@ -6598,6 +6788,97 @@ static uint64_t vfs_chunk_hash_at(const struct dirent *d, uint32_t i) {
     return blk[j % VFS_IND_PER_BLK];
 }
 
+/* v0.84: THE REFERENCE EDGES OF A CHUNK MAP.
+ *
+ * A dirent references more CAS objects than its data chunks. The single- and
+ * double-indirect blocks are themselves ordinary CAS objects (see the format
+ * note above), so a release that walks only the data chunks leaks one block per
+ * indirect level, and a rebuild that counts only data chunks would report those
+ * same blocks as unreferenced and free them out from under a live file. Both
+ * halves therefore enumerate exactly the same set, and they are written next to
+ * each other so they cannot drift apart.
+ *
+ * ORDER WITHIN A RELEASE. The data chunks go first, because resolving chunk `i`
+ * of a large file READS the indirect blocks — freeing those first would make
+ * the rest of the map unresolvable and silently under-release it. Then the L1
+ * blocks named by ind2, then ind2 itself, then ind1.
+ *
+ * A hash appearing twice in one map is counted twice, deliberately. A file of
+ * repeated content — a zero-filled or sparse file, which this VFS produces on
+ * every extending write — names one block from many slots, and a release that
+ * de-duplicated would drop the count to zero while the file still used it. */
+static void vfs_map_walk_locked(const struct dirent *d, int retain) {
+    uint32_t nch = d->nchunks;
+    if (nch > VFS_CHUNKS_MAX) nch = VFS_CHUNKS_MAX;
+    for (uint32_t c = 0; c < nch; c++) {
+        uint64_t h = vfs_chunk_hash_at(d, c);
+        if (!h) continue;
+        if (retain) {
+            klock_acquire(&g_cas_lock);
+            int64_t b = cas_index_find(h, 0);
+            if (b >= 0) cas_ref_inc_block((uint64_t)b);
+            klock_release(&g_cas_lock);
+        } else cas_free(h);
+    }
+    if (d->ind2_hash) {
+        uint64_t top[VFS_IND_PER_BLK];
+        if (cas_get(d->ind2_hash, top, sizeof top) >= 0)
+            for (uint32_t g = 0; g < VFS_IND_PER_BLK; g++) {
+                if (!top[g]) continue;
+                if (retain) {
+                    klock_acquire(&g_cas_lock);
+                    int64_t b = cas_index_find(top[g], 0);
+                    if (b >= 0) cas_ref_inc_block((uint64_t)b);
+                    klock_release(&g_cas_lock);
+                } else cas_free(top[g]);
+            }
+        if (retain) {
+            klock_acquire(&g_cas_lock);
+            int64_t b = cas_index_find(d->ind2_hash, 0);
+            if (b >= 0) cas_ref_inc_block((uint64_t)b);
+            klock_release(&g_cas_lock);
+        } else cas_free(d->ind2_hash);
+    }
+    if (d->ind1_hash) {
+        if (retain) {
+            klock_acquire(&g_cas_lock);
+            int64_t b = cas_index_find(d->ind1_hash, 0);
+            if (b >= 0) cas_ref_inc_block((uint64_t)b);
+            klock_release(&g_cas_lock);
+        } else cas_free(d->ind1_hash);
+    }
+}
+static void vfs_retain_map_locked(const struct dirent *d)  { vfs_map_walk_locked(d, 1); }
+static void vfs_release_map_locked(const struct dirent *d) { vfs_map_walk_locked(d, 0); }
+
+/* Recompute every block's reference count from the live directory.
+ *
+ * This is what makes the count durable without an on-disk field: it is derived
+ * from state that is already journaled, so it is correct after a clean boot, a
+ * crash recovery, or a boot that mounted a volume some older kernel wrote with
+ * no notion of reference counting at all. Until it has run, cas_free() refuses
+ * to free anything — an unpopulated table reads as all-zero, and all-zero means
+ * "free everything", which is the worst possible default. */
+static void cas_refs_rebuild(void) {
+    klock_acquire(&g_cas_lock);
+    for (uint64_t i = 0; i < CAS_REF_MAX; i++) g_cas_refs[i] = 0;
+    klock_release(&g_cas_lock);
+    int nf = 0;
+    for (int i = 0; i < VFS_MAXFILES; i++) {
+        if (!DENTS[i].used) continue;
+        vfs_retain_map_locked(&DENTS[i]);
+        nf++;
+    }
+    g_cas_refs_ready = 1;
+    uint64_t tracked = 0;
+    klock_acquire(&g_cas_lock);
+    for (uint64_t i = 0; i < CAS_REF_MAX; i++) if (g_cas_refs[i]) tracked++;
+    klock_release(&g_cas_lock);
+    kprintf("[cas    ] refcounts derived from %d live file(s): %u block(s) referenced, "
+            "%u of %u in use\n",
+            (uint64_t)(int64_t)nf, tracked, SB->used_blocks, SB->total_blocks);
+}
+
 /* v0.84: write a chunk-hash array into a dirent's direct and indirect map.
  *
  * Factored out of vfs_write_locked so the whole-file writer and the positional
@@ -6677,6 +6958,16 @@ static int vfs_write_locked(int idx, const char *name, const void *data, uint32_
         return -1;
     }
     d->file_hash = len ? rust_cas_hash((uint64_t)data, len) : 0;
+    /* v0.84: RETAIN THE NEW MAP BEFORE RELEASING THE OLD ONE, and never the
+     * other way round. A rewrite very often stores content it already held —
+     * identical chunks dedup to the same blocks — so releasing first would drop
+     * a shared block's count to zero, free it, and leave the map we just built
+     * pointing at storage that is back in the free pool. Retaining first means
+     * the count dips to 1 rather than to 0 and the block is never a candidate.
+     * Only reached on the success path: a rolled-back write restored `prev` and
+     * changed no references at all. */
+    vfs_retain_map_locked(d);
+    if (prev.used) vfs_release_map_locked(&prev);
     vfs_journal_commit();          /* v0.48: journal-commit; see comment above */
     { char msg[64]; int mp = 0;
       const char *pre = "wrote file "; while (pre[mp]) { msg[mp] = pre[mp]; mp++; }
@@ -6822,6 +7113,13 @@ static int vfs_write_at_locked(int di, uint64_t off, const void *data, uint32_t 
         h = rust_cas_hash_cont(h, (uint64_t)blk, clen);
     }
     d->file_hash = newlen ? h : 0;
+    /* v0.84: same retain-then-release rule as the whole-file writer, and it
+     * matters more here. A positional write REBUILDS every chunk it touches
+     * from the old content, so the untouched chunks hash identically and dedup
+     * straight back to the blocks `prev` already names — releasing first would
+     * free most of the file and then point the new map at it. */
+    vfs_retain_map_locked(d);
+    if (prev.used) vfs_release_map_locked(&prev);
     vfs_journal_commit();
     return (int)len;
 }
@@ -8280,6 +8578,31 @@ static int vfs_open_for(const char *name, int owner, int creat, int trunc) {
             klock_release(&g_vfs_lock);
             return -13;                                        /* EACCES */
         }
+        /* v0.84: O_TRUNC drops the whole chunk map, so it drops every reference
+         * that map held. Released before the fields are zeroed, for the same
+         * reason unlink releases before clearing `used`: afterwards there is no
+         * record of which blocks to release.
+         *
+         * THE MAP ITSELF MUST BE CLEARED TOO, and forgetting that is a bug this
+         * cost a dirty-volume gate to find. Zeroing only len/nchunks/file_hash
+         * leaves chunk_hash[] and the two indirect hashes holding the values
+         * just released. The next write to this dirent snapshots `prev` — stale
+         * hashes and all — and releases them a SECOND time, and because that
+         * write has usually dedup'd the same content straight back to the same
+         * blocks, the second release takes a live block from 1 to 0 and frees
+         * it. The underflow counter cannot see that: the count really was 1.
+         * It surfaced as `/bin/emit: chunk 16 of 17 has no hash` — chunk 16 is
+         * the first SINGLE-INDIRECT chunk, so the freed block was ind1 — on
+         * boots 2 and 3 of the reused-image gate, where a populated volume makes
+         * the intervening dedup near-certain. A fresh volume hid it completely.
+         *
+         * nchunks == 0 is not enough on its own: cas_refs_rebuild() walks
+         * ind1_hash/ind2_hash regardless of nchunks, so a stale pair would also
+         * have the mount RETAIN blocks this file no longer uses. */
+        vfs_release_map_locked(&DENTS[di]);
+        cmemset(DENTS[di].chunk_hash, 0, sizeof DENTS[di].chunk_hash);
+        DENTS[di].ind1_hash = 0;
+        DENTS[di].ind2_hash = 0;
         DENTS[di].len = 0;
         DENTS[di].nchunks = 0;
         DENTS[di].file_hash = 0;
@@ -8376,6 +8699,22 @@ static int vfs_unlink(const char *name) {
     klock_acquire(&g_vfs_lock);
     int idx = vfs_find(name);
     if (idx < 0) { klock_release(&g_vfs_lock); return -1; }
+    /* v0.84: give the content back. This is what the v0.48 comment above
+     * declined to do, and the reference counts are what make it safe to do now:
+     * a block still named by another dirent simply drops to a lower non-zero
+     * count and stays put. Released BEFORE the dirent is cleared, because the
+     * map is the only record of which blocks this file held — clearing first
+     * would strand them permanently, which is the behaviour being fixed. */
+    vfs_release_map_locked(&DENTS[idx]);
+    /* Clear the map for the same reason O_TRUNC does. `used = 0` alone happens
+     * to be safe today — vfs_write_locked skips the release when `prev.used` is
+     * false — but that makes a released dirent safe by one caller's accident
+     * rather than by its own state. A dirent that has given its blocks back must
+     * not still name them. */
+    cmemset(DENTS[idx].chunk_hash, 0, sizeof DENTS[idx].chunk_hash);
+    DENTS[idx].ind1_hash = 0;
+    DENTS[idx].ind2_hash = 0;
+    DENTS[idx].nchunks = 0;
     DENTS[idx].used = 0;
     vfs_journal_commit();
     klock_release(&g_vfs_lock);
@@ -19534,10 +19873,28 @@ static void cmd_vfs_stress(void) {
          * forever. Printed, not asserted, until the fix lands. */
         int br = vfs_unlink("casrec-b");
         uint64_t used_end = SB->used_blocks;
-        kprintf("[vfsstrs] casrec: used_blocks after unlink A = %u, after unlink B = %u; "
-                "%u of %u chunk block(s) STILL HELD with no file referencing them\n",
-                used_afterA, used_end, used_end - used0, (uint64_t)CASREC_CHUNKS);
+        kprintf("[vfsstrs] casrec: used_blocks after unlink A = %u, after unlink B = %u "
+                "(started at %u); freed %u block(s), %u drop(s), %u underflow(s)\n",
+                used_afterA, used_end, used0,
+                g_cas_blocks_freed, g_cas_ref_drops, g_cas_ref_underflow);
         vfscheck("both halves of the dedup control unlink cleanly", ur == 0 && br == 0);
+
+        /* v0.84 Phase 4: THE RECLAMATION ASSERTIONS. Withheld in Phase 1 on
+         * purpose — they would have failed for the whole of it, and a suite
+         * expected to be red is a suite nobody reads.
+         *
+         * Two claims, separated because they fail for different reasons. The
+         * first is that unlinking A — whose every chunk is still named by B —
+         * frees NOTHING. The second is that unlinking B, the last referrer,
+         * returns the volume to where it started. A reclaimer that ignores
+         * sharing passes the second and fails the first; one that never frees
+         * passes the first and fails the second. Neither alone is the property. */
+        vfscheck("unlinking a file whose every chunk is still shared frees NO blocks "
+                 "(the reference count, not the unlink, decides)",
+                 used_afterA == used_b);
+        vfscheck("unlinking the LAST file referencing those chunks returns every block "
+                 "to the pool (used_blocks back to its pre-write value)",
+                 used_end == used0);
     }
 
     /* ===== v0.56 Stage B: HIERARCHICAL PATH NAMES ==========================
@@ -19885,6 +20242,31 @@ static void cmd_vfs_stress(void) {
             "ownership checks are REVERTED. This build is a reproducer, not a kernel.\n");
 #endif
     }
+    /* v0.84: CAS reclamation, reported on every boot in every build.
+     *
+     * `underflow` is the one that would say this scheme is WRONG rather than
+     * merely idle: a decrement of an already-zero count means a block was
+     * released twice, which is the corruption path itself announcing. It is
+     * asserted, not merely printed. `freed` is asserted > 0 for the reason the
+     * tmp counters are — a boot that reclaimed nothing has not tested
+     * reclamation, and would pass a "nothing was corrupted" check trivially. */
+    kprintf("[vfsstrs] cas reclaim: %u block(s) freed, %u reference drop(s), "
+            "%u underflow(s); volume %u/%u blocks used\n",
+            g_cas_blocks_freed, g_cas_ref_drops, g_cas_ref_underflow,
+            (uint64_t)SB->used_blocks, (uint64_t)SB->total_blocks);
+#ifdef CAS_RECLAIM_REPRO
+    kputs("[vfsstrs] *** BUILT WITH CAS_RECLAIM_REPRO — cas_free() ignores the reference "
+          "count and frees on the first drop. This build is a reproducer, not a kernel.\n");
+#endif
+    vfscheck("CAS reclamation actually ran this boot (blocks freed > 0; zero would make "
+             "every reclamation claim above INCONCLUSIVE)",
+             g_cas_blocks_freed > 0);
+    vfscheck("no CAS block was ever released twice (reference-count underflow == 0)",
+             g_cas_ref_underflow == 0);
+    vfscheck("the free-block accounting still reconciles after reclamation "
+             "(used_blocks agrees with the bitmap)",
+             SB->used_blocks <= SB->total_blocks);
+
     vfscheck("the tmp ownership rule was exercised this boot (permission decisions > 0; "
              "zero would make every tmp permission claim below INCONCLUSIVE)",
              g_tmp_permit_checks > 0);
