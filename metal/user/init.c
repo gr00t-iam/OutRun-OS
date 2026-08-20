@@ -157,6 +157,7 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_AUTH                98          /* v0.74: (name, password) -> uid, or negative */
 #define SYS_USERADD             99          /* v0.74: (name, password, (gid<<32)|uid) */
 #define SYS_LSEEK              100          /* v0.82: (fd, offset, whence) -> new off  */
+#define SYS_FTRUNCATE          101          /* v0.84: (fd, length) -> 0, or -errno     */
 
 /* v0.82: the three POSIX whence values, in POSIX's order and with POSIX's
  * numbers. They are not an internal encoding to be chosen freely — a ring-3
@@ -1837,6 +1838,12 @@ static void stdio_init(void) {
  * tail-preserving in the same release — a write no longer replaces a file's
  * whole contents, so "author this file" has to say so at open. */
 #define O_TRUNC 2
+/* v0.84: O_APPEND. Every write through this descriptor lands at end-of-file,
+ * whatever the descriptor's offset says — and the kernel resolves that end
+ * inside the same lock that performs the write, so two appenders cannot both
+ * choose the same place. An lseek before the write is not merely unnecessary,
+ * it is IGNORED, which is the property the suite checks rather than assumes. */
+#define O_APPEND 4
 static int oopen_flags(const char *path, u64 flags) {
     i64 k = (i64)sysc(SYS_OPEN, (u64)path, flags, 0);
     if (k < 0) return (int)k;
@@ -1902,6 +1909,16 @@ static i64 olseek(int fd, i64 off, int whence) {
     if (fd < 0 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;      /* EBADF  */
     if (g_ofd[fd] == OFD_CONSOLE)                   return -29;     /* ESPIPE */
     return (i64)sysc(SYS_LSEEK, (u64)g_ofd[fd], (u64)off, (u64)(i64)whence);
+}
+/* v0.84: set a file's length through an open descriptor. Returns 0, or a
+ * negative errno. The console is refused here rather than passed down for the
+ * same reason olseek refuses it: fd 0/1/2 map to OFD_CONSOLE, which is not a
+ * kernel descriptor, so handing it over would have the kernel read the sentinel
+ * as an fd number. */
+static i64 oftruncate(int fd, i64 len) {
+    if (fd < 0 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;      /* EBADF  */
+    if (g_ofd[fd] == OFD_CONSOLE)                   return -22;     /* EINVAL */
+    return (i64)sysc(SYS_FTRUNCATE, (u64)g_ofd[fd], (u64)len, 0);
 }
 static int oclose(int fd) {
     if (fd < 3 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;  /* std three are not closable */
@@ -3051,6 +3068,130 @@ static void lseek_worker(void) {
         if (b[0] != 'a' || b[1] != 'b' || b[2] != 'c') sysc(SYS_EXIT, 1805, 0, 0); }
       oclose(t);
       if (ounlink("tmp/rperm") != 0)                  sysc(SYS_EXIT, 1806, 0, 0); }
+
+    /* ==================================================================
+     * v0.84: ftruncate — SHRINK, GROW, and the shrink-then-grow case that
+     * is the whole reason the boundary chunk is re-put.
+     *
+     * A shortened file whose last chunk still holds the old bytes past the
+     * new end READS correctly, because reads are bounded by the length. It
+     * only stops reading correctly when the file is extended again, and
+     * POSIX says that gap must be zeroes. So the shrink is checked, and
+     * then the file is grown back over the same region and the bytes are
+     * checked AGAIN — a test that stopped at the shrink would pass against
+     * an implementation that never zeroed anything.
+     * ================================================================== */
+#define FTR_PATH "/ftr-probe"
+#define FTR_LEN  2048u
+#define FTR_CUT  700u
+    { for (u32 i = 0; i < FTR_LEN; i++) g_lsb[i] = (u8)((i * 13u + 5u) & 0xFF);
+      int f = ocreat(FTR_PATH);
+      if (f < 0)                                    sysc(SYS_EXIT, 1820, 0, 0);
+      if (owrite(f, (const char *)g_lsb, FTR_LEN) != (i64)FTR_LEN)
+                                                    sysc(SYS_EXIT, 1821, 0, 0);
+
+      /* SHRINK to a non-chunk boundary: 700 is mid-chunk on purpose. */
+      if (oftruncate(f, FTR_CUT) != 0)              sysc(SYS_EXIT, 1822, 0, 0);
+      if (olseek(f, 0, SEEK_END) != (i64)FTR_CUT)   sysc(SYS_EXIT, 1823, 0, 0);
+      if (olseek(f, 0, SEEK_SET) != 0)              sysc(SYS_EXIT, 1824, 0, 0);
+      if (oread(f, (char *)g_lsb + FTR_LEN, FTR_CUT) != (i64)FTR_CUT)
+                                                    sysc(SYS_EXIT, 1824, 0, 0);
+      for (u32 i = 0; i < FTR_CUT; i++)
+          if (g_lsb[FTR_LEN + i] != g_lsb[i])       sysc(SYS_EXIT, 1824, 0, 0);
+
+      /* GROW back over the region just discarded. Every byte from the old
+       * cut to the new end must be ZERO — if the boundary chunk kept its
+       * tail, the original pattern reappears here instead. */
+      if (oftruncate(f, FTR_LEN) != 0)              sysc(SYS_EXIT, 1825, 0, 0);
+      if (olseek(f, 0, SEEK_END) != (i64)FTR_LEN)   sysc(SYS_EXIT, 1826, 0, 0);
+      if (olseek(f, (i64)FTR_CUT, SEEK_SET) != (i64)FTR_CUT)
+                                                    sysc(SYS_EXIT, 1826, 0, 0);
+      { u32 tail = FTR_LEN - FTR_CUT;
+        for (u32 i = 0; i < tail; i++) g_lsb[FTR_LEN + i] = 0xAA;   /* poison */
+        if (oread(f, (char *)g_lsb + FTR_LEN, tail) != (i64)tail)
+                                                    sysc(SYS_EXIT, 1826, 0, 0);
+        for (u32 i = 0; i < tail; i++)
+            if (g_lsb[FTR_LEN + i] != 0)            sysc(SYS_EXIT, 1827, 0, 0); }
+
+      /* To zero, and back up again: the empty-map case. */
+      if (oftruncate(f, 0) != 0)                    sysc(SYS_EXIT, 1828, 0, 0);
+      if (olseek(f, 0, SEEK_END) != 0)              sysc(SYS_EXIT, 1828, 0, 0);
+      if (oftruncate(f, 1000) != 0)                 sysc(SYS_EXIT, 1828, 0, 0);
+      if (olseek(f, 0, SEEK_END) != 1000)           sysc(SYS_EXIT, 1828, 0, 0);
+      if (olseek(f, 0, SEEK_SET) != 0)              sysc(SYS_EXIT, 1828, 0, 0);
+      { for (u32 i = 0; i < 1000; i++) g_lsb[FTR_LEN + i] = 0xAA;
+        if (oread(f, (char *)g_lsb + FTR_LEN, 1000) != 1000)
+                                                    sysc(SYS_EXIT, 1828, 0, 0);
+        for (u32 i = 0; i < 1000; i++)
+            if (g_lsb[FTR_LEN + i] != 0)            sysc(SYS_EXIT, 1827, 0, 0); }
+
+      /* A negative length is EINVAL, and is refused BEFORE anything moves. */
+      if (oftruncate(f, -1) != -22)                 sysc(SYS_EXIT, 1829, 0, 0);
+      if (olseek(f, 0, SEEK_END) != 1000)           sysc(SYS_EXIT, 1829, 0, 0);
+      oclose(f);
+      ounlink(FTR_PATH); }
+
+    /* A pipe has no length to set. EINVAL rather than ESPIPE: the caller did
+     * not attempt to seek, and answering "illegal seek" would name an
+     * operation that never happened. */
+    { i64 pv[2];
+      if ((i64)sysc(SYS_PIPE, (u64)(void *)pv, 0, 0) != 0) sysc(SYS_EXIT, 1830, 0, 0);
+      if ((i64)sysc(SYS_FTRUNCATE, (u64)pv[0], 0, 0) != -22) sysc(SYS_EXIT, 1830, 0, 0);
+      sysc(SYS_CLOSE, (u64)pv[0], 0, 0);
+      sysc(SYS_CLOSE, (u64)pv[1], 0, 0); }
+
+    /* ==================================================================
+     * v0.84: O_APPEND — on BOTH volumes.
+     *
+     * The load-bearing check is that an explicit lseek to 0 is IGNORED. A
+     * naive implementation that merely seeks to the end at open time passes
+     * a "two writes land end to end" test and fails this one, because the
+     * offset it set is then honoured by the next write.
+     * ================================================================== */
+#define APP_PATH "/app-probe"
+    { int f = ocreat(APP_PATH);
+      if (f < 0)                                    sysc(SYS_EXIT, 1831, 0, 0);
+      if (owrite(f, "abc", 3) != 3)                 sysc(SYS_EXIT, 1832, 0, 0);
+      oclose(f);
+
+      int a = oopen_flags(APP_PATH, O_APPEND);
+      if (a < 0)                                    sysc(SYS_EXIT, 1833, 0, 0);
+      /* Seek to the START, then write: the bytes must still land at the end. */
+      if (olseek(a, 0, SEEK_SET) != 0)              sysc(SYS_EXIT, 1834, 0, 0);
+      if (owrite(a, "DE", 2) != 2)                  sysc(SYS_EXIT, 1834, 0, 0);
+      if (owrite(a, "F", 1) != 1)                   sysc(SYS_EXIT, 1834, 0, 0);
+      if (olseek(a, 0, SEEK_END) != 6)              sysc(SYS_EXIT, 1835, 0, 0);
+      if (olseek(a, 0, SEEK_SET) != 0)              sysc(SYS_EXIT, 1835, 0, 0);
+      { char b[8]; for (int i = 0; i < 8; i++) b[i] = 0;
+        if (oread(a, b, 6) != 6)                    sysc(SYS_EXIT, 1835, 0, 0);
+        if (b[0] != 'a' || b[1] != 'b' || b[2] != 'c' ||
+            b[3] != 'D' || b[4] != 'E' || b[5] != 'F')
+                                                    sysc(SYS_EXIT, 1836, 0, 0); }
+      oclose(a);
+      ounlink(APP_PATH); }
+
+    /* The same rule on the tmp volume, which has agreed with the root volume
+     * about what a position means since v0.83. */
+    { int t = ocreat("tmp/appprobe");
+      if (t < 0)                                    sysc(SYS_EXIT, 1837, 0, 0);
+      if (owrite(t, "12", 2) != 2)                  sysc(SYS_EXIT, 1837, 0, 0);
+      oclose(t);
+      int a = oopen_flags("tmp/appprobe", O_APPEND);
+      if (a < 0)                                    sysc(SYS_EXIT, 1837, 0, 0);
+      if (olseek(a, 0, SEEK_SET) != 0)              sysc(SYS_EXIT, 1837, 0, 0);
+      if (owrite(a, "34", 2) != 2)                  sysc(SYS_EXIT, 1837, 0, 0);
+      if (olseek(a, 0, SEEK_END) != 4)              sysc(SYS_EXIT, 1838, 0, 0);
+      if (olseek(a, 0, SEEK_SET) != 0)              sysc(SYS_EXIT, 1838, 0, 0);
+      { char b[6]; for (int i = 0; i < 6; i++) b[i] = 0;
+        if (oread(a, b, 4) != 4)                    sysc(SYS_EXIT, 1838, 0, 0);
+        if (b[0] != '1' || b[1] != '2' || b[2] != '3' || b[3] != '4')
+                                                    sysc(SYS_EXIT, 1838, 0, 0); }
+      /* ftruncate on the tmp volume too, so the parity is tested and not
+       * merely claimed. */
+      if (oftruncate(a, 2) != 0)                    sysc(SYS_EXIT, 1839, 0, 0);
+      if (olseek(a, 0, SEEK_END) != 2)              sysc(SYS_EXIT, 1839, 0, 0);
+      oclose(a);
+      ounlink("tmp/appprobe"); }
 
     ounlink("/lseek-seq");
     ounlink(LS_PATH);

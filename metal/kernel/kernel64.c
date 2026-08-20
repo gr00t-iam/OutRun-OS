@@ -7166,6 +7166,145 @@ static int vfs_write_at_locked(int di, uint64_t off, const void *data, uint32_t 
     vfs_journal_commit();
     return (int)len;
 }
+
+/* v0.84: SET A FILE'S LENGTH — the operation ftruncate() names, and the last
+ * thing the positional-write work left without an expression.
+ *
+ * v0.83 added O_TRUNC and its comment recorded why: before positional writes, a
+ * write REPLACED a file's whole contents, so that side effect WAS the only way
+ * to shorten one. O_TRUNC covers "empty this file at open". It does not cover
+ * shortening an open file to a chosen length, or extending one without writing
+ * bytes, and neither did anything else.
+ *
+ * Built on vfs_write_at_locked's shape rather than beside it: same chunk-array
+ * rebuild, same vfs_build_map_locked, same retain-new-before-release-old. That
+ * last point is what makes SHRINKING return storage — the trailing chunks are
+ * simply absent from the new map, so releasing `prev` drops their references
+ * and the v0.84 reclamation path frees any block no other file names. No new
+ * free logic exists here, deliberately: a second place that returns blocks is a
+ * second place that can return one twice.
+ *
+ * THE BOUNDARY CHUNK IS RE-PUT AT ITS NEW, SHORTER LENGTH — it is not reused by
+ * hash, even though its first bytes are unchanged. That is what actually
+ * discards the tail: cas_put stores clen bytes, so the content past the new end
+ * is never written, and a later grow re-reads a short chunk into a zeroed buffer
+ * and sees the zeroes POSIX promises.
+ *
+ * Worth stating because the failure it prevents is INVISIBLE to a shrink-only
+ * test. Reads are bounded by d->len, so a shortened file whose last chunk still
+ * held the old bytes would read correctly and look right; it would stop looking
+ * right only when the file was extended again. The ring-3 test therefore shrinks
+ * AND grows back over the same region, and poisons its buffer first so a short
+ * read cannot pass as zeroes.
+ *
+ * Called with g_vfs_lock HELD. */
+static int vfs_truncate_locked(int di, uint32_t newlen) {
+    struct dirent *d = &DENTS[di];
+    if (!d->used) return -1;
+#ifdef FTRUNC_NOOP_REPRO
+    /* v0.84 REACHABILITY PROBE, opt-in and never in a release build: report
+     * success and change nothing. The ring-3 checks must go red — if they do
+     * not, they are not running, and the gate that passed beside them was
+     * measuring nothing. Expect exit 1823. */
+    (void)newlen; return 0;
+#endif
+    if (newlen > (uint32_t)VFS_MAX_FILE_BYTES) return -28;       /* ENOSPC */
+    uint32_t oldlen = d->len;
+    if (newlen == oldlen) return 0;                              /* nothing to do */
+
+    uint32_t nch    = (newlen + 511) / 512;
+    uint32_t oldnch = (oldlen + 511) / 512;
+    struct dirent prev = *d;
+    uint8_t blk[512];
+    int put_failed = 0;
+
+    for (uint32_t i = 0; i < nch; i++) {
+        uint64_t cstart = (uint64_t)i * 512;
+        uint32_t clen   = (newlen - (uint32_t)cstart) < 512 ? (newlen - (uint32_t)cstart) : 512;
+        /* A whole chunk that survives the new length unchanged: its hash still
+         * describes its bytes, so reuse it and store nothing. */
+        if (i < oldnch && cstart + 512 <= (uint64_t)oldlen && clen == 512) {
+            g_wa_ch[i] = vfs_chunk_hash_at(&prev, i);
+            if (!g_wa_ch[i]) put_failed = 1;
+            continue;
+        }
+        /* Otherwise rebuild it: old bytes where the old file had them, zeroes
+         * everywhere else. `clen` bounds the put, so the bytes past the new end
+         * are not merely unread — they are not stored. */
+        for (uint32_t k = 0; k < 512; k++) blk[k] = 0;
+        if (i < oldnch && cstart < (uint64_t)oldlen) {
+            uint64_t oh = vfs_chunk_hash_at(&prev, i);
+            if (oh) cas_get(oh, blk, 512);          /* short/absent -> zeroes stand */
+            /* No explicit tail-zeroing here, and the first version of this
+             * function had some. It was dead: cas_put(blk, clen) below stores
+             * exactly clen bytes, so everything past the new end is discarded by
+             * the LENGTH BOUND rather than by clearing a buffer that is not
+             * written. The zeroes a later grow reads come from the cmemset above
+             * on re-entry, because cas_get then returns only the clen bytes that
+             * were stored. Removed after a reproducer built to prove the
+             * zeroing load-bearing passed unchanged without it. */
+        }
+        g_wa_ch[i] = cas_put(blk, clen);
+        if (!g_wa_ch[i]) put_failed = 1;
+    }
+
+    cmemset(d->chunk_hash, 0, sizeof d->chunk_hash);
+    d->ind1_hash = 0; d->ind2_hash = 0;
+    d->len = newlen; d->nchunks = nch;
+    if (!vfs_build_map_locked(d, g_wa_ch, nch)) put_failed = 1;
+    if (put_failed) { *d = prev; return -1; }
+
+    /* Same streamed identity the positional writer computes, for the same
+     * reason: file_hash must describe the file as it now is, and a stale one
+     * would make the cross-reboot content probe compare against a file that no
+     * longer exists. */
+    uint64_t h = FNV1A_SEED;
+    for (uint32_t i = 0; i < nch; i++) {
+        uint32_t clen = (newlen - i * 512) < 512 ? (newlen - i * 512) : 512;
+        uint64_t hh = vfs_chunk_hash_at(d, i);
+        for (uint32_t k = 0; k < 512; k++) blk[k] = 0;
+        if (hh) cas_get(hh, blk, 512);
+        h = rust_cas_hash_cont(h, (uint64_t)blk, clen);
+    }
+    d->file_hash = newlen ? h : 0;
+    vfs_retain_map_locked(d);
+    if (prev.used) vfs_release_map_locked(&prev);
+    vfs_journal_commit();
+    return 0;
+}
+
+static int vfs_truncate(int di, uint32_t newlen) {
+    if (di < 0 || di >= VFS_MAXFILES) return -1;
+    klock_acquire(&g_vfs_lock);
+    int r = DENTS[di].used ? vfs_truncate_locked(di, newlen) : -1;
+    klock_release(&g_vfs_lock);
+    return r;
+}
+
+/* v0.84: APPEND — resolve end-of-file and write in ONE critical section.
+ *
+ * The obvious implementation is to read the length, then call the positional
+ * writer with it, and it is wrong for the reason O_APPEND exists at all: two
+ * appenders that both read the length before either writes will both write at
+ * the same offset and one loses its bytes entirely. POSIX requires the seek and
+ * the write to be a single atomic step, so the offset is taken from d->len
+ * INSIDE the lock the write already holds, and no caller is ever in a position
+ * to observe or supply a stale one.
+ *
+ * Returns the number of bytes written, or a negative errno, exactly as
+ * vfs_write_at does — plus the offset it landed at, so the caller can advance
+ * the descriptor without a second lookup that could see a different length. */
+static int64_t vfs_write_append(int di, const void *data, uint32_t len, uint64_t *landed) {
+    if (di < 0 || di >= VFS_MAXFILES) return -1;
+    klock_acquire(&g_vfs_lock);
+    if (!DENTS[di].used) { klock_release(&g_vfs_lock); return -1; }
+    uint64_t off = (uint64_t)DENTS[di].len;
+    int r = vfs_write_at_locked(di, off, data, len);
+    klock_release(&g_vfs_lock);
+    if (landed) *landed = off;
+    return (int64_t)r;
+}
+
 static int64_t vfs_read_file(int idx, void *buf, uint32_t max);   /* fwd: v0.66 */
 static void thread_tlb_release(uint64_t va, uint32_t pages);      /* fwd: v0.66 */
 
@@ -7909,6 +8048,57 @@ static int64_t tmp_write_at(int ti, uint64_t off, const void *data, uint32_t len
     return (int64_t)len;
 }
 
+/* v0.84: the tmp counterparts of vfs_truncate and vfs_write_append. Both
+ * volumes have agreed about what a file position means since v0.83, and an
+ * ftruncate or an O_APPEND that worked on one and not the other would reopen
+ * exactly the asymmetry that work closed.
+ *
+ * Simpler than the root versions for the reason every tmp operation is: storage
+ * IS the buffer, so there is no chunk map to rebuild and no blocks to return.
+ * The TAIL IS ZEROED ON SHRINK all the same — reads are bounded by len, so
+ * stale bytes past the end are invisible until the file grows again, and then
+ * they would surface instead of the zeroes POSIX promises. */
+static int tmp_truncate(int ti, uint32_t newlen) {
+    if (ti < 0 || ti >= TMP_MAXFILES) return -1;
+    if (newlen > TMP_MAXBYTES) return -28;                     /* ENOSPC */
+    klock_acquire(&g_vfs_lock);
+    if (!g_tmpfiles[ti].used) { klock_release(&g_vfs_lock); return -1; }
+    if (!tmp_permit_locked(ti, tmp_caller_euid())) {
+        klock_release(&g_vfs_lock);
+        return -13;                                            /* EACCES */
+    }
+    uint32_t old = g_tmpfiles[ti].len;
+    if (newlen > old) cmemset(g_tmpfiles[ti].data + old, 0, newlen - old);
+    else if (newlen < old) cmemset(g_tmpfiles[ti].data + newlen, 0, old - newlen);
+    g_tmpfiles[ti].len = newlen;
+    klock_release(&g_vfs_lock);
+    return 0;
+}
+
+/* End-of-file resolved under the same acquisition that performs the write — see
+ * vfs_write_append for why reading the length first is a lost-write bug rather
+ * than a style preference. */
+static int64_t tmp_write_append(int ti, const void *data, uint32_t len, uint64_t *landed) {
+    if (ti < 0 || ti >= TMP_MAXFILES) return -1;
+    if (!len) return 0;
+    klock_acquire(&g_vfs_lock);
+    if (!g_tmpfiles[ti].used) { klock_release(&g_vfs_lock); return -1; }
+    if (!tmp_permit_locked(ti, tmp_caller_euid())) {
+        klock_release(&g_vfs_lock);
+        return -13;                                            /* EACCES */
+    }
+    uint32_t off = g_tmpfiles[ti].len;
+    if ((uint64_t)off + len > (uint64_t)TMP_MAXBYTES) {
+        klock_release(&g_vfs_lock);
+        return -28;                                            /* ENOSPC */
+    }
+    cmemcpy(g_tmpfiles[ti].data + off, data, len);
+    g_tmpfiles[ti].len = off + len;
+    klock_release(&g_vfs_lock);
+    if (landed) *landed = (uint64_t)off;
+    return (int64_t)len;
+}
+
 static int tmp_write_file(int ti, const void *data, uint32_t len) {
     if (ti < 0 || ti >= TMP_MAXFILES) return -1;
     if (len > TMP_MAXBYTES) len = TMP_MAXBYTES;
@@ -8493,7 +8683,38 @@ static int pipe_create_for(int owner, int *rfd, int *wfd) {
     *rfd = r; *wfd = w;
     return 0;
 }
-static int vfs_open_for(const char *name, int owner, int creat, int trunc) {
+/* v0.84: OPEN FLAGS AS A WORD, and the SAME word ring 3 passes to SYS_OPEN.
+ *
+ * vfs_open_for took two booleans and had four wrapper functions to cover their
+ * combinations. O_APPEND would have made it three booleans and eight wrappers,
+ * which is the point at which the enumeration is the bug: every future flag
+ * doubles a list that nothing keeps in step with the ABI it mirrors.
+ *
+ * The values are deliberately IDENTICAL to SYS_OPEN's bits (1 = O_CREAT,
+ * 2 = O_TRUNC, 4 = O_APPEND) so the syscall passes its validated flags word
+ * straight through. Two numbering schemes for one concept is how a translation
+ * layer acquires a bug that neither side can see. */
+#define VFS_O_CREAT  1u
+#define VFS_O_TRUNC  2u
+#define VFS_O_APPEND 4u
+#define VFS_O_ALL    (VFS_O_CREAT | VFS_O_TRUNC | VFS_O_APPEND)
+
+/* O_APPEND is a property of the DESCRIPTION, not of the file — see struct
+ * ofile's note on why O_NONBLOCK lives there: fork aliases a descriptor into a
+ * second slot, and each alias carries its own discipline. Applied after the
+ * claim rather than inside ofile_claim so the claim keeps its single job and
+ * its existing callers keep their signatures. */
+static int vfs_apply_oflags(int fd, uint32_t oflags) {
+    if (fd < 0 || !(oflags & VFS_O_APPEND)) return fd;
+    klock_acquire(&g_ofile_lock);
+    if (g_ofiles[fd].used) g_ofiles[fd].flags |= (int)VFS_O_APPEND;
+    klock_release(&g_ofile_lock);
+    return fd;
+}
+
+static int vfs_open_for(const char *name, int owner, uint32_t oflags) {
+    int creat = (oflags & VFS_O_CREAT) != 0;
+    int trunc = (oflags & VFS_O_TRUNC) != 0;
     if (path_has_prefix(name, "tmp/")) {
         const char *rest = name + 4;
         klock_acquire(&g_vfs_lock);
@@ -8553,7 +8774,7 @@ static int vfs_open_for(const char *name, int owner, int creat, int trunc) {
         if (ti >= 0 && trunc) g_tmpfiles[ti].len = 0;
         klock_release(&g_vfs_lock);
         if (ti < 0) return -1;
-        return ofile_claim(owner, VOL_TMP, ti);
+        return vfs_apply_oflags(ofile_claim(owner, VOL_TMP, ti), oflags);
     }
     if (path_has_prefix(name, "dev/"))
         return ofile_claim(owner, VOL_DEV, 0);     /* dirent unused: a live view, not a file */
@@ -8653,15 +8874,22 @@ static int vfs_open_for(const char *name, int owner, int creat, int trunc) {
     }
     klock_release(&g_vfs_lock);                /* released BEFORE the fd claim  */
     if (di < 0) return -1;
-    return ofile_claim(owner, VOL_ROOT, di);
+    return vfs_apply_oflags(ofile_claim(owner, VOL_ROOT, di), oflags);
 }
-static int vfs_open(const char *name) { return vfs_open_for(name, fd_owner(), 0, 0); }
-static int vfs_open_creat(const char *name) { return vfs_open_for(name, fd_owner(), 1, 0); }
-/* v0.83: O_CREAT|O_TRUNC — what "author this file" means now that a write no
- * longer replaces a file's whole contents. */
-static int vfs_open_creat_trunc(const char *name) { return vfs_open_for(name, fd_owner(), 1, 1); }
-/* O_TRUNC without O_CREAT: empty a file that must already exist. */
-static int vfs_open_trunc(const char *name) { return vfs_open_for(name, fd_owner(), 0, 1); }
+/* v0.84: ONE flags-taking entry point.
+ *
+ * This replaced vfs_open / vfs_open_creat / vfs_open_creat_trunc /
+ * vfs_open_trunc — four wrappers enumerating the combinations of two booleans,
+ * whose only caller was SYS_OPEN's four-way conditional. O_APPEND would have
+ * made it eight, and the compiler said so immediately: with the syscall passing
+ * its flags word straight through, every one of the four became dead code. They
+ * are deleted rather than kept behind __attribute__((unused)), because a named
+ * wrapper nothing calls is the enumeration this change exists to remove, just
+ * quieter. `vfs_open_flags(name, VFS_O_CREAT | VFS_O_TRUNC)` says at the call
+ * site exactly what the wrapper's name used to say. */
+static int vfs_open_flags(const char *name, uint32_t oflags) {
+    return vfs_open_for(name, fd_owner(), oflags);
+}
 
 /* ===========================================================================
  * v0.48: SYS_VFS_UNLINK — zero the dirent, journal-commit the directory
@@ -15336,9 +15564,13 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
          * all — an ABI that ignores flags it does not understand can never
          * grow one. O_TRUNC is meaningful with or without O_CREAT: with it,
          * "author this file"; without it, "empty this existing file". */
-        if (a1 & ~3ull) return (uint64_t)-22;              /* EINVAL */
-        int fd = (a1 & 1) ? ((a1 & 2) ? vfs_open_creat_trunc(name) : vfs_open_creat(name))
-                          : ((a1 & 2) ? vfs_open_trunc(name)       : vfs_open(name));
+        /* v0.84: bit 2 is O_APPEND, and this is the growth the rejection above
+         * was preserved for. The four-way conditional that used to expand the
+         * two known bits into four named wrappers is gone with it: the validated
+         * word is passed straight through, so the syscall and the VFS share one
+         * numbering instead of translating between two. */
+        if (a1 & ~(uint64_t)VFS_O_ALL) return (uint64_t)-22;   /* EINVAL */
+        int fd = vfs_open_flags(name, (uint32_t)a1);
         fs_witness_leave();
         return (uint64_t)(int64_t)fd;
     }
@@ -15439,6 +15671,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int vol = VOL_ROOT;
         int di = ofile_deref(fd, &vol);
         int64_t r = -9;
+        /* v0.84: does this DESCRIPTION append? Read once, here, rather than at
+         * each volume's branch — the answer is a property of the descriptor and
+         * cannot change between the branches. */
+        int appending = 0;
+        if (fd >= 0 && fd < 16) {
+            klock_acquire(&g_ofile_lock);
+            appending = g_ofiles[fd].used && (g_ofiles[fd].flags & (int)VFS_O_APPEND);
+            klock_release(&g_ofile_lock);
+        }
         if (di >= 0) {
             /* v0.66: exhaustive, for the reason set out in SYS_READ above. */
             if (vol == VOL_ROOT) {
@@ -15465,13 +15706,22 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                  * rank 0 would be an inversion outright. Not holding it at all
                  * is the version that needs no argument. */
                 uint64_t woff = 0;
-                if (ok) {
+                if (ok && !appending) {
                     klock_acquire(&g_ofile_lock);
                     woff = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
                     klock_release(&g_ofile_lock);
                 }
-                r = ok ? vfs_write_at(di, woff, (const void *)a1, len)
-                       : -13;                                              /* EACCES */
+                /* v0.84: O_APPEND does NOT read the offset here, and that is the
+                 * whole of it. Resolving end-of-file in this section and then
+                 * writing in another would let two appenders both read the same
+                 * length and both write there, and the second would overwrite
+                 * the first rather than follow it — the exact loss O_APPEND
+                 * exists to prevent. vfs_write_append takes the offset from the
+                 * dirent inside the lock that performs the write, so no caller
+                 * can supply or observe a stale one. */
+                if (!ok)          r = -13;                                 /* EACCES */
+                else if (appending) r = vfs_write_append(di, (const void *)a1, len, &woff);
+                else                r = vfs_write_at(di, woff, (const void *)a1, len);
                 if (r > 0) {
                     klock_acquire(&g_ofile_lock);
                     if (g_ofiles[fd].used) g_ofiles[fd].off = woff + (uint64_t)r;
@@ -15483,11 +15733,17 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
              * does tmp_write_at take g_vfs_lock (rank 2) to touch the buffer —
              * rank 1 is never held across the copy. */
             else if (vol == VOL_TMP) {
-                uint64_t toff;
-                klock_acquire(&g_ofile_lock);
-                toff = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
-                klock_release(&g_ofile_lock);
-                r = tmp_write_at(di, toff, (const void *)a1, len);
+                uint64_t toff = 0;
+                if (!appending) {
+                    klock_acquire(&g_ofile_lock);
+                    toff = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
+                    klock_release(&g_ofile_lock);
+                }
+                /* v0.84: same atomic append as the root volume — both volumes
+                 * have agreed about the meaning of a position since v0.83, and
+                 * a flag honoured on one of them would undo that. */
+                r = appending ? tmp_write_append(di, (const void *)a1, len, &toff)
+                              : tmp_write_at(di, toff, (const void *)a1, len);
                 if (r > 0) {
                     klock_acquire(&g_ofile_lock);
                     if (g_ofiles[fd].used) g_ofiles[fd].off = toff + (uint64_t)r;
@@ -17395,7 +17651,17 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (!g_ofiles[fd].used || !(g_ofiles[fd].owner_mask & (1ull << fd_owner()))) rc = -9;
         else if (cmd == F_GETFL) rc = (int64_t)g_ofiles[fd].flags;
         else if (cmd == F_SETFL) {
-            g_ofiles[fd].flags = (int)(a2 & O_NONBLOCK);   /* only settable bit */
+            /* v0.84: O_NONBLOCK is still the only bit a caller may SET here, but
+             * O_APPEND must SURVIVE. This was a wholesale replace, so once
+             * O_APPEND lived in the same word an unrelated F_SETFL — the socket
+             * suites issue them routinely — would silently turn appending off on
+             * a descriptor that had asked for it, and the next write would land
+             * at the offset instead of the end. Preserved rather than made
+             * settable: changing an open file's append discipline after the fact
+             * is a separate decision, and this is not the change that should
+             * make it. */
+            g_ofiles[fd].flags = (g_ofiles[fd].flags & (int)VFS_O_APPEND) |
+                                 (int)(a2 & O_NONBLOCK);
             rc = 0;
         } else rc = -22;                                   /* EINVAL */
         klock_release(&g_ofile_lock);
@@ -18260,6 +18526,65 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             !(g_ofiles[fd].owner_mask & (1ull << fd_owner()))) rc = -9;
         else { g_ofiles[fd].off = (uint64_t)want; rc = want; }
         klock_release(&g_ofile_lock);
+        return (uint64_t)rc;
+    }
+    case 101: {  /* v0.84: SYS_FTRUNCATE(fd, length) -> 0, or a negative errno.
+                  *
+                  * The last gap the positional-write work left. v0.83's O_TRUNC
+                  * comment names it directly — "this kernel has no O_TRUNC and no
+                  * ftruncate" — and O_TRUNC closed only the half that happens at
+                  * open. Shortening an open file to a chosen length, and growing
+                  * one without writing bytes, had no expression at all.
+                  *
+                  * Descriptor discipline follows SYS_LSEEK exactly: EBADF for a
+                  * descriptor this process does not own, and EINVAL rather than
+                  * ESPIPE for objects that have no length to set — a pipe, an
+                  * epoll set, an eventfd and a socket are not short files, and
+                  * answering "illegal seek" would describe an operation the
+                  * caller did not attempt. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+        int fd = (int)(int64_t)a0;
+        int64_t want = (int64_t)a1;
+        if (fd < 0 || fd >= 16) return (uint64_t)-9;                 /* EBADF  */
+        if (want < 0) return (uint64_t)-22;                          /* EINVAL */
+
+        int snap_vol, snap_di;
+        klock_acquire(&g_ofile_lock);
+        if (!g_ofiles[fd].used ||
+            !(g_ofiles[fd].owner_mask & (1ull << fd_owner()))) {
+            klock_release(&g_ofile_lock);
+            return (uint64_t)-9;                                     /* EBADF  */
+        }
+        if (g_ofiles[fd].pipe >= 0 || g_ofiles[fd].ep >= 0 ||
+            g_ofiles[fd].efd  >= 0 || g_ofiles[fd].sock >= 0) {
+            klock_release(&g_ofile_lock);
+            return (uint64_t)-22;                                    /* EINVAL */
+        }
+        snap_vol = g_ofiles[fd].volume;
+        snap_di  = g_ofiles[fd].dirent;
+        klock_release(&g_ofile_lock);
+
+        /* THE OFFSET IS DELIBERATELY NOT MOVED. POSIX is explicit that
+         * ftruncate does not change the file position, and a descriptor left
+         * past the new end simply reads 0 — which is end-of-file and already
+         * what every reader here handles. Silently clamping it would be a
+         * second, undocumented side effect. */
+        fs_witness_enter();
+        int64_t rc;
+        if (snap_vol == VOL_TMP) rc = tmp_truncate(snap_di, (uint32_t)want);
+        else if (snap_vol == VOL_ROOT) {
+            /* Setting a length destroys or fabricates content, so it needs the
+             * same right a write does — checked here, at the operation, exactly
+             * as SYS_WRITE_FILE checks it. */
+            int L = tg_of((int)current_proc_idx);
+            klock_acquire(&g_vfs_lock);
+            int ok = (snap_di >= 0 && snap_di < VFS_MAXFILES && DENTS[snap_di].used) &&
+                     vfs_permit(&DENTS[snap_di], cred_euid(L), cred_egid(L), VFS_P_WRITE);
+            klock_release(&g_vfs_lock);
+            rc = ok ? vfs_truncate(snap_di, (uint32_t)want) : -13;   /* EACCES */
+        }
+        else rc = -22;                       /* dev, and anything else with no length */
+        fs_witness_leave();
         return (uint64_t)rc;
     }
     case 67:     /* SYS_GETTID() -> this THREAD's own id.
@@ -20242,6 +20567,22 @@ static void cmd_vfs_stress(void) {
             ls == 1815               ? "*** an UNPRIVILEGED caller READ and OPENED another user's tmp file" :
             ls == 1816               ? "*** an UNPRIVILEGED caller WROTE and OPENED another user's tmp file" :
             ls == 1817               ? "*** tmp ownership is NOT ENFORCED AT ALL — read, write and open all let an unprivileged caller through" :
+            /* v0.84: ftruncate and O_APPEND. */
+            ls == 1820 || ls == 1821 ? "could not author the ftruncate probe file" :
+            ls == 1822               ? "*** ftruncate SHRINK was refused" :
+            ls == 1823               ? "*** ftruncate shrank the file but SEEK_END still reports the old length" :
+            ls == 1824               ? "*** the surviving bytes changed when the file was shortened" :
+            ls == 1825 || ls == 1826 ? "*** ftruncate GROW was refused, or did not extend the length" :
+            ls == 1827               ? "*** the region created by GROWING did not read as zeroes — the boundary chunk kept its old tail, so shrink-then-grow RESURRECTED discarded bytes" :
+            ls == 1828               ? "*** truncating to 0, or growing from 0, did not take effect" :
+            ls == 1829               ? "*** a negative ftruncate length was not refused with EINVAL, or it changed the length anyway" :
+            ls == 1830               ? "*** ftruncate on a PIPE was not refused with EINVAL" :
+            ls >= 1831 && ls <= 1833 ? "could not set up the O_APPEND probe" :
+            ls == 1834               ? "*** a write through an O_APPEND descriptor failed" :
+            ls == 1835               ? "*** O_APPEND did not write at end-of-file — an explicit lseek was honoured, so the offset is being used instead of the length" :
+            ls == 1836               ? "*** the appended bytes are not in the order they were written" :
+            ls == 1837 || ls == 1838 ? "*** O_APPEND does not work on the TMP volume (root/tmp parity is broken)" :
+            ls == 1839               ? "*** ftruncate does not work on the TMP volume (root/tmp parity is broken)" :
                                        "unknown";
         if (ls != LSEEK_WORKER_OK)
             kprintf("[vfsstrs] ring-3 lseek: worker exit %d — %s\n", (uint64_t)ls, why);
@@ -22245,7 +22586,7 @@ static void cmd_users_stress(void) {
          * claims are false and two assertions fail on every boot after the
          * first. Reset it so "newly created" is true again. */
         suite_fixture_reset("m72own");
-        int fa = vfs_open_for("m72own", alice, 1, 0);          /* alice creates it */
+        int fa = vfs_open_for("m72own", alice, VFS_O_CREAT);          /* alice creates it */
         if (fa >= 0) held[nheld++] = fa;
         int di = vfs_find("m72own");
         usercheck("a file created by a user is owned by that user",
@@ -22254,7 +22595,7 @@ static void cmd_users_stress(void) {
                   di >= 0 && vfs_mode_of(&DENTS[di]) == (uint32_t)VFS_MODE_DEFAULT);
 
         /* 0644: a stranger may read it. Permission is not ownership. */
-        int fb = vfs_open_for("m72own", bob, 0, 0);
+        int fb = vfs_open_for("m72own", bob, 0);
         if (fb >= 0) held[nheld++] = fb;
         usercheck("a stranger CAN open another user's 0644 file for reading", fb >= 0);
         usercheck("but the stranger has no write right to it",
@@ -22264,10 +22605,10 @@ static void cmd_users_stress(void) {
 
         /* Tighten it, and the stranger loses the descriptor it could have had. */
         if (di >= 0) { klock_acquire(&g_vfs_lock); DENTS[di].mode = 0600; klock_release(&g_vfs_lock); }
-        int fb2 = vfs_open_for("m72own", bob, 0, 0);
+        int fb2 = vfs_open_for("m72own", bob, 0);
         if (fb2 >= 0) held[nheld++] = fb2;
         usercheck("after chmod 0600 the stranger can no longer open it at all", fb2 == -13);
-        int fa2 = vfs_open_for("m72own", alice, 0, 0);
+        int fa2 = vfs_open_for("m72own", alice, 0);
         if (fa2 >= 0) held[nheld++] = fa2;
         usercheck("and the owner still can", fa2 >= 0);
         /* Root is not stopped by a mode that stops everybody else. */
@@ -22278,7 +22619,7 @@ static void cmd_users_stress(void) {
             kprocs[rooted].uid = 0; kprocs[rooted].gid = 0;
             kprocs[rooted].euid = 0; kprocs[rooted].egid = 0;   /* v0.74: in full, as above */
             kprocs[rooted].suid = 0; kprocs[rooted].sgid = 0;
-            fr = vfs_open_for("m72own", rooted, 0, 0);
+            fr = vfs_open_for("m72own", rooted, 0);
             usercheck("root opens a 0600 file it does not own", fr >= 0);
         }
         /* Give every slot back, and prove it: the descriptor table must be
