@@ -258,6 +258,24 @@ gate-dirty-smp: $(ISO)
 # gate-matrix.sh prints an explicit coverage line naming what it did NOT test,
 # because a gate whose gaps are invisible is how "verified" drifts away from
 # "measured".
+# v0.85: the O_APPEND contention SOAK -- the same test the gate runs, at the full
+# 1024 appends instead of 128.
+#
+# It is a target rather than a note in a doc because APPSMP_SOAK has to reach
+# BOTH halves: EXTRA compiles the kernel's expected total, UEXTRA compiles the
+# ring-3 worker's loop count. Setting one and forgetting the other builds a
+# kernel expecting 16384 bytes and a worker that writes 2048, which looks like a
+# lost append and is not one. Nobody should have to remember that; this target
+# is the memory.
+#
+# Roughly 220 s of guest time on top of a normal boot -- affordable deliberately,
+# which is exactly why it is not in `make gate`.
+.PHONY: appendsoak
+appendsoak:
+	$(MAKE) clean
+	$(MAKE) EXTRA=-DAPPSMP_SOAK UEXTRA=-DAPPSMP_SOAK
+	@echo "  [appendsoak] built with 1024 appends; boot it with 'make qemu' or tools/gate-matrix.sh"
+
 .PHONY: gate gate-all gate-selftest
 
 # v0.81: the gate's own reporting logic, tested before it is trusted.

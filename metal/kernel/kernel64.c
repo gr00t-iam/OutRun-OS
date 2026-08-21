@@ -7296,6 +7296,34 @@ static int vfs_truncate(int di, uint32_t newlen) {
  * the descriptor without a second lookup that could see a different length. */
 static int64_t vfs_write_append(int di, const void *data, uint32_t len, uint64_t *landed) {
     if (di < 0 || di >= VFS_MAXFILES) return -1;
+#ifdef APPEND_RACE_REPRO
+    /* v0.85 REPRODUCER, opt-in (`make EXTRA=-DAPPEND_RACE_REPRO`) and never in a
+     * release build: resolve end-of-file, DROP the lock, then take it again to
+     * write at the offset remembered from before. That is the two-step form this
+     * function exists to avoid, and it is what an implementation reads like when
+     * someone "just" seeks to the end before writing.
+     *
+     * The pause loop widens the window rather than creating the bug -- the race
+     * is real without it, but a window of a few instructions needs far more than
+     * 128 appends to land on, and a reproducer that only fails sometimes teaches
+     * people to re-run it until it passes. Kernel-only, so EXTRA alone is enough;
+     * the ring-3 half is unchanged.
+     *
+     * Expect the append-smp phase to report a file SHORTER than
+     * workers x iterations x payload, with per-worker counts below iterations:
+     * two writers resolved the same end-of-file and one overwrote the other. */
+    klock_acquire(&g_vfs_lock);
+    if (!DENTS[di].used) { klock_release(&g_vfs_lock); return -1; }
+    uint64_t off = (uint64_t)DENTS[di].len;
+    klock_release(&g_vfs_lock);
+    for (volatile int w = 0; w < 4000; w++) __asm__ volatile("pause");
+    klock_acquire(&g_vfs_lock);
+    if (!DENTS[di].used) { klock_release(&g_vfs_lock); return -1; }
+    int r = vfs_write_at_locked(di, off, data, len);
+    klock_release(&g_vfs_lock);
+    if (landed) *landed = off;
+    return (int64_t)r;
+#else
     klock_acquire(&g_vfs_lock);
     if (!DENTS[di].used) { klock_release(&g_vfs_lock); return -1; }
     uint64_t off = (uint64_t)DENTS[di].len;
@@ -7303,6 +7331,7 @@ static int64_t vfs_write_append(int di, const void *data, uint32_t len, uint64_t
     klock_release(&g_vfs_lock);
     if (landed) *landed = off;
     return (int64_t)r;
+#endif
 }
 
 static int64_t vfs_read_file(int idx, void *buf, uint32_t max);   /* fwd: v0.66 */
@@ -20071,6 +20100,121 @@ static int vfs_tmp_in_use(void) {
 static int64_t pipe_run_role(const char *label, uint64_t caps, uint64_t role,
                              uint64_t watchdog);
 
+/* ===========================================================================
+ * v0.85: O_APPEND UNDER REAL MULTI-CORE CONTENTION
+ * ===========================================================================
+ * v0.84 shipped O_APPEND and its tag says, in KNOWN NOT FIXED, that atomicity
+ * was "argued via write-lock discipline rather than multi-core stress tested".
+ * The argument: vfs_write_append() takes the offset from DENTS[di].len INSIDE
+ * the lock that performs the write, so two appenders cannot both pick the same
+ * place. An argument is not a measurement, and this is the measurement.
+ *
+ * FOUR WORKERS, PINNED, ONE FILE, NO USER-SPACE LOCKING. Each worker is a
+ * separate kproc with affinity set to exactly one core and pushed to that
+ * core's queue, so contention across cores is CONSTRUCTED rather than hoped
+ * for. Each appends APPSMP_ITERS blocks of one repeated byte, distinct per
+ * worker; 4 x 256 = 1024 appends with nothing serialising them.
+ *
+ * WHY NOT ONE SHARED DESCRIPTOR. The guarantee under test is per-FILE: the
+ * offset comes from DENTS[di].len under g_vfs_lock, so N descriptors on one
+ * file exercise it exactly. A shared descriptor would have to come from fork(),
+ * and sys_fork enqueues a child on its PARENT'S core -- it reaches another only
+ * if a sibling happens to steal it. "Ran on different cores" would then be luck
+ * rather than construction, and that is the single property this test exists to
+ * establish.
+ *
+ * WHY THE PAYLOAD IS SMALL. Every positional write recomputes file_hash over
+ * the whole file (vfs_write_at_locked says so, and why: FNV is sequential and
+ * has no incremental update). A run of N appends is therefore O(N^2) in chunk
+ * reads, and v0.84 already blew a 30 s watchdog building a 40 KiB file that
+ * way. 16 bytes x 1024 lands at 16 KiB -- 32 chunks -- which keeps the total
+ * bounded while staying far larger than any plausible torn-write window. The
+ * elapsed ticks are printed so the cost is visible rather than assumed.
+ *
+ * WHAT THE FILE PROVES. The kernel reads it back without trusting the workers
+ * that wrote it:
+ *   - SIZE must be exactly W * ITERS * PAY. Short means an append was lost;
+ *     long means one landed twice.
+ *   - EVERY PAY-sized block must be UNIFORM. A block holding two different
+ *     bytes is a torn write or a byte-level interleave, and its offset is
+ *     printed.
+ *   - EACH PATTERN must appear exactly ITERS times. Uniform blocks alone would
+ *     still pass if one worker's appends had overwritten another's.
+ *
+ * AND WHETHER THE BOOT ACTUALLY CONTENDED. Uniform blocks in the right counts
+ * are also what a run where every worker finished before the next started would
+ * produce -- a pass that tested nothing. So the harness counts TRANSITIONS
+ * (adjacent blocks whose patterns differ) and reports the union of
+ * kprocs[].ran_on, the cores that really executed the workers. On a
+ * uniprocessor those numbers legitimately show one core, and the suite says so
+ * rather than asserting a property the topology cannot provide. */
+#define APPSMP_ROLE0   56u
+#define APPSMP_W       4u
+#define APPSMP_PAY     16u
+/* v0.85: the gate variant and the soak variant. See append_smp_worker() in
+ * user/init.c for the measurement behind the split -- every append journals all
+ * 48 directory blocks, a constant 49 block writes, measured at 4.67 appends per
+ * second under four-way contention. 1024 appends is ~220 s, which is affordable
+ * on demand and not ten times over inside `make gate-all`.
+ *
+ * THESE MUST MATCH THE RING-3 HALF. APPSMP_SOAK reaches the kernel through
+ * EXTRA and user/init.c through UEXTRA, which are separate variables; building
+ * one side with it and not the other produces a file of the wrong length and
+ * the size assertion below prints a hint saying so, rather than reporting a
+ * phantom lost append. `make appendsoak` sets both. */
+#ifdef APPSMP_SOAK
+#define APPSMP_ITERS   256u
+#define APPSMP_WATCH   54000u     /* 540 s for the whole phase                   */
+#else
+#define APPSMP_ITERS   32u
+#define APPSMP_WATCH   9000u      /* 90 s for the whole phase                    */
+#endif
+#define APPSMP_TOTAL   (APPSMP_W * APPSMP_ITERS * APPSMP_PAY)
+/* The size the OTHER variant would produce. Used for one diagnostic only, and
+ * it has to be this exact rather than a "looks like a whole number of payloads"
+ * test: a genuine lost append also leaves a whole number of payloads with every
+ * worker reporting success, so the loose form pointed at a build-flag mismatch
+ * in precisely the case this phase exists to catch. Caught by the reproducer,
+ * which printed the wrong advice next to a real 67-append loss. */
+#ifdef APPSMP_SOAK
+#define APPSMP_OTHER   (APPSMP_W * 32u * APPSMP_PAY)
+#else
+#define APPSMP_OTHER   (APPSMP_W * 256u * APPSMP_PAY)
+#endif
+#define APPSMP_PATH    "appsmp"
+
+static int appsmp_live(void) {
+    int n = 0;
+    for (int i = 0; i < n_kproc; i++)
+        if (kprocs[i].used && !kprocs[i].exited &&
+            kprocs[i].role >= (int)APPSMP_ROLE0 &&
+            kprocs[i].role <  (int)(APPSMP_ROLE0 + APPSMP_W)) n++;
+    return n;
+}
+
+/* Drain until every worker is terminal. Returns 0 on the watchdog, which the
+ * caller must report as a failure and never as an absent result. Same shape as
+ * px_orphan_drain: the BSP keeps executing queued work while it waits, or a
+ * uniprocessor would deadlock waiting for tasks only it can run. */
+static int appsmp_drain(uint64_t watchdog) {
+    uint64_t t0 = g_ticks, lastlog = g_ticks, spins = 0;
+    for (;;) {
+        if (appsmp_live() == 0) return 1;
+        if (g_ticks - t0 >= watchdog) return 0;
+        int q = rq_pop(0);
+        if (q >= 0) { cpu_exec_proc(0, q); sched_yield(); continue; }
+        futex_timeout_scan();
+        if (++spins & 1) sched_yield();
+        if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);
+        if (g_ticks - lastlog >= 200) {
+            lastlog = g_ticks;
+            kprintf("[vfsstrs] .. append-smp waiting ticks=%u live=%d\n",
+                    g_ticks - t0, (uint64_t)(int64_t)appsmp_live());
+        }
+        __asm__ volatile("pause");
+    }
+}
+
 /* The worker is lseek_worker() in user/init.c; 42 is its only success value and
  * every other code is decoded at the call site. */
 #define LSEEK_WORKER_ROLE  55u
@@ -20592,6 +20736,157 @@ static void cmd_vfs_stress(void) {
                  "with a zero-filled hole; O_TRUNC empties on open; tmp reads advance, bound at "
                  "EOF and resolve SEEK_END against their own volume; refusals leave the offset alone)",
                  ls == LSEEK_WORKER_OK);
+    }
+
+    /* ===== v0.85: O_APPEND UNDER MULTI-CORE CONTENTION ===================== */
+    {
+        static uint8_t appbuf[APPSMP_TOTAL];
+        int procs[APPSMP_W]; int nsp = 0;
+        uint32_t ran_mask = 0;
+        uint64_t t_start = g_ticks;
+
+        /* The file is created EMPTY here, before any worker runs. The workers
+         * open with O_APPEND and no O_CREAT, so one that finds it missing
+         * reports a setup failure instead of quietly authoring its own. */
+        int fi = vfs_write_file(APPSMP_PATH, "", 0);
+        if (fi < 0) vfscheck("append-smp: the shared file could be created", 0);
+        else {
+            for (uint32_t i = 0; i < APPSMP_W; i++) {
+                int p = kproc_spawn("appsmp", PCAP_FILESYSTEM);
+                if (p < 0) break;
+                kprocs[p].role = (int)(APPSMP_ROLE0 + i);
+                /* PINNED, one worker per core. This is what makes the
+                 * contention constructed rather than hoped for: with affinity
+                 * unset the scheduler is free to run all four on one core and
+                 * the test would silently become a uniprocessor test wearing an
+                 * -smp 4 label. Modulo the online count so the pinning is
+                 * meaningful at 1, 2 and 4 cores alike. */
+                kprocs[p].affinity = 1u << (i % (uint32_t)n);
+                uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+                current_proc_idx = save;
+                if (!e) break;
+                kprocs[p].entry = e;
+                procs[nsp++] = p;
+            }
+            for (int i = 0; i < nsp; i++) {
+                rq_push(i % n, procs[i]);
+                __sync_synchronize();
+                if (n > 1) lapic_ipi(0, IPI_PING, 1);
+            }
+            vfscheck("append-smp: every worker spawned and loaded", nsp == (int)APPSMP_W);
+
+            int drained = appsmp_drain(APPSMP_WATCH);
+            current_proc_idx = save;
+            if (!drained)
+                kprintf("[vfsstrs] append-smp WATCHDOG: %d worker(s) still live after %u ticks\n",
+                        (uint64_t)(int64_t)appsmp_live(), (uint64_t)APPSMP_WATCH);
+            vfscheck("append-smp: every worker reached a terminal state (no watchdog)", drained);
+
+            int codes_ok = 1;
+            for (int i = 0; i < nsp; i++) {
+                ran_mask |= kprocs[procs[i]].ran_on;
+                if (kprocs[procs[i]].exit_code != 42) {
+                    uint32_t c = kprocs[procs[i]].exit_code;
+                    const char *why =
+                        (c >= 1900 && c <= 1903) ? "could not open the shared file with O_APPEND" :
+                        (c >= 1910 && c <= 1913) ? "*** an append returned the wrong byte count" :
+                        (c >= 1920 && c <= 1923) ? "the worker's DEADLINE expired — a slow host, not a defect" :
+                        (c == 1899)              ? "the role-to-index mapping is wrong" : "unknown";
+                    kprintf("[vfsstrs] append-smp worker role %u exited %u — %s\n",
+                            (uint64_t)kprocs[procs[i]].role, (uint64_t)c, why);
+                    codes_ok = 0;
+                }
+            }
+            vfscheck("append-smp: every worker completed its whole append loop", codes_ok);
+
+            /* ---- read the file back and judge it, without trusting a worker ---- */
+            int di = vfs_find(APPSMP_PATH);
+            uint32_t flen = (di >= 0) ? (uint32_t)DENTS[di].len : 0;
+            int64_t got = (di >= 0) ? vfs_read_file(di, appbuf, APPSMP_TOTAL) : -1;
+
+            kprintf("[vfsstrs] append-smp: %u worker(s) x %u appends x %u B — file is %u B "
+                    "(want %u), read %d, %u tick(s), cores 0x%X\n",
+                    (uint64_t)APPSMP_W, (uint64_t)APPSMP_ITERS, (uint64_t)APPSMP_PAY,
+                    (uint64_t)flen, (uint64_t)APPSMP_TOTAL, got,
+                    (uint64_t)(g_ticks - t_start), (uint64_t)ran_mask);
+
+            /* SIZE. Short means an append was lost — two writers resolved the
+             * same end-of-file and one overwrote the other. Long means one
+             * landed twice. Either is the defect this phase exists to find.
+             *
+             * Unless the two halves were built with different APPSMP_SOAK
+             * settings, which produces a file that is a clean multiple of the
+             * payload and nothing to do with atomicity. Named here so it is
+             * never mistaken for the defect above. */
+            if (flen == APPSMP_OTHER && codes_ok)
+                kprintf("[vfsstrs] append-smp: NOTE %u B is EXACTLY what the other APPSMP_SOAK "
+                        "setting produces — EXTRA and UEXTRA disagree; this is a build-flag "
+                        "mismatch, not a lost append\n", (uint64_t)flen);
+            vfscheck("append-smp: the file is EXACTLY workers x iterations x payload bytes "
+                     "(a lost append is two writers agreeing on the same offset)",
+                     flen == APPSMP_TOTAL && got == (int64_t)APPSMP_TOTAL);
+
+            if (got == (int64_t)APPSMP_TOTAL) {
+                uint32_t counts[APPSMP_W]; for (uint32_t i = 0; i < APPSMP_W; i++) counts[i] = 0;
+                uint32_t torn = 0, first_bad = 0, transitions = 0, alien = 0;
+                int prev_pat = -1;
+                for (uint32_t b = 0; b < APPSMP_TOTAL; b += APPSMP_PAY) {
+                    uint8_t p0 = appbuf[b];
+                    int uniform = 1;
+                    for (uint32_t k = 1; k < APPSMP_PAY; k++)
+                        if (appbuf[b + k] != p0) { uniform = 0; break; }
+                    if (!uniform) { if (!torn) first_bad = b; torn++; continue; }
+                    if (p0 >= 0xA0 && p0 < 0xA0 + APPSMP_W) counts[p0 - 0xA0]++;
+                    else { if (!alien) first_bad = b; alien++; }
+                    if (prev_pat >= 0 && p0 != (uint8_t)prev_pat) transitions++;
+                    prev_pat = p0;
+                }
+                if (torn)
+                    kprintf("[vfsstrs] append-smp: *** %u TORN block(s); first at byte offset %u "
+                            "— that block holds bytes from more than one worker\n",
+                            (uint64_t)torn, (uint64_t)first_bad);
+                if (alien)
+                    kprintf("[vfsstrs] append-smp: *** %u block(s) carry a pattern no worker wrote; "
+                            "first at byte offset %u\n", (uint64_t)alien, (uint64_t)first_bad);
+                kprintf("[vfsstrs] append-smp: per-worker block counts %u/%u/%u/%u (want %u each), "
+                        "%u interleave transition(s)\n",
+                        (uint64_t)counts[0], (uint64_t)counts[1], (uint64_t)counts[2],
+                        (uint64_t)counts[3], (uint64_t)APPSMP_ITERS, (uint64_t)transitions);
+
+                vfscheck("append-smp: every payload block is INTACT and CONTIGUOUS — no block "
+                         "holds bytes from two workers (no torn or byte-interleaved write)",
+                         torn == 0 && alien == 0);
+
+                int counts_ok = 1;
+                for (uint32_t i = 0; i < APPSMP_W; i++)
+                    if (counts[i] != APPSMP_ITERS) counts_ok = 0;
+                vfscheck("append-smp: every worker's appends are ALL present, exactly once each "
+                         "(uniform blocks alone would not catch one writer overwriting another)",
+                         counts_ok);
+
+                /* THE PREMISE. Correct counts are also what a run in which each
+                 * worker finished before the next began would produce, and that
+                 * run tested nothing. Transitions say the appends actually
+                 * interleaved. Asserted only where the topology can deliver it:
+                 * on one core the workers are time-sliced and interleaving is
+                 * real but incidental, so it is reported, not required. */
+                if (n > 1) {
+                    vfscheck("append-smp: the appends genuinely INTERLEAVED across workers "
+                             "(zero transitions would mean the writers never overlapped and "
+                             "this boot proved nothing about contention)",
+                             transitions > 0);
+                    vfscheck("append-smp: the workers really ran on MORE THAN ONE core "
+                             "(affinity pinning took effect; a single-core mask would make "
+                             "this an -smp test in name only)",
+                             (ran_mask & (ran_mask - 1)) != 0);
+                } else {
+                    kprintf("[vfsstrs] NOTE  uniprocessor: the append workers are time-multiplexed "
+                            "through one core, so cross-core contention is not assertable here. "
+                            "The size, intactness and per-worker counts above still hold.\n");
+                }
+            }
+            vfs_unlink(APPSMP_PATH);
+        }
     }
 
     /* v0.84: THE TMP OWNERSHIP RULE, AND WHETHER THIS BOOT ACTUALLY ASKED IT.

@@ -3198,6 +3198,96 @@ static void lseek_worker(void) {
     sysc(SYS_EXIT, 42, 0, 0);
 }
 
+/* --- roles 56..59: v0.85 O_APPEND UNDER REAL MULTI-CORE CONTENTION ----------
+ *
+ * v0.84 shipped O_APPEND and recorded, in the tag's KNOWN NOT FIXED list, that
+ * its atomicity was "argued via write-lock discipline rather than multi-core
+ * stress tested". The argument is that vfs_write_append() resolves end-of-file
+ * from the dirent INSIDE the lock that performs the write, so two appenders
+ * cannot both choose the same offset. This is the measurement.
+ *
+ * WHY FOUR ROLES AND NOT ONE. A ring-3 worker has no argument channel — the
+ * kernel sets `role` and nothing else — so the four workers are four
+ * consecutive roles and each derives its index from its own. That is the
+ * idiom already used for the GUI app variants (roles 25..28) and the
+ * clean/fault driver pairs, rather than a new mechanism.
+ *
+ * WHY SEPARATE DESCRIPTORS ON ONE PATH, and not one fd shared by forked
+ * children. The guarantee under test is per-FILE: the offset comes from
+ * DENTS[di].len under g_vfs_lock, so N descriptors on one file exercise it
+ * exactly. A shared descriptor would have to come from fork(), and a forked
+ * child is enqueued on its PARENT'S core and reaches another only if a sibling
+ * happens to steal it — so "ran on different cores" would be luck rather than
+ * construction, and multi-core contention is the one property this test exists
+ * to establish. The kernel half pins each worker to its own core instead.
+ *
+ * Each worker writes a block of ONE repeated byte, distinct per worker. A torn
+ * or interleaved write is then visible as a block that is not uniform, and a
+ * lost or duplicated write as a per-pattern count that is not exactly
+ * APPSMP_ITERS. Both are checked by the kernel half, which can read the file
+ * without trusting the workers that wrote it.
+ *
+ * The loop is bounded by a DEADLINE, not an iteration budget: this runs at one
+ * core and at four, and a spin count means different durations at each. */
+#define APPSMP_PATH   "appsmp"
+#define APPSMP_W      4u          /* workers == roles 56..59                     */
+#define APPSMP_PAY    16u         /* bytes per write                             */
+/* v0.85: TWO SIZES, AND THE REASON IS MEASURED RATHER THAN GUESSED.
+ *
+ * Every append calls vfs_journal_commit(), which writes the journal header plus
+ * ALL VFS_DIR_BLOCKS (48) directory blocks -- 49 block writes per append, a
+ * CONSTANT cost that does not shrink with the payload or the file. Measured on
+ * this harness at -smp 4: 286 appends in 6124 ticks, i.e. 4.67 appends/second,
+ * or ~230 block writes/second.
+ *
+ * So 1024 appends is ~220 s. That is affordable once, on demand, and NOT ten
+ * times over inside `make gate-all`. The gate therefore runs 128 appends (~27 s)
+ * and `make appendsoak` runs the full 1024.
+ *
+ * Atomicity is a property of ONE write, so the smaller count exercises exactly
+ * the same guarantee; more samples raise confidence, they do not change what is
+ * being tested. The soak variant exists because confidence is worth buying
+ * deliberately, just not on every boot.
+ *
+ * APPSMP_SOAK must reach BOTH halves -- EXTRA for the kernel, UEXTRA for this
+ * file. `make appendsoak` sets both, because the Makefile's own comment warns
+ * that forgetting one bites. */
+#ifdef APPSMP_SOAK
+#define APPSMP_ITERS  256u        /* 4 * 256 = 1024 appends, ~220 s             */
+#define APPSMP_T      45000u      /* 450 s ceiling for one worker's whole loop  */
+#else
+#define APPSMP_ITERS  32u         /* 4 * 32  = 128 appends, ~27 s               */
+#define APPSMP_T      6000u       /* 60 s ceiling for one worker's whole loop   */
+#endif
+
+static void append_smp_worker(u32 idx) {
+    if (idx >= APPSMP_W) sysc(SYS_EXIT, 1899, 0, 0);
+    /* O_APPEND only — NOT O_CREAT. The kernel half creates the file empty
+     * before any worker starts, so a worker that finds it missing has found a
+     * setup failure and must say so rather than quietly creating a second
+     * file for itself. */
+    int f = oopen_flags(APPSMP_PATH, O_APPEND);
+    if (f < 0) sysc(SYS_EXIT, 1900 + (u64)idx, 0, 0);
+
+    u8 blk[APPSMP_PAY];
+    u8 pat = (u8)(0xA0u + idx);
+    for (u32 k = 0; k < APPSMP_PAY; k++) blk[k] = pat;
+
+    u32 t0 = osysticks();
+    for (u32 i = 0; i < APPSMP_ITERS; i++) {
+        /* NO USER-SPACE SYNCHRONISATION. That is the point: nothing here
+         * serialises the writers, so if the kernel does not make each append
+         * atomic the file will show it. */
+        i64 w = owrite(f, (const char *)blk, APPSMP_PAY);
+        if (w != (i64)APPSMP_PAY) sysc(SYS_EXIT, 1910 + (u64)idx, 0, 0);
+        /* A deadline, not a spin budget. Its own exit code, so a slow host is
+         * never decoded as a torn write. */
+        if (osysticks() - t0 >= APPSMP_T) sysc(SYS_EXIT, 1920 + (u64)idx, 0, 0);
+    }
+    oclose(f);
+    sysc(SYS_EXIT, 42, 0, 0);
+}
+
 /* role 54: v0.82 RING-3 ONE-WAY PRIVILEGE DROP.
  *
  * usersstrs has always checked the credential rules from the KERNEL side, by
@@ -5719,6 +5809,10 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 53) { posix_orphan_worker(); }         /* v0.77 cross-generation orphan: getppid() after a slot recycle */
     if (role == 54) { setuid_privdrop_worker(); }      /* v0.82 one-way privilege drop, observed from ring 3          */
     if (role == 55) { lseek_worker(); }                /* v0.82 SYS_LSEEK: the file position, from ring 3             */
+    /* v0.85: four workers, one file, no user-space locking. The index is the
+     * role's distance from 56 — see append_smp_worker for why the index has to
+     * travel that way. */
+    if (role >= 56 && role <= 59) { append_smp_worker((u32)(role - 56)); }
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
     if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
     if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */
