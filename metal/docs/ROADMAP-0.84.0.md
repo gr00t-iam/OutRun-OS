@@ -128,12 +128,66 @@ of a `TRUNCATED` boot.
 
 ## STILL OPEN
 
-Nothing here blocks the tag; all of it should be written into the release notes
-as KNOWN, NOT FIXED.
+Nothing here blocked the tag; all of it was written into the v0.84.0 release
+notes as KNOWN, NOT FIXED.
 
-- **`O_APPEND` atomicity is argued, not measured.** The offset is resolved inside
-  the write lock, which is the correct construction, but there is no concurrent
-  multi-writer test that would fail if it were not.
+**One entry has since been closed.** It is struck through rather than deleted,
+and it keeps its original wording, because the `v0.84.0` tag annotation is
+immutable and still lists it — a reader comparing the two should be able to see
+that the tag was accurate for what was true when it was cut, and that the gap
+was closed afterwards. Deleting the line would make the tag look wrong.
+
+- ~~**`O_APPEND` atomicity is argued, not measured.** The offset is resolved
+  inside the write lock, which is the correct construction, but there is no
+  concurrent multi-writer test that would fail if it were not.~~
+
+  **CLOSED / VERIFIED — post-tag, in `66b0698`** (`test(vfs): add SMP multi-core
+  O_APPEND atomic write stress test`).
+
+  *Topology.* The `append-smp` phase in `cmd_vfs_stress` spawns four ring-3
+  workers (roles 56..59), each `affinity`-pinned to one core and pushed to that
+  core's queue, all appending to one file with no user-space synchronisation.
+  Pinning is what makes the contention constructed rather than hoped for: with
+  affinity unset the scheduler may run all four on one core and the test becomes
+  a uniprocessor test wearing an `-smp 4` label. The kernel reads the file back
+  and judges it without trusting the workers that wrote it.
+
+  *Measured.* 100% write integrity in both sizes — every payload block intact
+  and contiguous, per-worker counts exact, file length exact:
+
+  | run | appends | file | per-worker | interleave | cores |
+  |---|---|---|---|---|---|
+  | gate (`bf4ef8ec…`, smp4-iommu) | 128 | 2048 B exact | 32/32/32/32 | 100 transitions | `0x0f` |
+  | soak (`bc50fc44…`, smp4-bios) | 1024 | 16384 B exact | 256/256/256/256 | 810 transitions | `0x0f` |
+
+  Transitions are reported because correct counts alone are also what a run in
+  which each worker finished before the next began would produce — a pass that
+  tested nothing.
+
+  *Falsifiable.* `EXTRA=-DAPPEND_RACE_REPRO` reverts `vfs_write_append` to the
+  two-step form — resolve end-of-file, drop the lock, retake it and write at the
+  remembered offset — which is what the code reads like when someone "just"
+  seeks to the end first. On `smp4-bios` (`6ad31a70…`) the file came back
+  **896 B of an expected 2048: 72 of 128 appends lost, ~56%** — while every
+  worker still reported success, which is why the file is the arbiter and not
+  the workers.
+
+  *Cost, and why the gate runs the smaller size.* Every append calls
+  `vfs_journal_commit()`, which writes the journal header plus all 48 directory
+  blocks — 49 block writes per append, a constant that does not shrink with the
+  payload or the file. Measured at 4.67 appends/second under four-way
+  contention, so 1024 appends is ~283 s: affordable once, not ten times over
+  inside `gate-all`. The gate runs 128 (~28 s) on every tier; `make appendsoak`
+  runs the full 1024 and sets `APPSMP_SOAK` in both `EXTRA` and `UEXTRA`, which
+  have to agree.
+
+  Logs: `OUTRUN-0.85-appendsmp-gate-smp4-iommu.log`,
+  `OUTRUN-0.85-appendsmp-soak-1024.log`,
+  `OUTRUN-0.85-appendsmp-race-repro.log`.
+
+  *Still not covered by it:* the workers are pinned one per core, so this is
+  four concurrent appenders and not oversubscription; no crash is injected
+  mid-append; and no gate runs the soak variant.
 - **Reference-count underflow cannot see a masked double release** (above). Not
   fixable by a counter; the dirty-volume tier is the thing that catches it.
 - **VOL_TMP has no mode and no group.** Deliberate — owner-or-root is the whole
