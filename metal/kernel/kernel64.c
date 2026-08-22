@@ -18415,14 +18415,41 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             /* chmod: the OWNER or root. Not "anyone who can write the file" —
              * write permission lets you change the contents, never the terms
              * on which others may reach them. */
-            if (kprocs[L].uid != 0 && DENTS[di].uid != kprocs[L].uid) rc = -1;    /* EPERM */
+            /* v0.85: the EFFECTIVE uid, not the real one. These two syscalls
+             * are v0.72 and were never converted when v0.74 introduced the
+             * effective pair, so they alone judged by kprocs[].uid while every
+             * other VFS check used cred_euid(). vfs_permit's header already
+             * names the consequence: passing the real pair "would make setuid()
+             * cosmetic, since a process could hold a privileged effective id
+             * the filesystem never consulted (and, symmetrically, a dropped one
+             * it never honoured)."
+             *
+             * Both halves of that were live. SYS_SETEUID moves ONLY the
+             * effective id, so a root process that dropped to euid 1000 was
+             * judged 1000 by vfs_permit and refused writes -- while chmod still
+             * saw real uid 0 and let it change the mode of any file on the
+             * volume. Symmetrically a setuid-root binary (real 1000, euid 0)
+             * was refused chown while being effectively root. */
+#ifndef CHMOD_REALUID_REPRO
+            if (cred_euid(L) != 0 && DENTS[di].uid != cred_euid(L)) rc = -1;      /* EPERM */
+#else
+            /* v0.85 REPRODUCER, opt-in (`make EXTRA=-DCHMOD_REALUID_REPRO`) and
+             * never in a release build: the pre-v0.85 check, judging by the REAL
+             * uid. Role 60 must go red on this build; if it does not, the
+             * credential assertion is not testing the credential. */
+            if (kprocs[L].uid != 0 && DENTS[di].uid != kprocs[L].uid) rc = -1;
+#endif
             else DENTS[di].mode = (uint32_t)a1 & 0777;
         } else {
             /* chown: ROOT ONLY, and that is not conservatism. If an owner
              * could give a file away, any user could dispose of files they no
              * longer want to be accountable for — and on a system with quotas
              * they could charge them to somebody else. */
-            if (kprocs[L].uid != 0) rc = -1;                                     /* EPERM */
+#ifndef CHMOD_REALUID_REPRO
+            if (cred_euid(L) != 0) rc = -1;                                      /* EPERM */
+#else
+            if (kprocs[L].uid != 0) rc = -1;                     /* pre-v0.85 */
+#endif
             else { DENTS[di].uid = (uint32_t)a1; DENTS[di].gid = (uint32_t)a2; }
         }
         klock_release(&g_vfs_lock);
