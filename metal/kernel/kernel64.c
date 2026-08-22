@@ -5192,13 +5192,63 @@ struct cjournal_header {
 
 #define VJ_STATE_EMPTY   0
 #define VJ_STATE_PENDING 1
+/* v0.85: THE DIRECTORY JOURNAL RECORDS WHICH BLOCKS IT HOLDS.
+ *
+ * v0.48 shadowed the WHOLE directory on every mutation -- 1 header + 48 blocks,
+ * 49 writes to record a change to one 256-byte dirent. Measured cost: 4.67
+ * appends/second under contention, which is why v0.85's append gate runs 128
+ * appends and not the 1024 its soak runs.
+ *
+ * It could not simply journal the one dirty block, because apply is DEFERRED:
+ * nothing copies shadow -> dir_start until SYS_VFS_SYNC or the next mount, so
+ * the shadow has to hold EVERY un-applied change, not just the newest. That is
+ * the property the full-directory shadow was buying, and dropping it would let
+ * commit B silently discard commit A.
+ *
+ * So the journal now holds a SET of dirty blocks. `blocks[i]` names the
+ * directory block living in shadow slot i, and each dirty block keeps its slot
+ * for as long as the journal is pending -- re-dirtying a block rewrites its own
+ * slot rather than appending a second entry. There are only VFS_DIR_BLOCKS
+ * directory blocks, so the set is bounded by construction and CANNOT overflow;
+ * the worst case is every block dirty, which is exactly the old behaviour and
+ * the old cost. The common case is one block: 2 writes instead of 49.
+ *
+ * The magic bump to VJRNL002 is what makes the format change safe. A volume
+ * carrying a PENDING v0.48-format journal still replays correctly -- see
+ * vfs_journal_apply(), which recognises both -- so upgrading a kernel does not
+ * discard a commit that was already durable.
+ *
+ * VJ_MAX_SLOTS is a fixed 64 rather than VFS_DIR_BLOCKS because this struct is
+ * declared before that macro exists. A static assertion beside VFS_DIR_BLOCKS
+ * fails the BUILD if the directory ever grows past what this header can name --
+ * the only other way that mismatch could show up is as a journal quietly unable
+ * to describe the blocks it holds.
+ *
+ * 8 + 4 + 4 + 4 + 4 + 2*64 = 152 bytes, comfortably inside one 512-byte block. */
+#define VJ_MAX_SLOTS 64
 struct vjournal_header {
-    char     magic[8];          /* "VJRNL001" */
+    char     magic[8];          /* "VJRNL002", or "VJRNL001" from before v0.85 */
     uint32_t state;
     uint32_t seq;
+    uint32_t count;             /* shadow slots in use                         */
+    uint32_t pad;
+    uint16_t blocks[VJ_MAX_SLOTS];     /* blocks[i] = dir block in slot i       */
 } __attribute__((packed));
 
 static uint32_t g_cj_seq = 0, g_vj_seq = 0;
+/* v0.85: which shadow slot each directory block occupies while a commit is
+ * pending, and how many slots are in use. Reset by apply() and by format --
+ * anywhere the journal stops being pending. -1 means "not dirty". */
+static int      g_vj_slot_of[VJ_MAX_SLOTS];   /* sized like the header's array */
+static uint32_t g_vj_count = 0;
+static int      g_vj_init  = 0;
+static uint64_t g_vj_blocks_written = 0;   /* benchmark: journal block writes  */
+static uint64_t g_vj_commits        = 0;
+static void vj_reset_slots(void) {
+    for (int i = 0; i < VJ_MAX_SLOTS; i++) g_vj_slot_of[i] = -1;
+    g_vj_count = 0;
+    g_vj_init  = 1;
+}
 
 /* All disk-facing buffers are a full 512-byte sector.                         */
 static uint8_t g_sbblk[512]  __attribute__((aligned(512)));
@@ -5267,6 +5317,11 @@ static uint64_t cas_scratch_base(uint64_t fallback) {
  * CHANGELOG-0.48.0.md for how this was found and confirmed with a direct read
  * of the pre-fix code. */
 #define VFS_DIR_BLOCKS ((VFS_MAXFILES * 256 + CAS_BS - 1) / CAS_BS)
+/* v0.85: the directory journal header names each dirty block in a fixed-size
+ * array of VJ_MAX_SLOTS entries. If VFS_MAXFILES ever grows the directory past
+ * that, the journal could not describe its own contents -- so it is a BUILD
+ * error rather than a runtime surprise. */
+typedef char vj_slots_fit_check[(VFS_DIR_BLOCKS <= VJ_MAX_SLOTS) ? 1 : -1];
 /* v0.56 Stage B: names are now PATHS. The VFS keeps its flat dirent table, but a
  * name may contain '/' and is long enough for real SDK layouts
  * ("/usr/include/outrun_abi.h" is 26 chars). This is a flat namespace with
@@ -6782,31 +6837,96 @@ static volatile uint64_t g_cji_fired = 0;   /* printed, so a zero is visible    
  * stays STRUCTURALLY sound, but it is a blend of two points in time rather than
  * an atomic snapshot of either. The v0.85 crash harness exists to measure what
  * that actually costs. */
-static void vfs_journal_commit(void) {
+/* v0.85: journal the block holding dirent `idx`, or EVERY block when idx < 0.
+ *
+ * THE SHADOW IS WRITTEN BEFORE THE HEADER, and that inversion is a correctness
+ * fix rather than a reordering. v0.48 wrote the header PENDING first, so a crash
+ * between the two left a header the next mount believed over a shadow that was
+ * part this commit and part the last one -- structurally survivable, because a
+ * 256-byte dirent never straddles a 512-byte block, but a blend of two points in
+ * time rather than an atomic snapshot of either. With the shadow first, a crash
+ * before the header simply leaves the PREVIOUS header, describing entries whose
+ * shadows are all still intact: the incomplete commit is not replayed at all.
+ * Every earlier entry keeps its slot, so none of them are disturbed by writing
+ * a new one.
+ *
+ * `idx < 0` means "shadow everything", the escape hatch for a caller that
+ * changed more of the directory than one dirent. Nothing needs it today -- all
+ * six mutation sites touch exactly one dirent -- but a future one that does and
+ * forgets to say so would lose an update silently, and the cost of having the
+ * hatch is one branch. */
+static void vfs_journal_commit_idx(int idx) {
     if (g_cas_legacy) { vfs_flush(); return; }             /* no journal region to use */
-    struct vjournal_header h; cmemset(&h, 0, sizeof h);
-    const char mg[8] = { 'V','J','R','N','L','0','0','1' };
-    cmemcpy(h.magic, mg, 8);
-    h.state = VJ_STATE_PENDING; h.seq = ++g_vj_seq;
-    uint8_t hdrblk[CAS_BS]; cmemset(hdrblk, 0, CAS_BS); cmemcpy(hdrblk, &h, sizeof h);
-    virtio_write_block(SB->vjournal_start + 0, hdrblk);
-    for (uint64_t i = 0; i < VFS_DIR_BLOCKS; i++) {
+    if (!g_vj_init) vj_reset_slots();
+
+    uint64_t nblk = SB->dir_blocks < VFS_DIR_BLOCKS ? SB->dir_blocks : VFS_DIR_BLOCKS;
+    uint64_t first = 0, last = nblk;                       /* [first,last) to shadow */
+    if (idx >= 0 && idx < VFS_MAXFILES) {
+        uint64_t b = ((uint64_t)idx * 256u) / CAS_BS;
+        if (b < nblk) { first = b; last = b + 1; }
+    }
+
+    for (uint64_t b = first; b < last; b++) {
+        /* v0.85 REPRODUCER, opt-in (`make EXTRA=-DJOURNAL_WRONG_BLOCK_REPRO`)
+         * and never in a release build: record the entry under the block that
+         * really changed, but shadow the CONTENTS of block 0. The journal then
+         * holds something real and holds the WRONG thing -- replay writes block
+         * 0's bytes over the block that changed, so the mutation is lost at the
+         * next mount while the volume mounts cleanly and every in-memory read
+         * looks perfect until the reboot.
+         *
+         * This is the failure mode per-block journaling introduces and that
+         * whole-directory journaling could not have: the old commit shadowed
+         * everything, so it was structurally incapable of naming the wrong
+         * block. It is the right thing to aim the crash harness at.
+         *
+         * `src` exists rather than assigning to `b` because assigning to the
+         * loop variable is an infinite loop whenever the target block is not 0 —
+         * the first version of this reproducer did exactly that and hung the
+         * boot until the gate cap, which the classifier reported as TRUNCATED
+         * and correctly refused to call either a pass or a failure. */
+        uint64_t src = b;
+#ifdef JOURNAL_WRONG_BLOCK_REPRO
+        src = 0;
+#endif
+        int slot = g_vj_slot_of[b];
+        if (slot < 0) {
+            if (g_vj_count >= (uint32_t)nblk) continue;    /* unreachable: bounded by nblk */
+            slot = (int)g_vj_count++;
+            g_vj_slot_of[b] = slot;
+        }
+        virtio_write_block(SB->vjournal_start + 1 + (uint64_t)slot, g_dir + src * CAS_BS);
+        g_vj_blocks_written++;
 #ifdef CRASH_INJECT_COMMIT_FAIL
-        /* Stop half way. The header is already on disk and PENDING, so the next
-         * mount will find a commit it believes in and a shadow that is only
-         * half this commit's. */
-        if (g_cji_arm && i == VFS_DIR_BLOCKS / 2) {
+        /* Cut the commit off BEFORE its header reaches disk. That is the honest
+         * power-loss shape for this ordering, and what the next mount should do
+         * with it is nothing at all. */
+        if (g_cji_arm) {
             g_cji_arm = 0;
             g_cji_fired++;
-            kprintf("[vfs    ] CRASH INJECT: commit seq %u TRUNCATED after %u of %u "
-                    "shadow blocks (header already PENDING on disk)\n",
-                    (uint64_t)h.seq, i, (uint64_t)VFS_DIR_BLOCKS);
+            kprintf("[vfs    ] CRASH INJECT: commit TRUNCATED after shadow block %u "
+                    "and BEFORE the header (nothing to replay)\n", b);
             return;
         }
 #endif
-        virtio_write_block(SB->vjournal_start + 1 + i, g_dir + i * CAS_BS);
     }
+
+    struct vjournal_header h; cmemset(&h, 0, sizeof h);
+    const char mg[8] = { 'V','J','R','N','L','0','0','2' };
+    cmemcpy(h.magic, mg, 8);
+    h.state = VJ_STATE_PENDING; h.seq = ++g_vj_seq; h.count = g_vj_count;
+    for (int b = 0; b < VJ_MAX_SLOTS; b++)
+        if (g_vj_slot_of[b] >= 0) h.blocks[g_vj_slot_of[b]] = (uint16_t)b;
+    uint8_t hdrblk[CAS_BS]; cmemset(hdrblk, 0, CAS_BS); cmemcpy(hdrblk, &h, sizeof h);
+    virtio_write_block(SB->vjournal_start + 0, hdrblk);
+    g_vj_blocks_written++;
+    g_vj_commits++;
 }
+/* No no-argument wrapper. All six mutation sites name the dirent they changed,
+ * and a wrapper that quietly shadowed the whole directory would be the easy
+ * thing to reach for -- which is how the cost this change removes would come
+ * back. A caller that genuinely dirties more than one dirent says so with
+ * vfs_journal_commit_idx(-1). */
 /* Applies a PENDING journal commit to the real dir_start region — called
  * both from cas_mount() (boot-time recovery) and SYS_VFS_SYNC (explicit,
  * eager flush). Idempotent: a CLEAN/EMPTY journal is a no-op. Returns 1 if
@@ -6816,20 +6936,60 @@ static void vfs_journal_apply(void) {
     if (g_cas_legacy) { g_vfs_last_sync_applied = 0; return; }
     uint8_t hdrblk[CAS_BS]; virtio_read_block(SB->vjournal_start + 0, hdrblk);
     struct vjournal_header *h = (struct vjournal_header *)hdrblk;
-    const char mg[8] = { 'V','J','R','N','L','0','0','1' };
-    if (h->state != VJ_STATE_PENDING || cmemcmp(h->magic, mg, 8) != 0) {
+    const char mg2[8] = { 'V','J','R','N','L','0','0','2' };
+    const char mg1[8] = { 'V','J','R','N','L','0','0','1' };
+    int v2 = (cmemcmp(h->magic, mg2, 8) == 0);
+    int v1 = (cmemcmp(h->magic, mg1, 8) == 0);
+    if (h->state != VJ_STATE_PENDING || (!v1 && !v2)) {
         g_vfs_last_sync_applied = 0;
+        vj_reset_slots();
         return;
     }
     uint8_t buf[CAS_BS];
-    for (uint64_t i = 0; i < VFS_DIR_BLOCKS && i < SB->dir_blocks; i++) {
-        virtio_read_block(SB->vjournal_start + 1 + i, buf);
-        virtio_write_block(SB->dir_start + i, buf);
+    if (v2) {
+        /* v0.85: replay only the blocks this journal says it holds. Idempotent
+         * exactly as the whole-directory replay was -- each slot is copied to
+         * the home block it names, and copying it twice is copying the same
+         * bytes twice. */
+        uint32_t cnt = h->count;
+        if (cnt > VFS_DIR_BLOCKS) cnt = VFS_DIR_BLOCKS;
+        for (uint32_t i = 0; i < cnt; i++) {
+            uint64_t home = h->blocks[i];
+            if (home >= VFS_DIR_BLOCKS || home >= SB->dir_blocks) continue;
+            virtio_read_block(SB->vjournal_start + 1 + i, buf);
+            virtio_write_block(SB->dir_start + home, buf);
+        }
+    } else {
+        /* A journal written by v0.48..v0.84: the shadow IS the whole directory.
+         * Replayed the way that kernel meant it, so upgrading does not discard a
+         * commit that was already durable. */
+        for (uint64_t i = 0; i < VFS_DIR_BLOCKS && i < SB->dir_blocks; i++) {
+            virtio_read_block(SB->vjournal_start + 1 + i, buf);
+            virtio_write_block(SB->dir_start + i, buf);
+        }
     }
     uint8_t z[CAS_BS]; cmemset(z, 0, CAS_BS);
     virtio_write_block(SB->vjournal_start + 0, z);
-    kprintf("[vfs    ] VFS journal: applied a pending directory commit (seq %u) to disk\n",
-            (uint64_t)h->seq);
+    kprintf("[vfs    ] VFS journal: applied a pending directory commit (seq %u, %u block(s)) to disk\n",
+            (uint64_t)h->seq, (uint64_t)(v2 ? h->count : (uint32_t)VFS_DIR_BLOCKS));
+    /* The journal is no longer pending, so no block is dirty and every slot is
+     * free. Forgetting this would make the next commit append to a set that
+     * disk no longer agrees with. */
+    /* MEASURED, and it is hygiene rather than correctness. A build that skips
+     * this reset was run deliberately (v0.85) to see whether the crash harness
+     * would catch it: it did not, and it was right not to. Every block that is
+     * dirtied rewrites its OWN slot, so a stale map still points every entry at
+     * that block's current content and replay stays correct; there are only
+     * VFS_DIR_BLOCKS blocks and each takes at most one slot, so the capacity
+     * guard above is unreachable either way. The measured cost of skipping it
+     * was 305 s against 300 s on the same tier -- noise.
+     *
+     * It is kept because a slot map that agrees with disk is worth more than
+     * five seconds, and because "the entry count grows monotonically forever"
+     * is the kind of thing that stops being harmless the moment someone adds a
+     * second journal user. It is NOT load-bearing, and this comment says so
+     * rather than implying a correctness role it does not have. */
+    vj_reset_slots();
     g_vfs_last_sync_applied = 1;
 }
 
@@ -7053,7 +7213,7 @@ static int vfs_write_locked(int idx, const char *name, const void *data, uint32_
      * changed no references at all. */
     vfs_retain_map_locked(d);
     if (prev.used) vfs_release_map_locked(&prev);
-    vfs_journal_commit();          /* v0.48: journal-commit; see comment above */
+    vfs_journal_commit_idx(idx);   /* v0.48: journal-commit; see comment above */
     { char msg[64]; int mp = 0;
       const char *pre = "wrote file "; while (pre[mp]) { msg[mp] = pre[mp]; mp++; }
       for (int q = 0; name[q] && mp < 60; q++) msg[mp++] = name[q];
@@ -7205,7 +7365,7 @@ static int vfs_write_at_locked(int di, uint64_t off, const void *data, uint32_t 
      * free most of the file and then point the new map at it. */
     vfs_retain_map_locked(d);
     if (prev.used) vfs_release_map_locked(&prev);
-    vfs_journal_commit();
+    vfs_journal_commit_idx(di);
     return (int)len;
 }
 
@@ -7311,7 +7471,7 @@ static int vfs_truncate_locked(int di, uint32_t newlen) {
     d->file_hash = newlen ? h : 0;
     vfs_retain_map_locked(d);
     if (prev.used) vfs_release_map_locked(&prev);
-    vfs_journal_commit();
+    vfs_journal_commit_idx(di);
     return 0;
 }
 
@@ -8875,7 +9035,17 @@ static int vfs_open_for(const char *name, int owner, uint32_t oflags) {
             DENTS[i].uid = o_uid;          /* v0.72: a file belongs to its author */
             DENTS[i].gid = o_gid;
             DENTS[i].mode = VFS_MODE_DEFAULT;
-            di = i; created = 1; break;
+            di = i; created = 1;
+            /* v0.85: JOURNAL THE CREATION. Until now this path created a dirent
+             * and committed nothing, and the new name still reached disk --
+             * because the next commit, whatever it was for, shadowed the WHOLE
+             * directory and carried this along with it. That free ride ends with
+             * per-block journaling: a commit now shadows only its own block, so
+             * an unjournalled creation in a different block would simply never
+             * be written. Two block writes, and the name is durable on its own
+             * terms rather than on a neighbour's. */
+            vfs_journal_commit_idx(i);
+            break;
         }
     }
     /* v0.72: opening an EXISTING file needs read permission. Checked here,
@@ -8941,7 +9111,7 @@ static int vfs_open_for(const char *name, int owner, uint32_t oflags) {
         DENTS[di].len = 0;
         DENTS[di].nchunks = 0;
         DENTS[di].file_hash = 0;
-        vfs_journal_commit();                  /* the directory change is durable */
+        vfs_journal_commit_idx(di);            /* the directory change is durable */
     }
     klock_release(&g_vfs_lock);                /* released BEFORE the fd claim  */
     if (di < 0) return -1;
@@ -9058,7 +9228,7 @@ static int vfs_unlink(const char *name) {
     DENTS[idx].ind2_hash = 0;
     DENTS[idx].nchunks = 0;
     DENTS[idx].used = 0;
-    vfs_journal_commit();
+    vfs_journal_commit_idx(idx);
     klock_release(&g_vfs_lock);
 
     klock_acquire(&g_ofile_lock);              /* separate, non-nested section (rank 1) */
@@ -18258,7 +18428,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         klock_release(&g_vfs_lock);
         /* The directory is journalled, so a metadata change has to reach the
          * disk the same way a content change does or it is lost at reboot. */
-        if (rc == 0) { fs_witness_enter(); vfs_journal_commit(); fs_witness_leave(); }
+        if (rc == 0) { fs_witness_enter(); vfs_journal_commit_idx(di); fs_witness_leave(); }
         return (uint64_t)rc;
     }
     case 83: {   /* v0.66: SYS_MMAP_FILE(fd_prot_flags, length, offset) -> base, or -1.

@@ -88,6 +88,98 @@ a crash-injection test BEFORE the change, in the shape v0.84's dedup negative
 control established — write it, watch it pass against the current kernel, then
 change the kernel.
 
+### DONE — measured
+
+`c2e04fe` (harness) and the commit that follows it (optimisation), in that
+order and as separate commits, because the baseline is the point.
+
+**The `cjournal_header` pattern turned out not to be transferable, and that
+changed the design.** The CAS metadata journal is EAGER: it writes the index and
+bitmap home blocks immediately after journaling them, so its journal only ever
+covers one in-flight write. The VFS directory journal is deliberately DEFERRED —
+nothing copies shadow to `dir_start` until `SYS_VFS_SYNC` or the next mount, and
+a suite asserts exactly that (`deferred_ok`, "proves apply is deferred, not
+eager"). Because apply is deferred, the shadow has to hold EVERY un-applied
+change, not just the newest, which is what the whole-directory shadow was
+buying. A naive single-block journal would have let commit B silently discard
+commit A.
+
+So the journal holds a SET of dirty blocks instead: the header names the
+directory block living in each shadow slot, and a re-dirtied block rewrites its
+own slot rather than appending a second entry. There are only `VFS_DIR_BLOCKS`
+directory blocks and each takes at most one slot, so the set is bounded by
+construction and cannot overflow — the worst case is every block dirty, which is
+exactly the old behaviour at exactly the old cost. A static assertion fails the
+BUILD if `VFS_MAXFILES` ever grows the directory past what the header can name.
+
+**Two things had to change beyond the size of the write.**
+
+- **The shadow is now written BEFORE the header**, which makes a commit atomic
+  rather than merely survivable. Previously a crash between the two left a
+  PENDING header over a half-updated shadow; now it leaves the PREVIOUS header,
+  whose entries all still have intact shadows, so the incomplete commit is not
+  replayed at all.
+- **`vfs_open_for`'s O_CREAT path had to start journaling.** It created a dirent
+  and committed nothing, and the name still reached disk because the next
+  commit — whatever it was for — shadowed the whole directory and carried it
+  along. That free ride ends under per-block journaling.
+
+`VJRNL001` journals are still replayed as whole-directory shadows, so upgrading
+a kernel does not discard a commit that was already durable.
+
+**Measured.** Block writes per commit **49 → 2**, a 24.5x reduction. The
+throughput gain is smaller than that ratio because the journal was the dominant
+per-append cost, not the only one — each append still does its own `cas_put` and
+file-hash walk.
+
+| | before (`bf4ef8ec`) | after (`0b536c35`) | |
+|---|---|---|---|
+| append phase, smp4-bios | 2846 ticks | **1038** | **2.74x** |
+| append phase, smp4-iommu | 2630 ticks | **972** | **2.71x** |
+| appends/second, smp4-bios | 4.50 | **12.3** | |
+| boot, uniprocessor | 375 s | **300 s** | |
+| boot, smp2-bios | 295 s | **235 s** | |
+| boot, smp4-bios | 305 s | **235 s** | |
+| boot, smp4-iommu | 305 s | **235 s** | |
+
+Six-tier gate on `0b536c355d51ced7ac558648696752a5`: 513 / 527 / 531 / 544 plus
+both dirty tiers, zero failing assertions and `ranks=0` throughout, empty
+consecutive-boot diffs. **The assertion counts are identical to the pre-change
+baseline** — the change is faster and asserts exactly as much, which is the
+result worth having. Roughly 12 minutes comes off a full `gate-all`.
+
+**Crash consistency, before and after.** The harness fires once, on a chosen
+commit, and checks that the recovered directory contains no dirent it cannot
+produce and that a file made durable earlier survives byte-for-byte:
+
+| build | result |
+|---|---|
+| harness vs OLD journal (`d104783a`) | PASS — 48 live dirents, 0 unreadable |
+| harness vs NEW journal | PASS — 49 live dirents, 0 unreadable |
+| `-DJOURNAL_WRONG_BLOCK_REPRO` | **FAIL — 18 assertions** |
+
+The reproducer records the entry under the block that really changed but shadows
+the CONTENTS of block 0, so replay overwrites the changed block and the mutation
+is lost at the next mount. It is the failure mode per-block journaling
+introduces and whole-directory journaling was structurally incapable of, and it
+takes down the harness's own durability check, the pre-existing
+`recovered directory reloads with correct content`, and three `toolstrs`
+assertions whose SDK files simply are not there any more.
+
+**Two corrections worth keeping**, because both were wrong first:
+
+- A `-DJOURNAL_STALE_SLOTS_REPRO` build — skipping the slot-map reset after
+  apply — was written as the falsifiability target and **passed**. It was right
+  to pass: every dirtied block rewrites its own slot, so a stale map still
+  points each entry at that block's current content and replay stays correct.
+  Measured cost of skipping the reset was 305 s against 300 s. The reset is
+  hygiene, not correctness, and the code now says so instead of implying a role
+  it does not have.
+- The first `WRONG_BLOCK` reproducer assigned to the loop variable and hung the
+  boot until the gate cap. The classifier reported `TRUNCATED` and refused to
+  score it as either a pass or a failure, which is the only reason it was not
+  read as "0 failures".
+
 ## KNOWN TECHNICAL DEBT
 
 Carried from v0.84. The first two are named in this milestone's brief; the rest
