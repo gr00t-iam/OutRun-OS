@@ -6754,6 +6754,34 @@ static void ts_emit(int type, const char *who, const char *text);  /* Time-Strea
  * buys the caller is EAGER application: without calling it, the on-disk
  * dir_start region stays stale (last-applied state) until the next mount's
  * recovery runs, even though the journal already holds the true state.       */
+/* v0.85: MID-COMMIT CRASH INJECTION, opt-in (`make EXTRA=-DCRASH_INJECT_COMMIT_FAIL`)
+ * and never in a release build.
+ *
+ * ARMED AT RUNTIME, not at build time, and fires exactly once. A build-time
+ * injection would truncate EVERY commit for the whole boot, which does not
+ * simulate a power loss -- it simulates a permanently broken filesystem, and
+ * every later suite would fail for reasons that have nothing to do with the
+ * property under test. The test arms it immediately before the one mutation it
+ * wants interrupted.
+ *
+ * What it models: the machine loses power after the journal header has been
+ * written PENDING and only some of the shadow blocks have followed. That is a
+ * reachable state on this journal because the header is written FIRST -- see
+ * the note in vfs_journal_commit below. */
+#ifdef CRASH_INJECT_COMMIT_FAIL
+static volatile int      g_cji_arm   = 0;   /* set by the test; self-clearing   */
+static volatile uint64_t g_cji_fired = 0;   /* printed, so a zero is visible    */
+#endif
+
+/* v0.48 + v0.85. The header is written BEFORE the shadow blocks, and that
+ * ordering is load-bearing to understand before changing anything here: a crash
+ * between the two leaves a PENDING header over a shadow that is part this
+ * commit and part the previous one, and vfs_journal_apply() replays all of it.
+ * Every dirent in that mixture comes wholly from one commit or the other -- a
+ * 256-byte dirent never straddles a 512-byte block boundary -- so the directory
+ * stays STRUCTURALLY sound, but it is a blend of two points in time rather than
+ * an atomic snapshot of either. The v0.85 crash harness exists to measure what
+ * that actually costs. */
 static void vfs_journal_commit(void) {
     if (g_cas_legacy) { vfs_flush(); return; }             /* no journal region to use */
     struct vjournal_header h; cmemset(&h, 0, sizeof h);
@@ -6762,8 +6790,22 @@ static void vfs_journal_commit(void) {
     h.state = VJ_STATE_PENDING; h.seq = ++g_vj_seq;
     uint8_t hdrblk[CAS_BS]; cmemset(hdrblk, 0, CAS_BS); cmemcpy(hdrblk, &h, sizeof h);
     virtio_write_block(SB->vjournal_start + 0, hdrblk);
-    for (uint64_t i = 0; i < VFS_DIR_BLOCKS; i++)
+    for (uint64_t i = 0; i < VFS_DIR_BLOCKS; i++) {
+#ifdef CRASH_INJECT_COMMIT_FAIL
+        /* Stop half way. The header is already on disk and PENDING, so the next
+         * mount will find a commit it believes in and a shadow that is only
+         * half this commit's. */
+        if (g_cji_arm && i == VFS_DIR_BLOCKS / 2) {
+            g_cji_arm = 0;
+            g_cji_fired++;
+            kprintf("[vfs    ] CRASH INJECT: commit seq %u TRUNCATED after %u of %u "
+                    "shadow blocks (header already PENDING on disk)\n",
+                    (uint64_t)h.seq, i, (uint64_t)VFS_DIR_BLOCKS);
+            return;
+        }
+#endif
         virtio_write_block(SB->vjournal_start + 1 + i, g_dir + i * CAS_BS);
+    }
 }
 /* Applies a PENDING journal commit to the real dir_start region — called
  * both from cas_mount() (boot-time recovery) and SYS_VFS_SYNC (explicit,
@@ -20737,6 +20779,110 @@ static void cmd_vfs_stress(void) {
                  "EOF and resolve SEEK_END against their own volume; refusals leave the offset alone)",
                  ls == LSEEK_WORKER_OK);
     }
+
+    /* ===== v0.85: MID-COMMIT CRASH CONSISTENCY ============================
+     *
+     * Written BEFORE the journal is optimised, and run against the CURRENT
+     * kernel first, which is the order v0.84's dedup negative control
+     * established: a harness that has only ever seen the new code cannot say
+     * whether the new code changed anything.
+     *
+     * The property under test is not "the last commit survives" -- a journal
+     * that loses the most recent commit to a power cut is behaving correctly,
+     * because that commit never completed. The property is that whatever
+     * survives is STRUCTURALLY SOUND: every dirent the directory still claims
+     * is readable, with content matching the length it advertises. A filesystem
+     * may lose the tail of history; it may not come back describing files it
+     * cannot produce.
+     *
+     * Only compiled with -DCRASH_INJECT_COMMIT_FAIL, because arming the
+     * injection needs the injection to exist. In a normal build the phase is
+     * absent entirely rather than present and skipped -- a phase that silently
+     * does nothing is the shape this project has been burned by.
+     * ====================================================================== */
+#ifdef CRASH_INJECT_COMMIT_FAIL
+    {
+        static uint8_t cc_buf[4096];
+        const char *A = "ccrash-a";
+        const char *B = "ccrash-b";
+        uint32_t alen = 1200, blen = 900;
+
+        for (uint32_t i = 0; i < alen; i++) cc_buf[i] = (uint8_t)((i * 29u + 11u) & 0xFF);
+        int ai = vfs_write_file(A, cc_buf, alen);
+        for (uint32_t i = 0; i < blen; i++) cc_buf[i] = (uint8_t)((i * 37u + 5u) & 0xFF);
+        int bi = vfs_write_file(B, cc_buf, blen);
+        /* Apply, so dir_start genuinely holds both files. Without this the
+         * journal is the only record of them and the test would be measuring
+         * the deferred-apply design rather than the crash. */
+        vfs_journal_apply();
+        vfscheck("crash-inject: the two probe files exist before the interrupted commit",
+                 ai >= 0 && bi >= 0);
+
+        /* ARM, then mutate. The commit that carries this mutation is cut off
+         * after half its shadow blocks, with its header already PENDING. */
+        g_cji_arm = 1;
+        uint64_t fired0 = g_cji_fired;
+        for (uint32_t i = 0; i < 600; i++) cc_buf[i] = (uint8_t)((i * 41u + 3u) & 0xFF);
+        (void)vfs_write_file("ccrash-c", cc_buf, 600);
+        vfscheck("crash-inject: the injection actually FIRED (a phase that armed "
+                 "nothing would pass every check below having tested nothing)",
+                 g_cji_fired > fired0);
+
+        /* REMOUNT. cas_mount runs the real recovery path -- vfs_journal_apply
+         * replays whatever the interrupted commit left -- and reloads g_dir
+         * from disk, so everything checked below comes from the volume rather
+         * than from memory that never went through it. */
+        g_cas_mounted = 0;
+        int remounted = cas_mount();
+        vfscheck("crash-inject: the volume still MOUNTS after an interrupted commit",
+                 remounted == 1);
+
+        /* THE INVARIANT. Every dirent the recovered directory still claims must
+         * be readable at the length it advertises. A file may be missing --
+         * losing an incomplete commit is correct -- but a file that is present
+         * and unreadable is a directory describing content that does not
+         * exist. */
+        int structurally_sound = 1, live = 0, unreadable = 0;
+        for (int i = 0; i < VFS_MAXFILES; i++) {
+            if (!DENTS[i].used) continue;
+            live++;
+            uint32_t want = DENTS[i].len;
+            if (want > sizeof cc_buf) continue;        /* big files are not the subject */
+            int64_t got = vfs_read_file(i, cc_buf, (uint32_t)sizeof cc_buf);
+            if (got != (int64_t)want) {
+                if (!unreadable)
+                    kprintf("[vfsstrs] crash-inject: *** '%s' claims %u byte(s) but reads %d\n",
+                            DENTS[i].name, (uint64_t)want, got);
+                unreadable++;
+                structurally_sound = 0;
+            }
+        }
+        kprintf("[vfsstrs] crash-inject: %d live dirent(s) after recovery, %d unreadable, "
+                "injection fired %u time(s)\n",
+                (uint64_t)(int64_t)live, (uint64_t)(int64_t)unreadable, g_cji_fired);
+        vfscheck("crash-inject: after recovery EVERY live dirent reads back the length it "
+                 "advertises (a lost commit is correct; a file the directory claims and "
+                 "cannot produce is not)",
+                 structurally_sound);
+
+        /* And the file that was already durable before the interrupted commit
+         * must still be there. Losing the in-flight commit is acceptable;
+         * losing a file that was synced two commits earlier is not. */
+        int a2 = vfs_find(A);
+        int a_ok = 0;
+        if (a2 >= 0 && DENTS[a2].len == alen) {
+            int64_t got = vfs_read_file(a2, cc_buf, (uint32_t)sizeof cc_buf);
+            a_ok = (got == (int64_t)alen);
+            for (uint32_t i = 0; i < alen && a_ok; i++)
+                if (cc_buf[i] != (uint8_t)((i * 29u + 11u) & 0xFF)) a_ok = 0;
+        }
+        vfscheck("crash-inject: a file made durable BEFORE the interrupted commit survives "
+                 "it byte-for-byte", a_ok);
+
+        vfs_unlink(A); vfs_unlink(B); vfs_unlink("ccrash-c");
+        vfs_journal_apply();
+    }
+#endif
 
     /* ===== v0.85: O_APPEND UNDER MULTI-CORE CONTENTION ===================== */
     {
