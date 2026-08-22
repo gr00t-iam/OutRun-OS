@@ -49,10 +49,25 @@ guessed at, and which now has a number attached to it.
   atomically, and the replaced file's blocks must be released exactly as an
   unlink releases them (`vfs_release_map_locked`), or rename becomes a way to
   leak storage that unlink cannot.
-- **`chmod` / `chown`.** `struct dirent` already carries `uid`, `gid` and
-  `mode`, and `vfs_permit` already reads all three; what is missing is any way
-  to CHANGE them after creation. Ownership transfer needs the usual rule — only
-  root may give a file away — and `chmod` needs owner-or-root.
+- **`chmod` / `chown`.** ~~What is missing is any way to CHANGE them after
+  creation.~~ **That was wrong.** `SYS_CHMOD` (92) and `SYS_CHOWN` (93) have
+  existed since v0.72, complete with owner-or-root for chmod, root-only for
+  chown, ENOENT and a tmp/dev refusal — and the v0.85 journal work already
+  routed them through `vfs_journal_commit_idx(di)`.
+
+  The actual defect, found by the Phase 1 audit, is the CREDENTIAL they read:
+  both consult `kprocs[L].uid`, the REAL uid, while every other VFS check uses
+  `cred_euid()`. `vfs_permit`'s own header says why that is wrong — passing the
+  real pair "would make setuid() cosmetic". Because `SYS_SETEUID` moves only the
+  effective id, a process that has dropped effective privilege keeps real uid 0
+  and therefore keeps the authority to chmod ANY file on the volume, while a
+  genuinely setuid-root program (real 1000, euid 0) is refused chown. The fix is
+  two lines; the value is in the test that proves it, which does not exist.
+
+  Neither syscall has ANY coverage, kernel-side or ring-3. The assertion reading
+  "after chmod 0600 the stranger can no longer open it at all" assigns
+  `DENTS[di].mode` directly and never calls chmod — true, and misleadingly
+  named. See `OUTRUN-0.85-vfs-metadata-recon.md`.
 - **`st_mtime` / `st_atime`.** `SYS_STAT` exists and reports no time at all.
   `g_ticks` at 100 Hz is the only clock this kernel has, so these are
   boot-relative and must be documented as such rather than presented as wall
