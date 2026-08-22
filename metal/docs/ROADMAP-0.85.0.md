@@ -80,6 +80,92 @@ metadata call honoured on one volume and not the other reopens exactly that gap.
 Note that tmp has no mode and no group by design (owner-or-root is the whole
 rule), so `chmod` on a tmp file has to refuse rather than pretend.
 
+### DONE — measured
+
+`7eeab2e` (credential fix) and the commit that follows it, plus the Phase 1
+audit `5c446fb`.
+
+**A live authority leak, fixed.** `chmod`/`chown` judged by the REAL uid while
+every other VFS check used the effective one, so a process that had dropped with
+`seteuid(1000)` was refused every write by `vfs_permit` and could still re-mode
+ANY file on the volume. Four tagged releases carried that, with no test — the
+assertion that appeared to cover it assigned `DENTS[di].mode` directly and never
+called the syscall.
+
+**`SYS_RENAME` (102).** The namespace is FLAT, so a "cross-directory move" and a
+"same-directory rename" are the same operation: one dirent's inline name is
+overwritten, no content moves, and the CAS reference counts are untouched by
+construction. The case that is genuinely two dirents is renaming ONTO AN
+EXISTING NAME, which must replace atomically and release the replaced file's
+blocks — measured at `used_blocks 1122 -> 1120`, so the storage really comes
+back rather than the return code merely saying so.
+
+**`vfs_journal_commit_multi(idx1, idx2)`.** Both shadows, then one header: 3
+writes when the dirents sit in different blocks, 2 when they share one, 2 when
+`idx2` is -1. Committing the two indices in turn would NOT be atomic — the first
+header names only the first block, and a crash between the two leaves the entry
+renamed and the target not yet removed, i.e. two live dirents carrying one name.
+
+**Timestamps.** `mtime`/`atime` carved from `reserved[12]`, leaving 4 bytes and
+holding the 256-byte static assert. Boot-relative 100 Hz ticks, documented as
+such — there is no RTC, and calling them seconds-since-1970 would be inventing a
+number. Zero means UNKNOWN, following v0.72's rule for `mode`, so a file on an
+older volume does not appear to have been touched at startup.
+
+Two deviations from the brief, both deliberate:
+
+- **`SYS_STAT` was NOT widened.** `omake.oc` allocates exactly two 64-bit words
+  and the kernel `cmemcpy`s `sizeof(st)` into it, so growing that struct would
+  write 16 bytes past a ring-3 buffer in a program `occ` compiles during the
+  boot. Timestamps arrive through a new `SYS_FSTAT` (103) instead, which is also
+  what fstat properly means. Same reasoning the v0.58 comment gives for not
+  widening `SYS_READDIR`.
+- **`atime` is lazy and never journalled.** Committing on every read would cost
+  2 block writes and a publish for an operation that changed no content, making
+  reads as expensive as writes — which is why real systems ship `relatime`. The
+  stamp reaches disk with the next commit that dirties the block, so a crash can
+  lose it. A stated trade, not an oversight.
+
+**Coverage: all 10 Phase 1 cases implemented.** +7 assertions on every tier in a
+normal build, +6 more in the crash-injection build.
+
+| tier | before | after |
+|---|---|---|
+| uniprocessor | 513 | **520** |
+| smp2-bios | 527 | **534** |
+| smp4-bios | 531 | **538** |
+| smp4-iommu | 544 | **551** |
+| gate-dirty / gate-dirty-smp | 0 failing | **0 failing**, empty diffs |
+
+Six tiers on one image, `cf842dc0876dc95d2b2aa7e888c0e709`, `ranks=0`
+throughout, clean build with no warnings.
+
+**Falsifiability.** `EXTRA=-DCHMOD_REALUID_REPRO` restores the real-uid check:
+exactly one assertion moves, and its decode names the defect —
+*"an effectively-unprivileged caller CHANGED THE MODE of root's file (chmod is
+judging the real uid, not the effective one)"*, worker exit 1972.
+`EXTRA=-DCRASH_INJECT_COMMIT_FAIL` interrupts a replacing rename and the
+directory comes back with the OLD PAIR intact — the interrupted commit simply
+not applied.
+
+**Two corrections from doing the work**, both recorded because both were wrong
+first:
+
+- The crash-atomic rename test first reported `fired=0`. The refactor that
+  introduced `vj_stage_block` had left `vfs_journal_commit_idx` carrying a
+  DUPLICATE staging loop, and the injection hook lived only in the old copy — so
+  rename, the operation whose atomicity most needed testing, could not be
+  interrupted at all. The main assertion would have passed; only the
+  "did it actually fire" guard caught it. There is now one staging
+  implementation and one injection point.
+- A `gate-all` run failed on `smp4-bios` with `[langstrs]` red. The tier had
+  taken **1615 s against 235 s** for the others, and the failure was
+  `finished == false` — a drain watchdog — while the driver's own exit code was
+  970, its success sentinel. A control re-run of the SAME image passed 538/0 in
+  240 s. Host degradation, per the standing note in the v0.81 tag. Because
+  `gate-all` stops when the fresh matrix fails, the dirty tiers had not run on
+  that build and were run separately rather than cited from an earlier binary.
+
 ### 2. Single-block directory journal commit
 
 `vfs_journal_commit()` writes the journal header plus **all** `VFS_DIR_BLOCKS`

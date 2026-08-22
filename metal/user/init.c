@@ -158,6 +158,8 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_USERADD             99          /* v0.74: (name, password, (gid<<32)|uid) */
 #define SYS_LSEEK              100          /* v0.82: (fd, offset, whence) -> new off  */
 #define SYS_FTRUNCATE          101          /* v0.84: (fd, length) -> 0, or -errno     */
+#define SYS_RENAME             102          /* v0.85: (oldpath, newpath) -> 0, or -errno */
+#define SYS_FSTAT              103          /* v0.85: (fd, out) -> 0; out has timestamps */
 
 /* v0.82: the three POSIX whence values, in POSIX's order and with POSIX's
  * numbers. They are not an internal encoding to be chosen freely — a ring-3
@@ -1920,6 +1922,26 @@ static i64 oftruncate(int fd, i64 len) {
     if (g_ofd[fd] == OFD_CONSOLE)                   return -22;     /* EINVAL */
     return (i64)sysc(SYS_FTRUNCATE, (u64)g_ofd[fd], (u64)len, 0);
 }
+/* v0.85: rename a path. 0, or a negative errno. */
+static i64 orename(const char *oldp, const char *newp) {
+    return (i64)sysc(SYS_RENAME, (u64)oldp, (u64)newp, 0);
+}
+/* v0.85: mode and ownership. Both take a PATH, both return 0 or -errno. */
+static i64 ochmod(const char *path, u64 mode) {
+    return (i64)sysc(SYS_CHMOD, (u64)path, mode, 0);
+}
+static i64 ochown(const char *path, u64 uid, u64 gid) {
+    return (i64)sysc(SYS_CHOWN, (u64)path, uid, gid);
+}
+/* v0.85: the timestamped stat. Separate from SYS_STAT, whose two-word ABI is
+ * load-bearing -- omake allocates exactly two words for it, so widening it
+ * would have the kernel write past a ring-3 buffer. */
+struct ostatx { u64 hash; u64 len; u32 mtime; u32 atime; };
+static i64 ofstat(int fd, struct ostatx *out) {
+    if (fd < 0 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;
+    if (g_ofd[fd] == OFD_CONSOLE)                   return -22;
+    return (i64)sysc(SYS_FSTAT, (u64)g_ofd[fd], (u64)out, 0);
+}
 static int oclose(int fd) {
     if (fd < 3 || fd >= OFD_MAX || g_ofd[fd] == -1) return -9;  /* std three are not closable */
     sysc(SYS_CLOSE, (u64)g_ofd[fd], 0, 0);
@@ -3285,6 +3307,96 @@ static void append_smp_worker(u32 idx) {
         if (osysticks() - t0 >= APPSMP_T) sysc(SYS_EXIT, 1920 + (u64)idx, 0, 0);
     }
     oclose(f);
+    sysc(SYS_EXIT, 42, 0, 0);
+}
+
+/* --- role 60: v0.85 VFS METADATA FROM RING 3 --------------------------------
+ *
+ * Three things the kernel half cannot honestly test for itself.
+ *
+ * THE CREDENTIAL RULE, which is why this role exists at all. chmod and chown
+ * judged by the REAL uid from v0.72 until v0.85, while every other VFS check
+ * used the EFFECTIVE one. A kernel-side test cannot show that: it would have to
+ * fake a credential, and faking the very thing under test proves nothing. So a
+ * child here drops with seteuid(1000) -- which moves ONLY the effective id,
+ * leaving real uid 0 -- and is required to be REFUSED chmod and chown on a file
+ * root owns. Against the pre-v0.85 kernel this FAILS, which is the point.
+ *
+ * THE SYSCALL, not the struct. The pre-v0.85 kernel-side assertion that reads
+ * "after chmod 0600 the stranger can no longer open it" assigns DENTS[di].mode
+ * directly and never calls chmod. This one calls it.
+ *
+ * TIMESTAMPS through the descriptor, so mtime and atime are observed the way a
+ * program would observe them rather than by reading the dirent.
+ *
+ * Exit 42 on success; every failure point has its own code. */
+#define META_PATH "metaown"
+static void meta_worker(void) {
+    /* (1) Author a file as root and set a mode through the SYSCALL. */
+    { int f = ocreat(META_PATH);
+      if (f < 0)                                  sysc(SYS_EXIT, 1950, 0, 0);
+      if (owrite(f, "meta", 4) != 4)              sysc(SYS_EXIT, 1951, 0, 0);
+      oclose(f); }
+    if (ochmod(META_PATH, 0600) != 0)             sysc(SYS_EXIT, 1952, 0, 0);
+
+    /* (2) TIMESTAMPS. mtime must move on a write and NOT on a read; atime must
+     * move on a read. Ticks are 100 Hz, so the deadline loop below is what makes
+     * the comparison meaningful rather than a race against the clock. */
+    { int f = oopen(META_PATH);
+      if (f < 0)                                  sysc(SYS_EXIT, 1953, 0, 0);
+      struct ostatx a, b, c;
+      if (ofstat(f, &a) != 0)                     sysc(SYS_EXIT, 1954, 0, 0);
+      if (a.mtime == 0)                           sysc(SYS_EXIT, 1955, 0, 0);
+      /* Wait for the clock to advance, or "unchanged" and "changed within the
+       * same tick" would be indistinguishable. */
+      { u32 t0 = osysticks(); while (osysticks() == t0) oyield(); }
+      /* A READ must move atime and leave mtime alone. */
+      { char rb[8]; if (olseek(f, 0, SEEK_SET) != 0) sysc(SYS_EXIT, 1956, 0, 0);
+        if (oread(f, rb, 4) != 4)                 sysc(SYS_EXIT, 1956, 0, 0); }
+      if (ofstat(f, &b) != 0)                     sysc(SYS_EXIT, 1954, 0, 0);
+      if (b.atime <= a.atime)                     sysc(SYS_EXIT, 1957, 0, 0);
+      if (b.mtime != a.mtime)                     sysc(SYS_EXIT, 1958, 0, 0);
+      { u32 t0 = osysticks(); while (osysticks() == t0) oyield(); }
+      /* A WRITE must move mtime. */
+      if (olseek(f, 0, SEEK_SET) != 0)            sysc(SYS_EXIT, 1956, 0, 0);
+      if (owrite(f, "MET", 3) != 3)               sysc(SYS_EXIT, 1959, 0, 0);
+      if (ofstat(f, &c) != 0)                     sysc(SYS_EXIT, 1954, 0, 0);
+      if (c.mtime <= b.mtime)                     sysc(SYS_EXIT, 1960, 0, 0);
+      oclose(f); }
+
+    /* (3) THE CREDENTIAL RULE, from a process that has genuinely dropped. */
+    { i64 c = ofork();
+      if (c < 0)                                  sysc(SYS_EXIT, 1961, 0, 0);
+      if (c == 0) {
+          /* seteuid ONLY -- real uid stays 0, which is exactly the shape that
+           * made the old check wrong. */
+          if ((i64)sysc(SYS_SETEUID, 1000, 0, 0) != 0) sysc(SYS_EXIT, 120, 0, 0);
+          if (sysc(SYS_GETEUID, 0, 0, 0) != 1000)      sysc(SYS_EXIT, 121, 0, 0);
+          /* Root owns META_PATH. An effectively-unprivileged caller may not
+           * change its mode, and may not give it away. */
+          if (ochmod(META_PATH, 0666) != -1)           sysc(SYS_EXIT, 122, 0, 0);
+          if (ochown(META_PATH, 1000, 1000) != -1)     sysc(SYS_EXIT, 123, 0, 0);
+          sysc(SYS_EXIT, 119, 0, 0);
+      }
+      i64 st = owaitpid_ticks((u32)c, WAIT_T_FORK, 0);
+      if (st == -11)                              sysc(SYS_EXIT, 1962, 0, 0);
+      if (st != 119) sysc(SYS_EXIT, 1970 + (u64)(st >= 120 && st <= 123 ? st - 120 : 4), 0, 0);
+    }
+
+    /* (4) RENAME, including onto an existing name. */
+    { if (orename(META_PATH, "metanew") != 0)     sysc(SYS_EXIT, 1980, 0, 0);
+      if (oopen(META_PATH) >= 0)                  sysc(SYS_EXIT, 1981, 0, 0);   /* old gone */
+      int f = oopen("metanew");
+      if (f < 0)                                  sysc(SYS_EXIT, 1982, 0, 0);
+      { char rb[8]; for (int i = 0; i < 8; i++) rb[i] = 0;
+        if (oread(f, rb, 4) != 4)                 sysc(SYS_EXIT, 1982, 0, 0);
+        if (rb[0] != 'M' || rb[1] != 'E' || rb[2] != 'T' || rb[3] != 'a')
+                                                  sysc(SYS_EXIT, 1983, 0, 0); }
+      oclose(f);
+      /* Renaming a missing name is ENOENT, not a silent success. */
+      if (orename("meta-absent", "meta-x") != -2) sysc(SYS_EXIT, 1984, 0, 0);
+      ounlink("metanew"); }
+
     sysc(SYS_EXIT, 42, 0, 0);
 }
 
@@ -5813,6 +5925,7 @@ int main(int argc, const char **argv, const char **envp) {
      * role's distance from 56 — see append_smp_worker for why the index has to
      * travel that way. */
     if (role >= 56 && role <= 59) { append_smp_worker((u32)(role - 56)); }
+    if (role == 60) { meta_worker(); }                 /* v0.85 VFS metadata from ring 3 */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
     if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
     if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */

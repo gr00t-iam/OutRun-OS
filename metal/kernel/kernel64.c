@@ -5243,6 +5243,7 @@ static int      g_vj_slot_of[VJ_MAX_SLOTS];   /* sized like the header's array *
 static uint32_t g_vj_count = 0;
 static int      g_vj_init  = 0;
 static uint64_t g_vj_blocks_written = 0;   /* benchmark: journal block writes  */
+static int      g_vj_inject_stop    = 0;   /* set by the injection; stops publish */
 static uint64_t g_vj_commits        = 0;
 static void vj_reset_slots(void) {
     for (int i = 0; i < VJ_MAX_SLOTS; i++) g_vj_slot_of[i] = -1;
@@ -5365,7 +5366,24 @@ struct dirent {
     uint32_t uid;                             /* owning user                     */
     uint32_t gid;                             /* owning group                    */
     uint32_t mode;                            /* rwx triples, 0 = unset (legacy) */
-    uint8_t  reserved[12];                    /* pad dirent to exactly 256 bytes  */
+    /* v0.85: TIMESTAMPS, carved out of reserved[] exactly as v0.56 carved the
+     * indirect map and v0.72 carved ownership -- the dirent stays EXACTLY 256
+     * bytes, so the on-disk directory layout, VFS_DIR_BLOCKS, the journal record
+     * and cas_mount's restore all keep working and an older volume still mounts.
+     *
+     * BOOT-RELATIVE TICKS, NOT WALL TIME, and the distinction is not pedantry.
+     * g_ticks at 100 Hz is the only clock this kernel has; there is no RTC and
+     * no epoch. A uint32_t of ticks covers ~497 days, far past any boot. Calling
+     * these seconds-since-1970 would be inventing a number, so they are ticks
+     * since THIS boot and every consumer has to know that.
+     *
+     * ZERO MEANS UNKNOWN, following the rule v0.72 wrote for mode: on a volume
+     * written by an older kernel these read as 0, and 0 must not be read as "the
+     * first tick of this boot" or every pre-existing file would appear to have
+     * been touched at startup. vfs_now() never returns 0 for that reason. */
+    uint32_t mtime;                           /* ticks at last content change    */
+    uint32_t atime;                           /* ticks at last read (lazy)       */
+    uint8_t  reserved[4];                     /* pad dirent to exactly 256 bytes  */
 } __attribute__((packed));
 /* Compile-time guard: if this ever trips, the on-disk layout has been broken. */
 _Static_assert(sizeof(struct dirent) == 256, "dirent must stay exactly 256 bytes");
@@ -5993,6 +6011,13 @@ static inline uint32_t vfs_mode_of(const struct dirent *d) {
  * is no second, weaker way to ask. Passing the real pair would make setuid()
  * cosmetic, since a process could hold a privileged effective id the filesystem
  * never consulted (and, symmetrically, a dropped one it never honoured). */
+/* v0.85: the timestamp clock. Never returns 0, because 0 is the "unknown"
+ * sentinel a pre-v0.85 volume carries -- see struct dirent. */
+static inline uint32_t vfs_now(void) {
+    uint32_t t = (uint32_t)g_ticks;
+    return t ? t : 1u;
+}
+
 static int vfs_permit(const struct dirent *d, uint32_t uid, uint32_t gid, uint32_t want) {
     if (uid == 0) return 1;
     uint32_t m = vfs_mode_of(d);
@@ -6855,62 +6880,46 @@ static volatile uint64_t g_cji_fired = 0;   /* printed, so a zero is visible    
  * six mutation sites touch exactly one dirent -- but a future one that does and
  * forgets to say so would lose an update silently, and the cost of having the
  * hatch is one branch. */
-static void vfs_journal_commit_idx(int idx) {
-    if (g_cas_legacy) { vfs_flush(); return; }             /* no journal region to use */
-    if (!g_vj_init) vj_reset_slots();
-
-    uint64_t nblk = SB->dir_blocks < VFS_DIR_BLOCKS ? SB->dir_blocks : VFS_DIR_BLOCKS;
-    uint64_t first = 0, last = nblk;                       /* [first,last) to shadow */
-    if (idx >= 0 && idx < VFS_MAXFILES) {
-        uint64_t b = ((uint64_t)idx * 256u) / CAS_BS;
-        if (b < nblk) { first = b; last = b + 1; }
+/* v0.85: stage ONE directory block into its shadow slot, writing no header.
+ * Split out so a transaction can stage several blocks and publish them with a
+ * single header -- which is what makes a multi-dirent operation atomic. */
+static void vj_stage_block(uint64_t b, uint64_t nblk) {
+    if (b >= nblk) return;
+    int slot = g_vj_slot_of[b];
+    if (slot < 0) {
+        if (g_vj_count >= (uint32_t)nblk) return;   /* unreachable: bounded by nblk */
+        slot = (int)g_vj_count++;
+        g_vj_slot_of[b] = slot;
     }
-
-    for (uint64_t b = first; b < last; b++) {
-        /* v0.85 REPRODUCER, opt-in (`make EXTRA=-DJOURNAL_WRONG_BLOCK_REPRO`)
-         * and never in a release build: record the entry under the block that
-         * really changed, but shadow the CONTENTS of block 0. The journal then
-         * holds something real and holds the WRONG thing -- replay writes block
-         * 0's bytes over the block that changed, so the mutation is lost at the
-         * next mount while the volume mounts cleanly and every in-memory read
-         * looks perfect until the reboot.
-         *
-         * This is the failure mode per-block journaling introduces and that
-         * whole-directory journaling could not have: the old commit shadowed
-         * everything, so it was structurally incapable of naming the wrong
-         * block. It is the right thing to aim the crash harness at.
-         *
-         * `src` exists rather than assigning to `b` because assigning to the
-         * loop variable is an infinite loop whenever the target block is not 0 —
-         * the first version of this reproducer did exactly that and hung the
-         * boot until the gate cap, which the classifier reported as TRUNCATED
-         * and correctly refused to call either a pass or a failure. */
-        uint64_t src = b;
+    uint64_t src = b;
 #ifdef JOURNAL_WRONG_BLOCK_REPRO
-        src = 0;
+    src = 0;
 #endif
-        int slot = g_vj_slot_of[b];
-        if (slot < 0) {
-            if (g_vj_count >= (uint32_t)nblk) continue;    /* unreachable: bounded by nblk */
-            slot = (int)g_vj_count++;
-            g_vj_slot_of[b] = slot;
-        }
-        virtio_write_block(SB->vjournal_start + 1 + (uint64_t)slot, g_dir + src * CAS_BS);
-        g_vj_blocks_written++;
+    virtio_write_block(SB->vjournal_start + 1 + (uint64_t)slot, g_dir + src * CAS_BS);
+    g_vj_blocks_written++;
 #ifdef CRASH_INJECT_COMMIT_FAIL
-        /* Cut the commit off BEFORE its header reaches disk. That is the honest
-         * power-loss shape for this ordering, and what the next mount should do
-         * with it is nothing at all. */
-        if (g_cji_arm) {
-            g_cji_arm = 0;
-            g_cji_fired++;
-            kprintf("[vfs    ] CRASH INJECT: commit TRUNCATED after shadow block %u "
-                    "and BEFORE the header (nothing to replay)\n", b);
-            return;
-        }
-#endif
+    /* v0.85: the injection lives HERE, in the one place every commit path
+     * stages a block, rather than in a caller's loop. It was originally in
+     * vfs_journal_commit_idx's own loop, which meant vfs_journal_commit_multi --
+     * and therefore rename, the operation whose atomicity most needed testing --
+     * could not be interrupted at all. The crash-atomic rename assertion caught
+     * that by reporting fired=0 and refusing to pass on a premise it had not
+     * established. */
+    if (g_cji_arm) {
+        g_cji_arm = 0;
+        g_cji_fired++;
+        kprintf("[vfs    ] CRASH INJECT: commit TRUNCATED after shadow block %u "
+                "and BEFORE the header (nothing to replay)\n", b);
+        g_vj_inject_stop = 1;
     }
+#endif
+}
 
+/* Publish everything staged so far. The header is written LAST and is what
+ * makes the transaction visible: until it lands, the previous header still
+ * describes a complete, replayable set, so a crash mid-transaction replays the
+ * old state rather than a partial new one. */
+static void vj_publish(void) {
     struct vjournal_header h; cmemset(&h, 0, sizeof h);
     const char mg[8] = { 'V','J','R','N','L','0','0','2' };
     cmemcpy(h.magic, mg, 8);
@@ -6921,6 +6930,53 @@ static void vfs_journal_commit_idx(int idx) {
     virtio_write_block(SB->vjournal_start + 0, hdrblk);
     g_vj_blocks_written++;
     g_vj_commits++;
+}
+
+/* v0.85: journal up to TWO dirty directory blocks in one transaction -- both
+ * shadows, then one header. 3 writes when the two dirents live in different
+ * blocks, 2 when they share one, 2 when idx2 is -1.
+ *
+ * rename is why this exists. Replacing an existing name mutates TWO dirents --
+ * the entry being moved and the entry being replaced -- and committing them one
+ * after another is NOT atomic: the first header names only the first block, so
+ * a crash between the two leaves the entry renamed and the target not yet
+ * removed, i.e. two live dirents carrying the same name. Staging both before
+ * publishing either is what removes that window. */
+static void vfs_journal_commit_multi(int idx1, int idx2) {
+    if (g_cas_legacy) { vfs_flush(); return; }
+    if (!g_vj_init) vj_reset_slots();
+    uint64_t nblk = SB->dir_blocks < VFS_DIR_BLOCKS ? SB->dir_blocks : VFS_DIR_BLOCKS;
+
+    if (idx1 >= 0 && idx1 < VFS_MAXFILES) vj_stage_block(((uint64_t)idx1 * 256u) / CAS_BS, nblk);
+    else for (uint64_t b = 0; b < nblk; b++) vj_stage_block(b, nblk);   /* -1: everything */
+
+    /* idx2 < 0 degrades to a single-block commit, and a second index landing in
+     * the SAME block is not staged twice -- vj_stage_block reuses that block's
+     * existing slot, so the shadow is written once with both dirents already in
+     * it. */
+    if (idx2 >= 0 && idx2 < VFS_MAXFILES && !g_vj_inject_stop)
+        vj_stage_block(((uint64_t)idx2 * 256u) / CAS_BS, nblk);
+
+    /* The header is what publishes the transaction. If the injection fired we
+     * return without it, which is precisely the power-loss shape this ordering
+     * is designed for: the previous header still describes a complete set. */
+    if (g_vj_inject_stop) { g_vj_inject_stop = 0; return; }
+    vj_publish();
+}
+
+static void vfs_journal_commit_idx(int idx) {
+    if (g_cas_legacy) { vfs_flush(); return; }             /* no journal region to use */
+    if (!g_vj_init) vj_reset_slots();
+    uint64_t nblk = SB->dir_blocks < VFS_DIR_BLOCKS ? SB->dir_blocks : VFS_DIR_BLOCKS;
+
+    /* v0.85: one staging implementation, shared with vfs_journal_commit_multi.
+     * This function used to carry its own copy of the loop, which is how the
+     * crash injection came to exist in only one of the two commit paths. */
+    if (idx >= 0 && idx < VFS_MAXFILES) vj_stage_block(((uint64_t)idx * 256u) / CAS_BS, nblk);
+    else for (uint64_t b = 0; b < nblk && !g_vj_inject_stop; b++) vj_stage_block(b, nblk);
+
+    if (g_vj_inject_stop) { g_vj_inject_stop = 0; return; }
+    vj_publish();
 }
 /* No no-argument wrapper. All six mutation sites name the dirent they changed,
  * and a wrapper that quietly shadowed the whole directory would be the easy
@@ -7203,6 +7259,8 @@ static int vfs_write_locked(int idx, const char *name, const void *data, uint32_
         return -1;
     }
     d->file_hash = len ? rust_cas_hash((uint64_t)data, len) : 0;
+    d->mtime = vfs_now();                      /* v0.85: content changed */
+    if (!d->atime) d->atime = d->mtime;
     /* v0.84: RETAIN THE NEW MAP BEFORE RELEASING THE OLD ONE, and never the
      * other way round. A rewrite very often stores content it already held —
      * identical chunks dedup to the same blocks — so releasing first would drop
@@ -7358,6 +7416,8 @@ static int vfs_write_at_locked(int di, uint64_t off, const void *data, uint32_t 
         h = rust_cas_hash_cont(h, (uint64_t)blk, clen);
     }
     d->file_hash = newlen ? h : 0;
+    d->mtime = vfs_now();                      /* v0.85 */
+    if (!d->atime) d->atime = d->mtime;
     /* v0.84: same retain-then-release rule as the whole-file writer, and it
      * matters more here. A positional write REBUILDS every chunk it touches
      * from the old content, so the untouched chunks hash identically and dedup
@@ -7469,6 +7529,8 @@ static int vfs_truncate_locked(int di, uint32_t newlen) {
         h = rust_cas_hash_cont(h, (uint64_t)blk, clen);
     }
     d->file_hash = newlen ? h : 0;
+    d->mtime = vfs_now();                      /* v0.85: truncate changes content */
+    if (!d->atime) d->atime = d->mtime;
     vfs_retain_map_locked(d);
     if (prev.used) vfs_release_map_locked(&prev);
     vfs_journal_commit_idx(di);
@@ -7549,6 +7611,7 @@ static int64_t vfs_read_range(int di, uint64_t off, void *out, uint32_t len) {
     klock_acquire(&g_vfs_lock);
     struct dirent *d = &DENTS[di];
     if (!d->used) { klock_release(&g_vfs_lock); return -1; }
+    d->atime = vfs_now();                      /* v0.85: lazy, never journalled */
     uint32_t flen = d->len;
     if (off >= flen) { klock_release(&g_vfs_lock); return 0; }   /* wholly past EOF */
     uint32_t want = len;
@@ -7747,9 +7810,21 @@ static void vmfile_teardown_kproc(int proc_idx) {
      * refcount is what decides when the last reference goes. */
 }
 
+/* v0.85: stamp a read. DELIBERATELY NOT JOURNALLED. Committing on every read
+ * would make a read as expensive as a write -- 2 block writes and a journal
+ * publish for an operation that changed no content -- which is why real systems
+ * ship relatime or noatime rather than strict POSIX atime. The stamp lands in
+ * g_dir and reaches disk with the next commit that dirties that block, so it is
+ * best-effort and a crash can lose it. That is a deliberate trade and it is
+ * stated here rather than discovered later from a performance graph. */
+static inline void vfs_touch_atime(int idx) {
+    if (idx >= 0 && idx < VFS_MAXFILES && DENTS[idx].used) DENTS[idx].atime = vfs_now();
+}
+
 static int64_t vfs_read_file(int idx, void *buf, uint32_t max) {
     klock_acquire(&g_vfs_lock);                /* the chunk list must not be    */
     struct dirent *d = &DENTS[idx];            /* COW-swapped under our read    */
+    if (d->used) d->atime = vfs_now();         /* v0.85: lazy, never journalled */
     uint32_t got = 0;
     uint8_t tmp[512];
     for (uint32_t i = 0; i < d->nchunks; i++) {
@@ -9035,6 +9110,7 @@ static int vfs_open_for(const char *name, int owner, uint32_t oflags) {
             DENTS[i].uid = o_uid;          /* v0.72: a file belongs to its author */
             DENTS[i].gid = o_gid;
             DENTS[i].mode = VFS_MODE_DEFAULT;
+            DENTS[i].mtime = DENTS[i].atime = vfs_now();   /* v0.85 */
             di = i; created = 1;
             /* v0.85: JOURNAL THE CREATION. Until now this path created a dirent
              * and committed nothing, and the new name still reached disk --
@@ -9111,6 +9187,7 @@ static int vfs_open_for(const char *name, int owner, uint32_t oflags) {
         DENTS[di].len = 0;
         DENTS[di].nchunks = 0;
         DENTS[di].file_hash = 0;
+        DENTS[di].mtime = vfs_now();           /* v0.85: O_TRUNC changes content */
         vfs_journal_commit_idx(di);            /* the directory change is durable */
     }
     klock_release(&g_vfs_lock);                /* released BEFORE the fd claim  */
@@ -9130,6 +9207,87 @@ static int vfs_open_for(const char *name, int owner, uint32_t oflags) {
  * site exactly what the wrapper's name used to say. */
 static int vfs_open_flags(const char *name, uint32_t oflags) {
     return vfs_open_for(name, fd_owner(), oflags);
+}
+
+/* v0.85: POSIX rename, on a FLAT namespace.
+ *
+ * Names here are paths but there is no directory tree, so a "cross-directory
+ * move" and a "same-directory rename" are the SAME operation: one dirent's
+ * inline name is overwritten and no content moves. The chunk map is untouched,
+ * so the CAS reference counts are untouched by construction -- a rename cannot
+ * leak or free a block.
+ *
+ * Except in the one case POSIX spends its words on. Renaming ONTO AN EXISTING
+ * NAME must replace it atomically, and the replaced file's blocks have to be
+ * released exactly as unlink releases them, or rename becomes a way to leak
+ * storage that unlink cannot. That is what makes this a TWO-DIRENT operation
+ * and why it commits through vfs_journal_commit_multi: the two dirents are two
+ * directory blocks whenever they sit in different halves of the table, and
+ * committing them one after another would leave a window where the entry has
+ * been renamed and the target not yet removed -- two live dirents carrying the
+ * same name, which is the corruption rename is supposed to be incapable of.
+ *
+ * Refuses tmp/ and dev/ for the same reason chmod does: tmp is a separate
+ * namespace with its own table, and dev is a live view rather than a directory.
+ *
+ * Returns 0, or a negative errno: -2 ENOENT, -13 EACCES, -22 EINVAL. */
+static int vfs_rename(const char *oldp, const char *newp) {
+    if (!oldp || !newp || !oldp[0] || !newp[0]) return -22;
+    if (path_has_prefix(oldp, "tmp/") || path_has_prefix(oldp, "dev/")) return -22;
+    if (path_has_prefix(newp, "tmp/") || path_has_prefix(newp, "dev/")) return -22;
+
+    int L = tg_of((int)current_proc_idx);
+    uint32_t eu = cred_euid(L), eg = cred_egid(L);
+    int victim = -1;
+
+    klock_acquire(&g_vfs_lock);
+    int oi = vfs_find(oldp);
+    if (oi < 0) { klock_release(&g_vfs_lock); return -2; }          /* ENOENT */
+    if (streq_n(DENTS[oi].name, newp, VFS_NAME_MAX)) {              /* same name */
+        klock_release(&g_vfs_lock); return 0;
+    }
+    /* Changing a name is changing the file, so it needs write on the source --
+     * the same right chmod refuses to accept for a mode change, applied the
+     * other way round: here the content is untouched and the NAME is what
+     * moves. */
+    if (!vfs_permit(&DENTS[oi], eu, eg, VFS_P_WRITE)) {
+        klock_release(&g_vfs_lock); return -13;                     /* EACCES */
+    }
+    int ti = vfs_find(newp);
+    if (ti == oi) { klock_release(&g_vfs_lock); return 0; }
+    if (ti >= 0) {
+        /* Replacing a file destroys it, so it needs write on the target too. */
+        if (!vfs_permit(&DENTS[ti], eu, eg, VFS_P_WRITE)) {
+            klock_release(&g_vfs_lock); return -13;                 /* EACCES */
+        }
+        vfs_release_map_locked(&DENTS[ti]);
+        cmemset(DENTS[ti].chunk_hash, 0, sizeof DENTS[ti].chunk_hash);
+        DENTS[ti].ind1_hash = 0;
+        DENTS[ti].ind2_hash = 0;
+        DENTS[ti].nchunks = 0;
+        DENTS[ti].used = 0;
+        victim = ti;
+    }
+    kstrcpy_n(DENTS[oi].name, newp, VFS_NAME_MAX);
+    DENTS[oi].mtime = vfs_now();
+    /* BOTH blocks, ONE header. See the note above. */
+    vfs_journal_commit_multi(oi, ti);
+    klock_release(&g_vfs_lock);
+
+    /* A descriptor still naming the replaced dirent must stop resolving, or it
+     * would read whatever file next claims that index -- the same
+     * "regardless of how it got there" teardown unlink performs, and in a
+     * separate non-nested section for the same reason: rank 2 is released
+     * before rank 1 is taken. */
+    if (victim >= 0) {
+        klock_acquire(&g_ofile_lock);
+        for (int fd = 0; fd < 16; fd++)
+            if (g_ofiles[fd].used && g_ofiles[fd].volume == VOL_ROOT &&
+                g_ofiles[fd].dirent == victim)
+                { g_ofiles[fd].used = 0; g_ofiles[fd].owner_mask = 0; }
+        klock_release(&g_ofile_lock);
+    }
+    return 0;
 }
 
 /* ===========================================================================
@@ -18435,8 +18593,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
 #else
             /* v0.85 REPRODUCER, opt-in (`make EXTRA=-DCHMOD_REALUID_REPRO`) and
              * never in a release build: the pre-v0.85 check, judging by the REAL
-             * uid. Role 60 must go red on this build; if it does not, the
-             * credential assertion is not testing the credential. */
+             * uid. A process that dropped with seteuid(1000) keeps real uid 0
+             * and is therefore treated as root here, so it may change the mode
+             * of any file on the volume while vfs_permit refuses it every write.
+             * Role 60 must go red on this build; if it does not, the credential
+             * assertion is not testing the credential. */
             if (kprocs[L].uid != 0 && DENTS[di].uid != kprocs[L].uid) rc = -1;
 #endif
             else DENTS[di].mode = (uint32_t)a1 & 0777;
@@ -18854,6 +19015,54 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         else rc = -22;                       /* dev, and anything else with no length */
         fs_witness_leave();
         return (uint64_t)rc;
+    }
+    case 102: {  /* v0.85: SYS_RENAME(oldpath, newpath) -> 0, or negative errno.
+                  *
+                  * -2 ENOENT, -13 EACCES, -22 EINVAL (empty name, or a tmp/dev
+                  * path -- see vfs_rename). Atomic against a replaced target:
+                  * both dirents are journalled under one header. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+        char oldp[VFS_NAME_MAX], newp[VFS_NAME_MAX];
+        if (copy_user_str(kprocs[current_proc_idx].cr3, a0, oldp, sizeof oldp) < 0) return (uint64_t)-14;
+        if (copy_user_str(kprocs[current_proc_idx].cr3, a1, newp, sizeof newp) < 0) return (uint64_t)-14;
+        fs_witness_enter();
+        int64_t rc = vfs_rename(oldp, newp);
+        fs_witness_leave();
+        return (uint64_t)rc;
+    }
+    case 103: {  /* v0.85: SYS_FSTAT(fd, out) -> 0, or negative errno.
+                  *   out = { uint64_t hash; uint64_t len; uint32_t mtime; uint32_t atime; }
+                  *
+                  * A NEW syscall rather than a wider SYS_STAT, and that is not
+                  * taste. SYS_STAT (61) writes exactly two 64-bit words and
+                  * omake.oc allocates exactly two to receive them -- the kernel
+                  * cmemcpy's sizeof(st) into the caller's buffer, so growing
+                  * that struct would have the kernel write 16 bytes past a
+                  * ring-3 allocation, in a program occ compiles during the boot.
+                  * SYS_STAT's ABI is therefore untouched and the timestamps
+                  * arrive on their own call. Same reasoning the v0.58 comment
+                  * gives for not widening SYS_READDIR's record.
+                  *
+                  * fd-based because that is what fstat means, and because a
+                  * descriptor already resolves to the dirent without a second
+                  * name lookup that could race the first. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
+        struct { uint64_t hash, len; uint32_t mtime, atime; } st;
+        if (!access_ok(kprocs[current_proc_idx].cr3, a1, sizeof st, 1)) return (uint64_t)-14;
+        int vol = VOL_ROOT;
+        int di = ofile_deref((int)a0, &vol);
+        if (di < 0) return (uint64_t)-9;                            /* EBADF */
+        if (vol != VOL_ROOT) return (uint64_t)-22;                  /* EINVAL: no dirent */
+        fs_witness_enter();
+        klock_acquire(&g_vfs_lock);
+        st.hash  = DENTS[di].file_hash;
+        st.len   = DENTS[di].len;
+        st.mtime = DENTS[di].mtime;
+        st.atime = DENTS[di].atime;
+        klock_release(&g_vfs_lock);
+        fs_witness_leave();
+        cmemcpy((void *)a1, &st, sizeof st);
+        return 0;
     }
     case 67:     /* SYS_GETTID() -> this THREAD's own id.
                   * 0 for a process that never called SYS_THREAD_CREATE, so
@@ -21076,10 +21285,143 @@ static void cmd_vfs_stress(void) {
         vfscheck("crash-inject: a file made durable BEFORE the interrupted commit survives "
                  "it byte-for-byte", a_ok);
 
+        /* v0.85: A REPLACING RENAME, INTERRUPTED.
+         *
+         * rename mutates TWO dirents and publishes them under ONE header, so an
+         * interrupted commit must leave the directory in one of exactly two
+         * states: the old pair still present, or the move complete. What it must
+         * never leave is the state a per-block journal would produce if the two
+         * blocks were committed separately -- the entry renamed and the target
+         * not yet removed, i.e. two live dirents carrying the same name.
+         *
+         * That is the assertion. Not "the rename survived" -- losing an
+         * interrupted commit is correct -- but that the directory never shows
+         * the same name twice, and never loses both names at once. */
+        { const char *X = "ccr-x", *Y = "ccr-y";
+          for (uint32_t i = 0; i < 300; i++) cc_buf[i] = (uint8_t)(i & 0xFF);
+          (void)vfs_write_file(X, cc_buf, 300);
+          for (uint32_t i = 0; i < 200; i++) cc_buf[i] = (uint8_t)((i * 3u) & 0xFF);
+          (void)vfs_write_file(Y, cc_buf, 200);
+          vfs_journal_apply();                      /* both durable before the crash */
+
+          g_cji_arm = 1;
+          uint64_t f0 = g_cji_fired;
+          (void)vfs_rename(X, Y);                   /* replacing rename, cut off */
+          int fired = (g_cji_fired > f0);
+
+          g_cas_mounted = 0;
+          int rem2 = cas_mount();
+
+          int nx = 0, ny = 0, dupn = 0;
+          for (int i = 0; i < VFS_MAXFILES; i++) {
+              if (!DENTS[i].used) continue;
+              if (streq_n(DENTS[i].name, X, VFS_NAME_MAX)) nx++;
+              if (streq_n(DENTS[i].name, Y, VFS_NAME_MAX)) ny++;
+          }
+          if (nx > 1 || ny > 1) dupn = 1;
+          kprintf("[vfsstrs] crash-inject: after an interrupted REPLACING rename — "
+                  "'%s' x%d, '%s' x%d (fired=%d, remounted=%d)\n",
+                  X, (uint64_t)(int64_t)nx, Y, (uint64_t)(int64_t)ny,
+                  (uint64_t)(int64_t)fired, (uint64_t)(int64_t)rem2);
+          vfscheck("crash-inject: an interrupted REPLACING rename leaves EITHER the old pair or "
+                   "the completed move — never one name on two dirents, and never neither name",
+                   rem2 == 1 && fired && !dupn && ny == 1 && (nx == 1 || nx == 0));
+          vfs_unlink(X); vfs_unlink(Y); }
+
         vfs_unlink(A); vfs_unlink(B); vfs_unlink("ccrash-c");
         vfs_journal_apply();
     }
 #endif
+
+    /* ===== v0.85: VFS METADATA — rename, chmod credentials, timestamps =====
+     *
+     * The kernel half judges what ring 3 cannot see: the directory itself. The
+     * ring-3 half (role 60) covers what the kernel cannot honestly fake — a
+     * process that has GENUINELY dropped privilege.
+     * ====================================================================== */
+    {
+        static uint8_t rn_a[600], rn_b[600];
+        const char *A = "rn-alpha", *B = "rn-beta";
+        int live0 = vfs_dirents_in_use();
+
+        for (uint32_t i = 0; i < sizeof rn_a; i++) rn_a[i] = (uint8_t)((i * 23u + 7u) & 0xFF);
+        int ai = vfs_write_file(A, rn_a, sizeof rn_a);
+        vfscheck("rename: the probe file could be authored", ai >= 0);
+
+        /* (1) SIMPLE RENAME. The content moves with the name and no dirent is
+         * created or leaked — a rename that quietly copied would pass a content
+         * check and fail this one. */
+        int rr = vfs_rename(A, B);
+        int bi = vfs_find(B);
+        int64_t got = (bi >= 0) ? vfs_read_file(bi, rn_b, sizeof rn_b) : -1;
+        int same = (got == (int64_t)sizeof rn_a);
+        for (uint32_t i = 0; i < sizeof rn_a && same; i++) if (rn_b[i] != rn_a[i]) same = 0;
+        vfscheck("rename: the file arrives under the new name byte-for-byte, the old name is "
+                 "gone, and the directory gained no entry",
+                 rr == 0 && bi >= 0 && vfs_find(A) < 0 && same &&
+                 vfs_dirents_in_use() == live0 + 1);
+
+        /* (2) RENAME ONTO AN EXISTING NAME. The replaced file's blocks must come
+         * back exactly as unlink returns them, or rename is a storage leak
+         * unlink cannot be. Measured with the v0.84 reclamation accounting
+         * rather than asserted. */
+        for (uint32_t i = 0; i < sizeof rn_a; i++) rn_a[i] = (uint8_t)((i * 61u + 3u) & 0xFF);
+        int ci = vfs_write_file(A, rn_a, sizeof rn_a);           /* A again, new content */
+        uint64_t used_before = SB->used_blocks;
+        int rr2 = vfs_rename(A, B);                              /* A replaces B          */
+        uint64_t used_after = SB->used_blocks;
+        int di2 = vfs_find(B);
+        int64_t got2 = (di2 >= 0) ? vfs_read_file(di2, rn_b, sizeof rn_b) : -1;
+        int same2 = (got2 == (int64_t)sizeof rn_a);
+        for (uint32_t i = 0; i < sizeof rn_a && same2; i++) if (rn_b[i] != rn_a[i]) same2 = 0;
+        kprintf("[vfsstrs] rename: replace used_blocks %u -> %u, dirents %d -> %d\n",
+                used_before, used_after, (uint64_t)(int64_t)(live0 + 2),
+                (uint64_t)(int64_t)vfs_dirents_in_use());
+        vfscheck("rename: replacing an existing name leaves the mover's content under it, "
+                 "removes the replaced entry, and RETURNS its blocks (a rename that leaked "
+                 "would grow the volume)",
+                 rr2 == 0 && ci >= 0 && same2 && vfs_find(A) < 0 &&
+                 vfs_dirents_in_use() == live0 + 1 && used_after <= used_before);
+
+        /* (3) NO TWO LIVE DIRENTS MAY SHARE A NAME. This is the assertion a
+         * half-applied replacing rename would trip — the entry renamed and the
+         * target not yet removed — and it is checked over the WHOLE directory,
+         * not just the two names this phase touched. */
+        int dup = 0;
+        for (int i = 0; i < VFS_MAXFILES; i++) {
+            if (!DENTS[i].used) continue;
+            for (int j = i + 1; j < VFS_MAXFILES; j++)
+                if (DENTS[j].used && streq_n(DENTS[i].name, DENTS[j].name, VFS_NAME_MAX)) {
+                    if (!dup) kprintf("[vfsstrs] rename: *** '%s' is live at dirents %d and %d\n",
+                                      DENTS[i].name, (uint64_t)(int64_t)i, (uint64_t)(int64_t)j);
+                    dup++;
+                }
+        }
+        vfscheck("rename: no two live dirents share a name anywhere in the directory",
+                 dup == 0);
+
+        /* (4) The refusals, which are what stop rename becoming a way around
+         * the rest of the filesystem's rules. */
+        vfscheck("rename: a missing source is ENOENT, an empty name and a tmp/dev path are "
+                 "EINVAL — never a silent success",
+                 vfs_rename("rn-absent", "rn-x") == -2 &&
+                 vfs_rename("", "rn-x") == -22 &&
+                 vfs_rename(B, "tmp/rn") == -22 &&
+                 vfs_rename(B, "dev/rn") == -22);
+
+        /* (5) TIMESTAMPS survive a remount, and an older volume's zero reads as
+         * UNKNOWN rather than as the first tick of this boot. */
+        uint32_t mt = (di2 >= 0) ? DENTS[di2].mtime : 0;
+        vfs_journal_apply();
+        g_cas_mounted = 0;
+        int remounted = cas_mount();
+        int di3 = vfs_find(B);
+        vfscheck("timestamps: mtime is non-zero and survives a remount (a journalled metadata "
+                 "field, not an in-memory one)",
+                 remounted == 1 && mt != 0 && di3 >= 0 && DENTS[di3].mtime == mt);
+
+        vfs_unlink(B);
+    }
 
     /* ===== v0.85: O_APPEND UNDER MULTI-CORE CONTENTION ===================== */
     {
@@ -21230,6 +21572,39 @@ static void cmd_vfs_stress(void) {
             }
             vfs_unlink(APPSMP_PATH);
         }
+    }
+
+    /* v0.85: the ring-3 metadata worker. It carries the one assertion the kernel
+     * cannot make honestly — that a process which has GENUINELY dropped
+     * effective privilege is refused chmod and chown on root's file. Faking a
+     * credential to test a credential check proves nothing. */
+    {
+        int64_t mw = pipe_run_role("metaw", PCAP_FILESYSTEM, 60, 3000);
+        const char *why =
+            mw == -1                 ? "the worker never started, or the round hit its deadline" :
+            mw >= 1950 && mw <= 1952 ? "could not author the probe file or set its mode" :
+            mw == 1953 || mw == 1954 ? "could not open the probe file or fstat it" :
+            mw == 1955               ? "*** a newly written file has mtime 0 — nothing is stamping it" :
+            mw == 1956               ? "a seek or read failed during the timestamp checks" :
+            mw == 1957               ? "*** atime did NOT move across a read" :
+            mw == 1958               ? "*** mtime moved across a READ — reads are stamping content time" :
+            mw == 1959 || mw == 1960 ? "*** mtime did NOT move across a write" :
+            mw == 1961 || mw == 1962 ? "could not fork the unprivileged child, or it hit its deadline" :
+            mw == 1970 || mw == 1971 ? "the child could not seteuid(1000), or its euid was wrong after" :
+            mw == 1972               ? "*** an effectively-unprivileged caller CHANGED THE MODE of root's file "
+                                       "(chmod is judging the real uid, not the effective one)" :
+            mw == 1973               ? "*** an effectively-unprivileged caller CHOWNED root's file" :
+            mw == 1974               ? "the child failed for an unrecognised reason" :
+            mw == 1980 || mw == 1981 ? "*** rename from ring 3 failed, or left the old name behind" :
+            mw == 1982 || mw == 1983 ? "*** the renamed file lost its content" :
+            mw == 1984               ? "renaming a missing name was not ENOENT" :
+                                       "unknown";
+        if (mw != 42)
+            kprintf("[vfsstrs] ring-3 metadata: worker exit %d — %s\n", (uint64_t)mw, why);
+        vfscheck("VFS metadata from ring 3: chmod/chown judge the EFFECTIVE uid (a process that "
+                 "dropped with seteuid is refused root's file), mtime moves on write but not on "
+                 "read, atime moves on read, and rename carries content to the new name",
+                 mw == 42);
     }
 
     /* v0.84: THE TMP OWNERSHIP RULE, AND WHETHER THIS BOOT ACTUALLY ASKED IT.
