@@ -311,9 +311,50 @@ is complete rather than convenient.
 - **CAS reclamation completeness is not asserted.** `blocks freed > 0` says it
   ran, and the dedup control says it is correct for the shared case; nothing
   asserts that every unreferenced block is eventually returned.
-- **No crash injection between a free's two writes.** The existing crash test
-  covers puts, not frees — and see the journal work above, which needs this
-  machinery anyway.
+- ~~**No crash injection between a free's two writes.** The existing crash test
+  covers puts, not frees.~~ **CLOSED — and it was hiding a real defect, not just
+  a test gap.**
+
+  `cas_journal_write()` snapshots the superblock, the live bitmap block and the
+  staged index block. `cas_put` has always called `bm_alloc()` BEFORE it, so all
+  three shadows describe the same post-transaction state. `cas_free` called
+  `bm_free()` AFTER it — so its index shadow was post-free while its bitmap and
+  superblock shadows were PRE-free. Replaying that pair marks the block
+  allocated with no index entry naming it: unreachable, and unfreeable for the
+  life of the volume. One block per interrupted free, shipped since v0.84.
+
+  **Nothing would have noticed.** The standing `used_blocks ==
+  popcount(bitmap)` audit passes either way, because recovery restores both
+  halves from the same snapshot and they agree with each other. The volume
+  mounts, every file reads back, every counter reconciles. Only asking which
+  ALLOCATED blocks are named by a live file exposes it — and that instrument
+  (`cas_unreferenced_locked`) exists only because v0.84 added it to explain an
+  unrelated 2-block residual.
+
+  Measured, uniprocessor, one interrupted free:
+
+  | build | image | unreferenced | used_blocks | verdict |
+  |---|---|---|---|---|
+  | unfixed | `407e14e4` | 4 → **5** | 1125 → 1125 | FAIL |
+  | fixed | `90f6c9b6` | 4 → 4 | 1125 → **1124** | PASS |
+  | fixed + `-DCAS_FREE_ORDER_REPRO` | `1c26c723` | 4 → **5** | 1125 → 1125 | FAIL |
+
+  `used_blocks` not moving on the broken build is the whole point: the leak is
+  invisible to arithmetic that only checks self-consistency.
+
+  **The fix is one line moved** — `bm_free()` above `cas_journal_write()`, giving
+  `cas_free` the ordering `cas_put` already had. The harness is a second arm on
+  the existing `-DCRASH_INJECT_COMMIT_FAIL` build, runtime-armed and
+  self-clearing, firing between the journal write and the bitmap flush.
+
+  Six-tier gate on `701b824b1da2963b9676a16819d5d2e3`: 520 / 534 / 538 / 551
+  plus both dirty tiers, `ranks=0`, empty consecutive-boot diffs, clean build
+  with no warnings. Assertion counts are IDENTICAL to the pre-change baseline —
+  the crash phase is opt-in, so the gate is confirming the reorder regressed
+  nothing rather than counting the new test.
+
+  Logs: `OUTRUN-0.85-casfree-baseline-fail.log`,
+  `OUTRUN-0.85-casfree-fixed.log`, `OUTRUN-0.85-casfree-order-repro.log`.
 - **Changelogs for 0.81–0.84 do not exist in the tree.** The tags carry the
   content. Writing them out remains bookkeeping this project should finish, and
   it is the reason this roadmap exists at all: a v0.84 session was handed a

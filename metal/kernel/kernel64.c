@@ -5747,6 +5747,20 @@ static uint64_t cas_put(const void *data, uint32_t len) {
     return h;
 }
 
+#ifdef CRASH_INJECT_COMMIT_FAIL
+/* v0.85: a SECOND arm, for the CAS free path. Same build flag, separate trigger,
+ * because the two harnesses interrupt different transactions and arming one must
+ * not fire the other. The directory-journal arm interrupts a commit; this one
+ * interrupts a metadata transaction inside cas_free(), between the journal write
+ * and the bitmap flush -- the window the roadmap records as never having been
+ * crash-tested ("the existing crash test covers puts, not frees").
+ *
+ * Declared HERE rather than beside the other arm because cas_free precedes that
+ * code in this file, and a harness that does not compile is not a harness. */
+static volatile int      g_cjf_arm   = 0;
+static volatile uint64_t g_cjf_fired = 0;
+#endif
+
 /* v0.84: DROP ONE REFERENCE TO `hash`, and return its block to the pool if that
  * was the last one. Returns 1 if the block was freed, 0 if it is still
  * referenced (or untracked), -1 if the hash is not in the index.
@@ -5809,9 +5823,59 @@ static int cas_free(uint64_t hash) {
     if (sec < 0) { klock_release(&g_cas_lock); return -1; }
     if (!g_cas_legacy) {
         uint64_t bitmap_blk = SB->bitmap_start + ((uint64_t)b >> 3) / CAS_BS;
+        /* v0.85: THE BITMAP IS CLEARED BEFORE THE JOURNAL IS WRITTEN, and the
+         * order is the whole fix.
+         *
+         * cas_journal_write() snapshots g_sbblk, the live bitmap block and
+         * g_idxbuf. cas_put has always called bm_alloc() BEFORE it, so all
+         * three of its shadows describe the same post-transaction state. This
+         * function called bm_free() AFTER it, so its index shadow was
+         * post-free while its bitmap and superblock shadows were PRE-free.
+         *
+         * Replaying that pair marks the block allocated with no index entry
+         * naming it: unreachable, and unfreeable for the life of the volume.
+         * Nothing noticed, because the standing `used_blocks ==
+         * popcount(bitmap)` audit passes -- both halves come from the same
+         * snapshot and agree with each other. Measured before the fix: one
+         * interrupted free took allocated-but-unreferenced blocks from 4 to 5
+         * while used_blocks did not move.
+         *
+         * With the clear moved above the journal write, an interrupted free
+         * replays a consistent freed state instead. */
+#ifndef CAS_FREE_ORDER_REPRO
+        bm_free((uint64_t)b);
+#endif
         cas_journal_write((uint64_t)sec, bitmap_blk);
         virtio_write_block((uint64_t)sec, g_idxbuf);       /* index entry gone first */
+#ifdef CRASH_INJECT_COMMIT_FAIL
+        /* v0.85: POWER LOSS HERE. The journal is PENDING and the index entry has
+         * reached its home block; the bitmap and superblock have not been
+         * flushed. Returning without clearing the journal is exactly what a
+         * crash leaves behind, and the next mount replays whatever
+         * cas_journal_write happened to capture.
+         *
+         * That capture is the thing under test. cas_put calls bm_alloc BEFORE
+         * cas_journal_write, so all three of its shadows are post-mutation and
+         * agree. cas_free called bm_free AFTER, so its bitmap and superblock
+         * shadows are PRE-free while its index shadow is post-free -- replaying
+         * that pair marks the block allocated with no index entry naming it,
+         * and it can never be found or freed again. */
+        if (g_cjf_arm) {
+            g_cjf_arm = 0;
+            g_cjf_fired++;
+            kprintf("[cas    ] CRASH INJECT: free of block %d TRUNCATED after the journal "
+                    "write and BEFORE the bitmap flush\n", (uint64_t)b);
+            klock_release(&g_cas_lock);
+            return 1;
+        }
+#endif
+#ifdef CAS_FREE_ORDER_REPRO
+        /* v0.85 REPRODUCER, opt-in (`make EXTRA=-DCAS_FREE_ORDER_REPRO`) and
+         * never in a release build: clear the bitmap AFTER the journal write,
+         * the pre-v0.85 order. The crash harness must go red on this build; if
+         * it does not, the assertion is not measuring the ordering. */
         bm_free((uint64_t)b);
+#endif
         cas_flush_meta();
         cas_journal_clear();
     } else {
@@ -21327,6 +21391,62 @@ static void cmd_vfs_stress(void) {
                    "the completed move — never one name on two dirents, and never neither name",
                    rem2 == 1 && fired && !dupn && ny == 1 && (nx == 1 || nx == 0));
           vfs_unlink(X); vfs_unlink(Y); }
+
+        /* v0.85: A FREE INTERRUPTED BETWEEN ITS JOURNAL WRITE AND ITS BITMAP
+         * FLUSH — the window the roadmap records as never crash-tested.
+         *
+         * The probe is one chunk of content chosen to be unique on the volume,
+         * so unlinking it really releases a block rather than dropping a
+         * shared reference. The file is made durable first; then the free is
+         * cut off mid-transaction and the volume remounted, so recovery runs
+         * for real.
+         *
+         * THE MEASUREMENT is the count of blocks the bitmap calls allocated
+         * that no live file names. A correctly journalled free leaves that
+         * count where it was: either the block came back, or the whole
+         * transaction was rolled back and the file still owns it. A free whose
+         * journal captured a POST-free index beside a PRE-free bitmap leaves
+         * the block marked allocated with nothing naming it — unreachable, and
+         * unfreeable for the life of the volume.
+         *
+         * Note what does NOT catch this: the standing `used_blocks ==
+         * popcount(bitmap)` audit passes either way, because both halves are
+         * replayed from the same snapshot and agree with each other. The leak
+         * is only visible by asking which allocated blocks are referenced. */
+        { static uint8_t cf_buf[512];
+          for (uint32_t i = 0; i < sizeof cf_buf; i++)
+              cf_buf[i] = (uint8_t)((i * 97u + 41u) & 0xFF);
+          int fi = vfs_write_file("cfree-probe", cf_buf, sizeof cf_buf);
+          vfs_journal_apply();
+
+          uint64_t unref0, unref1, used0, used1;
+          klock_acquire(&g_cas_lock);
+          unref0 = cas_unreferenced_locked();
+          klock_release(&g_cas_lock);
+          used0 = SB->used_blocks;
+
+          g_cjf_arm = 1;
+          uint64_t f0 = g_cjf_fired;
+          vfs_unlink("cfree-probe");
+          int fired = (g_cjf_fired > f0);
+
+          g_cas_mounted = 0;
+          int rem3 = cas_mount();
+
+          klock_acquire(&g_cas_lock);
+          unref1 = cas_unreferenced_locked();
+          klock_release(&g_cas_lock);
+          used1 = SB->used_blocks;
+
+          kprintf("[vfsstrs] crash-inject: interrupted FREE — unreferenced %u -> %u, "
+                  "used_blocks %u -> %u (probe dirent %d, fired=%d, remounted=%d)\n",
+                  unref0, unref1, used0, used1, (uint64_t)(int64_t)fi,
+                  (uint64_t)(int64_t)fired, (uint64_t)(int64_t)rem3);
+          vfscheck("crash-inject: a free interrupted between its journal write and its "
+                   "bitmap flush STRANDS NO BLOCK — after recovery the volume holds no "
+                   "more allocated-but-unreferenced blocks than before it",
+                   rem3 == 1 && fired && fi >= 0 && unref1 <= unref0);
+          vfs_unlink("cfree-probe"); }
 
         vfs_unlink(A); vfs_unlink(B); vfs_unlink("ccrash-c");
         vfs_journal_apply();
