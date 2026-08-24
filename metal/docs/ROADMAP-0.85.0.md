@@ -287,22 +287,99 @@ Carried from v0.84. The first two are named in this milestone's brief; the rest
 are the remainder of that milestone's STILL OPEN list, kept here so the tracker
 is complete rather than convenient.
 
-- **`O_APPEND` under CPU OVERSUBSCRIPTION is untested.** The v0.85 harness pins
-  one worker per core, so it measures four concurrent appenders and not more
-  writers than cores. Oversubscription is the case where a writer is preempted
-  mid-syscall, which is a different schedule from four writers each owning a
-  core. The harness already takes its worker and iteration counts from defines,
-  so testing it is mostly a matter of unpinning and raising the count — and of
-  deciding what the assertion should be when the deadline is the binding
-  constraint rather than the defect.
-- **Dedup-masked reference-count underflow cannot be observed.**
+- ~~**`O_APPEND` under CPU OVERSUBSCRIPTION is untested.**~~ **CLOSED.**
+
+  An `append-oversub` phase now runs alongside the pinned one: twice as many
+  workers as online cores, cycling the same four roles, with **affinity left
+  unset** so the scheduler may stack and migrate them. The worker is unchanged —
+  same roles, payload and loop — so nothing measured here can be true only of a
+  special build.
+
+  **The assertions were adapted, not relaxed.** Size, block uniformity and
+  per-worker counts are statements about ATOMICITY and hold whatever the
+  schedule, so they are identical. The two premise guards changed:
+
+  - The pinned phase asserts the workers ran on MORE THAN ONE CORE, which is how
+    it proves it is not a uniprocessor test wearing an `-smp 4` label. That is
+    the wrong question here: on one core, two workers time-slicing IS the
+    oversubscription under test. It is replaced by the structural guarantee —
+    more workers than cores — asserted rather than assumed, so a later change to
+    the worker count cannot quietly turn this back into a pinned test.
+  - Interleave transitions were previously only meaningful at `n > 1`. Under
+    oversubscription they are meaningful at EVERY core count, because two
+    workers sharing one core can only produce interleaved output by being
+    preempted.
+
+  Two workers share a pattern byte when there are more workers than roles, so
+  the per-pattern expectation is COMPUTED from the worker-to-pattern mapping.
+  Asserting "ITERS each" would be wrong the moment the count stops dividing
+  evenly by four — which it does at one and two cores.
+
+  Measured, smp4-bios, 8 workers on 4 cores:
+
+  | build | image | file | per-pattern | verdict |
+  |---|---|---|---|---|
+  | current | `20db2cf4` | 4096 B exact, 149 transitions | 64/64/64/64 | PASS |
+  | `-DAPPEND_RACE_REPRO` | `8137f151` | **1760 B of 4096** | — | FAIL |
+
+  The reproducer loses **146 of 256 appends (57%)**, close to the 56% the pinned
+  phase loses, so the new mode genuinely exercises the atomicity path rather
+  than passing for incidental reasons. The existing `APPEND_RACE_REPRO` flag was
+  reused rather than a second reproducer written: a new switch would only
+  re-test the same defect, and this cycle has already produced two reproducers
+  that reproduced the wrong thing.
+- **Dedup-masked reference-count underflow cannot be observed.** **DESIGN SPIKE
+  DONE — NOT IMPLEMENTED, and the reason is structural rather than effort.**
+
   `g_cas_ref_underflow` detects a double release only when nothing
   re-references the block in between. v0.84's O_TRUNC double-release ran with
-  that counter reading zero throughout, because an intervening dedup had raised
-  the count back to 1 — the dirty-volume gate caught it, the counter did not.
-  There may be no counter-shaped fix; what would help is a way to distinguish
-  "released twice" from "released, re-referenced, released", for instance a
-  per-block release generation checked against the retain that raised it.
+  that counter reading zero throughout; the dirty-volume gate caught it, the
+  counter did not.
+
+  **Why zero was the honest answer.** Tracing the actual sequence: the first
+  release took the block 1 -> 0 and REMOVED ITS INDEX ENTRY, so the block was
+  genuinely free. A later `cas_put` of the same content then found no index
+  entry, allocated a NEW block, and the retain took it 0 -> 1. The stale-hash
+  release that followed resolved that same hash to the new block and took it
+  1 -> 0. The count was legitimately 1 at both releases. No counter positioned
+  at the decrement can distinguish them, because nothing is wrong AT the
+  decrement — the reference that authorised it belonged to a map that no longer
+  exists.
+
+  **This is carryover 3's problem in a different subsystem:** a stale reference
+  resolving to a recycled identity. That was fixed by pinning the reference to a
+  `(slot, generation)` pair and rejecting a mismatch — and the same shape is
+  what would work here.
+
+  **The obstacle is storage, and it is specific.** A per-block generation is
+  cheap: `g_cas_refs` is already a 65536-entry table, and a parallel generation
+  array costs the same again in BSS. The missing half is the RETAIN-side record.
+  A reference lives in `dirent.chunk_hash[]` as a bare 64-bit hash with no room
+  beside it, and `struct dirent` is fixed at 256 bytes by
+  `_Static_assert` — with `reserved[]` down to 4 bytes after v0.85's timestamps,
+  which is not enough for a generation per chunk even in the direct tier, let
+  alone the 4176 an indirect map can reach.
+
+  So a counter-shaped fix is not available, and the honest options are:
+
+  1. **Widen the on-disk dirent** to carry a generation per chunk. Breaks the
+     256-byte layout, `VFS_DIR_BLOCKS`, the journal record and every existing
+     volume. Disproportionate to the defect class.
+  2. **Validate at release** that the dirent still names the hash it is
+     releasing. Does not work: the release is called WITH the stale map, which
+     does name it — that is exactly the bug.
+  3. **Detect after the fact** rather than at the decrement: a periodic sweep
+     comparing derived reference counts against the live table, which
+     `cas_refs_rebuild()` already computes. This is the tractable one, and it is
+     the recommendation — it catches a corrupted count wherever it came from,
+     without needing to attribute it to a particular release.
+
+  **Recommendation: do not add a counter here.** The v0.84 defect was caught by
+  the dirty-volume gate, and the v0.85 free-path defect was caught by measuring
+  allocated-but-unreferenced blocks — both times by asking about the WHOLE
+  volume rather than about an individual operation. Option 3 follows that grain.
+  A per-release counter would reassure without detecting, which is the failure
+  mode this project has documented repeatedly.
 - **VOL_TMP has no mode and no group.** Deliberate; owner-or-root is the whole
   rule, so a tmpfile cannot be shared. Revisit only if something needs it, and
   see the `chmod` note above.

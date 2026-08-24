@@ -21694,6 +21694,157 @@ static void cmd_vfs_stress(void) {
         }
     }
 
+    /* ===== v0.85: O_APPEND UNDER CPU OVERSUBSCRIPTION =====================
+     *
+     * The pinned phase above measures four appenders each OWNING a core. That
+     * is concurrency, and it is not the same schedule as PREEMPTION: with more
+     * writers than cores, a writer is stopped mid-syscall and resumed later,
+     * which is the case a lock-based argument is most often quietly wrong
+     * about. v0.85's tag recorded this as untested.
+     *
+     * The worker is unchanged -- same roles 56..59, same payload, same loop --
+     * so nothing here can be true only of a special oversubscription build.
+     * What changes is the SPAWN: twice as many workers as online cores, cycling
+     * through the four roles, and AFFINITY LEFT UNSET so the scheduler is free
+     * to stack them and to move them. Two workers therefore share a pattern
+     * byte, which is why the per-pattern expectation below is computed rather
+     * than assumed to be one worker each.
+     *
+     * WHAT THE ASSERTIONS BECOME. Size, block uniformity and per-pattern counts
+     * are unchanged -- they are statements about atomicity and hold whatever
+     * the schedule. The two premise guards do change:
+     *
+     *   - the pinned phase asserts the workers ran on MORE THAN ONE CORE, which
+     *     is how it proves it was not a uniprocessor test in disguise. Here that
+     *     is the wrong question: on one core, two workers time-slicing IS the
+     *     oversubscription under test. The structural guarantee replaces it --
+     *     more workers than cores, by construction, asserted so a future change
+     *     to the worker count cannot quietly make this a pinned test again.
+     *   - interleave transitions are still required, and are now meaningful at
+     *     EVERY core count: two workers sharing one core can only produce
+     *     interleaved output by being preempted, so zero transitions here would
+     *     mean the appends did not overlap at all and the phase proved nothing.
+     * ====================================================================== */
+    {
+        static uint8_t osbuf[APPSMP_W * 2u * APPSMP_ITERS * APPSMP_PAY];
+        int nw = 2 * n; if (nw > (int)(APPSMP_W * 2u)) nw = (int)(APPSMP_W * 2u);
+        if (nw < 2) nw = 2;
+        uint32_t total = (uint32_t)nw * APPSMP_ITERS * APPSMP_PAY;
+        int procs[APPSMP_W * 2u]; int nsp = 0;
+        uint32_t ran_mask = 0;
+        uint64_t t_start = g_ticks;
+
+        int fi = vfs_write_file(APPSMP_PATH, "", 0);
+        if (fi < 0) vfscheck("append-oversub: the shared file could be created", 0);
+        else {
+            for (int i = 0; i < nw; i++) {
+                int p = kproc_spawn("appos", PCAP_FILESYSTEM);
+                if (p < 0) break;
+                kprocs[p].role = (int)(APPSMP_ROLE0 + (uint32_t)(i % (int)APPSMP_W));
+                /* AFFINITY DELIBERATELY UNSET. The pinned phase sets it to
+                 * construct one-worker-per-core; leaving it 0 here is what
+                 * lets the scheduler oversubscribe and migrate, which is the
+                 * whole point of this phase. */
+                kprocs[p].affinity = 0;
+                uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+                current_proc_idx = save;
+                if (!e) break;
+                kprocs[p].entry = e;
+                procs[nsp++] = p;
+            }
+            for (int i = 0; i < nsp; i++) {
+                rq_push(i % n, procs[i]);
+                __sync_synchronize();
+                if (n > 1) lapic_ipi(0, IPI_PING, 1);
+            }
+            vfscheck("append-oversub: every worker spawned and loaded", nsp == nw);
+            vfscheck("append-oversub: there are MORE WORKERS THAN ONLINE CORES (without this "
+                     "the phase is the pinned test again, and proves nothing new)",
+                     nw > n);
+
+            int drained = appsmp_drain(APPSMP_WATCH);
+            current_proc_idx = save;
+            if (!drained)
+                kprintf("[vfsstrs] append-oversub WATCHDOG: %d worker(s) still live\n",
+                        (uint64_t)(int64_t)appsmp_live());
+            vfscheck("append-oversub: every worker reached a terminal state (no watchdog)",
+                     drained);
+
+            int codes_ok = 1;
+            for (int i = 0; i < nsp; i++) {
+                ran_mask |= kprocs[procs[i]].ran_on;
+                if (kprocs[procs[i]].exit_code != 42) {
+                    uint32_t c = kprocs[procs[i]].exit_code;
+                    kprintf("[vfsstrs] append-oversub worker role %u exited %u%s\n",
+                            (uint64_t)kprocs[procs[i]].role, (uint64_t)c,
+                            (c >= 1920 && c <= 1923)
+                                ? " — DEADLINE expired; a slow host, not a lost append" : "");
+                    codes_ok = 0;
+                }
+            }
+            vfscheck("append-oversub: every worker completed its whole append loop", codes_ok);
+
+            int di = vfs_find(APPSMP_PATH);
+            uint32_t flen = (di >= 0) ? (uint32_t)DENTS[di].len : 0;
+            int64_t got = (di >= 0) ? vfs_read_file(di, osbuf, total) : -1;
+
+            kprintf("[vfsstrs] append-oversub: %d worker(s) on %d core(s) x %u appends x %u B — "
+                    "file is %u B (want %u), read %d, %u tick(s), cores 0x%X\n",
+                    (uint64_t)(int64_t)nw, (uint64_t)(int64_t)n, (uint64_t)APPSMP_ITERS,
+                    (uint64_t)APPSMP_PAY, (uint64_t)flen, (uint64_t)total, got,
+                    (uint64_t)(g_ticks - t_start), (uint64_t)ran_mask);
+
+            vfscheck("append-oversub: the file is EXACTLY workers x iterations x payload bytes "
+                     "under PREEMPTION (a writer stopped mid-syscall must not lose its append)",
+                     flen == total && got == (int64_t)total);
+
+            if (got == (int64_t)total) {
+                uint32_t counts[APPSMP_W]; for (uint32_t i = 0; i < APPSMP_W; i++) counts[i] = 0;
+                uint32_t torn = 0, first_bad = 0, transitions = 0, alien = 0;
+                int prev_pat = -1;
+                for (uint32_t b = 0; b < total; b += APPSMP_PAY) {
+                    uint8_t p0 = osbuf[b];
+                    int uniform = 1;
+                    for (uint32_t k = 1; k < APPSMP_PAY; k++)
+                        if (osbuf[b + k] != p0) { uniform = 0; break; }
+                    if (!uniform) { if (!torn) first_bad = b; torn++; continue; }
+                    if (p0 >= 0xA0 && p0 < 0xA0 + APPSMP_W) counts[p0 - 0xA0]++;
+                    else { if (!alien) first_bad = b; alien++; }
+                    if (prev_pat >= 0 && p0 != (uint8_t)prev_pat) transitions++;
+                    prev_pat = p0;
+                }
+                if (torn)
+                    kprintf("[vfsstrs] append-oversub: *** %u TORN block(s); first at byte %u\n",
+                            (uint64_t)torn, (uint64_t)first_bad);
+                /* Two workers share a pattern when nw > APPSMP_W, so the
+                 * expectation is COMPUTED. Asserting "ITERS each" would be
+                 * wrong the moment the worker count stops dividing evenly. */
+                int counts_ok = 1;
+                for (uint32_t k = 0; k < APPSMP_W; k++) {
+                    uint32_t wants = ((uint32_t)nw / APPSMP_W) +
+                                     ((k < (uint32_t)nw % APPSMP_W) ? 1u : 0u);
+                    if (counts[k] != wants * APPSMP_ITERS) counts_ok = 0;
+                }
+                kprintf("[vfsstrs] append-oversub: per-pattern block counts %u/%u/%u/%u, "
+                        "%u interleave transition(s)\n",
+                        (uint64_t)counts[0], (uint64_t)counts[1], (uint64_t)counts[2],
+                        (uint64_t)counts[3], (uint64_t)transitions);
+
+                vfscheck("append-oversub: every payload block is INTACT — no block holds bytes "
+                         "from two workers, even with writers preempted mid-syscall",
+                         torn == 0 && alien == 0);
+                vfscheck("append-oversub: every worker's appends are ALL present, exactly once "
+                         "each (counts computed from the worker-to-pattern mapping)",
+                         counts_ok);
+                vfscheck("append-oversub: the appends genuinely INTERLEAVED (with more workers "
+                         "than cores, zero transitions would mean they never overlapped and "
+                         "this phase tested nothing)",
+                         transitions > 0);
+            }
+            vfs_unlink(APPSMP_PATH);
+        }
+    }
+
     /* v0.85: the ring-3 metadata worker. It carries the one assertion the kernel
      * cannot make honestly — that a process which has GENUINELY dropped
      * effective privilege is refused chmod and chown on root's file. Faking a
