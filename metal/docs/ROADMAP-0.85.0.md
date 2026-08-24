@@ -380,6 +380,67 @@ is complete rather than convenient.
   volume rather than about an individual operation. Option 3 follows that grain.
   A per-release counter would reassure without detecting, which is the failure
   mode this project has documented repeatedly.
+
+### DONE — option 3 implemented, with its limits stated
+
+A live-versus-derived reference sweep now runs as the last thing
+`cmd_vfs_stress` does. `vfs_map_walk_locked` gained a third mode, `TALLY`, which
+resolves each chunk hash and accumulates without touching `g_cas_refs`; the
+sweep compares that derivation against the live table.
+
+**It does NOT catch the v0.84 defect, and the first version of this design said
+it would.** `cas_free` decrements and then removes the index entry, so after a
+bad release the hash stops resolving and a derivation contributes nothing for
+it — matching the wrong live value of zero. The disagreement exists only in the
+few instructions between the decrement and the de-index, which a sweep will not
+land in. That correction is recorded here rather than quietly dropped, because
+the earlier entry recommended this as the fix for exactly that defect.
+
+**What it does catch**, while the block is still indexed and therefore BEFORE
+either becomes corruption:
+
+| live vs derived | meaning |
+|---|---|
+| live HIGH | a release never happened — those blocks leak |
+| live LOW | a retain never happened — a block can be freed while a file still names it |
+
+The two are different defects and the failure output names which.
+
+**Two sums, not a second table.** `Σ refs[b]` and `Σ (b+1)·refs[b]`, so the
+auxiliary cost is O(1) rather than another 128 KiB of BSS for a check that runs
+once a boot. The weighting is what stops compensating errors cancelling — an
+extra reference at one block and a missing one at another leave the counts equal
+and the weighted sums apart — and it also localises: in the falsifier run the
+gap of 1119 identifies block 1118 directly.
+
+**Placement is load-bearing.** It runs AFTER every phase that remounts, because
+`cas_refs_rebuild()` zeroes and re-derives the table; running the sweep before
+one would compare a table against the directory it was just built from, which is
+true by construction and worth nothing. Its window is therefore "every retain
+and release since the last rebuild", which is stated rather than implied.
+
+**Not on a timer.** A derivation resolves every chunk hash through
+`cas_index_find`, which is real disk I/O — the same cost `cas_refs_rebuild`
+already pays once per mount. Once per suite and on demand via
+`cas_tally_verify()`; calling it periodic would overstate what is affordable.
+
+Measured, uniprocessor:
+
+| build | image | derived | live | verdict |
+|---|---|---|---|---|
+| normal | `3593ae64` | 796 refs / w 689075 | 796 / 689075 | PASS |
+| `-DCAS_TALLY_FALSIFY` | `c43869d5` | 796 / 689075 | **795 / 687956** | FAIL — "LIVE IS LOW by 1" |
+
+The falsifier skips exactly one retain, armed immediately before the probe file
+is written so the skipped reference belongs to a file still live when the sweep
+runs — skipping one on something later released would surface as an underflow
+instead, a different signal that would not test this assertion.
+
+One implementation note worth keeping: `TALLY` mirrors `cas_ref_inc_block`'s
+`CAS_REF_MAX` bound. Without that the derived sum would count references the
+live table is structurally unable to hold, and the sweep would report a
+permanent false mismatch on any volume larger than the table — a check failing
+for a reason that is not a defect.
 - **VOL_TMP has no mode and no group.** Deliberate; owner-or-root is the whole
   rule, so a tmpfile cannot be shared. Revisit only if something needs it, and
   see the `chmod` note above.

@@ -7160,49 +7160,134 @@ static uint64_t vfs_chunk_hash_at(const struct dirent *d, uint32_t i) {
  * repeated content — a zero-filled or sparse file, which this VFS produces on
  * every extending write — names one block from many slots, and a release that
  * de-duplicated would drop the count to zero while the file still used it. */
-static void vfs_map_walk_locked(const struct dirent *d, int retain) {
+/* v0.85: the three things a map walk can do to a reference. RETAIN and RELEASE
+ * are v0.84; TALLY counts what the DIRECTORY says without touching the live
+ * table, which is what makes a live-versus-derived comparison possible at all. */
+#define VFS_MAP_RETAIN  0
+#define VFS_MAP_RELEASE 1
+#define VFS_MAP_TALLY   2
+
+/* TALLY accumulators. O(1) auxiliary memory ON PURPOSE: the obvious way to
+ * compare two reference tables is to build the second one, and a second table
+ * is another 128 KiB of BSS for a check that runs once a boot. Two sums carry
+ * the same information for this defect class -- see cas_tally_verify(). */
+static uint64_t g_tally_n = 0;      /* number of references                     */
+static uint64_t g_tally_w = 0;      /* sum of (block + 1) over those references */
+
+#ifdef CAS_TALLY_FALSIFY
+/* v0.85 FALSIFIER, opt-in (`make EXTRA=-DCAS_TALLY_FALSIFY`) and never in a
+ * release build: skip exactly ONE retain, so the live table undercounts by a
+ * single reference. The sweep must notice. Armed by the test immediately before
+ * it authors a probe file, so the skipped reference belongs to a file that is
+ * still live when the sweep runs -- skipping a retain on something later
+ * released would produce an underflow instead, which is a different signal. */
+static volatile int      g_tally_falsify_arm = 0;
+static volatile uint64_t g_tally_skipped     = 0;
+#endif
+
+/* ONE place where a single hash is retained, released or tallied.
+ *
+ * The v0.84 original repeated the retain/release pair at all four call sites --
+ * data chunks, the L1 blocks under ind2, ind2 itself, ind1. Adding a third mode
+ * would have made that twelve copies, and this tree has already been bitten
+ * once by exactly that shape: the crash-injection hook lived in only one of two
+ * staging loops, so rename could not be interrupted at all. One helper, one
+ * place to change.
+ *
+ * The CAS_REF_MAX bound is mirrored deliberately. cas_ref_inc_block ignores a
+ * block at or beyond the table, so TALLY must ignore it too -- otherwise the
+ * derived sum would count references the live table was never able to hold, and
+ * the sweep would report a permanent false mismatch on a large volume. */
+static void vfs_map_ref_one(uint64_t h, int mode) {
+    if (!h) return;
+    if (mode == VFS_MAP_RELEASE) { cas_free(h); return; }
+    klock_acquire(&g_cas_lock);
+    int64_t b = cas_index_find(h, 0);
+    if (b >= 0 && (uint64_t)b < CAS_REF_MAX) {
+        if (mode == VFS_MAP_TALLY) {
+            g_tally_n += 1u;
+            g_tally_w += (uint64_t)b + 1u;
+        } else {
+#ifdef CAS_TALLY_FALSIFY
+            if (g_tally_falsify_arm) { g_tally_falsify_arm = 0; g_tally_skipped++; }
+            else
+#endif
+            cas_ref_inc_block((uint64_t)b);
+        }
+    }
+    klock_release(&g_cas_lock);
+}
+
+static void vfs_map_walk_locked(const struct dirent *d, int mode) {
     uint32_t nch = d->nchunks;
     if (nch > VFS_CHUNKS_MAX) nch = VFS_CHUNKS_MAX;
-    for (uint32_t c = 0; c < nch; c++) {
-        uint64_t h = vfs_chunk_hash_at(d, c);
-        if (!h) continue;
-        if (retain) {
-            klock_acquire(&g_cas_lock);
-            int64_t b = cas_index_find(h, 0);
-            if (b >= 0) cas_ref_inc_block((uint64_t)b);
-            klock_release(&g_cas_lock);
-        } else cas_free(h);
-    }
+    /* Data chunks FIRST, and the order still matters for RELEASE: resolving
+     * chunk i of a large file READS the indirect blocks, so freeing those first
+     * would make the rest of the map unresolvable. */
+    for (uint32_t c = 0; c < nch; c++) vfs_map_ref_one(vfs_chunk_hash_at(d, c), mode);
     if (d->ind2_hash) {
         uint64_t top[VFS_IND_PER_BLK];
         if (cas_get(d->ind2_hash, top, sizeof top) >= 0)
-            for (uint32_t g = 0; g < VFS_IND_PER_BLK; g++) {
-                if (!top[g]) continue;
-                if (retain) {
-                    klock_acquire(&g_cas_lock);
-                    int64_t b = cas_index_find(top[g], 0);
-                    if (b >= 0) cas_ref_inc_block((uint64_t)b);
-                    klock_release(&g_cas_lock);
-                } else cas_free(top[g]);
-            }
-        if (retain) {
-            klock_acquire(&g_cas_lock);
-            int64_t b = cas_index_find(d->ind2_hash, 0);
-            if (b >= 0) cas_ref_inc_block((uint64_t)b);
-            klock_release(&g_cas_lock);
-        } else cas_free(d->ind2_hash);
+            for (uint32_t g = 0; g < VFS_IND_PER_BLK; g++) vfs_map_ref_one(top[g], mode);
+        vfs_map_ref_one(d->ind2_hash, mode);
     }
-    if (d->ind1_hash) {
-        if (retain) {
-            klock_acquire(&g_cas_lock);
-            int64_t b = cas_index_find(d->ind1_hash, 0);
-            if (b >= 0) cas_ref_inc_block((uint64_t)b);
-            klock_release(&g_cas_lock);
-        } else cas_free(d->ind1_hash);
-    }
+    vfs_map_ref_one(d->ind1_hash, mode);
 }
-static void vfs_retain_map_locked(const struct dirent *d)  { vfs_map_walk_locked(d, 1); }
-static void vfs_release_map_locked(const struct dirent *d) { vfs_map_walk_locked(d, 0); }
+static void vfs_retain_map_locked(const struct dirent *d)  { vfs_map_walk_locked(d, VFS_MAP_RETAIN); }
+static void vfs_release_map_locked(const struct dirent *d) { vfs_map_walk_locked(d, VFS_MAP_RELEASE); }
+
+/* v0.85: DOES THE LIVE REFERENCE TABLE STILL AGREE WITH THE DIRECTORY?
+ *
+ * Walks every live dirent in TALLY mode to derive what the directory says, then
+ * folds the live table the same way, and compares. Two sums rather than a
+ * per-block diff: the plain count catches any imbalance, and the (block+1)
+ * weighting stops two compensating single-block errors from cancelling -- an
+ * extra reference to block 7 and a missing one at block 9 leave the count equal
+ * and the weighted sum two apart.
+ *
+ * WHAT IT CATCHES: a retain that did not happen (live LOW -- a block could be
+ * freed while a file still names it) and a release that did not happen (live
+ * HIGH -- the block leaks). Both are caught while the block is still indexed,
+ * which is to say BEFORE either turns into corruption.
+ *
+ * WHAT IT DOES NOT CATCH, stated because the first version of this design
+ * claimed otherwise: a release that also removes the index entry, which is the
+ * v0.84 defect. cas_free decrements and then de-indexes, so the hash stops
+ * resolving and a derivation contributes nothing for it -- matching the wrong
+ * live value of zero. The window where the two disagree is the handful of
+ * instructions between the decrement and the index removal, which a sweep will
+ * not land in. That class is caught by the readability assertion in the crash
+ * harness instead, and the two detectors are complementary rather than
+ * alternatives.
+ *
+ * MUST RUN BEFORE cas_refs_rebuild(). That function zeroes the table and
+ * re-derives it, so calling it first would erase exactly the disagreement this
+ * is looking for. */
+static int cas_tally_verify(uint64_t *dn, uint64_t *dw, uint64_t *ln, uint64_t *lw) {
+    klock_acquire(&g_cas_lock);
+    g_tally_n = 0; g_tally_w = 0;
+    klock_release(&g_cas_lock);
+
+    for (int i = 0; i < VFS_MAXFILES; i++)
+        if (DENTS[i].used) vfs_map_walk_locked(&DENTS[i], VFS_MAP_TALLY);
+
+    uint64_t a = 0, c = 0;
+    klock_acquire(&g_cas_lock);
+    uint64_t derived_n = g_tally_n, derived_w = g_tally_w;
+    for (uint64_t b = 0; b < CAS_REF_MAX; b++) {
+        uint16_t r = g_cas_refs[b];
+        if (!r) continue;
+        a += r;
+        c += ((uint64_t)b + 1u) * (uint64_t)r;
+    }
+    klock_release(&g_cas_lock);
+
+    if (dn) *dn = derived_n;
+    if (dw) *dw = derived_w;
+    if (ln) *ln = a;
+    if (lw) *lw = c;
+    return (derived_n == a) && (derived_w == c);
+}
 
 /* Recompute every block's reference count from the live directory.
  *
@@ -21973,6 +22058,61 @@ static void cmd_vfs_stress(void) {
     vfscheck("the rule refused at least one access (refusals > 0: a boot in which nobody "
              "was ever refused has not tested a refusal)",
              g_tmp_permit_refusals > 0);
+
+    /* ===== v0.85: LIVE-VERSUS-DERIVED REFERENCE SWEEP =====================
+     *
+     * The last thing this suite does, and the placement is load-bearing: every
+     * earlier phase has churned the volume, and two of them REMOUNT, which calls
+     * cas_refs_rebuild() and re-derives the table from scratch. Running the
+     * sweep before those would compare a table against the directory it was just
+     * built from -- true by construction, and worth nothing. Running it here
+     * measures every retain and release since the last rebuild.
+     *
+     * The probe file is authored in BOTH builds so each sees identical directory
+     * state; only the falsifier's skipped retain differs. */
+    {
+        static uint8_t tly[512];
+        for (uint32_t i = 0; i < sizeof tly; i++)
+            tly[i] = (uint8_t)((i * 151u + 17u) & 0xFF);
+#ifdef CAS_TALLY_FALSIFY
+        /* Armed immediately before the write, so the reference that is skipped
+         * belongs to a file still LIVE when the sweep runs. Skipping a retain on
+         * something later released would surface as an underflow instead, which
+         * is a different signal and would not test this assertion. */
+        g_tally_falsify_arm = 1;
+#endif
+        int ti = vfs_write_file("tally-probe", tly, sizeof tly);
+
+        uint64_t dn = 0, dw = 0, ln = 0, lw = 0;
+        int agree = cas_tally_verify(&dn, &dw, &ln, &lw);
+
+        kprintf("[vfsstrs] cas tally: derived %u ref(s) weight %u, live %u ref(s) weight %u\n",
+                dn, dw, ln, lw);
+        if (!agree) {
+            /* Name the DIRECTION: the two are different defects. Live high means
+             * a release never happened and those blocks leak. Live low means a
+             * retain never happened, so a block can be freed while a file still
+             * names it -- the dangerous one. */
+            if (ln > dn)
+                kprintf("[vfsstrs] cas tally: *** LIVE IS HIGH by %u ref(s) — a RELEASE was "
+                        "missed; those blocks leak\n", ln - dn);
+            if (ln < dn)
+                kprintf("[vfsstrs] cas tally: *** LIVE IS LOW by %u ref(s) — a RETAIN was "
+                        "missed; a block can be freed while a file still names it\n", dn - ln);
+            if (ln == dn && lw != dw)
+                kprintf("[vfsstrs] cas tally: *** counts agree but WEIGHTS DIFFER (%u vs %u) — "
+                        "compensating errors at two different blocks\n", lw, dw);
+        }
+#ifdef CAS_TALLY_FALSIFY
+        kprintf("[vfsstrs] cas tally: *** BUILT WITH CAS_TALLY_FALSIFY — %u retain(s) skipped "
+                "deliberately. This build is a falsifier, not a kernel.\n", g_tally_skipped);
+#endif
+        vfscheck("the live CAS reference table still agrees with the directory (every retain "
+                 "and release since the last rebuild balanced; a mismatch is a leak or a "
+                 "premature-free risk, caught before either becomes corruption)",
+                 ti >= 0 && agree);
+        vfs_unlink("tally-probe");
+    }
 
     kprintf("[vfsstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_vfspass, (uint64_t)g_vfsfail);
     if (!g_vfsfail)
