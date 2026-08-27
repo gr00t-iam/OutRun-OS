@@ -6,6 +6,19 @@ changelog in the tree at all until this milestone wrote them, and a v0.84 sessio
 was handed a carryover status superseded three milestones earlier and nearly
 re-implemented work that had already landed.
 
+## ARTEFACT
+
+```
+outrun-os-0.85.0.iso   (5,896,192 bytes)
+MD5    d1bb72645fc5a0a12e40c9653261c206
+SHA256 3242241a202a150a2a2ba7b19b8f473b4052630639501d67729a54437b9fd257
+```
+
+`make release-verify` PASS on that md5 — 45 suites, 0 failing assertions,
+0 rank faults, 325 s. The md5 `release-verify` stamped into its own log, the
+recorded `.md5`, and an independent `md5sum` all agree, so the PASS describes the
+published artefact rather than a neighbouring build.
+
 ## WHAT LANDED
 
 ### VFS metadata — `rename`, timestamps, and a credential leak
@@ -127,13 +140,19 @@ means a missed retain and a block that can be freed while a file still names it.
 
 Six tiers on one image, `ranks=0` throughout, clean build with no warnings:
 
+Every tier on ONE image, `e9fc67d773b5223fe65b277f3c3f5789`:
+
 | tier | v0.84 baseline | v0.85 |
 |---|---|---|
-| uniprocessor | 507 | **529** |
-| smp2-bios | 519 | **543** |
-| smp4-bios | 523 | **547** |
-| smp4-iommu | 536 | **560** |
+| uniprocessor | 507 | **530** |
+| smp2-bios | 519 | **544** |
+| smp4-bios | 523 | **548** |
+| smp4-iommu | 536 | **561** (47 suites) |
 | gate-dirty / gate-dirty-smp | 0 failing | **0 failing**, empty diffs |
+
+NOT run for this tag: bare metal, Proxmox, and any soak or repeat beyond the
+boots above — so this table cannot see an intermittent below roughly 1 in 10
+boots on the fresh tiers.
 
 ## WHAT THE PROCESS COST, AND WHAT IT CAUGHT
 
