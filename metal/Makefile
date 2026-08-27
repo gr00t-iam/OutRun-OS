@@ -24,7 +24,7 @@ OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(B
 # outrun-os-0.81.0-dev.iso, so a development image cannot be mistaken for a
 # release artefact by its filename alone. At release time this becomes plain
 # 0.81.0 and KERNEL_VERSION becomes 0.81.0-metal.
-VERSION := 0.85.0-dev
+VERSION := 0.85.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean

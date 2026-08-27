@@ -27,7 +27,7 @@
  * because release-version-check only ever compared the Makefile's VERSION against
  * the git tag. The string the KERNEL prints was never in the comparison. It is
  * now: see release-version-check in metal/Makefile, which greps this line. */
-#define KERNEL_VERSION "0.85.0-dev"
+#define KERNEL_VERSION "0.85.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -22058,6 +22058,72 @@ static void cmd_vfs_stress(void) {
     vfscheck("the rule refused at least one access (refusals > 0: a boot in which nobody "
              "was ever refused has not tested a refusal)",
              g_tmp_permit_refusals > 0);
+
+    /* ===== v0.85: RECLAMATION RETURNS TO ITS BASELINE ======================
+     *
+     * The suite already asserts that reclamation RAN (blocks freed > 0) and that
+     * it is correct for the SHARED case (the dedup control). Neither says that
+     * every block a workload allocated actually comes back when the workload
+     * unlinks what it made -- which is the difference between "reclamation
+     * works" and "reclamation is complete".
+     *
+     * So: measure allocated-but-unreferenced blocks, run a full create-and-
+     * unlink cycle over several files of different shapes, and require the count
+     * to return to exactly where it started. Not "no worse than" -- exactly.
+     * A cycle that leaves the volume holding one more unreachable block than it
+     * started with is a leak, and at one block per cycle it would take a long
+     * time and a lot of confusion to notice any other way.
+     *
+     * The files are deliberately different shapes: one small enough to live
+     * entirely in the direct chunk map, one past VFS_MAX_CHUNKS so it allocates
+     * an indirect block, and one whose content DUPLICATES the first so a shared
+     * chunk is in play. A cycle that only ever used direct-mapped, unshared
+     * files would not exercise the two paths where releasing is hardest.
+     *
+     * Uses cas_unreferenced_locked(), the same instrument that found the v0.84
+     * residual and the v0.85 free-path leak -- and for the same reason: asking
+     * which allocated blocks a live file names is the question the arithmetic
+     * audits cannot answer. */
+    {
+        static uint8_t rb_small[600], rb_big[12u * 1024];
+        for (uint32_t i = 0; i < sizeof rb_small; i++)
+            rb_small[i] = (uint8_t)((i * 71u + 13u) & 0xFF);
+        for (uint32_t i = 0; i < sizeof rb_big; i++)
+            rb_big[i] = (uint8_t)((i * 29u + (i / 512u) * 11u + 5u) & 0xFF);
+
+        uint64_t base;
+        klock_acquire(&g_cas_lock);
+        base = cas_unreferenced_locked();
+        klock_release(&g_cas_lock);
+        uint64_t used_base = SB->used_blocks;
+
+        int a = vfs_write_file("rbase-a", rb_small, sizeof rb_small);   /* direct only     */
+        int b = vfs_write_file("rbase-b", rb_big,   sizeof rb_big);     /* needs indirect  */
+        int c = vfs_write_file("rbase-c", rb_small, sizeof rb_small);   /* shares a's chunks */
+
+        int made = (a >= 0 && b >= 0 && c >= 0);
+        int gone = 1;
+        gone &= (vfs_unlink("rbase-a") == 0);
+        gone &= (vfs_unlink("rbase-b") == 0);
+        gone &= (vfs_unlink("rbase-c") == 0);
+
+        uint64_t after;
+        klock_acquire(&g_cas_lock);
+        after = cas_unreferenced_locked();
+        klock_release(&g_cas_lock);
+
+        kprintf("[vfsstrs] reclaim baseline: unreferenced %u -> %u, used_blocks %u -> %u "
+                "(3 files created and unlinked: direct, indirect, shared)\n",
+                base, after, used_base, (uint64_t)SB->used_blocks);
+        if (after > base)
+            kprintf("[vfsstrs] reclaim baseline: *** %u block(s) did NOT come back — a "
+                    "create-and-unlink cycle left the volume holding storage no file names\n",
+                    after - base);
+
+        vfscheck("a full create-and-unlink cycle returns the unreferenced-block count to its "
+                 "EXACT pre-workload baseline (reclamation is complete, not merely working)",
+                 made && gone && after == base);
+    }
 
     /* ===== v0.85: LIVE-VERSUS-DERIVED REFERENCE SWEEP =====================
      *
