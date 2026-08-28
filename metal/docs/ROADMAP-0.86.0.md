@@ -96,6 +96,37 @@ than a test of one — and this project has already learnt that costs a
 `TRUNCATED` boot and no verdict at all. Check 2 is the falsifiable half, and it
 can fail.
 
+#### What these four checks do NOT catch — measured, not assumed
+
+The `-DAPPEND_RACE_REPRO` build was re-run against this kernel to confirm the
+reverted `vfs_write_append()` still fires. It does, hard:
+
+| phase | got | wanted | lost |
+|---|---|---|---|
+| `append-smp` (4 pinned) | 880 B | 2048 B | 57% |
+| `append-oversub` (8 on 4) | 1760 B | 4096 B | 57% |
+
+**All four of the new journal-irq checks passed on that knowingly-broken
+kernel.** That is expected — the `vjirq` workload is single-threaded, so a
+seek-then-write race has no competing writer to lose against — but it has to be
+written down, because "passed against the reverted build" is exactly the
+signature of an assertion that cannot fail.
+
+So, precisely which of the four has demonstrated it can fail:
+
+- **Check 3's counter has.** Its first form asserted `dirq == 0` and failed at
+  `dirq == 9`; the current form asserts `dirq == dc`. The same counter has been
+  observed producing both verdicts, so it is live and discriminating.
+- **Checks 1, 2 and 4 have not.** They are regression guards: check 4 would fire
+  if a future change broke the single-threaded append path, and check 2 if the
+  sampler or its call site moved under a lock. Neither has been *observed*
+  failing, and neither should be described as proven until it has.
+
+The honest summary is that this block characterises where atomicity comes from
+and guards the premise of the oversubscription phases. **It is not a second
+detector for the append race** — `append-smp` and `append-oversub` are that, and
+they are the two that went red under the revert.
+
 ---
 
 ## Incidental finding: the ISO md5 does not identify the code
