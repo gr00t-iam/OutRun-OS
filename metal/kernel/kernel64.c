@@ -27,7 +27,7 @@
  * because release-version-check only ever compared the Makefile's VERSION against
  * the git tag. The string the KERNEL prints was never in the comparison. It is
  * now: see release-version-check in metal/Makefile, which greps this line. */
-#define KERNEL_VERSION "0.85.0-metal"
+#define KERNEL_VERSION "0.86.0-dev"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -5245,6 +5245,40 @@ static int      g_vj_init  = 0;
 static uint64_t g_vj_blocks_written = 0;   /* benchmark: journal block writes  */
 static int      g_vj_inject_stop    = 0;   /* set by the injection; stops publish */
 static uint64_t g_vj_commits        = 0;
+
+/* ===== v0.86: IS THE JOURNAL COMMIT PREEMPTIBLE? =========================
+ *
+ * v0.85 shipped with this in KNOWN-NOT-FIXED: "nothing tests a writer preempted
+ * while the journal transaction itself is mid-flight".
+ *
+ * The obvious reading of the lock says it cannot happen -- klock_acquire()
+ * opens with klock_irq_save(), a `cli`. That reading is WRONG, and this counter
+ * is what proved it: klock_acquire also CLOSES with klock_irq_restore(), under
+ * the comment "check done: reopen IF". The mask covers the rank-stack check
+ * only, so interrupts are on for the whole critical section and every journal
+ * commit is interruptible. Measured at 9 of 9 on the first boot that asked.
+ *
+ * Which makes the counter worth keeping rather than deleting. It pins down
+ * WHERE O_APPEND atomicity actually comes from -- mutual exclusion on
+ * g_vfs_lock, not interrupt masking -- and it turns that into something a
+ * future change can trip over instead of quietly invalidating: see the four
+ * checks in cmd_vfs_stress, where this is a PREMISE guard for the
+ * oversubscription phases rather than a safety claim of its own.
+ *
+ * Sampled at vj_publish(), the single point every journal transaction passes
+ * through. Deliberately NOT paired with a reproducer that re-enables interrupts
+ * inside the critical section: the timer ISR takes locks, so that would be a
+ * real hazard rather than a test of one, and this project has already learnt
+ * that costs a TRUNCATED boot and no verdict at all. The falsifiable half is
+ * the positive control in cmd_vfs_stress, which samples this same helper
+ * outside every klock and asserts it reads IF set -- without it, a sampler that
+ * could only ever return one value would look exactly like a green result. */
+static uint64_t g_vj_commit_irq_on = 0;    /* commits seen with RFLAGS.IF set  */
+static inline int vj_irq_is_on(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0" : "=r"(f) :: "memory");
+    return (f & 0x200ull) ? 1 : 0;         /* bit 9 = IF                        */
+}
 static void vj_reset_slots(void) {
     for (int i = 0; i < VJ_MAX_SLOTS; i++) g_vj_slot_of[i] = -1;
     g_vj_count = 0;
@@ -6994,6 +7028,7 @@ static void vj_publish(void) {
     virtio_write_block(SB->vjournal_start + 0, hdrblk);
     g_vj_blocks_written++;
     g_vj_commits++;
+    if (vj_irq_is_on()) g_vj_commit_irq_on++;   /* v0.86: see above */
 }
 
 /* v0.85: journal up to TWO dirty directory blocks in one transaction -- both
@@ -20747,6 +20782,21 @@ static int64_t pipe_run_role(const char *label, uint64_t caps, uint64_t role,
  * rather than asserting a property the topology cannot provide. */
 #define APPSMP_ROLE0   56u
 #define APPSMP_W       4u
+
+/* v0.86: the OVERSUBSCRIPTION RATIO, workers per online core. v0.85 hardcoded
+ * this at 2 and its tag recorded the constant as a gap -- 2:1 is the mildest
+ * oversubscription that exists, so a scheduler bug needing three runnable
+ * writers per core to surface could not be reached by any build in the tree.
+ *
+ * The DEFAULT STAYS 2 so the gate's cost and assertion count do not move; a
+ * higher ratio is a build-time override (`make EXTRA=-DAPPSMP_OSRATIO=4`),
+ * which is the same opt-in idiom the reproducers use. The phase computes its
+ * buffer, worker count and per-pattern expectation from this, so raising it
+ * needs no other edit -- the thing that made 2 a constant rather than a
+ * parameter was that four separate expressions each spelled it out. */
+#ifndef APPSMP_OSRATIO
+#define APPSMP_OSRATIO 2u
+#endif
 #define APPSMP_PAY     16u
 /* v0.85: the gate variant and the soak variant. See append_smp_worker() in
  * user/init.c for the measurement behind the split -- every append journals all
@@ -21811,11 +21861,12 @@ static void cmd_vfs_stress(void) {
      *     mean the appends did not overlap at all and the phase proved nothing.
      * ====================================================================== */
     {
-        static uint8_t osbuf[APPSMP_W * 2u * APPSMP_ITERS * APPSMP_PAY];
-        int nw = 2 * n; if (nw > (int)(APPSMP_W * 2u)) nw = (int)(APPSMP_W * 2u);
+        static uint8_t osbuf[APPSMP_W * APPSMP_OSRATIO * APPSMP_ITERS * APPSMP_PAY];
+        int nw = (int)APPSMP_OSRATIO * n;
+        if (nw > (int)(APPSMP_W * APPSMP_OSRATIO)) nw = (int)(APPSMP_W * APPSMP_OSRATIO);
         if (nw < 2) nw = 2;
         uint32_t total = (uint32_t)nw * APPSMP_ITERS * APPSMP_PAY;
-        int procs[APPSMP_W * 2u]; int nsp = 0;
+        int procs[APPSMP_W * APPSMP_OSRATIO]; int nsp = 0;
         uint32_t ran_mask = 0;
         uint64_t t_start = g_ticks;
 
@@ -21928,6 +21979,84 @@ static void cmd_vfs_stress(void) {
             }
             vfs_unlink(APPSMP_PATH);
         }
+    }
+
+    /* ===== v0.86: THE JOURNAL COMMIT IS PREEMPTIBLE ========================
+     *
+     * Closes the second half of the v0.85 oversubscription gap: "nothing tests a
+     * writer preempted while the journal transaction itself is mid-flight".
+     *
+     * THIS BLOCK ORIGINALLY ASSERTED THE OPPOSITE OF WHAT IS TRUE, and the
+     * measurement is what corrected it. The argument was: klock_acquire() calls
+     * klock_irq_save(), which is a `cli`, so a thread holding g_vfs_lock cannot
+     * be preempted and the case is unreachable. That reads correctly and is
+     * wrong -- klock_acquire ends with `klock_irq_restore(rf)` under the comment
+     * "check done: reopen IF". The cli guards only the RANK-STACK CHECK, not the
+     * critical section. Measured: 9 of 9 commits ran with interrupts ENABLED.
+     *
+     * So a writer IS preempted mid-transaction, routinely, and the append phases
+     * above still lose nothing. That locates the real guarantee: atomicity here
+     * comes from MUTUAL EXCLUSION -- every other writer blocks on g_vfs_lock --
+     * and NOT from interrupt masking. A future change that "fixed" an append
+     * race by masking interrupts would be treating a symptom.
+     *
+     * Four checks, in the order that makes each of the later ones mean anything:
+     *
+     *   1. DETECTION -- the workload actually reached the journal. Without it
+     *      every count below is zero for the uninteresting reason.
+     *   2. POSITIVE CONTROL -- the instrument can report interrupts-on at all,
+     *      sampled outside every klock. A sampler stuck at one value would
+     *      otherwise satisfy check 3 whatever the kernel did. This repository
+     *      has shipped that mistake once already (g_reproc_stale_ppid).
+     *   3. PREMISE GUARD -- the commits really were preemptible. If a future
+     *      change makes the journal run under cli this fires, and it SHOULD:
+     *      it would mean the append-oversub phases are no longer testing a
+     *      preemptible path and their conclusion has quietly changed meaning.
+     *      Same role as that phase's "more workers than cores" guard.
+     *   4. THE INVARIANT -- every appended byte is present and correct despite
+     *      every commit having been interruptible.
+     *
+     * Deliberately NOT falsified by re-enabling interrupts inside a critical
+     * section: the timer ISR takes locks, so that is a real hazard rather than a
+     * test of one, and this project has already learnt it costs a TRUNCATED boot
+     * and no verdict. Check 2 is the falsifiable half, and it can fail. */
+    {
+        uint64_t c0 = g_vj_commits, q0 = g_vj_commit_irq_on;
+        int ctl = vj_irq_is_on();          /* sampled OUTSIDE any lock */
+        int ji = vfs_write_file("vjirq", "", 0);
+        int wrote = 0;
+        for (int i = 0; ji >= 0 && i < 8; i++)
+            if (vfs_write_append(ji, "0123456789abcdef", 16, 0) >= 0) wrote++;
+        uint64_t dc = g_vj_commits - c0, dirq = g_vj_commit_irq_on - q0;
+
+        /* Read the file back rather than trusting the append return codes -- a
+         * lost append is exactly the failure that reports success per call. */
+        static uint8_t vjbuf[8 * 16];
+        int64_t got = (ji >= 0) ? vfs_read_file(ji, vjbuf, sizeof vjbuf) : -1;
+        int bytes_ok = (got == (int64_t)sizeof vjbuf);
+        for (uint32_t i = 0; bytes_ok && i < sizeof vjbuf; i++)
+            if (vjbuf[i] != (uint8_t)"0123456789abcdef"[i % 16]) bytes_ok = 0;
+
+        kprintf("[vfsstrs] journal irq: %u append(s), %u journal commit(s), %u of them "
+                "PREEMPTIBLE (interrupts on), read back %u/%u byte(s), control IF=%u\n",
+                (uint64_t)wrote, dc, dirq, (uint64_t)(got < 0 ? 0 : got),
+                (uint64_t)sizeof vjbuf, (uint64_t)ctl);
+
+        vfscheck("journal irq: the append workload actually REACHED the journal (without this "
+                 "every count below is zero for the uninteresting reason)",
+                 ji >= 0 && wrote == 8 && dc > 0);
+        vfscheck("journal irq: the instrument CAN report interrupts-on - sampled outside every "
+                 "klock it reads IF set (a sampler stuck at one value would satisfy the next "
+                 "check whatever the kernel did)", ctl == 1);
+        vfscheck("journal irq: every journal commit was PREEMPTIBLE - klock reopens IF after the "
+                 "rank check, so this path is NOT protected by interrupt masking, which is what "
+                 "makes the append-oversub result above a real preemption test",
+                 dc > 0 && dirq == dc);
+        vfscheck("journal irq: every appended byte is present and correct ANYWAY - O_APPEND "
+                 "atomicity rests on mutual exclusion via g_vfs_lock, not on interrupts "
+                 "being masked", bytes_ok);
+
+        if (ji >= 0) vfs_unlink("vjirq");
     }
 
     /* v0.85: the ring-3 metadata worker. It carries the one assertion the kernel
