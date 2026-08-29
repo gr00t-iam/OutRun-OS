@@ -208,6 +208,83 @@ The likely outcome is (1) plus a more precise KNOWN-NOT-FIXED entry. That is a
 real deliverable: an accurately bounded known issue is worth more than a vague
 one, and this one is currently vague.
 
+#### Outcome — the hypothesis was wrong; the entry was already accurate
+
+**This document predicted that `SYS_FSTAT` might widen the surface. It does
+not.** The prediction is recorded as made and then disproved, rather than
+quietly edited into agreement with the result.
+
+`SYS_FSTAT` refuses any descriptor whose volume is not `VOL_ROOT`:
+
+```c
+if (vol != VOL_ROOT) return (uint64_t)-22;   /* EINVAL: no dirent */
+```
+
+The full enumeration of what an unprivileged holder of an *inherited* tmp
+descriptor can obtain — every metadata path in the ABI, checked rather than
+assumed:
+
+| path | discloses | why |
+|---|---|---|
+| `SYS_FSTAT` (103) | **nothing** | refused, `vol != VOL_ROOT` |
+| `SYS_STAT` (61) | **nothing** | `vfs_find()` searches root `DENTS` only; tmp names are not there |
+| `SYS_READDIR` (45) | **nothing** | iterates `DENTS` only, and its record is `{len, used, name}` — no uid/gid/mode |
+| `lseek`/`SEEK_END` | **length** | the one documented disclosure |
+| read / write / truncate | refused | owner-or-root, `tmp_permit_locked()` |
+
+**Ruling: the KNOWN-NOT-FIXED entry is accurate, not understated.** Length is
+the whole surface. "Matches the root volume" had been asserted more often than
+measured; it is now measured.
+
+Two facts worth keeping, because both would otherwise have to be re-derived:
+
+1. **This kernel's fstat has no ownership fields at all.** The struct is
+   `{hash, len, mtime, atime}` — there is no `st_mode`, `st_uid` or `st_gid` to
+   leak, even for root files. A request to audit those fields on tmp is asking
+   about something that does not exist in the ABI.
+2. **The refusal is `EINVAL`, not `EACCES`, and that is correct.** It is denied
+   for *every* caller, including root and the file's owner, because there is no
+   dirent behind a tmp descriptor. A permission-shaped refusal would imply a
+   privileged caller could obtain the metadata, which is a different and weaker
+   claim.
+
+**What landed.** The existing uid-1000 child — which already holds an inherited
+descriptor on root's `tmp/rperm` and asserts read, write and open are all
+refused — now also asserts that `fstat` returns `-22` and that `SEEK_END` still
+reports 3. `SEEK_END` is pinned deliberately: a future change must not quietly
+widen the disclosure *or* silently close it without a test objecting.
+
+New exit codes **1818** and **1819**, deliberately *not* folded into the
+existing three-bit refusal mask — that mask's next value is 1818 but its range
+would run to 1825, and **1820 already belongs to `ftruncate`**. Widening it
+would have produced a misleading diagnostic rather than a build error, which is
+the shared-namespace hazard `CLAUDE.md` names for role numbers and which applies
+identically here.
+
+**Reachability had to be proved separately, and this is the important part.**
+The new checks live inside an existing worker and report through an assertion
+that already existed, so **the assertion count did not move: 539 before, 539
+after.** A green boot therefore does not show they ran — precisely the v0.84
+`ftruncate` failure, where identical counts concealed a check no workload could
+reach.
+
+So `-DTMP_FSTAT_LEAK_REPRO` makes `SYS_FSTAT` answer for tmp descriptors instead
+of refusing, which is what "someone gives tmp files a real fstat" looks like if
+the ownership question is not asked on the way past. Measured:
+
+| build | result |
+|---|---|
+| clean | **PASS** — 539 passed / 0 failed / 0 rank faults |
+| `-DTMP_FSTAT_LEAK_REPRO` | **FAIL** — 538 / 1, decoded as *exit 1818: SYS_FSTAT on an inherited TMP descriptor was NOT refused* |
+
+The disclosure the reproducer creates is real rather than cosmetic: the length
+it returns belongs to a file that same caller has already been refused both read
+and write access to.
+
+**Item B is closed.** The remaining tmp entry in KNOWN-NOT-FIXED should keep its
+current wording — it was right — with the surface now enumerated above so the
+next cycle does not re-open the same question.
+
 ### C. Untracked worktree: `.worktrees/v0-86`
 
 Checked at cycle open. **Not created by the v0.86 work** — that cycle used

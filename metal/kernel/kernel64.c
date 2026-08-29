@@ -19406,7 +19406,38 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int vol = VOL_ROOT;
         int di = ofile_deref((int)a0, &vol);
         if (di < 0) return (uint64_t)-9;                            /* EBADF */
+#ifndef TMP_FSTAT_LEAK_REPRO
         if (vol != VOL_ROOT) return (uint64_t)-22;                  /* EINVAL: no dirent */
+#else
+        /* v0.87 REPRODUCER, opt-in (`make EXTRA=-DTMP_FSTAT_LEAK_REPRO`) and
+         * never in a release build: answer fstat for a TMP descriptor instead
+         * of refusing it, which is what "someone gives tmp files a real fstat"
+         * looks like if the ownership question is not asked on the way past.
+         *
+         * This exists because the v0.87 metadata assertions live inside the
+         * existing tmp-permission worker and report through an assertion that
+         * ALREADY EXISTED -- so adding them did not change the assertion count,
+         * and a green boot does not on its own show they ran. This repository
+         * has shipped that exact mistake once (v0.84 ftruncate, where identical
+         * counts hid an unreachable check), and the standing rule is that a
+         * test which cannot fail has not passed.
+         *
+         * Expect the tmp-permission suite to go red naming exit 1818: SYS_FSTAT
+         * on an inherited TMP descriptor was not refused. Note the disclosure is
+         * real and not cosmetic -- the length below belongs to a file this
+         * caller has already been refused read AND write access to. */
+        if (vol != VOL_ROOT) {
+            klock_acquire(&g_vfs_lock);
+            st.hash  = 0;
+            st.len   = (di >= 0 && di < TMP_MAXFILES && g_tmpfiles[di].used)
+                       ? (uint64_t)g_tmpfiles[di].len : 0;
+            st.mtime = 0;
+            st.atime = 0;
+            klock_release(&g_vfs_lock);
+            cmemcpy((void *)a1, &st, sizeof st);
+            return 0;
+        }
+#endif
         fs_witness_enter();
         klock_acquire(&g_vfs_lock);
         st.hash  = DENTS[di].file_hash;
@@ -21528,6 +21559,10 @@ static void cmd_vfs_stress(void) {
             ls == 1815               ? "*** an UNPRIVILEGED caller READ and OPENED another user's tmp file" :
             ls == 1816               ? "*** an UNPRIVILEGED caller WROTE and OPENED another user's tmp file" :
             ls == 1817               ? "*** tmp ownership is NOT ENFORCED AT ALL — read, write and open all let an unprivileged caller through" :
+            /* v0.87: the metadata boundary (Objective 2). 1818 is the one that
+             * would mean the KNOWN-NOT-FIXED entry understates the surface. */
+            ls == 1818               ? "*** SYS_FSTAT on an inherited TMP descriptor was NOT refused — a caller who may not read the file can read its METADATA, so the disclosure is wider than 'lseek reports the length'" :
+            ls == 1819               ? "*** SEEK_END on an inherited tmp descriptor no longer reports the file's length — the one documented tmp disclosure changed shape, in either direction" :
             /* v0.84: ftruncate and O_APPEND. */
             ls == 1820 || ls == 1821 ? "could not author the ftruncate probe file" :
             ls == 1822               ? "*** ftruncate SHRINK was refused" :

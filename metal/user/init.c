@@ -3054,6 +3054,39 @@ static void lseek_worker(void) {
               if (u != -13) { bad |= 4; if (u >= 0) oclose(u); } }
             if (bad) sysc(SYS_EXIT, 130 + (u64)bad, 0, 0); }
 
+          /* v0.87: THE METADATA BOUNDARY, AUDITED.
+           *
+           * The three refusals above cover CONTENT. This covers what a caller
+           * who may not read the content can still LEARN about it, which is a
+           * separate question and had never been asked from ring 3.
+           *
+           * SYS_FSTAT is the widest metadata call in this ABI, and it is the
+           * one the v0.87 roadmap named as the open question -- if it answered
+           * for a tmp descriptor, the KNOWN-NOT-FIXED entry ("lseek discloses
+           * the LENGTH") would be understating the surface. It does not: the
+           * kernel refuses any descriptor whose volume is not VOL_ROOT, because
+           * a tmp file has no dirent to stat. Asserted here so that stays a
+           * decision. Anyone later giving tmp files a real fstat has to come
+           * through this line and answer the ownership question deliberately.
+           *
+           * Note the refusal is EINVAL and not EACCES, and that is right: the
+           * call is not being denied on permission grounds -- it is denied for
+           * every caller including the owner and root, because there is no
+           * dirent behind a tmp descriptor at all. A permission-shaped refusal
+           * here would imply a privileged caller could get the metadata.
+           *
+           * SEEK_END is then asserted to still report the length: that is the
+           * ONE disclosure this volume makes, it is POSIX-correct (permissions
+           * are checked at open, not per operation -- see the SEEK_SET comment
+           * above), and pinning it means a future change cannot quietly widen
+           * OR silently close it without a test saying so. The offset is put
+           * back afterwards because the parent re-reads through its own copy of
+           * this descriptor once the child exits. */
+          { struct ostatx md;
+            if (ofstat(t, &md) != -22)              sysc(SYS_EXIT, 122, 0, 0);
+            if (olseek(t, 0, SEEK_END) != 3)        sysc(SYS_EXIT, 123, 0, 0);
+            if (olseek(t, 0, SEEK_SET) != 0)        sysc(SYS_EXIT, 123, 0, 0); }
+
           /* THE RULE IS OWNER-OR-ROOT, NOT "unprivileged processes may not use
            * tmp". This caller's OWN file must remain fully usable — create,
            * write, rewind, read back, remove. Without this the whole block
@@ -3076,6 +3109,7 @@ static void lseek_worker(void) {
            * WHICH of the three guards let the caller through, rather than
            * reporting that "the permission test failed". */
           u64 e = (st >= 131 && st <= 137) ? 1810 + (u64)(st - 130)
+                : (st >= 122 && st <= 123) ? 1818 + (u64)(st - 122)
                 : (st >= 110 && st <= 121) ? 1790 + (u64)(st - 110)
                 : 1802;
           sysc(SYS_EXIT, e, 0, 0);
