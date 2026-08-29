@@ -4,8 +4,11 @@ Opened at `worktree-v086-oappend-oversub`, based on `main` at the v0.85.0 tag.
 `VERSION` is `0.86.0-dev` and `KERNEL_VERSION` is `"0.86.0-dev"`; both move to
 `0.86.0` / `0.86.0-metal` as step 1 of the Release Protocol, not before.
 
-**The v0.86.0 tag does not exist yet.** Nothing in this document is a released
-claim.
+**Status: CLOSED — released as v0.86.0.** `VERSION` is `0.86.0` and
+`KERNEL_VERSION` is `"0.86.0-metal"`, bumped and committed before the tag as step
+1 of the Release Protocol requires. The per-artefact checksums and the
+`release-verify` result live in `CHANGELOG-0.86.0.md` and in the tag message;
+this document records how the milestone got there.
 
 ---
 
@@ -329,8 +332,41 @@ it named in KNOWN-NOT-FIXED**, which is where it already is. If it is ever to be
 closed, the decision belongs at the level of "tmp descriptors stop behaving like
 POSIX file descriptors", not as an incidental fix.
 
-## Objectives for the rest of the cycle
+## Final release state
 
-1. The Item B derived generation table, with its falsifier.
-2. Crash injection on the CAS PUT path and the legacy `cas_free` branch.
-3. `CHANGELOG-0.86.0.md` written **as the cycle runs**, per the v0.85 precedent.
+Released as **v0.86.0**, cut from `main` after the full six-tier gate.
+
+### What closed
+
+| item | outcome |
+|---|---|
+| Oversubscription ratio fixed at 2:1 | Closed — `APPSMP_OSRATIO`, verified at 4:1 (441 interleave transitions vs 149) |
+| Nothing tests a writer preempted mid-journal-transaction | Closed — and the structural argument that said it was unreachable was **disproved** by the instrument, 9 of 9 commits preemptible |
+| Item B: per-block generation tracking | Closed — in-RAM `g_cas_gen`, two invariants, both independently falsified |
+| tmp `SEEK_END` "uninitialised memory disclosure" | Closed as **not a defect** — already implemented and already asserted; the real item is POSIX-correct length disclosure |
+
+### What this cycle got wrong, and how it was caught
+
+Recorded because the corrections are the most useful thing here:
+
+1. **The cycle opened against a superseded status.** Items A and B were briefed
+   as v0.85 debt; both had shipped in v0.85. Verified in the tree before any
+   code was written, so nothing was re-implemented.
+2. **The journal interrupt claim was backwards.** Asserted, failed on its first
+   boot, corrected. The assertion that failed was the one stating my own
+   reasoning.
+3. **A "fix" was requested for a defect that did not exist.** Every tmp path
+   already zeroed or clamped, and both requested assertions were already
+   present. No diff was written.
+4. **Three of the four journal-irq checks have never been observed failing.**
+   Named as unproven regression guards rather than described as verified.
+
+### Carried into v0.87
+
+- Durable (on-disk) generation, if and when something other than a diagnostic
+  also wants the format break — so the cost is paid once.
+- Crash injection on the CAS PUT path and the legacy `cas_free` branch.
+- A gate tier at an oversubscription ratio above 2:1. The parameter exists; no
+  tier uses it, so 4:1 is measured by hand and not defended by the gate.
+- Falsifiers for the three journal-irq regression guards, or an honest decision
+  that regression guards do not need them.
