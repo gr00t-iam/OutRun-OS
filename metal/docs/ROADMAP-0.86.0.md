@@ -242,14 +242,92 @@ Unchanged unless marked:
 - ~~**Nothing tests a writer preempted while the journal transaction is
   mid-flight**~~ — **closed, A2.** It is not unreachable: every commit is
   preemptible, and the invariant holds by mutual exclusion instead.
-- **The TALLY sweep sees only since the last rebuild.** Open. The Item B proposal
-  inherits this limitation and says so.
+- **The TALLY sweep sees only since the last rebuild.** Open. The generation
+  table implemented in Phase 2 inherits this limitation and says so.
 - **VOL_TMP has no mode and no group.** Deliberate; owner-or-root is the whole
   rule, so a tmpfile cannot be shared.
 - **`lseek` / `SEEK_END` on another user tmp descriptor discloses that file
-  length.** Metadata rather than content, and it matches the root volume.
+  length.** Metadata rather than content, matches the root volume, and is
+  POSIX-correct — see Item 3 above for why closing it would be a regression.
 - **No crash injection on the PUT path**, which has always had the consistent
   ordering, and none inside the legacy pre-journal branch of `cas_free`.
+
+## Phase 2
+
+### Item B implemented: the in-RAM generation table
+
+The spike above concluded "derive it, do not store it". That is what landed:
+`g_cas_gen[CAS_REF_MAX]` — 128 KiB, zeroed by `cas_refs_rebuild()`, which is the
+one function every path that establishes a directory already calls. No dirent
+change, no `cas_islot` change, no volume-format break, so every existing volume
+still mounts.
+
+One bump per completed free, placed at `g_cas_blocks_freed++` because that is
+where the **journaled and legacy branches converge** — beside either `bm_free`
+it would miss the other, and any earlier it would count frees that
+`cas_index_remove` refused.
+
+Two invariants the refcounts alone cannot state:
+
+**Synchronisation.** `sum(gen) + 65536×wraps == bumps == blocks_freed`. Three
+counters maintained at different points in `cas_free()` for different reasons; a
+future path that clears a bitmap bit without coming through `cas_gen_bump()`
+breaks the equality. Exact, not a bound, so there is nothing to interpret when
+it fails. It holds across **concurrent** unlinks because all three mutate only
+under `g_cas_lock` — the same argument the refcounts already rest on, now with a
+check behind it instead of a comment. Wrap is counted and folded into the
+equality rather than dismissed as impossible; "65536 frees of one block will not
+happen" is exactly the kind of assumption this tree has been burned by.
+
+**Structure.** No block with `refs > 0` may have a clear bitmap bit. A block
+freed while a live dirent still names it is the corruption the whole reference
+model exists to prevent.
+
+**The falsifier already existed.** `-DCAS_RECLAIM_REPRO` frees on the first drop
+ignoring sharing, which produces precisely `refs > 0` with the bitmap clear. No
+new reproducer was written, because the right one was already in the tree.
+
+**What it does not catch**, stated for the same reason the TALLY sweep's limits
+are stated: the table is rebuilt at every mount, so corruption from an earlier
+boot of a reused volume is erased before this can see it. It is a within-boot
+instrument. Durability needs the on-disk break the spike declined.
+
+### Item 3 — the tmp EOF debt does not exist as described
+
+Phase 2 was briefed to patch `tmp` `SEEK_END` handling against "uninitialised
+memory disclosure past true EOF" and to add assertions that reads past EOF
+return 0. **Both already hold, and the assertions already exist.** Verified in
+the tree rather than assumed:
+
+| path | behaviour | where |
+|---|---|---|
+| `tmp_read_range` | returns 0 at/after EOF; length clamped to `flen`, so no byte past the end is ever copied | `kernel64.c` |
+| `tmp_write_at` | zero-fills the hole when writing past EOF | `cmemset(data + flen, 0, off - flen)` |
+| `tmp_truncate` | zeroes on grow **and** shrink, with a comment naming this exact disclosure risk | `kernel64.c` |
+
+And the tests the brief asks for are already present as ring-3 exit codes:
+
+- **1682 / 1684** — *"a tmp read past EOF did not return 0"*
+- **1706** — `/* HOLE reads zero */`, checking the gap bytes specifically rather
+  than only that the file grew
+
+No uninitialised memory can be disclosed past EOF on any tmp path, so there is
+nothing to patch. Writing a "fix" here would have produced a diff that changed
+no behaviour and an assertion duplicating one that already passes.
+
+**The real v0.85 item is different from the brief.** It is that `SEEK_END` on an
+*inherited* tmp descriptor discloses that file's **length** — metadata, not
+memory. And it is deliberate: POSIX checks permissions at `open()`, not per
+operation, so a descriptor legitimately opened by its owner and inherited across
+a fork may still seek. The tree asserts this on purpose (**exit 1793**, *"lseek
+must not be permission-checked"*).
+
+Closing it would mean permission-checking `lseek`, which breaks POSIX semantics
+and trips that existing assertion — a real regression traded for a metadata leak
+that matches the root volume's behaviour. **Recommendation: leave it, and keep
+it named in KNOWN-NOT-FIXED**, which is where it already is. If it is ever to be
+closed, the decision belongs at the level of "tmp descriptors stop behaving like
+POSIX file descriptors", not as an incidental fix.
 
 ## Objectives for the rest of the cycle
 

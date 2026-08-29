@@ -5519,6 +5519,60 @@ static uint64_t g_cas_blocks_freed = 0;
 static uint64_t g_cas_ref_drops    = 0;
 static uint64_t g_cas_ref_underflow = 0;
 
+/* ===== v0.86: PER-BLOCK GENERATION, DERIVED AND IN RAM ====================
+ *
+ * The v0.86 design spike asked whether a generation could live in the dirent or
+ * the CAS index slot, and the answer was no, by a wide margin: per-chunk
+ * generations need VFS_MAX_CHUNKS * 2 = 32 bytes against the 4 left in
+ * dirent.reserved[], and cas_islot is 16 bytes BECAUSE 512/16 = 32 slots, so the
+ * only growth available is 16 -> 32, which halves the slots per block and makes
+ * every existing volume unreadable.
+ *
+ * So it is derived, exactly as the refcounts beside it are derived, and for the
+ * same stated reason: a table rebuilt from the journaled directory at mount
+ * cannot drift out of step with it and cannot be left stale by a crash. Zeroed
+ * by cas_refs_rebuild(), which is the one function every path that establishes a
+ * directory already calls.
+ *
+ * WHAT IT COUNTS: how many times a block has been RETURNED TO THE POOL this
+ * boot. One bump per completed free, at the single point where both the
+ * journaled and the legacy branch converge.
+ *
+ * WHAT IT IS FOR. Two invariants that the refcounts alone cannot state:
+ *
+ *   SYNCHRONISATION -- sum(gen) must equal the number of bumps must equal
+ *   g_cas_blocks_freed. Three numbers maintained at different places in
+ *   cas_free() for different reasons; if a future free path clears a bitmap bit
+ *   without going through here, they stop agreeing. Exact equality, not a
+ *   bound, so there is nothing to argue about when it breaks.
+ *
+ *   STRUCTURE -- a block that a live dirent still references MUST be allocated.
+ *   refs[b] > 0 with the bitmap bit clear means a block was freed while
+ *   something still named it, which is the corruption the whole reference model
+ *   exists to prevent. This is the check that -DCAS_RECLAIM_REPRO trips.
+ *
+ * WRAP IS HANDLED RATHER THAN ASSUMED AWAY. 65536 frees of ONE block will not
+ * happen in a boot, but "will not happen" is the kind of assumption this tree
+ * has been burned by, so the wrap is counted and folded into the equality
+ * instead of being argued about in a comment.
+ *
+ * PER-BOOT, like the TALLY sweep and for the same reason -- the mount that
+ * precedes a dirty boot rebuilds the table, so corruption in an EARLIER boot of
+ * a reused volume is erased before this can see it. Closing that needs the
+ * generation to be durable, which needs the on-disk break above. */
+static uint16_t g_cas_gen[CAS_REF_MAX];
+static uint64_t g_cas_gen_bumps = 0;
+static uint64_t g_cas_gen_wraps = 0;
+
+/* Caller holds g_cas_lock -- same lock as the refcount it must stay in step
+ * with, which is what makes "bumped" and "freed" one indivisible step. */
+static void cas_gen_bump(uint64_t b) {
+    if (b >= CAS_REF_MAX) return;              /* off the table, as with refs */
+    if (g_cas_gen[b] == 0xFFFFu) { g_cas_gen[b] = 0; g_cas_gen_wraps++; }
+    else g_cas_gen[b]++;
+    g_cas_gen_bumps++;
+}
+
 /* Caller holds g_cas_lock. */
 static void cas_ref_inc_block(uint64_t b) {
     if (b >= CAS_REF_MAX) return;
@@ -5547,6 +5601,26 @@ static void cas_ref_inc_block(uint64_t b) {
  *
  * Caller holds g_cas_lock. Blocks at or beyond CAS_REF_MAX are counted as
  * unreferenced because that is what they are — untracked, and never reclaimed. */
+/* v0.86: the two generation invariants, in one pass. Caller holds g_cas_lock.
+ *
+ * gsum          -- sum of every block's generation
+ * live_unalloc  -- blocks with refs > 0 whose bitmap bit is CLEAR (must be 0)
+ * tracked       -- blocks with refs > 0, so the caller can say the sweep saw
+ *                  something rather than reporting zero over an empty table */
+static void cas_gen_verify_locked(uint64_t *gsum, uint64_t *live_unalloc, uint64_t *tracked) {
+    uint64_t s = 0, bad = 0, t = 0;
+    uint64_t top = SB->total_blocks < CAS_REF_MAX ? SB->total_blocks : CAS_REF_MAX;
+    for (uint64_t b = 0; b < CAS_REF_MAX; b++) s += (uint64_t)g_cas_gen[b];
+    for (uint64_t b = SB->data_start; b < top; b++) {
+        if (!g_cas_refs[b]) continue;
+        t++;
+        if (!bm_get(b)) bad++;                 /* referenced but not allocated */
+    }
+    if (gsum) *gsum = s;
+    if (live_unalloc) *live_unalloc = bad;
+    if (tracked) *tracked = t;
+}
+
 static uint64_t cas_unreferenced_locked(void) {
     uint64_t n = 0;
     for (uint64_t b = SB->data_start; b < SB->total_blocks; b++) {
@@ -5917,6 +5991,34 @@ static int cas_free(uint64_t hash) {
         bm_free((uint64_t)b);
         cas_flush_meta();
     }
+    /* v0.86: ONE bump per completed free, here because this is where the
+     * journaled and legacy branches converge -- putting it beside either
+     * bm_free would miss the other, and putting it earlier would count
+     * frees that cas_index_remove refused. */
+#ifndef CAS_GEN_FALSIFY
+    cas_gen_bump((uint64_t)b);
+#else
+    /* v0.86 FALSIFIER, opt-in (`make EXTRA=-DCAS_GEN_FALSIFY`) and never in a
+     * release build: skip the bump on every 8th free, so the block still leaves
+     * the pool but the generation does not record it.
+     *
+     * This exists because -DCAS_RECLAIM_REPRO falsifies the STRUCTURAL check
+     * (refs > 0 with a clear bitmap bit) and nothing falsified the
+     * SYNCHRONISATION one. An equality that has never been watched to fail is
+     * an equality nobody has checked -- and this is precisely the defect shape
+     * it claims to catch: a free path that returns a block without coming
+     * through cas_gen_bump().
+     *
+     * Every 8th rather than every free, so the counters DIVERGE rather than
+     * both staying at zero -- a uniform skip would leave sum(gen) == bumps == 0
+     * and satisfy the equality while recording nothing, which is the failure
+     * mode the detection check exists to catch. Expect
+     * sum(gen)+wraps == bumps  <  blocks_freed. */
+    {
+        static uint64_t skip = 0;
+        if ((skip++ % 8u) != 7u) cas_gen_bump((uint64_t)b);
+    }
+#endif
     g_cas_blocks_freed++;
     klock_release(&g_cas_lock);
     return 1;
@@ -7335,6 +7437,12 @@ static int cas_tally_verify(uint64_t *dn, uint64_t *dw, uint64_t *ln, uint64_t *
 static void cas_refs_rebuild(void) {
     klock_acquire(&g_cas_lock);
     for (uint64_t i = 0; i < CAS_REF_MAX; i++) g_cas_refs[i] = 0;
+    /* v0.86: the generation table is rebuilt with the counts it must stay in
+     * step with. Resetting the tallies too is what keeps the equality a
+     * statement about THIS mount rather than about boot history the table no
+     * longer holds. */
+    for (uint64_t i = 0; i < CAS_REF_MAX; i++) g_cas_gen[i] = 0;
+    g_cas_gen_bumps = 0; g_cas_gen_wraps = 0; g_cas_blocks_freed = 0;
     klock_release(&g_cas_lock);
     int nf = 0;
     for (int i = 0; i < VFS_MAXFILES; i++) {
@@ -22252,6 +22360,71 @@ static void cmd_vfs_stress(void) {
         vfscheck("a full create-and-unlink cycle returns the unreferenced-block count to its "
                  "EXACT pre-workload baseline (reclamation is complete, not merely working)",
                  made && gone && after == base);
+    }
+
+    /* ===== v0.86: THE GENERATION TABLE, AND WHAT IT CAN SAY ================
+     *
+     * Placed immediately after the reclamation cycle above, because that cycle
+     * is what makes this sweep non-empty: it creates and unlinks three files of
+     * different shapes, so blocks have actually been returned to the pool by the
+     * time the counts are read. A sweep run before any free would report zero
+     * for every quantity and pass for the uninteresting reason.
+     *
+     * Three checks, and the first exists to stop the other two being vacuous:
+     *
+     *   DETECTION -- blocks were actually freed this boot. Without it, "sum of
+     *   generations equals frees" is 0 == 0.
+     *
+     *   SYNCHRONISATION -- sum(gen) + 65536*wraps == bumps == blocks_freed.
+     *   Three counters maintained for different reasons at different points in
+     *   cas_free(); a future path that clears a bitmap bit without coming
+     *   through cas_gen_bump() breaks the equality. Exact, so there is nothing
+     *   to interpret when it fails. This is the "increments stay synchronised"
+     *   property, and it holds across CONCURRENT unlinks because every mutation
+     *   of all three happens under g_cas_lock -- which is the same argument the
+     *   refcounts rest on, now with a check behind it rather than a comment.
+     *
+     *   STRUCTURE -- no block with refs > 0 has its bitmap bit clear. A block
+     *   freed while a live dirent still names it is the exact corruption the
+     *   reference model exists to prevent, and it is what -DCAS_RECLAIM_REPRO
+     *   (free on FIRST drop, ignoring sharing) produces. That reproducer already
+     *   existed for the dedup control; it falsifies this check too, which is
+     *   why no new one was written.
+     *
+     * WHAT THIS DOES NOT CATCH, stated because the v0.85 TALLY sweep was
+     * recommended for a defect it could not see: the table is rebuilt at every
+     * mount, so corruption from an earlier boot of a reused volume is gone
+     * before this runs. It is a within-boot instrument. */
+    {
+        uint64_t gsum = 0, live_unalloc = 0, gtracked = 0;
+        klock_acquire(&g_cas_lock);
+        cas_gen_verify_locked(&gsum, &live_unalloc, &gtracked);
+        uint64_t bumps = g_cas_gen_bumps, wraps = g_cas_gen_wraps,
+                 freed = g_cas_blocks_freed;
+        klock_release(&g_cas_lock);
+
+        uint64_t expect = gsum + wraps * 65536u;
+
+        kprintf("[vfsstrs] cas gen: %u block(s) freed this mount, %u bump(s), sum(gen)=%u "
+                "wrap(s)=%u, %u referenced block(s) checked, %u referenced-but-UNALLOCATED\n",
+                freed, bumps, gsum, wraps, gtracked, live_unalloc);
+        if (live_unalloc)
+            kprintf("[vfsstrs] cas gen: *** %u block(s) are named by a live dirent but their "
+                    "bitmap bit is CLEAR — freed while still referenced\n", live_unalloc);
+        if (expect != bumps || bumps != freed)
+            kprintf("[vfsstrs] cas gen: *** sum(gen)+wraps=%u, bumps=%u, blocks_freed=%u — a free "
+                    "path is not bumping the generation\n", expect, bumps, freed);
+
+        vfscheck("cas gen: the workload actually RETURNED blocks to the pool this mount "
+                 "(without this every equality below is 0 == 0)",
+                 freed > 0 && bumps > 0);
+        vfscheck("cas gen: generation bumps and block frees stay EXACTLY synchronised — "
+                 "sum(gen) + wraps == bumps == blocks_freed, three counters kept at "
+                 "different points in cas_free() under one lock",
+                 expect == bumps && bumps == freed);
+        vfscheck("cas gen: every block a live dirent references is ALLOCATED — refs > 0 with a "
+                 "clear bitmap bit is a block freed while something still named it",
+                 live_unalloc == 0);
     }
 
     /* ===== v0.85: LIVE-VERSUS-DERIVED REFERENCE SWEEP =====================
