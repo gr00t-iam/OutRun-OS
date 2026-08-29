@@ -123,6 +123,54 @@ since the last mount. A warm reboot re-mounts, so:
 objective 1, it costs a format break, and it should not be spent on a
 diagnostic.
 
+#### Outcome — points 1 and 2 done, point 3 still open
+
+**The reset is now checked, not assumed.** `cas_refs_rebuild()` verifies its own
+postcondition on every call: after the reset and before any free, `sum(gen)`,
+the bump tally, wraps and `blocks_freed` must all be zero. Violations are
+counted across the whole boot rather than sampled once.
+
+**Why "once" would have been worthless.** On a fresh boot `g_cas_gen[]` is BSS
+and already zero, so a *completely broken* reset still satisfies the
+postcondition at first mount — the zero means "nothing to carry", not "the reset
+works". Only a remount following real frees separates the two. The detection
+check therefore requires `rebuilds > 1`, and that is the load-bearing assertion
+of the pair.
+
+**A count corrected.** This document's first draft said the suite remounts five
+times. It does not: there are six `cas_mount()` call sites, but **three are
+inside `#ifdef CRASH_INJECT_COMMIT_FAIL`** and do not compile in a default
+build. A default boot performs **three** rebuilds — the boot mount plus two
+in-suite remounts. Source and measurement agree on three. The assertion is
+written as a lower bound (`> 1`) rather than pinned at 3, so building with the
+crash-injection flag — which legitimately raises the count — does not fail a
+check about something else.
+
+**Measured:**
+
+| build | rebuilds | dirty rebuilds | worst residue | verdict |
+|---|---|---|---|---|
+| clean, uniprocessor | 3 | 0 | 0 | **PASS** — 539 passed / 0 failed / 0 ranks |
+| clean, `gate-dirty` ×3 boots | 3 each | 0 each | 0 | **PASS** — empty diffs, artefacts intact |
+| `-DCAS_GEN_SKIP_ZERO` | 3 | **2** | **391** | **FAIL**, as designed |
+
+The falsifier behaves exactly as specified: **silent at first mount**, then
+catching both warm remounts (residue 356, then 391). A check placed only at
+first mount would have certified that broken build as correct. The residue
+values are internally consistent — `sum(gen) == bumps == freed` at each dirty
+rebuild — which is what an un-reset accumulating table looks like, and rules out
+the numbers being unrelated corruption.
+
+The dirty gate is the closest thing in the harness to a real warm-reboot
+sequence, and the audit reports zero residue on boots 2 and 3, which reuse the
+image.
+
+**Still open: point 3 — is anything actually LOST by the reset?** This audit
+establishes that the reset is complete. It does not establish that discarding
+the table costs nothing, and the plausible answer remains "nothing the refcount
+rebuild does not already re-derive". That needs measuring rather than assuming,
+and it is the part of item A that carries forward.
+
 ### B. POSIX tmp `SEEK_END` metadata boundary audit
 
 **Do not re-litigate the memory question.** v0.86 was asked to fix

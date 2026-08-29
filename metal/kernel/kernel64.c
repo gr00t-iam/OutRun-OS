@@ -5564,6 +5564,39 @@ static uint16_t g_cas_gen[CAS_REF_MAX];
 static uint64_t g_cas_gen_bumps = 0;
 static uint64_t g_cas_gen_wraps = 0;
 
+/* ===== v0.87: THE RESET IS THE PROPERTY, SO CHECK THE RESET ===============
+ *
+ * v0.86 shipped g_cas_gen[] as a per-boot table and named the bound in
+ * KNOWN-NOT-FIXED: it describes only the interval since the last mount, so a
+ * defect introduced in boot N is invisible in boot N+1. That bound rests
+ * entirely on the reset being COMPLETE -- if a rebuild left residue behind, the
+ * synchronisation equality would be comparing this mount's frees against a sum
+ * carrying a previous mount's history, and it would be wrong in the direction
+ * that still looks plausible.
+ *
+ * Nothing checked that. The zeroing loop was believed to work because it is
+ * three lines and obviously correct, which is the same standing this project's
+ * journal-interrupt claim had in v0.86 right up until it was measured and found
+ * backwards.
+ *
+ * So every rebuild verifies its own postcondition: after the reset and before
+ * any free, sum(gen), the bump tally and blocks_freed must ALL be zero. Counted
+ * across every rebuild in the boot rather than sampled once, because the
+ * interesting rebuild is not the first one -- on a fresh boot g_cas_gen[] is
+ * BSS and already zero, so a skipped reset is INVISIBLE at first mount and only
+ * shows on a REMOUNT that follows real frees. A default boot performs THREE
+ * rebuilds (measured, and it matches the source: six cas_mount() call sites
+ * exist, but three are inside #ifdef CRASH_INJECT_COMMIT_FAIL and do not
+ * compile here) -- the boot mount plus two in-suite remounts. Two warm remounts
+ * is what makes this reachable in one boot instead of needing a reboot.
+ *
+ * That asymmetry is also why the falsifier is worth having: a guard whose
+ * failure mode is unreachable at the moment it runs is a guard nobody has
+ * watched fail. See -DCAS_GEN_SKIP_ZERO below. */
+static uint64_t g_cas_gen_rebuilds       = 0;   /* how many rebuilds ran        */
+static uint64_t g_cas_gen_dirty_rebuilds = 0;   /* ...that left residue behind  */
+static uint64_t g_cas_gen_worst_residue  = 0;   /* largest sum(gen) seen after  */
+
 /* Caller holds g_cas_lock -- same lock as the refcount it must stay in step
  * with, which is what makes "bumped" and "freed" one indivisible step. */
 static void cas_gen_bump(uint64_t b) {
@@ -7441,8 +7474,20 @@ static void cas_refs_rebuild(void) {
      * step with. Resetting the tallies too is what keeps the equality a
      * statement about THIS mount rather than about boot history the table no
      * longer holds. */
+#ifndef CAS_GEN_SKIP_ZERO
     for (uint64_t i = 0; i < CAS_REF_MAX; i++) g_cas_gen[i] = 0;
     g_cas_gen_bumps = 0; g_cas_gen_wraps = 0; g_cas_blocks_freed = 0;
+#else
+    /* v0.87 FALSIFIER, opt-in (`make EXTRA=-DCAS_GEN_SKIP_ZERO`) and never in a
+     * release build: skip the reset entirely, so a remount inherits the previous
+     * mount's generation table and tallies.
+     *
+     * Deliberately silent at FIRST mount -- g_cas_gen[] is BSS, so on a fresh
+     * boot there is nothing to carry and the postcondition holds anyway. The
+     * violation appears on the first REMOUNT that follows real frees, which is
+     * precisely the warm-reboot boundary this audit is about, and precisely the
+     * case a check written only against first mount would miss. */
+#endif
     klock_release(&g_cas_lock);
     int nf = 0;
     for (int i = 0; i < VFS_MAXFILES; i++) {
@@ -7453,6 +7498,23 @@ static void cas_refs_rebuild(void) {
     g_cas_refs_ready = 1;
     uint64_t tracked = 0, alloc = 0, unref;
     klock_acquire(&g_cas_lock);
+    /* v0.87: the reset's own postcondition, checked here because nothing
+     * between the reset above and this point can free a block --
+     * vfs_retain_map_locked only RETAINS -- so the generation state must still
+     * be exactly what the reset left. */
+    {
+        uint64_t resid = 0;
+        for (uint64_t i = 0; i < CAS_REF_MAX; i++) resid += (uint64_t)g_cas_gen[i];
+        g_cas_gen_rebuilds++;
+        if (resid || g_cas_gen_bumps || g_cas_gen_wraps || g_cas_blocks_freed) {
+            g_cas_gen_dirty_rebuilds++;
+            if (resid > g_cas_gen_worst_residue) g_cas_gen_worst_residue = resid;
+            kprintf("[cas    ] *** rebuild %u left RESIDUE: sum(gen)=%u bumps=%u wraps=%u "
+                    "freed=%u — the generation table is carrying a previous mount\n",
+                    g_cas_gen_rebuilds, resid, g_cas_gen_bumps, g_cas_gen_wraps,
+                    g_cas_blocks_freed);
+        }
+    }
     for (uint64_t i = 0; i < CAS_REF_MAX; i++) if (g_cas_refs[i]) tracked++;
     for (uint64_t b = SB->data_start; b < SB->total_blocks; b++) if (bm_get(b)) alloc++;
     unref = cas_unreferenced_locked();
@@ -22425,6 +22487,57 @@ static void cmd_vfs_stress(void) {
         vfscheck("cas gen: every block a live dirent references is ALLOCATED — refs > 0 with a "
                  "clear bitmap bit is a block freed while something still named it",
                  live_unalloc == 0);
+    }
+
+    /* ===== v0.87: THE PERSISTENCE BOUND, AUDITED =============================
+     *
+     * v0.86 shipped the generation table with a bound in KNOWN-NOT-FIXED: it
+     * describes only the interval since the last mount. Everything the sweep
+     * above claims rests on that reset being COMPLETE — a rebuild that left
+     * residue would have the synchronisation equality comparing this mount's
+     * frees against a sum still carrying a previous mount's history, which is
+     * wrong in the direction that still looks plausible.
+     *
+     * cas_refs_rebuild() now checks its own postcondition on every call. This
+     * reports what those checks found.
+     *
+     * THE DETECTION CHECK IS THE LOAD-BEARING ONE, and it demands more than one
+     * rebuild. On a fresh boot g_cas_gen[] is BSS and already zero, so a
+     * COMPLETELY BROKEN reset still satisfies the postcondition at first mount.
+     * Only a remount that follows real frees can tell the two apart. A default
+     * boot performs three rebuilds — the boot mount plus two in-suite remounts
+     * that call cas_mount() for real — so requiring rebuilds > 1 is what makes
+     * the claim below a statement about warm mounts rather than about BSS
+     * initialisation.
+     *
+     * Three, not six: three further cas_mount() sites live inside
+     * #ifdef CRASH_INJECT_COMMIT_FAIL and do not compile in a default build.
+     * The count is asserted as a LOWER BOUND (> 1) rather than pinned at 3 so
+     * that building with the crash-injection flag, which legitimately raises it,
+     * does not fail a check about something else.
+     *
+     * That is also the honest answer to "does this audit need a real reboot".
+     * It does not: a remount runs the same cas_mount() -> cas_refs_rebuild()
+     * path a warm reboot runs, and it runs it with a volume that has already
+     * been churned. What it does NOT cover is a COLD boot boundary, where the
+     * table is BSS-zeroed by the loader before any of this executes — and that
+     * case is uninteresting precisely because it cannot carry residue. */
+    {
+        uint64_t rebuilds = g_cas_gen_rebuilds,
+                 dirty    = g_cas_gen_dirty_rebuilds,
+                 worst    = g_cas_gen_worst_residue;
+
+        kprintf("[vfsstrs] cas gen reset: %u rebuild(s) this boot, %u left residue, "
+                "worst sum(gen) after a reset was %u\n", rebuilds, dirty, worst);
+
+        vfscheck("cas gen reset: the boot performed MORE THAN ONE rebuild, so the check below "
+                 "covers a warm remount and not merely the BSS-zeroed first mount (a broken "
+                 "reset is invisible at first mount — the table starts zero either way)",
+                 rebuilds > 1);
+        vfscheck("cas gen reset: EVERY rebuild left sum(gen), bumps, wraps and blocks_freed all "
+                 "at zero — the per-boot bound holds because the reset is complete, not because "
+                 "nothing was carried",
+                 dirty == 0);
     }
 
     /* ===== v0.85: LIVE-VERSUS-DERIVED REFERENCE SWEEP =====================
