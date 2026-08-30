@@ -15,10 +15,18 @@
 #            console to create the deliberately durable cross-boot artefacts:
 #
 #              udbpersist     -> account 'udbreboot'    (v0.75 persistence)
-#              vfscrashwrite  -> file 'vfs-reboot-test' (v0.48 journal recovery)
+#              cascrashwrite  -> file 'vfs-reboot-test' (v0.48 journal recovery)
+#                             +  a PENDING CAS metadata journal (v0.89)
 #
-#            In that order: vfscrashwrite halts the machine forever (cli; hlt)
+#            In that order: cascrashwrite halts the machine forever (cli; hlt)
 #            on purpose, simulating power loss, so nothing can follow it.
+#
+#            v0.89 replaced `vfscrashwrite` here with `cascrashwrite`, which
+#            does everything the old command did and then leaves the CAS
+#            metadata journal PENDING as well — home bitmap and superblock
+#            never flushed. One power cut, two dirty journals, and boot 2
+#            exercises both recovery paths instead of one. `vfscrashwrite`
+#            still exists for interactive use.
 #
 #   boot 2.. the SAME image, untouched. Must reach the prompt with zero failing
 #            assertions, AND must still find both artefacts. The second half
@@ -104,7 +112,7 @@ feed_boot1() {
     sleep 2
     printf 'udbpersist\n'
     sleep 25                            # one 4096-round KDF, then the save
-    printf 'vfscrashwrite\n'            # LAST: halts the machine by design
+    printf 'cascrashwrite\n'            # LAST: halts the machine by design
     sleep 10
 }
 
@@ -132,11 +140,11 @@ for i in $(seq 1 "$BOOTS"); do
     fi
     q=$!; e=0
     # Boot 1 must outlive the prompt — it still has two commands to type — so it
-    # waits for vfscrashwrite's own confirmation instead of for the prompt.
+    # waits for cascrashwrite's own confirmation instead of for the prompt.
     while [ "$e" -lt "$CAP" ]; do
         kill -0 $q 2>/dev/null || break
         if [ "$i" = "1" ]; then
-            grep -aq 'vfscrashwrite: journal-committed' "$LOG" 2>/dev/null && { sleep 5; break; }
+            grep -aq 'cascrashwrite: journal-committed' "$LOG" 2>/dev/null && { sleep 5; break; }
         else
             grep -aq "Type 'help' for commands" "$LOG" 2>/dev/null && { sleep 5; break; }
             grep -aq 'system halted' "$LOG" 2>/dev/null && { sleep 3; break; }
@@ -210,19 +218,32 @@ for i in $(seq 1 "$BOOTS"); do
     # Only the detection line carries "CROSS-BOOT OK: account".
     udb=$(grep -ac 'CROSS-BOOT OK: account' "$WORK/boot$i.log")
     vfs=$(grep -ac 'cross-reboot journal probe: content VERIFIED' "$WORK/boot$i.log")
+    # v0.89: the CAS metadata journal's own cross-reboot proof. Counted here
+    # rather than left to the assertion tally because a boot that never STAGED
+    # the transaction skips the phase entirely and would otherwise look green
+    # for having tested nothing — the exact shape this gate exists to catch.
+    cas=$(grep -ac 'cas cross-reboot: VERIFIED' "$WORK/boot$i.log")
     if [ "$i" = "1" ]; then
         # Check boot 1 actually CREATED them. Without this, a failure to type at
         # the console shows up as "did not survive" on boot 2 — the wrong
         # diagnosis for the wrong boot, and the expensive kind to chase.
         cu=$(grep -ac "created 'udbreboot'" "$WORK/boot$i.log")
-        cv=$(grep -ac 'vfscrashwrite: journal-committed' "$WORK/boot$i.log")
-        printf 'boot %-2s created: udbreboot=%s vfs-reboot-test=%s\n' "$i" "$cu" "$cv"
+        cv=$(grep -ac 'cascrashwrite: journal-committed' "$WORK/boot$i.log")
+        cc=$(grep -ac 'cascrashwrite: staged an INTERRUPTED put' "$WORK/boot$i.log")
+        printf 'boot %-2s created: udbreboot=%s vfs-reboot-test=%s cas-pending=%s\n' "$i" "$cu" "$cv" "$cc"
         [ "$cu" -ge 1 ] || { echo "  !! boot 1 never created 'udbreboot' — console input did not land"; rc=1; }
         [ "$cv" -ge 1 ] || { echo "  !! boot 1 never created 'vfs-reboot-test' — console input did not land"; rc=1; }
+        # Distinguished from the line above on purpose: the command can commit
+        # the VFS half and still DECLINE the CAS half (marker already present,
+        # or no free block). Boot 1 is on a fresh image, so declining there is a
+        # defect and must not be read as "the console input failed".
+        [ "$cc" -ge 1 ] || { echo "  !! boot 1 committed the VFS half but staged NO pending CAS transaction"; rc=1; }
     else
-        printf 'boot %-2s udbreboot=%s vfs-reboot-test=%s\n' "$i" "$udb" "$vfs"
+        printf 'boot %-2s udbreboot=%s vfs-reboot-test=%s cas-recovered=%s\n' "$i" "$udb" "$vfs" "$cas"
         [ "$udb" -ge 1 ] || { echo "  !! 'udbreboot' did not survive into boot $i"; rc=1; }
         [ "$vfs" -ge 1 ] || { echo "  !! 'vfs-reboot-test' did not survive into boot $i"; rc=1; }
+        [ "$cas" -ge 1 ] || { echo "  !! the CAS cross-reboot probe did not run on boot $i — the"; \
+                              echo "  !! marker was absent, so its five assertions tested nothing"; rc=1; }
     fi
 done
 

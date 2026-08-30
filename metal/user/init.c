@@ -3371,6 +3371,111 @@ static void append_smp_worker(u32 idx) {
     sysc(SYS_EXIT, 42, 0, 0);
 }
 
+/* --- role 61: v0.89 CAS/VFS CONTENTION SOAK ---------------------------------
+ *
+ * The append-oversubscription phases (roles 56..59) put many writers on ONE
+ * file and measure that no byte is lost. That exercises the append offset under
+ * g_vfs_lock and almost nothing else: every worker writes the same payload, so
+ * every chunk dedups, and after the first iteration the CAS allocates nothing,
+ * frees nothing and mutates no index entry.
+ *
+ * This role exercises the half that leaves untouched. Each worker repeatedly:
+ *
+ *   create a file with content unique to (this worker, this iteration)
+ *      -> a real cas_put: index probe, index STAGE, bm_alloc, journal write
+ *   append to it
+ *      -> a directory-journal commit, and a second put
+ *   unlink it
+ *      -> cas_free: index REMOVE, bm_free, generation bump, journal write
+ *
+ * So the contended state is the CAS index and the block bitmap, under rank-3
+ * g_cas_lock, from every core at once — not the VFS append path. Uniqueness is
+ * what makes it real work: identical content would dedup to one block and the
+ * whole soak would allocate once and then measure nothing.
+ *
+ * WHY ONE ROLE AND NOT FOUR. The append workers take their index from their
+ * role number (56..59) because they must agree on four fixed payload patterns.
+ * These workers need only to be DISTINCT from one another, and SYS_GETPID
+ * already gives every one of them a value nothing else shares. Four role
+ * numbers is a cost paid in a namespace matched by nothing but the integer —
+ * v0.81 and v0.82 both lost time to two suites sharing role 7 — and there is no
+ * reason to pay it twice.
+ *
+ * Exit 42 on success. Every failure point has its own code, and the DEADLINE
+ * has its own separate code (1849) so a slow host is never decoded as a defect
+ * — the kernel half counts deadline expiries apart from failures for exactly
+ * the reason v0.88 had to learn twice. */
+#define CASC_ITERS   12u
+#define CASC_PAY     192u
+#define CASC_T       6000u          /* ticks; 100 Hz, so 60 s */
+static void cas_contend_worker(void) {
+    u64 pid = sysc(SYS_GETPID, 0, 0, 0);
+
+    /* Name: "ccXXXX" where XXXX is this worker's pid in hex. Distinct per
+     * worker by construction, so two workers can never collide on a dirent and
+     * a collision failure can never be misread as a CAS defect. */
+    char path[8];
+    path[0] = 'c'; path[1] = 'c';
+    for (u32 i = 0; i < 4; i++) {
+        u32 nib = (u32)((pid >> ((3u - i) * 4u)) & 0xFu);
+        path[2 + i] = (char)(nib < 10 ? ('0' + nib) : ('a' + nib - 10));
+    }
+    path[6] = 0;
+
+    u8 blk[CASC_PAY];
+    u32 t0 = osysticks();
+
+    for (u32 it = 0; it < CASC_ITERS; it++) {
+        /* Content unique to (pid, iteration): no two writes anywhere in the
+         * soak share a block, so every create is a real allocation and every
+         * unlink a real free. */
+        for (u32 k = 0; k < CASC_PAY; k++)
+            blk[k] = (u8)((k * 7u) + (u32)(pid * 31u) + (it * 101u));
+
+        int f = ocreat(path);
+        if (f < 0)                                    sysc(SYS_EXIT, 1840, 0, 0);
+        if (owrite(f, (const char *)blk, CASC_PAY) != (i64)CASC_PAY)
+                                                      sysc(SYS_EXIT, 1841, 0, 0);
+        /* A second write on the SAME descriptor. SYS_WRITE_FILE has been
+         * POSITIONAL since v0.83, so this lands at offset CASC_PAY and the file
+         * ends up 2 x CASC_PAY long — it does NOT replace the first write.
+         *
+         * Written down because the first version of this worker assumed
+         * whole-file replacement and compared the read-back against the second
+         * payload alone. Every worker on every core failed identically with
+         * "wrong content", which looked exactly like the CAS handing back
+         * somebody else's block and was nothing of the kind. Both halves are
+         * verified below now, which is the stronger check anyway: it proves the
+         * second write did not disturb the first. */
+        u8 blk2[CASC_PAY];
+        for (u32 k = 0; k < CASC_PAY; k++) blk2[k] = (u8)(blk[k] ^ 0x5Au);
+        if (owrite(f, (const char *)blk2, CASC_PAY) != (i64)CASC_PAY)
+                                                      sysc(SYS_EXIT, 1842, 0, 0);
+        if (oclose(f) != 0)                           sysc(SYS_EXIT, 1843, 0, 0);
+
+        /* Read it back before releasing it. A soak that only writes cannot tell
+         * a lost block from a busy one, and this is the cheapest place to find
+         * out that the content the index handed back is not the content stored
+         * — the v0.56 "confidently wrong content" failure, from ring 3. */
+        { int r = oopen(path);
+          if (r < 0)                                  sysc(SYS_EXIT, 1844, 0, 0);
+          u8 back[2u * CASC_PAY];
+          i64 n = oread(r, (char *)back, 2u * CASC_PAY);
+          if (n != (i64)(2u * CASC_PAY))              sysc(SYS_EXIT, 1845, 0, 0);
+          for (u32 k = 0; k < CASC_PAY; k++)
+              if (back[k] != blk[k])                  sysc(SYS_EXIT, 1846, 0, 0);
+          for (u32 k = 0; k < CASC_PAY; k++)
+              if (back[CASC_PAY + k] != blk2[k])      sysc(SYS_EXIT, 1850, 0, 0);
+          if (oclose(r) != 0)                         sysc(SYS_EXIT, 1847, 0, 0); }
+
+        if (ounlink(path) != 0)                       sysc(SYS_EXIT, 1848, 0, 0);
+
+        /* Deadline, not a spin budget, and on its own exit code. */
+        if (osysticks() - t0 >= CASC_T)               sysc(SYS_EXIT, 1849, 0, 0);
+    }
+    sysc(SYS_EXIT, 42, 0, 0);
+}
+
 /* --- role 60: v0.85 VFS METADATA FROM RING 3 --------------------------------
  *
  * Three things the kernel half cannot honestly test for itself.
@@ -5987,6 +6092,7 @@ int main(int argc, const char **argv, const char **envp) {
      * travel that way. */
     if (role >= 56 && role <= 59) { append_smp_worker((u32)(role - 56)); }
     if (role == 60) { meta_worker(); }                 /* v0.85 VFS metadata from ring 3 */
+    if (role == 61) { cas_contend_worker(); }          /* v0.89 CAS index/bitmap contention soak */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
     if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
     if (role == 44) { pthreads_smp_worker(); }         /* v0.62 mutex contention + condvar across cores     */

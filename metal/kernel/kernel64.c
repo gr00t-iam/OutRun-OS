@@ -5845,15 +5845,88 @@ static void cas_journal_clear(void) {
     uint8_t z[CAS_BS]; cmemset(z, 0, CAS_BS);
     virtio_write_block(SB->cjournal_start + 0, z);
 }
+/* v0.89: HOW MANY CPUs WERE ONLINE WHEN RECOVERY RAN.
+ *
+ * The claim worth pinning is "transaction-log recovery cannot race an AP". In
+ * this kernel that is true by CONSTRUCTION rather than by interrupt masking, and
+ * the construction is a boot ordering: kernel_main calls cmd_cas() — which is
+ * where the boot mount and therefore the boot recovery happen — BEFORE it calls
+ * smp_init(). No AP exists yet, so there is nothing to race.
+ *
+ * That is worth measuring rather than asserting from a reading of the source,
+ * because the ordering is two calls forty lines apart in a function nobody edits
+ * with the filesystem in mind. It is also worth measuring rather than "fixing"
+ * with a cli around recovery: v0.86 measured that journal commits already run
+ * with interrupts ENABLED and that atomicity here comes from mutual exclusion,
+ * and the tree's standing ruling is that masking interrupts across a path the
+ * timer ISR can reach buys a TRUNCATED boot and no verdict.
+ *
+ * Recorded separately for the BOOT recovery and for any later one, because they
+ * are different situations: the in-suite remounts run after smp_init() with
+ * every AP live, and a remount is not the claim. Only the boot recovery is. */
+/* Tentative definition: the real one, with its initialiser, is beside the SMP
+ * code some 7,700 lines below. C permits the pair, and it is preferable to
+ * hoisting the SMP globals up here purely so the filesystem can read one. */
+static int g_ncpu_online;
+
+static uint64_t g_cas_recover_calls    = 0;   /* cas_journal_recover() entries   */
+static uint64_t g_cas_recover_replays  = 0;   /* ...that found PENDING and acted */
+static int      g_cas_recover_max_cpu  = 0;   /* highest seen at any replay      */
+
+/* Set at the top of smp_init(), so "no AP exists yet" is a state this code can
+ * TEST rather than a call ordering it has to trust. */
+static int      g_smp_started;
+static uint64_t g_cas_recover_boot_repl = 0;  /* replays that ran pre-SMP        */
+static int      g_cas_mount_boot_cpu    = -1; /* ncpu at the first pre-SMP mount */
+static int      g_cas_recover_boot_cpu  = -1; /* ncpu at the first pre-SMP replay */
+
+/* v0.89: THIS COUNTER WAS WRONG ON ITS FIRST BOOT, and the shape of the mistake
+ * is worth keeping rather than quietly repairing.
+ *
+ * It began as "g_ncpu_online at the FIRST call to cas_journal_recover()", named
+ * boot_cpu, asserted to be 1. Uniprocessor passed. smp4-bios read 4 and failed
+ * — correctly, because the number was not measuring what its name said.
+ *
+ * On a FRESH volume cas_mount() returns at the magic check without ever
+ * reaching cas_journal_recover(), so there is no boot-time recovery at all and
+ * the "first call" was an IN-SUITE REMOUNT, which runs after smp_init() with
+ * every AP live. The measurement was real; the label was fiction.
+ *
+ * That is a counter incremented somewhere other than where its name claims —
+ * the same family as the counter nothing increments, and it would have shipped
+ * green on the uniprocessor tier alone. The phase is now a state the code tests
+ * rather than a call ordinal, and the two claims are separated: the MOUNT is
+ * always pre-SMP and is asserted on every volume, while a boot-time REPLAY only
+ * happens on a dirty one and is asserted only where it actually occurred. */
+
 /* Called once, from cas_mount(), BEFORE the bitmap/index are trusted. Replays
  * a PENDING transaction to its recorded home locations so the disk always
  * ends up in the "both writes landed" state regardless of exactly how far a
  * prior crash interrupted the real writes.                                   */
 static void cas_journal_recover(void) {
+    g_cas_recover_calls++;
+#ifdef CAS_NORECOVER_REPRO
+    /* v0.89 FALSIFIER, opt-in (`make EXTRA=-DCAS_NORECOVER_REPRO`) and never in
+     * a release build: mount without replaying anything.
+     *
+     * This is what the pre-v0.48 kernel did, and it is the only way to watch the
+     * cross-reboot recovery assertions fail. Without it they are green on a
+     * volume whose home blocks happened to be consistent already, which is
+     * exactly the state a SUCCESSFUL crash-stage does NOT leave: the home index
+     * names a block the home bitmap calls free until recovery reconciles them.
+     * A test that cannot fail has not passed. */
+    return;
+#endif
     uint8_t hdrblk[CAS_BS]; virtio_read_block(SB->cjournal_start + 0, hdrblk);
     struct cjournal_header *h = (struct cjournal_header *)hdrblk;
     const char mg[8] = { 'C','J','R','N','L','0','0','1' };
     if (h->state != CJ_STATE_PENDING || cmemcmp(h->magic, mg, 8) != 0) return;
+    g_cas_recover_replays++;
+    if (g_ncpu_online > g_cas_recover_max_cpu) g_cas_recover_max_cpu = g_ncpu_online;
+    if (!g_smp_started) {
+        g_cas_recover_boot_repl++;
+        if (g_cas_recover_boot_cpu < 0) g_cas_recover_boot_cpu = g_ncpu_online;
+    }
     uint8_t sbblk[CAS_BS]; virtio_read_block(SB->cjournal_start + 1, sbblk);
     virtio_write_block(0, sbblk);
     uint8_t bmblk[CAS_BS]; virtio_read_block(SB->cjournal_start + 2, bmblk);
@@ -5865,6 +5938,87 @@ static void cas_journal_recover(void) {
     kprintf("[cas    ] CAS journal recovery: replayed a pending metadata transaction "
             "(bitmap blk %d, index blk %d, seq %u)\n",
             h->bitmap_block, h->index_block, (uint64_t)h->seq);
+}
+
+/* ===========================================================================
+ * v0.89: THE CAS METADATA JOURNAL, INTERRUPTED ACROSS A REAL POWER CYCLE
+ * ===========================================================================
+ * v0.48 gave the VFS DIRECTORY journal a genuine cross-reboot proof: the
+ * `vfscrashwrite` command commits a write and halts without syncing, and a
+ * LATER, separate QEMU process mounting the same image is what demonstrates
+ * recovery. The CAS METADATA journal never got one.
+ *
+ * v0.88's crash injection does interrupt a put, but it remounts IN-PROCESS —
+ * cas_mount() called from the running kernel. That is a weaker test than it
+ * looks, and the weakness is specific: the RAM bitmap, superblock and index
+ * buffer are ALREADY post-transaction at that moment, so a recovery that wrote
+ * nothing at all would leave the in-memory picture correct anyway. Only the
+ * home BLOCKS would be wrong, and nothing in that boot has to read them again.
+ *
+ * Across a power cycle nothing is in RAM. Every byte the next boot judges comes
+ * off the disk, so a recovery that does not run is a recovery that shows.
+ *
+ * WHAT THIS LEAVES ON THE VOLUME, deliberately, and why each part matters:
+ *
+ *   - the data block, written                      (content is durable)
+ *   - the index entry, written to its HOME block   (the index names the block)
+ *   - the cjournal, PENDING, holding post-transaction shadows of the
+ *     superblock, the bitmap block and the index block
+ *   - the home bitmap and superblock, NEVER FLUSHED, so on disk they still say
+ *     the block is FREE
+ *
+ * That last pair is the whole point. Until recovery reconciles them the volume
+ * is in exactly the state the v0.48 journal exists to repair, and it is a state
+ * the v0.88 standing index audit can SEE: the index names a block the bitmap
+ * calls free. So the next boot's verdict is not "did a file survive" — it is
+ * "did the two halves come back agreeing", which is falsifiable and is
+ * falsified by -DCAS_NORECOVER_REPRO.
+ *
+ * Manual and one-shot, exactly like vfscrashwrite and for the same reason: a
+ * marker the boot creates for itself proves nothing about the boot before it.
+ * See cmd_cas_crash_write() at the shell, and the probe in cmd_vfs_stress. */
+#define CASCRASH_MAGIC "CAS-REBOOT-JOURNAL-OK"
+#define CASCRASH_LEN   21u
+
+/* Fill `out` (CAS_BS bytes) with the marker payload. One definition, used by
+ * both the writer and the probe, so the two cannot drift apart — a probe that
+ * looks for content the writer no longer produces reads as "never staged" and
+ * is indistinguishable from a pass. */
+static void cascrash_payload(uint8_t *out) {
+    cmemset(out, 0, CAS_BS);
+    for (uint32_t i = 0; i < CASCRASH_LEN; i++) out[i] = (uint8_t)CASCRASH_MAGIC[i];
+    /* Tail bytes make the block's content distinctive beyond the magic, so a
+     * partially-written block cannot match on its first 21 bytes alone. */
+    for (uint32_t i = CASCRASH_LEN; i < CAS_BS; i++)
+        out[i] = (uint8_t)((i * 173u + 61u) & 0xFF);
+}
+
+/* Stage the interrupted transaction. Returns the block it allocated, or -1 if
+ * it declined (already staged on this volume, or no space). Caller halts. */
+static int64_t cas_crash_stage(void) {
+    static uint8_t pay[CAS_BS];
+    cascrash_payload(pay);
+    uint64_t h = rust_cas_hash((uint64_t)pay, CAS_BS);
+
+    klock_acquire(&g_cas_lock);
+    uint32_t elen;
+    if (cas_index_find(h, &elen) >= 0) {        /* an earlier boot already staged it */
+        klock_release(&g_cas_lock);
+        return -1;
+    }
+    int64_t b = bm_alloc();
+    if (b < 0) { klock_release(&g_cas_lock); return -1; }
+    virtio_write_block((uint64_t)b, pay);
+    int64_t idx_sec = cas_index_stage(h, (uint32_t)b, CAS_BS);
+    if (idx_sec < 0) { bm_free((uint64_t)b); cas_flush_meta(); klock_release(&g_cas_lock); return -1; }
+
+    uint64_t bitmap_blk = SB->bitmap_start + ((uint64_t)b >> 3) / CAS_BS;
+    cas_journal_write((uint64_t)idx_sec, bitmap_blk);
+    virtio_write_block((uint64_t)idx_sec, g_idxbuf);   /* home index write lands */
+    /* AND STOP. No cas_flush_meta(), no cas_journal_clear(). The caller halts
+     * with `cli; hlt`, so this is where the power goes out. */
+    klock_release(&g_cas_lock);
+    return b;
 }
 
 #ifdef CRASH_INJECT_COMMIT_FAIL
@@ -6251,6 +6405,11 @@ static void vfs_journal_apply(void);   /* fwd: v0.48, defined in the VFS section
  * ranks here would only blur the invariant that matters: every POST-SMP
  * entry into CAS state goes through cas_put/cas_get under rank 3.            */
 static int cas_mount(void) {
+    /* v0.89: sampled HERE and not inside cas_journal_recover(), because a fresh
+     * volume never reaches recovery at all — see the note at
+     * g_cas_mount_boot_cpu. Every mount that happens before smp_init() is a boot
+     * mount, whatever the volume looks like. */
+    if (!g_smp_started && g_cas_mount_boot_cpu < 0) g_cas_mount_boot_cpu = g_ncpu_online;
     virtio_read_block(0, g_sbblk);
     const char mg[8] = { 'O','R','U','N','C','A','S','1' };
     /* v0.57: only version 5 mounts. v2/v3 predate the widened dirent name, and
@@ -14340,6 +14499,11 @@ static void madt_scan(void) {
 }
 
 static void smp_init(void) {
+    /* v0.89: from here on, an AP may exist. The filesystem reads this to say
+     * whether a mount or a journal replay happened before any core but this one
+     * was running — see g_cas_mount_boot_cpu. Set FIRST, before madt_scan, so
+     * the flag can never be false while an AP is being brought up. */
+    g_smp_started = 1;
     kputs("-- SMP GROUNDWORK: boot every core, prove the cross-core protocols --\n");
     madt_scan();
     map_mmio(LAPIC_V, LAPIC_PHYS, 0x1000);
@@ -21229,6 +21393,85 @@ static int appsmp_drain(uint64_t watchdog) {
     }
 }
 
+/* ===========================================================================
+ * v0.89: CAS INDEX AND BITMAP UNDER MULTI-CORE CONTENTION
+ * ===========================================================================
+ * The append phases above contend on the VFS append offset. After their first
+ * iteration they contend on nothing else: every worker writes the SAME payload,
+ * so every chunk dedups and the CAS allocates no block, frees no block and
+ * mutates no index entry for the rest of the run. The rank-3 lock they are
+ * often described as exercising is barely touched.
+ *
+ * This phase contends on that. Each worker creates a file whose content is
+ * unique to (worker, iteration), writes it twice, reads it back, and unlinks
+ * it — so every iteration is a real cas_put (index probe, index stage,
+ * bm_alloc, metadata journal transaction) followed by a real cas_free (index
+ * remove, bm_free, generation bump, second journal transaction), from every
+ * core at once.
+ *
+ * WHAT IS ASSERTED, and all of it is exact rather than "no worse than":
+ *
+ *   - every worker reached a terminal state (no watchdog)
+ *   - every worker that finished, finished with the success sentinel; deadline
+ *     expiry is counted SEPARATELY and tolerated, because a slow host must not
+ *     be decoded as a defect
+ *   - allocated-but-unreferenced blocks return to EXACTLY their pre-phase
+ *     value. Not "no worse than": one leaked block per cycle is invisible for
+ *     a long time and then is not
+ *   - used_blocks returns to exactly its pre-phase value
+ *   - no index entry names a block the bitmap calls free, volume-wide
+ *   - the reference count never underflowed (a double release)
+ *   - the generation table stayed in step: sum(gen) + wraps == bumps
+ *   - the workers actually RAN ON MORE THAN ONE CORE where more than one exists
+ *
+ * That last one is the premise guard, and the phase is worth nothing without
+ * it: a soak that ran entirely on the boot core is a single-threaded test
+ * reporting a concurrency result. It is asserted only where n > 1, because on
+ * a genuine uniprocessor the honest statement is that the phase ran without
+ * contention and the correctness assertions still hold.
+ *
+ * NOT ASSERTED: anything about page tables. The requirement this implements
+ * asked for "page-table integrity faults", and this workload does not touch
+ * them — it is filesystem metadata under a spinlock. Page-table integrity is
+ * covered by the mmap and COW-fork suites (roles 46 and 47), which is where a
+ * page-table claim belongs. Saying so here rather than adding an assertion that
+ * would pass for reasons unrelated to this phase. */
+#define CASC_ROLE     61u
+#define CASC_ITERS    12u          /* MUST match user/init.c's CASC_ITERS */
+#define CASC_PAY      192u         /* MUST match user/init.c's CASC_PAY   */
+#define CASC_OK       42
+#define CASC_DEADLINE 1849
+#define CASC_MAXW     32
+#define CASC_WATCH_FOR(nw) ((uint32_t)(nw) * 1200u < 12000u ? 12000u : (uint32_t)(nw) * 1200u)
+
+static int casc_live(void) {
+    int c = 0;
+    for (int i = 0; i < n_kproc; i++)
+        if (kprocs[i].used && !kprocs[i].exited && kprocs[i].role == (int)CASC_ROLE) c++;
+    return c;
+}
+
+/* Same shape as appsmp_drain: the BSP keeps executing queued work while it
+ * waits, or a uniprocessor deadlocks waiting for tasks only it can run. */
+static int casc_drain(uint64_t watchdog) {
+    uint64_t t0 = g_ticks, lastlog = g_ticks, spins = 0;
+    for (;;) {
+        if (casc_live() == 0) return 1;
+        if (g_ticks - t0 >= watchdog) return 0;
+        int q = rq_pop(0);
+        if (q >= 0) { cpu_exec_proc(0, q); sched_yield(); continue; }
+        futex_timeout_scan();
+        if (++spins & 1) sched_yield();
+        if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);
+        if (g_ticks - lastlog >= 200) {
+            lastlog = g_ticks;
+            kprintf("[vfsstrs] .. cas-contend waiting ticks=%u live=%d\n",
+                    g_ticks - t0, (uint64_t)(int64_t)casc_live());
+        }
+        __asm__ volatile("pause");
+    }
+}
+
 /* The worker is lseek_worker() in user/init.c; 42 is its only success value and
  * every other code is decoded at the call site. */
 #define LSEEK_WORKER_ROLE  55u
@@ -22556,6 +22799,138 @@ static void cmd_vfs_stress(void) {
         }
     }
 
+    /* ===== v0.89: CAS INDEX/BITMAP CONTENTION SOAK =========================
+     * See the header comment at CASC_ROLE for what this contends on and why the
+     * append phases above do not. ======================================== */
+    {
+        int nw = 2 * n;
+        if (nw > CASC_MAXW) nw = CASC_MAXW;
+        if (nw < 2) nw = 2;                    /* a uniprocessor still gets two */
+
+        uint64_t unref0, used0, gsum0, glive0, gtrack0;
+        uint64_t bumps0 = g_cas_gen_bumps, wraps0 = g_cas_gen_wraps;
+        uint64_t under0 = g_cas_ref_underflow, freed0 = g_cas_blocks_freed;
+        klock_acquire(&g_cas_lock);
+        unref0 = cas_unreferenced_locked();
+        cas_gen_verify_locked(&gsum0, &glive0, &gtrack0);
+        klock_release(&g_cas_lock);
+        used0 = SB->used_blocks;
+
+        int procs[CASC_MAXW]; int nsp = 0;
+        uint32_t ran_mask = 0;
+        uint64_t t_start = g_ticks;
+
+        for (int i = 0; i < nw; i++) {
+            int p = kproc_spawn("cascon", PCAP_FILESYSTEM);
+            if (p < 0) break;
+            kprocs[p].role     = (int)CASC_ROLE;
+            kprocs[p].affinity = 0;            /* free to migrate and to stack */
+            uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+            current_proc_idx = save;
+            if (!e) break;
+            kprocs[p].entry = e;
+            procs[nsp++] = p;
+        }
+        for (int i = 0; i < nsp; i++) {
+            rq_push(i % n, procs[i]);
+            __sync_synchronize();
+            if (n > 1) lapic_ipi(0, IPI_PING, 1);
+        }
+        vfscheck("cas-contend: every worker spawned and loaded", nsp == nw);
+
+        int drained = casc_drain(CASC_WATCH_FOR(nw));
+        current_proc_idx = save;
+        if (!drained)
+            kprintf("[vfsstrs] cas-contend WATCHDOG: %d worker(s) still live\n",
+                    (uint64_t)(int64_t)casc_live());
+        vfscheck("cas-contend: every worker reached a terminal state (no watchdog)", drained);
+
+        /* Deadline expiry counted apart from failure, per CLAUDE.md's ring-3
+         * convention: the deadline has its own exit code SO THAT a suite can
+         * decline to treat a slow host as a defect. The correctness assertions
+         * below are unchanged by it and remain fatal. */
+        int okc = 0, deadline = 0, failed = 0; int firstbad = -1;
+        for (int i = 0; i < nsp; i++) {
+            int ec = (int)kprocs[procs[i]].exit_code;
+            ran_mask |= kprocs[procs[i]].ran_on;
+            if (ec == CASC_OK)            okc++;
+            else if (ec == CASC_DEADLINE) deadline++;
+            else { failed++; if (firstbad < 0) firstbad = ec; }
+        }
+        int cores_used = 0;
+        for (int c = 0; c < MAX_CPUS; c++) if (ran_mask & (1u << c)) cores_used++;
+
+        uint64_t unref1, used1, gsum1, glive1, gtrack1;
+        klock_acquire(&g_cas_lock);
+        unref1 = cas_unreferenced_locked();
+        cas_gen_verify_locked(&gsum1, &glive1, &gtrack1);
+        uint64_t ilive, idang; cas_index_verify_locked(&ilive, &idang);
+        klock_release(&g_cas_lock);
+        used1 = SB->used_blocks;
+
+        const char *why =
+            firstbad == 1840 ? "could not create its file" :
+            firstbad == 1841 ? "*** the first write was short" :
+            firstbad == 1842 ? "*** the second write was short" :
+            firstbad == 1843 ? "could not close after writing" :
+            firstbad == 1844 ? "could not reopen the file it had just written" :
+            firstbad == 1845 ? "*** the read-back was the wrong LENGTH (writes are POSITIONAL "
+                               "since v0.83, so two writes make a 2 x payload file)" :
+            firstbad == 1846 ? "*** the FIRST payload read back wrong — the index handed back "
+                               "storage that is not what was stored, or the second write "
+                               "disturbed the first" :
+            firstbad == 1850 ? "*** the SECOND payload read back wrong" :
+            firstbad == 1847 ? "could not close after reading" :
+            firstbad == 1848 ? "*** unlink refused" :
+            firstbad <  0    ? "" : "an unrecognised code";
+
+        kprintf("[vfsstrs] cas-contend: %d worker(s) on %d core(s), %u iteration(s) each — "
+                "%d ok, %d deadline, %d failed%s%s; ran on %d core(s) (mask %x) in %u ticks\n",
+                (uint64_t)(int64_t)nsp, (uint64_t)(int64_t)n, (uint64_t)CASC_ITERS,
+                (uint64_t)(int64_t)okc, (uint64_t)(int64_t)deadline, (uint64_t)(int64_t)failed,
+                firstbad >= 0 ? " — first bad: " : "", why,
+                (uint64_t)(int64_t)cores_used, (uint64_t)ran_mask,
+                (uint64_t)(g_ticks - t_start));
+        kprintf("[vfsstrs] cas-contend: unreferenced %u -> %u, used_blocks %u -> %u, "
+                "gen bumps %u -> %u, frees %u -> %u, underflow %u -> %u, dangling %u\n",
+                unref0, unref1, used0, used1, bumps0, g_cas_gen_bumps,
+                freed0, g_cas_blocks_freed, under0, g_cas_ref_underflow, idang);
+
+        vfscheck("cas-contend: no worker FAILED (deadline expiry is counted separately and "
+                 "tolerated — a slow host must never be decoded as a defect; a worker that "
+                 "actually lost or corrupted a block exits on its own code and is caught here)",
+                 failed == 0);
+        vfscheck("cas-contend: the soak actually DID WORK — at least one worker completed every "
+                 "iteration (all-deadline would leave every count below true of nothing)",
+                 okc > 0);
+        vfscheck("cas-contend: the CAS free path RAN during the soak (blocks freed advanced; "
+                 "without this the reclamation equalities below hold trivially)",
+                 g_cas_blocks_freed > freed0);
+        vfscheck("cas-contend: allocated-but-unreferenced blocks return to EXACTLY their "
+                 "pre-soak value — not 'no worse than'. One leaked block per create/unlink "
+                 "cycle is invisible for a long time and then is not",
+                 unref1 == unref0);
+        vfscheck("cas-contend: used_blocks returns to EXACTLY its pre-soak value (every block "
+                 "the soak allocated came back)", used1 == used0);
+        vfscheck("cas-contend: no index entry names a block the bitmap calls free after "
+                 "concurrent index churn from every core", idang == 0 && ilive > 0);
+        vfscheck("cas-contend: the reference count never underflowed — nothing released a block "
+                 "twice under contention", g_cas_ref_underflow == under0);
+        vfscheck("cas-contend: the generation table stayed in step with the frees it records "
+                 "(sum(gen) + wraps accounts for every bump; a free path that returned a block "
+                 "without bumping would break this)",
+                 (gsum1 + g_cas_gen_wraps) == (gsum0 + wraps0) + (g_cas_gen_bumps - bumps0));
+        vfscheck("cas-contend: no block is referenced while the bitmap calls it free",
+                 glive1 == 0);
+        if (n > 1)
+            vfscheck("cas-contend: the workers RAN ON MORE THAN ONE CORE — without this the "
+                     "phase is a single-threaded test reporting a concurrency result",
+                     cores_used > 1);
+        else
+            kputs("[vfsstrs] cas-contend: one core online, so this boot measures correctness "
+                  "without contention — the multi-core premise is asserted only where n > 1\n");
+    }
+
     /* ===== v0.86: THE JOURNAL COMMIT IS PREEMPTIBLE ========================
      *
      * Closes the second half of the v0.85 oversubscription gap: "nothing tests a
@@ -22848,6 +23223,126 @@ static void cmd_vfs_stress(void) {
                "a later put would dedup to it and hand back storage since reallocated)",
                idang == 0);
     }
+
+    /* ===== v0.89: CROSS-REBOOT CAS-JOURNAL RECOVERY ========================
+     *
+     * The dirty-volume half of this milestone. `cascrashwrite` (manual, at the
+     * prompt, on an EARLIER boot) leaves a PENDING CAS metadata journal and
+     * halts without flushing the home bitmap or superblock. This is the boot
+     * that judges what a completely separate QEMU process left behind.
+     *
+     * ON A FRESH VOLUME THIS PHASE ASSERTS NOTHING and says so. That is not a
+     * silent skip: the marker's absence is printed, and it is the correct
+     * outcome for the four fresh-image tiers, which is why their assertion
+     * counts are unchanged by this. The dirty gate is where it has teeth, and
+     * tools/gate-dirty.sh fails the run if the VERIFIED line is missing from a
+     * boot that should have had one.
+     *
+     * WHAT IS ASSERTED, precisely, rather than "the file came back":
+     *
+     *   1. the marker's content is in the index at all
+     *   2. the block it names is ALLOCATED in the bitmap. This is the assertion
+     *      the whole design serves: at the halt the home bitmap said FREE, and
+     *      only recovery can have changed that. -DCAS_NORECOVER_REPRO makes this
+     *      one go red.
+     *   3. the block reads back byte-for-byte, all 512 of them
+     *   4. the volume-wide index/bitmap agreement holds (dangling == 0), so the
+     *      repair did not fix this entry by breaking another
+     *   5. used_blocks still equals the bitmap's popcount — the superblock
+     *      shadow was replayed too, not just the bitmap block
+     *
+     * Check 5 is worth stating because it is the one the arithmetic audit
+     * elsewhere ALSO makes, and it passes for a different reason here: those
+     * halves came off the disk from two different shadow blocks rather than
+     * from one live snapshot. ==================================================== */
+    {
+        static uint8_t cr_want[CAS_BS], cr_got[CAS_BS];
+        cascrash_payload(cr_want);
+        uint64_t crh = rust_cas_hash((uint64_t)cr_want, CAS_BS);
+
+        int64_t crb; uint64_t crlive, crdang, crpop = 0;
+        klock_acquire(&g_cas_lock);
+        crb = cas_index_find(crh, 0);
+        cas_index_verify_locked(&crlive, &crdang);
+        for (uint64_t b = 0; b < SB->total_blocks; b++) if (bm_get(b)) crpop++;
+        int cralloc = (crb >= 0) ? bm_get((uint64_t)crb) : 0;
+        klock_release(&g_cas_lock);
+
+        if (crb < 0) {
+            kprintf("[vfsstrs] cas cross-reboot: marker NOT on this volume — no prior boot ran "
+                    "`cascrashwrite`. Nothing asserted (recover calls %u, replays %u)\n",
+                    g_cas_recover_calls, g_cas_recover_replays);
+        } else {
+            int64_t crn = cas_get(crh, cr_got, sizeof cr_got);
+            int crbytes = (crn == (int64_t)CAS_BS);
+            for (uint32_t i = 0; i < CAS_BS && crbytes; i++)
+                if (cr_got[i] != cr_want[i]) crbytes = 0;
+
+            kprintf("[vfsstrs] cas cross-reboot: marker at block %d, bitmap says %s, %u/%u byte(s) "
+                    "exact, dangling %u, used_blocks %u vs popcount %u (recover calls %u, "
+                    "replays %u, boot-time CPUs online %d)\n",
+                    crb, cralloc ? "ALLOCATED" : "*** FREE ***",
+                    (uint64_t)(crn < 0 ? 0 : crn), (uint64_t)CAS_BS, crdang,
+                    SB->used_blocks, crpop, g_cas_recover_calls, g_cas_recover_replays,
+                    (uint64_t)(int64_t)g_cas_recover_boot_cpu);
+
+            vfscheck("cas cross-reboot: a PRIOR boot's interrupted CAS transaction left its index "
+                     "entry on the volume (the marker is present at all)", crb >= 0);
+            vfscheck("cas cross-reboot: the block that entry names is ALLOCATED after recovery — "
+                     "at the halt the home bitmap said FREE, so only cas_journal_recover() can "
+                     "have reconciled them", cralloc == 1);
+            vfscheck("cas cross-reboot: the recovered block reads back all 512 bytes exactly (a "
+                     "volume that comes back describing content it cannot produce is worse than "
+                     "one that lost the transaction)", crbytes);
+            vfscheck("cas cross-reboot: volume-wide index/bitmap agreement holds after the repair "
+                     "(dangling == 0 — the replay did not fix this entry by breaking another)",
+                     crdang == 0 && crlive > 0);
+            vfscheck("cas cross-reboot: used_blocks still equals the bitmap popcount, so the "
+                     "SUPERBLOCK shadow was replayed too and not only the bitmap block",
+                     SB->used_blocks == crpop);
+            kputs("[vfsstrs] cas cross-reboot: VERIFIED\n");
+        }
+    }
+
+    /* v0.89: RECOVERY CANNOT RACE AN AP, and here is the state that says so.
+     *
+     * The requirement was phrased as "recovery must run inside an IRQ-guarded
+     * critical section". It does not, and it should not: v0.86 MEASURED that
+     * journal commits already run with interrupts enabled, and the standing
+     * ruling in this tree is that masking interrupts across a path the timer ISR
+     * can reach buys a TRUNCATED boot and no verdict rather than safety.
+     *
+     * The property actually wanted — no AP can be executing while the log is
+     * replayed — holds here by boot ORDERING: kernel_main calls cmd_cas(), and
+     * therefore the boot mount and its recovery, BEFORE it calls smp_init().
+     * There is no AP to race because no AP has been started.
+     *
+     * That is an argument about two calls forty lines apart, so it is measured
+     * instead: g_cas_recover_boot_cpu is g_ncpu_online sampled INSIDE
+     * cas_journal_recover() on its first call of the boot. If someone moves
+     * smp_init() above cmd_cas(), this goes red and names the reason. */
+    kprintf("[vfsstrs] cas recovery context: %u recover call(s), %u replay(s) of which %u ran "
+            "pre-SMP; CPUs online at the boot MOUNT = %d, at the first pre-SMP replay = %d, "
+            "highest at any replay = %d (this boot has %d online now)\n",
+            g_cas_recover_calls, g_cas_recover_replays, g_cas_recover_boot_repl,
+            (uint64_t)(int64_t)g_cas_mount_boot_cpu, (uint64_t)(int64_t)g_cas_recover_boot_cpu,
+            (uint64_t)(int64_t)g_cas_recover_max_cpu, (uint64_t)(int64_t)g_ncpu_online);
+
+    vfscheck("a boot-time CAS mount happened at all (without it the CPU-count claim below is a "
+             "statement about an event that never occurred)",
+             g_cas_mount_boot_cpu >= 0);
+    vfscheck("the BOOT-time CAS mount ran with exactly ONE CPU online — no AP can race it or the "
+             "journal replay it performs, because kernel_main calls cmd_cas() before smp_init() "
+             "(boot ordering, not interrupt masking; see the note at cas_journal_recover)",
+             g_cas_mount_boot_cpu == 1);
+    if (g_cas_recover_boot_repl > 0)
+        vfscheck("the boot-time journal REPLAY itself also ran pre-SMP with one CPU online (only "
+                 "assertable on a volume that actually had a pending transaction to replay)",
+                 g_cas_recover_boot_cpu == 1);
+    else
+        kputs("[vfsstrs] cas recovery context: no PRE-SMP replay on this volume — nothing was "
+              "pending at the boot mount, which is the normal state of a fresh image. The "
+              "replay-side claim is asserted on the dirty gate, not here\n");
 
     vfscheck("the tmp ownership rule was exercised this boot (permission decisions > 0; "
              "zero would make every tmp permission claim below INCONCLUSIVE)",
@@ -31234,6 +31729,40 @@ static void shell_exec(char *line) {
         static const uint8_t crashpat2[24] = "CROSS-REBOOT-JOURNAL-OK";
         vfs_write_file("vfs-reboot-test", crashpat2, sizeof crashpat2);
         kputs("[vfs    ] vfscrashwrite: journal-committed 'vfs-reboot-test', halting WITHOUT sync (simulated power loss)\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    else if (!kstrcmp(argv[0], "cascrashwrite")) {
+        /* v0.89: BOTH journals left dirty by one power cut, in the order that
+         * lets both survive.
+         *
+         * The VFS marker goes FIRST and the CAS transaction SECOND, and the
+         * order is load-bearing rather than tidy: vfs_write_file() stores its
+         * content through cas_put(), which runs a COMPLETE metadata transaction
+         * — journal write, home writes, journal CLEAR. Staging the CAS crash
+         * first and then writing the file would erase the pending CAS journal
+         * with the file's own completed one, and the next boot would find
+         * nothing to recover while every line here still claimed it had staged
+         * something. Done the other way round, the file's transaction completes
+         * and closes, then ours is left open.
+         *
+         * At the halt the volume therefore carries a PENDING vjournal (the
+         * dirent, never synced) and a PENDING cjournal (this transaction, never
+         * flushed). One reboot exercises both recovery paths.
+         *
+         * This supersedes `vfscrashwrite` for the dirty gate, which now types
+         * this instead; vfscrashwrite is kept for interactive use and because
+         * a fixture that has been green for forty milestones is not something to
+         * delete on the way past. */
+        static const uint8_t crashpat3[24] = "CROSS-REBOOT-JOURNAL-OK";
+        vfs_write_file("vfs-reboot-test", crashpat3, sizeof crashpat3);
+        int64_t cb = cas_crash_stage();
+        if (cb < 0)
+            kputs("[cas    ] cascrashwrite: CAS transaction NOT staged (already present on this "
+                  "volume, or no free block) — the VFS half is still armed\n");
+        else
+            kprintf("[cas    ] cascrashwrite: staged an INTERRUPTED put of block %d — cjournal "
+                    "PENDING, home bitmap and superblock NOT flushed\n", (uint64_t)cb);
+        kputs("[vfs    ] cascrashwrite: journal-committed 'vfs-reboot-test', halting WITHOUT sync (simulated power loss)\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
     else if (!kstrcmp(argv[0], "mem"))    multiboot_scan(g_mb_info, true);
