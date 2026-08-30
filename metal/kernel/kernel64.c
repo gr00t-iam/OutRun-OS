@@ -5129,10 +5129,11 @@ struct cas_superblock {
     uint64_t put_count, dedup_hits;
     uint64_t dir_start, dir_blocks;    /* VFS directory region (v2)             */
     /* v0.48 (version 3): WAL journal regions. A version-2 on-disk superblock  */
-    /* never wrote these bytes (cas_format zeroed the whole 512B sector first, */
-    /* so they read back as zero) — cas_mount() gates ALL journal activity on */
-    /* SB->version == 3, so a version-2 volume is mounted in legacy            */
-    /* compatibility mode instead of trusting these fields. See cas_mount().   */
+    /* never wrote these bytes, so they read back as zero — which is why v0.48 */
+    /* mounted such a volume in a legacy, journal-inactive mode rather than    */
+    /* trusting these fields. v0.56 stopped mounting anything but version 5    */
+    /* outright, and v0.88 removed the legacy mode's remains: these fields are */
+    /* now always meaningful on any volume this kernel will mount.             */
     uint64_t vjournal_start, vjournal_blocks;   /* VFS-directory journal        */
     uint64_t cjournal_start, cjournal_blocks;   /* CAS-metadata journal          */
     /* v0.57 (version 5): a RESERVED RAW-BLOCK SCRATCH REGION.
@@ -5291,7 +5292,9 @@ static uint8_t g_bitmap[8192] __attribute__((aligned(512)));           /* up to 
 static uint8_t g_idxbuf[512]  __attribute__((aligned(512)));
 static uint8_t g_blk[512]     __attribute__((aligned(512)));
 static int     g_cas_mounted = 0;
-static int     g_cas_legacy  = 0;      /* v0.48: mounted a pre-journal (version 2) volume */
+/* v0.48's g_cas_legacy ("mounted a pre-journal version-2 volume") is gone as of
+ * v0.88. v0.56 stopped mounting anything but version 5, which left it a
+ * compile-time zero with ten unreachable branches hanging off it. See cas_mount. */
 #define SB ((struct cas_superblock *)g_sbblk)
 
 static uint64_t cas_scratch_base(uint64_t fallback) {
@@ -5345,7 +5348,8 @@ static uint64_t cas_scratch_base(uint64_t fallback) {
 #define VFS_CHUNKS_MAX  (VFS_CHUNKS_L1 + VFS_IND_PER_BLK * VFS_IND_PER_BLK) /* 4176 */
 #define VFS_MAX_FILE_BYTES (256u * 1024u)     /* staging-buffer ceiling: 512 chunks    */
 /* v0.48: the ACTUAL number of 512B blocks needed to hold VFS_MAXFILES 256-byte
- * dirents — cas_format()/vfs_flush()/cas_mount() used to hardcode "8", which
+ * dirents — cas_format()/vfs_flush()/cas_mount() used to hardcode "8" (vfs_flush
+ * was removed in v0.88 with the legacy mount mode; see cas_mount), which
  * was only ever correct for the original VFS_MAXFILES==16 (8*512/256==16).
  * Every bump since (v0.43/46/47/48) silently left the new dirent slots
  * memory-only: never persisted to disk, never restored across a mount. See
@@ -5535,8 +5539,9 @@ static uint64_t g_cas_ref_underflow = 0;
  * directory already calls.
  *
  * WHAT IT COUNTS: how many times a block has been RETURNED TO THE POOL this
- * boot. One bump per completed free, at the single point where both the
- * journaled and the legacy branch converge.
+ * boot. One bump per completed free, at the single point every free path
+ * reaches. (Until v0.88 that was phrased as "where the journaled and the legacy
+ * branch converge"; there is no legacy branch any more.)
  *
  * WHAT IT IS FOR. Two invariants that the refcounts alone cannot state:
  *
@@ -5907,59 +5912,54 @@ static uint64_t cas_put(const void *data, uint32_t len) {
     virtio_write_block((uint64_t)b, g_blk);
     int64_t idx_sec = cas_index_stage(h, (uint32_t)b, len);
     if (idx_sec >= 0) {
-        if (!g_cas_legacy) {
-            uint64_t bitmap_blk = SB->bitmap_start + ((uint64_t)b >> 3) / CAS_BS;
+        uint64_t bitmap_blk = SB->bitmap_start + ((uint64_t)b >> 3) / CAS_BS;
 #ifndef CAS_PUT_NOJOURNAL_REPRO
-            cas_journal_write((uint64_t)idx_sec, bitmap_blk);
+        cas_journal_write((uint64_t)idx_sec, bitmap_blk);
 #else
-            /* v0.88 REPRODUCER, opt-in (`make EXTRA=-DCAS_PUT_NOJOURNAL_REPRO`)
-             * and never in a release build: perform the put WITHOUT its metadata
-             * journal, which is the exact pre-v0.48 sequence the journal was
-             * introduced to close — home index write, then bitmap and superblock,
-             * with no shadow in between.
-             *
-             * This is not a contrived reordering. It is the shipped code of an
-             * earlier kernel, and the hazard it produces is the one written down
-             * in the CAS-journal header comment above: a crash between the two
-             * writes leaves the index naming a block the bitmap calls free.
-             *
-             * The v0.88 put-crash assertions must go RED on this build. If they
-             * stay green, they are not measuring the journal — they are
-             * measuring something that happens to be true either way, which is
-             * how Carryover 3's harness reported 12/12 against a deliberately
-             * broken kernel for a whole session. */
-            (void)bitmap_blk;
+        /* v0.88 REPRODUCER, opt-in (`make EXTRA=-DCAS_PUT_NOJOURNAL_REPRO`)
+         * and never in a release build: perform the put WITHOUT its metadata
+         * journal, which is the exact pre-v0.48 sequence the journal was
+         * introduced to close — home index write, then bitmap and superblock,
+         * with no shadow in between.
+         *
+         * This is not a contrived reordering. It is the shipped code of an
+         * earlier kernel, and the hazard it produces is the one written down
+         * in the CAS-journal header comment above: a crash between the two
+         * writes leaves the index naming a block the bitmap calls free.
+         *
+         * The v0.88 put-crash assertions must go RED on this build. If they
+         * stay green, they are not measuring the journal — they are
+         * measuring something that happens to be true either way, which is
+         * how Carryover 3's harness reported 12/12 against a deliberately
+         * broken kernel for a whole session. */
+        (void)bitmap_blk;
 #endif
-            virtio_write_block((uint64_t)idx_sec, g_idxbuf);   /* home index write   */
+        virtio_write_block((uint64_t)idx_sec, g_idxbuf);   /* home index write   */
 #ifdef CRASH_INJECT_COMMIT_FAIL
-            /* v0.88: POWER LOSS HERE, at the mirror of the free arm's window.
-             * The journal is PENDING and the index entry has reached its home
-             * block; the bitmap and superblock have not been flushed. Returning
-             * without clearing the journal is what a crash leaves behind.
-             *
-             * The hash is returned as if the put had completed, which is a lie
-             * the CALLER never gets to act on in practice — the harness calls
-             * cas_put directly and remounts immediately, so nothing builds a map
-             * from it. Returning 0 instead would be a different lie (a full
-             * volume) and would exercise the caller's error path rather than
-             * recovery, which is not what is under test. */
-            if (g_cjp_arm) {
-                g_cjp_arm = 0;
-                g_cjp_fired++;
-                kprintf("[cas    ] CRASH INJECT: put of block %d TRUNCATED after the home "
-                        "index write and BEFORE the bitmap flush\n", (uint64_t)b);
-                klock_release(&g_cas_lock);
-                return h;
-            }
-#endif
-            cas_flush_meta();                                  /* home sb+bitmap write */
-#ifndef CAS_PUT_NOJOURNAL_REPRO
-            cas_journal_clear();
-#endif
-        } else {
-            virtio_write_block((uint64_t)idx_sec, g_idxbuf);
-            cas_flush_meta();
+        /* v0.88: POWER LOSS HERE, at the mirror of the free arm's window.
+         * The journal is PENDING and the index entry has reached its home
+         * block; the bitmap and superblock have not been flushed. Returning
+         * without clearing the journal is what a crash leaves behind.
+         *
+         * The hash is returned as if the put had completed, which is a lie
+         * the CALLER never gets to act on in practice — the harness calls
+         * cas_put directly and remounts immediately, so nothing builds a map
+         * from it. Returning 0 instead would be a different lie (a full
+         * volume) and would exercise the caller's error path rather than
+         * recovery, which is not what is under test. */
+        if (g_cjp_arm) {
+            g_cjp_arm = 0;
+            g_cjp_fired++;
+            kprintf("[cas    ] CRASH INJECT: put of block %d TRUNCATED after the home "
+                    "index write and BEFORE the bitmap flush\n", (uint64_t)b);
+            klock_release(&g_cas_lock);
+            return h;
         }
+#endif
+        cas_flush_meta();                                  /* home sb+bitmap write */
+#ifndef CAS_PUT_NOJOURNAL_REPRO
+        cas_journal_clear();
+#endif
     } else {
         /* v0.56: block `b` is now UNREACHABLE. Either the index is full (-1) or
          * another put indexed this same hash while we were writing (-2); in
@@ -6065,72 +6065,68 @@ static int cas_free(uint64_t hash) {
 
     int64_t sec = cas_index_remove(hash);
     if (sec < 0) { klock_release(&g_cas_lock); return -1; }
-    if (!g_cas_legacy) {
-        uint64_t bitmap_blk = SB->bitmap_start + ((uint64_t)b >> 3) / CAS_BS;
-        /* v0.85: THE BITMAP IS CLEARED BEFORE THE JOURNAL IS WRITTEN, and the
-         * order is the whole fix.
-         *
-         * cas_journal_write() snapshots g_sbblk, the live bitmap block and
-         * g_idxbuf. cas_put has always called bm_alloc() BEFORE it, so all
-         * three of its shadows describe the same post-transaction state. This
-         * function called bm_free() AFTER it, so its index shadow was
-         * post-free while its bitmap and superblock shadows were PRE-free.
-         *
-         * Replaying that pair marks the block allocated with no index entry
-         * naming it: unreachable, and unfreeable for the life of the volume.
-         * Nothing noticed, because the standing `used_blocks ==
-         * popcount(bitmap)` audit passes -- both halves come from the same
-         * snapshot and agree with each other. Measured before the fix: one
-         * interrupted free took allocated-but-unreferenced blocks from 4 to 5
-         * while used_blocks did not move.
-         *
-         * With the clear moved above the journal write, an interrupted free
-         * replays a consistent freed state instead. */
+    uint64_t bitmap_blk = SB->bitmap_start + ((uint64_t)b >> 3) / CAS_BS;
+    /* v0.85: THE BITMAP IS CLEARED BEFORE THE JOURNAL IS WRITTEN, and the
+     * order is the whole fix.
+     *
+     * cas_journal_write() snapshots g_sbblk, the live bitmap block and
+     * g_idxbuf. cas_put has always called bm_alloc() BEFORE it, so all
+     * three of its shadows describe the same post-transaction state. This
+     * function called bm_free() AFTER it, so its index shadow was
+     * post-free while its bitmap and superblock shadows were PRE-free.
+     *
+     * Replaying that pair marks the block allocated with no index entry
+     * naming it: unreachable, and unfreeable for the life of the volume.
+     * Nothing noticed, because the standing `used_blocks ==
+     * popcount(bitmap)` audit passes -- both halves come from the same
+     * snapshot and agree with each other. Measured before the fix: one
+     * interrupted free took allocated-but-unreferenced blocks from 4 to 5
+     * while used_blocks did not move.
+     *
+     * With the clear moved above the journal write, an interrupted free
+     * replays a consistent freed state instead. */
 #ifndef CAS_FREE_ORDER_REPRO
-        bm_free((uint64_t)b);
+    bm_free((uint64_t)b);
 #endif
-        cas_journal_write((uint64_t)sec, bitmap_blk);
-        virtio_write_block((uint64_t)sec, g_idxbuf);       /* index entry gone first */
+    cas_journal_write((uint64_t)sec, bitmap_blk);
+    virtio_write_block((uint64_t)sec, g_idxbuf);       /* index entry gone first */
 #ifdef CRASH_INJECT_COMMIT_FAIL
-        /* v0.85: POWER LOSS HERE. The journal is PENDING and the index entry has
-         * reached its home block; the bitmap and superblock have not been
-         * flushed. Returning without clearing the journal is exactly what a
-         * crash leaves behind, and the next mount replays whatever
-         * cas_journal_write happened to capture.
-         *
-         * That capture is the thing under test. cas_put calls bm_alloc BEFORE
-         * cas_journal_write, so all three of its shadows are post-mutation and
-         * agree. cas_free called bm_free AFTER, so its bitmap and superblock
-         * shadows are PRE-free while its index shadow is post-free -- replaying
-         * that pair marks the block allocated with no index entry naming it,
-         * and it can never be found or freed again. */
-        if (g_cjf_arm) {
-            g_cjf_arm = 0;
-            g_cjf_fired++;
-            kprintf("[cas    ] CRASH INJECT: free of block %d TRUNCATED after the journal "
-                    "write and BEFORE the bitmap flush\n", (uint64_t)b);
-            klock_release(&g_cas_lock);
-            return 1;
-        }
+    /* v0.85: POWER LOSS HERE. The journal is PENDING and the index entry has
+     * reached its home block; the bitmap and superblock have not been
+     * flushed. Returning without clearing the journal is exactly what a
+     * crash leaves behind, and the next mount replays whatever
+     * cas_journal_write happened to capture.
+     *
+     * That capture is the thing under test. cas_put calls bm_alloc BEFORE
+     * cas_journal_write, so all three of its shadows are post-mutation and
+     * agree. cas_free called bm_free AFTER, so its bitmap and superblock
+     * shadows are PRE-free while its index shadow is post-free -- replaying
+     * that pair marks the block allocated with no index entry naming it,
+     * and it can never be found or freed again. */
+    if (g_cjf_arm) {
+        g_cjf_arm = 0;
+        g_cjf_fired++;
+        kprintf("[cas    ] CRASH INJECT: free of block %d TRUNCATED after the journal "
+                "write and BEFORE the bitmap flush\n", (uint64_t)b);
+        klock_release(&g_cas_lock);
+        return 1;
+    }
 #endif
 #ifdef CAS_FREE_ORDER_REPRO
-        /* v0.85 REPRODUCER, opt-in (`make EXTRA=-DCAS_FREE_ORDER_REPRO`) and
-         * never in a release build: clear the bitmap AFTER the journal write,
-         * the pre-v0.85 order. The crash harness must go red on this build; if
-         * it does not, the assertion is not measuring the ordering. */
-        bm_free((uint64_t)b);
+    /* v0.85 REPRODUCER, opt-in (`make EXTRA=-DCAS_FREE_ORDER_REPRO`) and
+     * never in a release build: clear the bitmap AFTER the journal write,
+     * the pre-v0.85 order. The crash harness must go red on this build; if
+     * it does not, the assertion is not measuring the ordering. */
+    bm_free((uint64_t)b);
 #endif
-        cas_flush_meta();
-        cas_journal_clear();
-    } else {
-        virtio_write_block((uint64_t)sec, g_idxbuf);
-        bm_free((uint64_t)b);
-        cas_flush_meta();
-    }
-    /* v0.86: ONE bump per completed free, here because this is where the
-     * journaled and legacy branches converge -- putting it beside either
-     * bm_free would miss the other, and putting it earlier would count
-     * frees that cas_index_remove refused. */
+    cas_flush_meta();
+    cas_journal_clear();
+    /* v0.86: ONE bump per completed free, placed after the transaction rather
+     * than beside bm_free -- putting it earlier would count frees that
+     * cas_index_remove refused.
+     *
+     * v0.88: this used to say "where the journaled and legacy branches
+     * converge". There is only one branch now; see cas_mount. */
 #ifndef CAS_GEN_FALSIFY
     cas_gen_bump((uint64_t)b);
 #else
@@ -6236,7 +6232,6 @@ static void cas_format(void) {
     for (uint64_t i = 0; i < SB->cjournal_blocks; i++) virtio_write_block(SB->cjournal_start + i, g_idxbuf);
     cas_flush_meta();
     g_cas_mounted = 1;
-    g_cas_legacy = 0;
     kprintf("[cas    ] formatted %d blocks: bitmap@%d(%d) index@%d(%d) dir@%d(%d) vjrnl@%d(%d) cjrnl@%d(%d) data@%d\n",
             SB->total_blocks, SB->bitmap_start, SB->bitmap_blocks,
             SB->index_start, SB->index_blocks, SB->dir_start, SB->dir_blocks,
@@ -6265,26 +6260,33 @@ static int cas_mount(void) {
      * lengths and the first flush would write that garbage back. Refusing the
      * mount makes cas_format run instead, which is the honest outcome. */
     if (cmemcmp(SB->magic, mg, 8) != 0 || SB->version != 5) return 0;
-    /* v0.48: a version-2 volume predates both the dir_blocks fix and the        */
-    /* journal regions — its on-disk bytes past dir_blocks/8 are DATA blocks,    */
-    /* not journal headers, so trusting SB->vjournal_start/cjournal_start here   */
-    /* would read (and later write!) garbage. Mount it read/write-compatible in  */
-    /* a legacy mode instead: same 8-block dir clamp this kernel always used,    */
-    /* journaling simply inactive until the volume is reformatted.               */
-    g_cas_legacy = 0;                  /* v0.56: pre-v4 volumes no longer mount at all */
-    if (!g_cas_legacy) {
-        cas_journal_recover();
-        virtio_read_block(0, g_sbblk);      /* recovery may have rewritten the superblock */
-    }
+    /* v0.88: THERE IS NO LEGACY MODE, and the history is worth keeping because
+     * the dead code that used to express it survived two milestones past the
+     * change that killed it.
+     *
+     * v0.48 mounted a version-2 volume in a "legacy" mode — journaling inactive,
+     * the old 8-block directory clamp — because such a volume's bytes past
+     * dir_blocks/8 are DATA blocks rather than journal headers, and trusting
+     * SB->vjournal_start on one would read (and then write) garbage. `g_cas_legacy`
+     * carried that state.
+     *
+     * v0.56 made the version check above refuse anything but version 5 outright,
+     * which is the honest outcome: cas_format() runs instead. From that moment
+     * `g_cas_legacy` could only ever hold 0 — thirteen references and ten
+     * branches on a compile-time constant — and every "legacy" arm below it was
+     * unreachable. v0.88's §2 audit found it while looking for a branch to
+     * crash-test, and removed it: a branch nothing enters is the mirror of a
+     * counter nothing increments, and this tree has been misled by both. */
+    cas_journal_recover();
+    virtio_read_block(0, g_sbblk);          /* recovery may have rewritten the superblock */
     for (uint64_t i = 0; i < SB->bitmap_blocks; i++)
         virtio_read_block(SB->bitmap_start + i, g_bitmap + i * CAS_BS);
-    if (!g_cas_legacy) vfs_journal_apply();  /* replay any pending directory commit before load */
-    uint64_t dirlim = g_cas_legacy ? 8 : VFS_DIR_BLOCKS;
-    for (uint64_t i = 0; i < SB->dir_blocks && i < dirlim; i++)
+    vfs_journal_apply();                    /* replay any pending directory commit before load */
+    for (uint64_t i = 0; i < SB->dir_blocks && i < VFS_DIR_BLOCKS; i++)
         virtio_read_block(SB->dir_start + i, g_dir + i * CAS_BS);
     g_cas_mounted = 1;
-    kprintf("[cas    ] mounted existing volume (v%d%s): %d/%d blocks used, %d puts, %d dedup hits\n",
-            SB->version, g_cas_legacy ? ", legacy/no-journal" : "",
+    kprintf("[cas    ] mounted existing volume (v%d): %d/%d blocks used, %d puts, %d dedup hits\n",
+            SB->version,
             SB->used_blocks, SB->total_blocks, SB->put_count, SB->dedup_hits);
     /* v0.84: the directory is loaded and recovered by here, so this is the first
      * moment the reference counts CAN be derived — and it must happen before any
@@ -6307,14 +6309,17 @@ static int streq_n(const char *a, const char *b, int n) {
     for (int i = 0; i < n; i++) { if (a[i] != b[i]) return 0; if (!a[i]) return 1; }
     return 1;
 }
-/* v0.48: legacy-only direct flush — a version-2 (pre-journal) volume has no
- * journal region to defer into, so it keeps writing dir_start straight away,
- * exactly like every version before this one. Non-legacy volumes never call
- * this; they go through vfs_journal_commit()/vfs_journal_apply() instead.    */
-static void vfs_flush(void) {
-    for (uint64_t i = 0; i < SB->dir_blocks && i < 8; i++)
-        virtio_write_block(SB->dir_start + i, g_dir + i * CAS_BS);
-}
+/* v0.88: vfs_flush() lived here and is gone with g_cas_legacy. It was the
+ * "legacy-only direct flush" — a version-2 volume has no journal region to
+ * defer into, so it wrote dir_start straight away — and its only three callers
+ * were the legacy arms of the two journal commit functions and
+ * vfs_journal_apply(). With those removed it had no caller at all, which the
+ * compiler says out loud (-Wunused-function) rather than leaving to a reader.
+ *
+ * It would also have been WRONG to keep as a general-purpose flush: its loop
+ * clamps at 8 directory blocks, the pre-v0.48 bound, and this kernel's
+ * directory is VFS_DIR_BLOCKS long. Every path that writes the directory today
+ * goes through vfs_journal_commit_idx()/vfs_journal_commit_multi(). */
 static int vfs_find(const char *name) {
     for (int i = 0; i < VFS_MAXFILES; i++)
         if (DENTS[i].used && streq_n(DENTS[i].name, name, VFS_NAME_MAX)) return i;
@@ -7280,7 +7285,6 @@ static void vj_publish(void) {
  * removed, i.e. two live dirents carrying the same name. Staging both before
  * publishing either is what removes that window. */
 static void vfs_journal_commit_multi(int idx1, int idx2) {
-    if (g_cas_legacy) { vfs_flush(); return; }
     if (!g_vj_init) vj_reset_slots();
     uint64_t nblk = SB->dir_blocks < VFS_DIR_BLOCKS ? SB->dir_blocks : VFS_DIR_BLOCKS;
 
@@ -7302,7 +7306,6 @@ static void vfs_journal_commit_multi(int idx1, int idx2) {
 }
 
 static void vfs_journal_commit_idx(int idx) {
-    if (g_cas_legacy) { vfs_flush(); return; }             /* no journal region to use */
     if (!g_vj_init) vj_reset_slots();
     uint64_t nblk = SB->dir_blocks < VFS_DIR_BLOCKS ? SB->dir_blocks : VFS_DIR_BLOCKS;
 
@@ -7326,7 +7329,6 @@ static void vfs_journal_commit_idx(int idx) {
  * it actually applied a pending commit, 0 otherwise.                        */
 static int g_vfs_last_sync_applied = 0;   /* diagnostic only, read by cmd_vfs_stress */
 static void vfs_journal_apply(void) {
-    if (g_cas_legacy) { g_vfs_last_sync_applied = 0; return; }
     uint8_t hdrblk[CAS_BS]; virtio_read_block(SB->vjournal_start + 0, hdrblk);
     struct vjournal_header *h = (struct vjournal_header *)hdrblk;
     const char mg2[8] = { 'V','J','R','N','L','0','0','2' };
@@ -21590,7 +21592,7 @@ static void cmd_vfs_stress(void) {
     vfs_write_file("vfs-crash-test", crashpat, sizeof crashpat);   /* commits journal PENDING; dir_start left stale */
     int idx = vfs_find("vfs-crash-test");
     int deferred_ok = 0, recovered_ok = 0, reload_ok = 0;
-    if (idx >= 0 && !g_cas_legacy) {
+    if (idx >= 0) {
         uint64_t blk = SB->dir_start + (uint64_t)idx / 2;
         uint32_t off = (uint32_t)(idx % 2) * 256;
         uint8_t raw[512]; virtio_read_block(blk, raw);
