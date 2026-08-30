@@ -4,8 +4,15 @@ Opened at `worktree-v087-init`, based on `main` at `bb4620c` (the v0.86.0 tag).
 `VERSION` is `0.87.0-dev` and `KERNEL_VERSION` is `"0.87.0-dev"`; both move to
 `0.87.0` / `0.87.0-metal` as step 1 of the Release Protocol, and not before.
 
-**The v0.87.0 tag does not exist yet.** Nothing in this document is a released
-claim.
+**Status: SEALED at `VERSION := 0.87.0` / `KERNEL_VERSION "0.87.0-metal"`,
+committed before any tag as step 1 of the Release Protocol requires.**
+
+**The v0.87.0 tag does not exist yet, and no release ISO has been built or
+`release-verify`'d.** Steps 2-4 of the Release Protocol — clean-tree
+`make release-iso`, a boot of the exact published image, and the checksums
+recorded beside the tag — have NOT been performed. This document is a sealed
+development state, not a released artefact, and nothing in it should be cited as
+one.
 
 ---
 
@@ -369,12 +376,48 @@ git worktree prune
 git branch -d V0.86
 ```
 
-**Left in place deliberately.** This cycle did not create it, and removing
-another session's or another person's worktree is not a decision to take
-silently — the state above is recorded so the removal is a one-line
-confirmation rather than an investigation. If it is still present at the v0.87
-release, this entry should be revisited rather than copied forward again: a
-carried item that is only ever carried is a habit, not a record.
+**Left in place deliberately at the time**, because this cycle did not create it
+and removing another session's worktree is not a decision to take silently. The
+state above was recorded so the removal would be a one-line confirmation rather
+than an investigation.
+
+#### Outcome — removed
+
+`git worktree remove --force .worktrees/v0-86` and `git branch -d V0.86`, run on
+confirmation. The target was re-verified clean immediately before the forced
+removal, since `--force` overrides exactly the safety that protects uncommitted
+work: `git status --porcelain` empty, still at `a49bee6`. `git branch -d` (the
+*safe* delete) succeeded on its own terms, which independently confirms the
+branch was fully merged — had it held unique commits git would have refused and
+demanded `-D`. Nothing was discarded.
+
+#### A second orphan, found during release hygiene
+
+`.claude/worktrees/v075-tier2-crypto` — dated 9 August, from the v0.75 era,
+twelve milestones back. Measured rather than assumed:
+
+| property | value |
+|---|---|
+| in `git worktree list` | **no** |
+| `.git` pointer file | present, naming `.git/worktrees/v075-tier2-crypto` |
+| that admin directory | **absent** — git already pruned the registry |
+| associated branch | none; `git branch -a` lists only `main` |
+
+So git has no knowledge of it whatsoever: it cannot hold branch state and cannot
+be restored with `git worktree repair` in any meaningful sense. What remains is a
+directory of files from an abandoned v0.75 checkout.
+
+**Left in place, and flagged rather than removed.** It predates this session by
+three weeks, it is not a registered worktree so `git worktree remove` does not
+apply to it, and — unlike the v0-86 case — git cannot tell us whether its
+contents are unique, because it tracks nothing about it. Deleting it is
+`rm -rf .claude/worktrees/v075-tier2-crypto`, which is a plain filesystem
+deletion of files nobody has diffed. That is the user's call, not an incidental
+hygiene action.
+
+Also present: an empty `.worktrees/` directory, left behind when `v0-86` was
+removed. Inert — git does not track empty directories, which is why it no longer
+appears in `git status`. Removable with `rmdir .worktrees`.
 
 ---
 
@@ -408,3 +451,137 @@ unable to answer "is this the same code".
 **Not covered by this boot:** the other five tiers, dirty-volume reuse, bare
 metal, and any intermittent below roughly 1 in 1 boot. It is a cycle-open sanity
 check, not a gate.
+
+---
+
+# v0.87.0 release consolidation
+
+## Deliverables
+
+| item | state |
+|---|---|
+| §3 gate tier above 2:1 | **DONE** — `make gate-oversub`, in `gate-all` |
+| debt A generation persistence bounds | **DONE** for points 1-2; point 3 open |
+| debt B tmp `SEEK_END` metadata audit | **DONE** — closed, hypothesis disproved |
+| debt C untracked worktree | **DONE** — removed; a second orphan found and flagged |
+| §1 durable generation | **OPEN, deliberately** — conditional on something else wanting the format break |
+| §2 crash injection on PUT / legacy `cas_free` | **OPEN** — not started |
+| §4 falsifiers for the three journal-irq guards | **OPEN** — not started |
+
+Two of the four numbered objectives did not land. That is stated here rather
+than left to be inferred from the absence of an Outcome section.
+
+## Full gate sweep
+
+`GATE_CAP=2400 make gate-all` from a verified-clean tree — `build/` and
+`iso/boot/` both empty beforehand. **Eleven boots, zero failing assertions, zero
+rank faults, banner seen on every boot.**
+
+| tier | passed | failed | rank faults |
+|---|---|---|---|
+| uniprocessor | 540 | 0 | 0 |
+| smp2-bios | 554 | 0 | 0 |
+| smp4-bios | 558 | 0 | 0 |
+| smp4-iommu | 571 | 0 | 0 |
+| `gate-dirty` ×3 boots | 540 each | 0 | 0 |
+| `gate-dirty-smp` ×3 boots | 558 each | 0 | 0 |
+| `gate-oversub` 4:1 | 558 | 0 | 0 |
+
+**6,075 assertions across eleven boots, 0 failed.**
+
+Both dirty tiers held identical counts across all three boots of one reused
+image. **Unreferenced blocks stayed at 2 on every dirty boot without growing** —
+the signal that matters, since a bare non-zero value is explained by `cas_put()`
+being reachable without a dirent. The v0.87 reset audit reported **0 residue on
+the reused-image boots too**, which is the case it was built for.
+
+**Not covered:** bare metal, Proxmox, soak or repeat beyond the boots above, and
+any intermittent below roughly 1 in 10 boots on the fresh tiers. No release ISO
+was built or booted — see the status note at the top.
+
+## The sealed build, booted
+
+The version bump changes `KERNEL_VERSION`, which is compiled in, so the gate
+above tested the **pre-bump** binary. Sealing on "it compiled" would be the
+distinction this tree exists to refuse, so the sealed image was booted on its own
+account:
+
+```
+outrun-os-0.87.0.iso   md5 0e0cb143f93aeaeedf870d73ff13f95e
+uniprocessor  OK   suites=45  passed=540  failed=0  ranks=0  (315s)
+banner: OUTRUN OS -- bare-metal kernel 0.87.0-metal
+```
+
+540 matches the pre-bump uniprocessor count exactly, which is the expected result
+for a change that touches two version strings: a different count would mean
+something unintended moved. The banner is the boot-level half of the check —
+`release-version-check` says the macro is right, the banner says the string
+reached ring 3 and the console, and v0.75.0 is why both are checked.
+
+Kernel ELF `0c15c1779e2175f62d91766a8c6ab4c1`. This is **not** a
+`release-verify` run and this ISO is **not** a published artefact — it was built
+by an ordinary `make`, not by `make release-iso` from a clean tree with
+checksums recorded beside a tag.
+
+## Empirical findings and disproven hypotheses
+
+The three results this cycle produced that were not what was expected:
+
+1. **The journal interrupt claim was backwards** (v0.86, corrected here in
+   context). `klock_acquire` closes with `klock_irq_restore()`, so the `cli`
+   covers only the rank-stack check. Every journal commit is preemptible;
+   O_APPEND atomicity rests on mutual exclusion, not interrupt masking.
+2. **The tmp metadata hypothesis was wrong** (debt B). This document predicted
+   `SYS_FSTAT` might widen the disclosure surface. It refuses tmp descriptors
+   outright, as do `SYS_STAT` and `SYS_READDIR`. Length via `SEEK_END` is the
+   entire surface, so the existing KNOWN-NOT-FIXED wording was **accurate, not
+   understated**.
+3. **A remount count was overstated** (debt A). "The suite remounts five times"
+   was read off `cas_mount()` call sites without checking they compile; three
+   are behind `#ifdef CRASH_INJECT_COMMIT_FAIL`. A default boot performs three
+   rebuilds. Source and measurement now agree.
+
+## Falsification results
+
+Every assertion added this cycle has been watched failing:
+
+| falsifier | effect |
+|---|---|
+| `-DCAS_GEN_SKIP_ZERO` | 2 of 3 rebuilds left residue (356, then 391) — **silent at first mount**, catching both warm remounts |
+| `-DTMP_FSTAT_LEAK_REPRO` | 538/1, exit **1818** — fstat answered for a tmp descriptor |
+| `-DAPPSMP_RATIO_REPRO` | 557/1 — **only** the ratio check failed; every other oversub assertion passed on the capped build |
+
+The third is the one worth keeping: it demonstrates that without that assertion a
+capped run satisfies every existing check and reports a clean 4:1 tier that
+actually ran 2:1.
+
+The tmp case also needed the reproducer for a second reason — its checks report
+through an assertion that already existed, so **the assertion count did not move
+(539 before, 539 after)** and a green boot proved nothing on its own. That is the
+v0.84 `ftruncate` failure, and it is why reachability was proved separately.
+
+## KNOWN, NOT FIXED
+
+- **The generation table and the TALLY sweep are both per-boot.** Each is rebuilt
+  at mount, so corruption from an earlier boot of a reused volume is erased
+  before either can see it. v0.87 proved the reset is *complete*; it did not
+  establish that anything is *lost* by it, and the plausible answer remains
+  "nothing the refcount rebuild does not already re-derive". Unmeasured.
+- **No crash injection on the CAS PUT path or the legacy `cas_free` branch.**
+  §2, not started.
+- **Three of the four journal-irq checks have never been observed failing.** The
+  premise guard's counter has, at both 0 and 9; detection, positive control and
+  byte integrity remain unproven regression guards. §4, not started.
+- **`lseek`/`SEEK_END` on another user's tmp descriptor discloses that file's
+  length.** POSIX-correct — permissions are checked at `open()`, not per
+  operation — and asserted deliberately (exit 1793). The full surface is now
+  enumerated in debt B: length and nothing else. Wording stands.
+- **VOL_TMP has no mode and no group.** Deliberate; owner-or-root is the whole
+  rule, so a tmpfile cannot be shared.
+- **The oversubscription cap still bites above `APPSMP_W` cores.** `gate-oversub`
+  now *detects* it rather than silently degrading, but the tier cannot run above
+  4:1 on a host with more than 4 online cores. Detection, not a fix.
+- **An orphaned directory remains at `.claude/worktrees/v075-tier2-crypto`.** Not
+  a registered worktree; git tracks nothing about it, so its contents have not
+  been diffed against anything. Left for the owner to remove.
+
