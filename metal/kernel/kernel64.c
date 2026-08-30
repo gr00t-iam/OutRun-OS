@@ -22594,14 +22594,80 @@ static void cmd_vfs_stress(void) {
      * Deliberately NOT falsified by re-enabling interrupts inside a critical
      * section: the timer ISR takes locks, so that is a real hazard rather than a
      * test of one, and this project has already learnt it costs a TRUNCATED boot
-     * and no verdict. Check 2 is the falsifiable half, and it can fail. */
+     * and no verdict.
+     *
+     * v0.88 (§4): THAT SENTENCE WAS DOING TOO MUCH WORK. It ruled out ONE
+     * falsifier — running the journal under cli, which is check 3's shape — and
+     * v0.86 and v0.87 both shipped reading it as though it excused all four.
+     * Only check 3 had ever been watched producing both verdicts (it read 9 when
+     * the first assertion demanded 0, and 9 again when the corrected assertion
+     * demanded 9). Checks 1, 2 and 4 had never been seen failing, and every one
+     * of them is falsifiable WITHOUT going anywhere near a critical section:
+     *
+     *   -DVJIRQ_DETECT_REPRO   skip the appends: the workload never reaches the
+     *                          journal, and check 1 must say so.
+     *   -DVJIRQ_CONTROL_REPRO  sample the control WITH interrupts masked — one
+     *                          `pushfq` between a save/restore pair, no lock
+     *                          taken and no ISR involved. Check 2 must go red.
+     *                          This is the one that matters most: a positive
+     *                          control that has only ever returned one value is
+     *                          exactly the g_reproc_stale_ppid mistake.
+     *   -DVJIRQ_BYTES_REPRO    make the last append one byte short. Check 4 must
+     *                          catch a file that is 127 bytes instead of 128.
+     *
+     * A PREDICTION THIS BLOCK GOT WRONG, kept because the correction is the
+     * useful part. It read: "checks 1 and 3 are not independent — check 3
+     * restates check 1's `dc > 0` — so the detection falsifier reds both."
+     * Measured, it does not. Under -DVJIRQ_DETECT_REPRO check 3 PASSES: creating
+     * the probe file is itself a journal commit, so dc == 1 and dirq == 1 with
+     * not a single append having run.
+     *
+     * That is worth more than the prediction was. Check 3's `dc > 0` clause is
+     * satisfied by the SETUP alone, so check 3 can never establish that the
+     * append workload happened — which is exactly why check 1 exists and why it
+     * asserts `wrote == 8` rather than only `dc > 0`. Delete check 1 as
+     * redundant and the phase would go green on a boot that appended nothing.
+     *
+     * Check 4 also reds under that build, and correctly: with no appends the
+     * file reads back 0 of 128 bytes. The detection falsifier removes the
+     * workload, so the invariant over that workload has nothing left to stand
+     * on. Two failures, both meant.
+     *
+     * Check 3 keeps its ruling, now stated narrowly enough to be true: it is the
+     * one guard here whose falsifier would be a genuine hazard, and it is also
+     * the one guard here that has already been observed failing for real. */
     {
         uint64_t c0 = g_vj_commits, q0 = g_vj_commit_irq_on;
+#ifndef VJIRQ_CONTROL_REPRO
         int ctl = vj_irq_is_on();          /* sampled OUTSIDE any lock */
+#else
+        /* v0.88 FALSIFIER for check 2. Sample the control with interrupts
+         * masked, so the sampler is asked the question in the state it must be
+         * able to report. No lock is taken and nothing runs between the save and
+         * the restore but one `pushfq`, which is why this is safe where
+         * falsifying check 3 is not. */
+        int ctl; { uint64_t _rf = klock_irq_save(); ctl = vj_irq_is_on(); klock_irq_restore(_rf); }
+#endif
         int ji = vfs_write_file("vjirq", "", 0);
         int wrote = 0;
-        for (int i = 0; ji >= 0 && i < 8; i++)
-            if (vfs_write_append(ji, "0123456789abcdef", 16, 0) >= 0) wrote++;
+#ifndef VJIRQ_DETECT_REPRO
+        for (int i = 0; ji >= 0 && i < 8; i++) {
+            /* v0.88 FALSIFIER for check 4: one byte short on the last append.
+             * The appends still all SUCCEED, so checks 1 and 3 stay green and
+             * only the read-back check can catch it — which is the whole reason
+             * the phase reads the file rather than trusting return codes. */
+#ifndef VJIRQ_BYTES_REPRO
+            uint32_t n = 16;
+#else
+            uint32_t n = (i == 7) ? 15u : 16u;
+#endif
+            if (vfs_write_append(ji, "0123456789abcdef", n, 0) >= 0) wrote++;
+        }
+#else
+        /* v0.88 FALSIFIER for check 1: the workload never reaches the journal.
+         * Check 3 goes red with it, because it restates check 1's `dc > 0`. */
+        (void)0;
+#endif
         uint64_t dc = g_vj_commits - c0, dirq = g_vj_commit_irq_on - q0;
 
         /* Read the file back rather than trusting the append return codes -- a

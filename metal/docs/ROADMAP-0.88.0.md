@@ -143,6 +143,11 @@ rebuild with zero warnings:
 | smp4-iommu | **PASS** 573 / 0 / 0 ranks (250 s) |
 | `gate-selftest` | 17 passed, 0 failed |
 
+Re-verified unchanged at the end of the cycle, on `f3d52a387c5a576c8cc99ec28c7d1316`
+— the tree with the `g_cas_legacy` removal and the §4 falsifiers in it: 542 /
+556 / 560 / 573, 0 failed and 0 rank faults on every tier. Same counts, two
+commits later, which is what "behaviour-neutral" is supposed to look like.
+
 Every tier is **+2 on v0.87**, and +2 is the whole of it: the two standing index
 audits. The five crash-phase assertions do not compile into a gate build, which
 is why the counts move by exactly two and not by seven.
@@ -196,6 +201,83 @@ rather than defect detectors, and the honest argument that a regression guard
 earns its place by construction — it fires if a future change breaks the thing
 it watches — may well be the right answer. If so, write it down and stop
 carrying the item.
+
+#### Outcome — falsifiers, not a ruling. All three go red.
+
+**First, a correction to the framing.** A restatement of this objective described
+the four checks as `vj_seq_mismatch`, `vj_crc_invalid`, `vj_len_overflow` and a
+premise check. **No such guards exist**, here or anywhere in the tree — there is
+no CRC and no sequence-mismatch check at `vj_publish()`; `grep` finds none of the
+three names. The four checks are the ones this section already listed, and they
+live in `cmd_vfs_stress`, not in `vj_publish()` itself (`vj_publish` holds the
+*sample* — `if (vj_irq_is_on()) g_vj_commit_irq_on++` — while the judging is done
+in the suite). Recorded rather than quietly worked around, because acting on
+invented names would have produced three falsifiers for guards nobody could find
+afterwards.
+
+**The ruling was available and it is the wrong answer.** The source comment
+carried one sentence — *"deliberately NOT falsified by re-enabling interrupts
+inside a critical section: the timer ISR takes locks"* — and v0.86 and v0.87 both
+shipped reading it as covering all four checks. It covers exactly one: check 3,
+which is also the only one already **proven**, having been observed producing both
+verdicts. Checks 1, 2 and 4 are falsifiable without going near a critical
+section, so there was nothing to rule on — only work not yet done.
+
+| flag | target | measured |
+|---|---|---|
+| `-DVJIRQ_DETECT_REPRO` | 1 — detection | **FAIL**, 2 failed — `0 append(s)`, and check 4 red with it |
+| `-DVJIRQ_CONTROL_REPRO` | 2 — positive control | **FAIL**, 1 failed — `control IF=0`, checks 1/3/4 green |
+| `-DVJIRQ_BYTES_REPRO` | 4 — byte integrity | **FAIL**, 1 failed — `read back 127/128`, checks 1/2/3 green |
+
+Each was observed red **twice**, on two independently built images — once before
+the source comment was corrected and once after — with identical `journal irq`
+lines and identical failure counts both times. The archived logs are the second
+pair.
+
+The control falsifier is the one that mattered most: a positive control that has
+only ever returned one value is the `g_reproc_stale_ppid` mistake, and this one
+now demonstrably returns both. It masks interrupts around a single `pushfq`
+between a save/restore pair — no lock taken, no ISR involved — which is why it is
+safe where falsifying check 3 is not.
+
+**A prediction the measurement disproved, which is the most useful thing here.**
+The comment written alongside the detection falsifier claimed checks 1 and 3 were
+not independent — that check 3 restates check 1's `dc > 0`, so falsifying
+detection would red both. It does not. Under `-DVJIRQ_DETECT_REPRO` **check 3
+passes**: creating the probe file is itself a journal commit, so `dc == 1` and
+`dirq == 1` with not a single append having run.
+
+That is worth more than the prediction was. **Check 3's `dc > 0` clause is
+satisfied by the setup alone**, so check 3 can never establish that the append
+workload happened — which is exactly why check 1 must assert `wrote == 8` and not
+merely `dc > 0`. Delete check 1 as redundant, as a tidying pass reasonably might,
+and the phase goes green on a boot that appended nothing. The source comment now
+carries the wrong prediction and its correction, not just the conclusion.
+
+Check 4 also reds under that build, correctly: with no appends the file reads
+back 0 of 128 bytes. Removing the workload leaves the invariant over it nothing
+to stand on. Two failures, both meant.
+
+**Status of the four checks now:**
+
+| check | status |
+|---|---|
+| 1. detection (`wrote == 8 && dc > 0`) | **proven** — red under `-DVJIRQ_DETECT_REPRO` |
+| 2. positive control (`ctl == 1`) | **proven** — red under `-DVJIRQ_CONTROL_REPRO` |
+| 3. premise guard (`dirq == dc`) | **proven** — both verdicts observed in v0.86, for real |
+| 4. byte integrity | **proven** — red under `-DVJIRQ_BYTES_REPRO` |
+
+Logs, each stamped with the md5 of the image it booted, on its own first line:
+`OUTRUN-0.88-vjirq-detect-repro.log` (`0d14ed236290aaec03e9fd7695f0bd6d`),
+`OUTRUN-0.88-vjirq-control-repro.log` (`d7544096d2e5bbcaee5fc0ec2c0e3f4b`),
+`OUTRUN-0.88-vjirq-bytes-repro.log` (`ccd5b4046ceef42c080eeee9dafb1153`).
+
+**The narrow ruling that survives**, stated so it stops being carried: check 3
+will not get a falsifier. Its falsifier is a journal commit running under `cli`,
+the timer ISR takes locks, and this project has already paid for that experiment
+with a `TRUNCATED` boot and no verdict. It is also the one check here that has
+been watched failing in production conditions rather than under a flag. **§4 is
+closed.**
 
 ---
 
@@ -392,10 +474,17 @@ Carried from v0.87 unchanged unless noted:
   falsifier that reproduces the v0.48 corruption end to end, and a standing
   index/bitmap audit; the legacy branch is ruled **unreachable** rather than
   untested. What replaces it as open: the standing audit cannot see a dangling
-  entry once the block it names has been reallocated, and the dead `g_cas_legacy`
-  arms have a recommendation but not yet a deletion.
-- **Three of the four journal-IRQ checks have never been observed failing** —
-  §4 above.
+  entry once the block it names has been reallocated. The dead `g_cas_legacy`
+  arms are **now deleted** — thirteen references, ten branches, plus the orphaned
+  `vfs_flush()` — at 542 / 0 / 0 ranks, identical to the count before the
+  removal, which is the expected result for deleting what the compiler had
+  already proved unreachable.
+- ~~**Three of the four journal-IRQ checks have never been observed failing**~~
+  — **closed in v0.88**, §4 above. All four are now proven: three by falsifiers
+  (`-DVJIRQ_DETECT_REPRO`, `-DVJIRQ_CONTROL_REPRO`, `-DVJIRQ_BYTES_REPRO`, each
+  watched going red), and check 3 by having failed for real in v0.86. The one
+  ruling that survives is narrow and stated: check 3 gets no falsifier, because
+  its falsifier is a genuine hazard.
 - **`lseek`/`SEEK_END` on another user's tmp descriptor discloses that file's
   length.** POSIX-correct and asserted deliberately (exit 1793). v0.87 enumerated
   the full surface — `SYS_FSTAT`, `SYS_STAT` and `SYS_READDIR` all refuse tmp —
