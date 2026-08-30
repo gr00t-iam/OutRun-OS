@@ -131,6 +131,107 @@ cycle spent real time on a prediction about `SYS_FSTAT` that measurement
 disproved; the lesson taken is to write the option down and then check it, rather
 than to write it down as settled.
 
+#### Outcome — option 2 was right, and it was the smallest part of the work
+
+**Root cause: a conflation, not a resource limit.** The clamp read
+`nw > APPSMP_W * APPSMP_OSRATIO`. `APPSMP_W` is the number of distinct worker
+**roles** — four payload patterns, roles 56..59 — and says nothing about how many
+workers may run. The phase already cycles roles with `i % APPSMP_W` and computes
+the per-pattern expectation from `nw` rather than assuming it. The cap was the
+array bound wearing the role count's name.
+
+**A detail that reframes the v0.87 result.** That clamp bites exactly when
+`n > APPSMP_W`, *independent of the ratio*. At n = 4 it is a no-op. So the 4:1
+tier passing on the reference host never exercised the ceiling at all — the debt
+was real and structurally unreachable here, which is why it took a new
+configuration to see.
+
+**`smp8-bios`.** Added to `gate-matrix.sh`: eight vCPUs, which TCG emulates
+regardless of what the host has. The ratio arithmetic's correctness does not
+depend on those vCPUs running truly in parallel, and this is the only way to
+reach `n > 4` on a 4-core machine. Not in `GATE_CONFIGS` — it is slower, and it
+is a diagnostic rather than a standing tier.
+
+**The fix itself is six lines**: `APPSMP_MAXW`, decoupled from the role count and
+sized by what actually bounds it — BSS (`MAXW × ITERS × PAY`, 16 KiB default and
+128 KiB soak, the same order as `g_cas_refs` and `g_cas_gen`) and `MAX_KPROC`,
+64 system-wide and shared with every other suite, which is why 32 rather than
+something arbitrary. Ceiling moves from 4 cores to **8 at 4:1**, 16 at 2:1.
+
+### Three more layers, each hidden behind the one before it
+
+Everything below was found by running the fix, not by reviewing it. Three
+constants had been correct for a ceiling of 16 workers and stopped being correct
+at 32:
+
+**1. The phase watchdog did not scale.** Fixing the cap alone made the run
+*worse*: 32 workers reached a true 4:1 and then blew a deadline sized for 8, with
+12 still live. Three assertions went red for a non-defect. `APPSMP_WATCH` is now
+per-worker via `APPSMP_WATCH_FOR(nw)`.
+
+**2. The completion check contradicted its own diagnostic.** It recognised exit
+codes 1920..1923, printed *"a slow host, not a lost append"*, and then set
+`codes_ok = 0` for them anyway. Deadline and failure are now counted separately,
+which is what `CLAUDE.md`'s ring-3 convention asks for — deadline expiry gets its
+own code *so that* a suite can decline to treat it as a defect.
+
+This cannot hide a lost append, and that was checked rather than argued: the
+byte-level assertions are untouched and still fatal. On the very next run one
+worker hit its deadline, the tolerance held, **and the byte check caught a real
+48-byte shortfall anyway.**
+
+**3. The ring-3 worker deadline did not scale either.** That 48-byte shortfall
+was three appends **never attempted** — one worker of 32 exhausted its 60 s while
+the other 31 finished. Not a lost append and not an atomicity failure, but
+`nw × ITERS × PAY` assumes every worker *attempted* every iteration, and that
+stops being true once a worker times out mid-loop.
+
+The worker cannot see how many peers it has: it is selected by role, the same
+four roles serve both phases, and the count lives in the kernel. Rather than
+invent a channel for one constant, `APPSMP_TSCALE` multiplies its budget —
+default 1, so every existing configuration is bit-identical, and 4 for the
+`smp8` diagnostic. The **ordering invariant** this exposed is now written down:
+the worker's own deadline must stay below the kernel's phase watchdog, or the
+phase gives up first and the precise per-worker exit code is never collected.
+
+### A regression I introduced, stated as such
+
+The first `APPSMP_WATCH_FOR` was a bare multiply. It scales up past 8 workers and
+silently scales **down** below it: at `nw = 2` — uniprocessor, ratio 2 × 1 core —
+it yields 2250 ticks where the flat constant allowed 9000, a **4× cut to the
+small-configuration deadline**.
+
+**The 4-core gate cannot see this**, because `nw = 8` there makes the buggy and
+correct forms numerically identical. That is the same blindness this whole
+objective is about, reproduced by the fix for it. A floor is the remedy.
+
+Honest about what the measurement shows: uniprocessor completed the phase in
+**522 ticks**, so it would have passed against 2250 as well. This was a latent
+margin reduction, not an observed failure — it would have bitten on a degraded
+host, which is precisely when the gate matters most. Found by reasoning about
+`nw = 2`, not by running it.
+
+### Verified
+
+| configuration | result |
+|---|---|
+| `smp8-bios`, 4:1, `TSCALE=4` | **PASS** 558 / 0 / 0 ranks — 32 workers on 8 cores, effective **4:1**, file 16384 B exact, per-pattern 256/256/256/256, 837 interleave transitions, no deadline expiries |
+| `make gate` uniprocessor | **PASS** 540 / 0 / 0 ranks |
+| `make gate` smp2-bios | **PASS** 554 / 0 / 0 ranks |
+| `make gate` smp4-bios | **PASS** 558 / 0 / 0 ranks |
+| `make gate` smp4-iommu | **PASS** 571 / 0 / 0 ranks |
+| `make gate-oversub` 4:1 | **PASS** 558 / 0 / 0 ranks |
+
+Every count is **identical to v0.87**, which is the expected result: on a 4-core
+host the new ceiling is never reached, so the reference configuration is
+unchanged by construction. Clean build, zero warnings throughout.
+
+**Still not fixed.** The ceiling is higher, not absent. Above 8 cores at 4:1 the
+clamp bites again — and now it *says so* rather than degrading quietly, which was
+already true in v0.87 and remains the backstop. `MAX_KPROC = 64` is the real wall
+behind `APPSMP_MAXW = 32`, and raising it further is a decision about the whole
+process table rather than about this phase.
+
 ---
 
 ## Workspace

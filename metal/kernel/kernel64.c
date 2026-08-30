@@ -20998,6 +20998,67 @@ static int64_t pipe_run_role(const char *label, uint64_t caps, uint64_t role,
 #ifndef APPSMP_OSRATIO
 #define APPSMP_OSRATIO 2u
 #endif
+
+/* v0.88: THE WORKER CEILING, DECOUPLED FROM THE ROLE COUNT.
+ *
+ * v0.87 capped the worker count at APPSMP_W * APPSMP_OSRATIO and recorded the
+ * consequence as new debt: above APPSMP_W online cores the cap bites and the
+ * effective ratio silently falls back toward the default tier's.
+ *
+ * The root cause is a CONFLATION, not a resource limit. APPSMP_W is the number
+ * of distinct worker ROLES -- four payload patterns, roles 56..59 -- and has
+ * nothing to say about how many workers may run. The phase already cycles roles
+ * with `i % APPSMP_W`, so N workers over W roles has always been supported, and
+ * the per-pattern expectation below is COMPUTED from nw rather than assumed.
+ * The cap was simply the array bound wearing the role count's name.
+ *
+ * So the ceiling gets its own constant, sized by what actually bounds it:
+ *
+ *   BSS      osbuf is APPSMP_MAXW * APPSMP_ITERS * APPSMP_PAY. At 32 workers
+ *            that is 16 KiB in a default build and 128 KiB in a soak build,
+ *            which is the same order as g_cas_refs and g_cas_gen already cost.
+ *   PROCESSES MAX_KPROC is 64 for the whole system, shared with every other
+ *            suite. 32 is half of it, which is why this is not simply set to
+ *            something enormous.
+ *
+ * 32 raises the reachable ceiling from 4 cores to EIGHT at 4:1, and to sixteen
+ * at 2:1. It does not make the ceiling infinite, and the v0.87 ratio assertion
+ * remains the backstop: a host that outgrows even this fails LOUDLY rather than
+ * degrading in silence, which was the whole point of that assertion. */
+#ifndef APPSMP_MAXW
+#define APPSMP_MAXW 32u
+#endif
+
+/* v0.88: THE DRAIN DEADLINE HAS TO SCALE WITH THE WORKER COUNT.
+ *
+ * Raising APPSMP_MAXW alone was NOT the fix, and the first 8-vCPU run said so:
+ * 32 workers at 4:1 reached the correct ratio and then blew the phase watchdog
+ * with 12 workers still live, whose own exit code was 1920 -- DEADLINE expired,
+ * which the decoder already names as a slow host rather than a lost append.
+ * Three assertions went red for a reason that was not a defect.
+ *
+ * APPSMP_WATCH is a whole-phase budget that was sized when the ceiling was
+ * eight workers. Quadrupling the workers quadruples the work while the deadline
+ * stayed put, which turns a slow run into a false FAILURE -- the exact outcome
+ * CLAUDE.md forbids: "a timeout must be a deadline", and "a slow host must
+ * never be decoded as a defect".
+ *
+ * So the budget becomes PER WORKER, derived from the existing constant and the
+ * worker count it was written for, which keeps every existing configuration
+ * bit-identical: at nw = 8 this evaluates to exactly APPSMP_WATCH. It scales
+ * from there, and it scales in the SOAK build too, where APPSMP_WATCH is
+ * already 6x larger for the same reason. */
+#define APPSMP_WATCH_BASEW 8u     /* the worker count APPSMP_WATCH was sized for */
+/* NEVER SHORTER THAN THE ORIGINAL BUDGET. The first version of this macro was a
+ * bare multiply, which scales UP past 8 workers and silently scales DOWN below
+ * it: at nw = 2 (uniprocessor, ratio 2 x 1 core) it produced 2250 ticks where
+ * the flat constant allowed 9000, cutting the small-configuration deadline by
+ * four. The 4-core gate could not see it, because nw = 8 there makes the two
+ * forms identical -- the same "passes on the reference host" blindness this
+ * whole objective is about. The floor is the fix. */
+#define APPSMP_WATCH_FOR(nw) \
+    (((uint32_t)(nw) * (APPSMP_WATCH / APPSMP_WATCH_BASEW)) > (uint32_t)APPSMP_WATCH \
+        ? ((uint32_t)(nw) * (APPSMP_WATCH / APPSMP_WATCH_BASEW)) : (uint32_t)APPSMP_WATCH)
 #define APPSMP_PAY     16u
 /* v0.85: the gate variant and the soak variant. See append_smp_worker() in
  * user/init.c for the measurement behind the split -- every append journals all
@@ -22066,10 +22127,12 @@ static void cmd_vfs_stress(void) {
      *     mean the appends did not overlap at all and the phase proved nothing.
      * ====================================================================== */
     {
-        static uint8_t osbuf[APPSMP_W * APPSMP_OSRATIO * APPSMP_ITERS * APPSMP_PAY];
+        /* v0.88: sized by the WORKER ceiling, not by the role count. See
+         * APPSMP_MAXW for why those were ever the same number. */
+        static uint8_t osbuf[APPSMP_MAXW * APPSMP_ITERS * APPSMP_PAY];
         int nw = (int)APPSMP_OSRATIO * n;
         int nw_want = nw;                       /* v0.87: before any clamping */
-        if (nw > (int)(APPSMP_W * APPSMP_OSRATIO)) nw = (int)(APPSMP_W * APPSMP_OSRATIO);
+        if (nw > (int)APPSMP_MAXW) nw = (int)APPSMP_MAXW;
         if (nw < 2) nw = 2;
         if (nw_want < 2) nw_want = 2;           /* the floor is not a cap */
 #ifdef APPSMP_RATIO_REPRO
@@ -22087,7 +22150,7 @@ static void cmd_vfs_stress(void) {
         if (nw > 2) nw /= 2;
 #endif
         uint32_t total = (uint32_t)nw * APPSMP_ITERS * APPSMP_PAY;
-        int procs[APPSMP_W * APPSMP_OSRATIO]; int nsp = 0;
+        int procs[APPSMP_MAXW]; int nsp = 0;
         uint32_t ran_mask = 0;
         uint64_t t_start = g_ticks;
 
@@ -22149,7 +22212,11 @@ static void cmd_vfs_stress(void) {
                      "asked for)",
                      nw == nw_want);
 
-            int drained = appsmp_drain(APPSMP_WATCH);
+            /* v0.88: scaled by the worker count -- see APPSMP_WATCH_FOR. The
+             * pinned phase above keeps the flat budget because its worker count
+             * is APPSMP_W and does not move; this one is nw and does. */
+            uint32_t os_watch = APPSMP_WATCH_FOR(nw);
+            int drained = appsmp_drain(os_watch);
             current_proc_idx = save;
             if (!drained)
                 kprintf("[vfsstrs] append-oversub WATCHDOG: %d worker(s) still live\n",
@@ -22157,19 +22224,51 @@ static void cmd_vfs_stress(void) {
             vfscheck("append-oversub: every worker reached a terminal state (no watchdog)",
                      drained);
 
-            int codes_ok = 1;
+            /* v0.88: DEADLINE EXPIRY IS NOT A DEFECT, AND THIS USED TO SAY SO
+             * IN THE SAME BREATH AS FAILING FOR IT.
+             *
+             * The loop already recognised codes 1920..1923 and printed "a slow
+             * host, not a lost append" -- and then set codes_ok = 0 anyway, so
+             * the diagnostic and the verdict contradicted each other. On the
+             * 8-vCPU configuration that surfaced immediately: one worker of 32
+             * timed out while the file came back byte-exact at 16384 with
+             * per-pattern counts of 256/256/256/256, which is every append from
+             * every worker present exactly once.
+             *
+             * CLAUDE.md's ring-3 convention says to keep deadline expiry on its
+             * own code precisely so a suite can decide it is not a defect. The
+             * counts are therefore split: a code that is neither the success
+             * sentinel nor a deadline is a FAILURE, a deadline is reported and
+             * tolerated.
+             *
+             * This cannot hide a lost append, which is the obvious worry. The
+             * byte-level assertions below are unchanged and still fatal: a
+             * worker that genuinely failed to write would leave the file short
+             * and the per-pattern counts wrong, and those are what detect it.
+             * What this stops is a slow host being decoded as a correctness
+             * failure -- the exact misattribution v0.81 predicted and v0.86 hit
+             * with [langstrs] at 1615 s. */
+            int n_bad = 0, n_slow = 0;
             for (int i = 0; i < nsp; i++) {
                 ran_mask |= kprocs[procs[i]].ran_on;
-                if (kprocs[procs[i]].exit_code != 42) {
-                    uint32_t c = kprocs[procs[i]].exit_code;
-                    kprintf("[vfsstrs] append-oversub worker role %u exited %u%s\n",
-                            (uint64_t)kprocs[procs[i]].role, (uint64_t)c,
-                            (c >= 1920 && c <= 1923)
-                                ? " — DEADLINE expired; a slow host, not a lost append" : "");
-                    codes_ok = 0;
-                }
+                uint32_t c = kprocs[procs[i]].exit_code;
+                if (c == 42) continue;                      /* success sentinel */
+                int is_deadline = (c >= 1920 && c <= 1923);
+                kprintf("[vfsstrs] append-oversub worker role %u exited %u%s\n",
+                        (uint64_t)kprocs[procs[i]].role, (uint64_t)c,
+                        is_deadline ? " — DEADLINE expired; a slow host, not a lost append"
+                                    : " — *** worker FAILURE");
+                if (is_deadline) n_slow++; else n_bad++;
             }
-            vfscheck("append-oversub: every worker completed its whole append loop", codes_ok);
+            if (n_slow)
+                kprintf("[vfsstrs] append-oversub: %d of %d worker(s) hit their DEADLINE — the "
+                        "byte-level checks below are what decide whether that cost anything\n",
+                        (uint64_t)(int64_t)n_slow, (uint64_t)(int64_t)nsp);
+            vfscheck("append-oversub: no worker FAILED — deadline expiry is counted separately "
+                     "and tolerated, because a slow host must not be decoded as a defect; a "
+                     "worker that actually lost an append is caught by the byte-level checks "
+                     "below, which are unchanged and still fatal",
+                     n_bad == 0);
 
             int di = vfs_find(APPSMP_PATH);
             uint32_t flen = (di >= 0) ? (uint32_t)DENTS[di].len : 0;

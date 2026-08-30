@@ -3310,11 +3310,38 @@ static void lseek_worker(void) {
  * that forgetting one bites. */
 #ifdef APPSMP_SOAK
 #define APPSMP_ITERS  256u        /* 4 * 256 = 1024 appends, ~220 s             */
-#define APPSMP_T      45000u      /* 450 s ceiling for one worker's whole loop  */
+#define APPSMP_TBASE  45000u      /* 450 s ceiling for one worker's whole loop  */
 #else
 #define APPSMP_ITERS  32u         /* 4 * 32  = 128 appends, ~27 s               */
-#define APPSMP_T      6000u       /* 60 s ceiling for one worker's whole loop   */
+#define APPSMP_TBASE  6000u       /* 60 s ceiling for one worker's whole loop   */
 #endif
+
+/* v0.88: A WORKER'S DEADLINE HAS TO SURVIVE THE CONTENTION IT RUNS UNDER, AND
+ * THIS WORKER CANNOT SEE HOW MUCH THERE IS.
+ *
+ * APPSMP_TBASE was sized when at most sixteen workers could exist. v0.88 lifted
+ * that ceiling to APPSMP_MAXW = 32, and the first 8-vCPU run showed the
+ * consequence: one worker of 32 exhausted its 60 s while the other 31 finished,
+ * so three appends were never ATTEMPTED and the file came back 48 bytes short.
+ * That is not a lost append and not an atomicity failure -- it is a worker that
+ * ran out of time -- but the byte-level check cannot tell those apart, and it
+ * should not have to.
+ *
+ * The worker has no way to know how many peers it has: it is selected by role,
+ * the same four roles serve both the pinned and the oversubscribed phase, and
+ * the worker count lives in the kernel. Rather than invent a channel for one
+ * constant, the budget gets an explicit multiplier, exactly as APPSMP_SOAK
+ * already scales both halves through EXTRA and UEXTRA.
+ *
+ * Default 1, so every existing configuration is bit-identical. Raise it for
+ * runs with more workers than cores by a wide margin -- the smp8-bios
+ * diagnostic uses 4. It must stay BELOW the kernel-side phase watchdog
+ * (APPSMP_WATCH_FOR), or the phase gives up first and the precise per-worker
+ * exit code is never collected. */
+#ifndef APPSMP_TSCALE
+#define APPSMP_TSCALE 1u
+#endif
+#define APPSMP_T      (APPSMP_TBASE * APPSMP_TSCALE)
 
 static void append_smp_worker(u32 idx) {
     if (idx >= APPSMP_W) sysc(SYS_EXIT, 1899, 0, 0);

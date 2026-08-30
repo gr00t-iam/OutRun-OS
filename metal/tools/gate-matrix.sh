@@ -13,6 +13,7 @@
 # Configurations (default: all three):
 #   uniprocessor   plain, one vCPU
 #   smp4-bios      -smp 4 on SeaBIOS
+#   smp8-bios      -smp 8 on SeaBIOS (guest cores > host cores; v0.88)
 #   smp4-iommu     -smp 4 on q35 behind an emulated Intel VT-d unit, intremap=on
 #
 # Each boots a FRESH disk image, and is accepted only if it reaches the shell
@@ -149,6 +150,20 @@ for CFG in $CONFIGS; do
       # all, and several SMP suites have only ever been exercised at four.
       smp2-bios)    SMP="-smp 2" ;;
       smp4-bios)    SMP="-smp 4" ;;
+      # v0.88: EIGHT vCPUs, and the reason is specific. The oversubscription
+      # worker cap only ever bit when the guest reported MORE THAN APPSMP_W (4)
+      # online cores -- at exactly 4 the clamp is a no-op, which is why the 4:1
+      # tier passed on the reference host while the ceiling it depended on was
+      # still there. Reproducing that needed a guest with more cores than the
+      # host has, which TCG will happily emulate: correctness of the ratio
+      # arithmetic does not depend on those vCPUs running in parallel.
+      #
+      # Slower than smp4 for the obvious reason -- eight emulated cores
+      # time-slicing on however many the host really has -- so this is not in
+      # GATE_CONFIGS by default. It is the configuration that proves the cap is
+      # gone, and it is named here so proving it again is one argument rather
+      # than a rediscovery.
+      smp8-bios)    SMP="-smp 8" ;;
       smp4-iommu)
         SMP="-smp 4 -machine q35,kernel-irqchip=split -device intel-iommu,intremap=on,caching-mode=on"
         # The virtio devices must sit BEHIND the IOMMU, or the configuration is
