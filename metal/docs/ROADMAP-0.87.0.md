@@ -71,6 +71,63 @@ cores, 8192 B exact, 441 interleave transitions against 149 at 2:1. **No gate
 tier uses it**, so the ratio is tunable but undefended — exactly the shape of
 gap that made the hardcoded `2` worth removing in the first place.
 
+#### Outcome — `make gate-oversub`, and a gap that would have been invisible
+
+**Done.** `gate-oversub` builds at `-DAPPSMP_OSRATIO=$(GATE_OSR)` (default 4),
+boots `smp4-bios`, and is appended to `gate-all`. `GATE_OSR` overrides the ratio.
+
+**This tier needs its own image, unlike every other tier.** The existing four
+vary QEMU flags over one ISO; the ratio is compile-time, so 4:1 is a different
+kernel. That makes the target's **trailing `make clean` load-bearing rather than
+tidiness**: without it, `build/` is left holding a 4:1 kernel under the ordinary
+ISO name, and the next `make gate` finds that ISO up to date and boots it while
+reporting as the default build. This repository has twice discovered a run that
+booted a different image than it claimed — once invalidating a 20-boot
+verification whose conclusion had to be publicly withdrawn. Ending on a clean
+tree makes that impossible rather than unlikely.
+
+**The gap the tier would have had.** `nw` is capped at
+`APPSMP_W * APPSMP_OSRATIO` = 16, so on a host with more than `APPSMP_W` online
+cores the cap bites and the effective ratio silently falls below the configured
+one. At `-DAPPSMP_OSRATIO=4` on an 8-core host: `nw = 16`, `n = 8` — a ratio of
+**2**, which is exactly what the default tier already runs.
+
+Nothing would have said so. Every other assertion in the phase is derived from
+`nw`, so all of them still pass. So the phase now asserts it ran at the ratio it
+was **built** for — exact equality against the pre-clamp worker count, because
+the question is whether the configuration was HONOURED, not whether the number
+happens to be large.
+
+**Measured:**
+
+| build | ratio line | result |
+|---|---|---|
+| default | `configured 2:1, 8 workers on 4 cores = effective 2:1` | **PASS** 558 / 0 / 0 ranks |
+| `make gate-oversub` (4:1) | `configured 4:1, 16 workers on 4 cores = effective 4:1` | **PASS** 558 / 0 / 0 ranks |
+| `-DAPPSMP_RATIO_REPRO` | `configured 4:1, 8 workers on 4 cores = effective 2:1  *** CAPPED` | **FAIL** 557 / 1 |
+
+At 4:1: 8192 B exact, per-pattern counts 128/128/128/128, and **425 interleave
+transitions against 149 at 2:1** — nearly 3× the interleaving, so the tier buys
+measurable preemption pressure rather than a larger worker count.
+
+**The falsification is the result worth keeping.** Under
+`-DAPPSMP_RATIO_REPRO` — which halves the worker count after computation,
+simulating exactly what the cap does on a bigger host — **only the new check went
+red. Every other assertion passed:** "MORE WORKERS THAN ONLINE CORES" (8 > 4),
+"the file is EXACTLY workers × iterations × payload" (4096 = 8 × 32 × 16), and
+every worker completing its loop. 557 passed, 1 failed.
+
+That is the claim demonstrated instead of argued: without this assertion a
+capped run satisfies every existing check and reports a clean 4:1 tier that
+actually ran 2:1. A gate whose gaps are invisible is how "verified" drifts from
+"measured", and this was that gap in its purest form — a whole tier reporting
+success while testing nothing new.
+
+**Note on the earlier figure.** v0.86 recorded 441 interleave transitions at
+4:1; this run measured 425. Both are far above the 149 at 2:1 and the count is
+schedule-dependent, so the difference is variance rather than a regression — it
+is not a number to assert on, and nothing does.
+
 ### 4. Falsifiers for the three unproven journal-irq guards, or an honest ruling
 
 Of the four checks at `vj_publish()`, only the premise guard's counter has been

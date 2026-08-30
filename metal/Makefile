@@ -276,7 +276,7 @@ appendsoak:
 	$(MAKE) EXTRA=-DAPPSMP_SOAK UEXTRA=-DAPPSMP_SOAK
 	@echo "  [appendsoak] built with 1024 appends; boot it with 'make qemu' or tools/gate-matrix.sh"
 
-.PHONY: gate gate-all gate-selftest
+.PHONY: gate gate-all gate-selftest gate-oversub
 
 # v0.81: the gate's own reporting logic, tested before it is trusted.
 #
@@ -302,6 +302,34 @@ gate-all: $(ISO)
 	$(MAKE) gate
 	$(MAKE) gate-dirty
 	$(MAKE) gate-dirty-smp
+	$(MAKE) gate-oversub
+
+# v0.87: THE OVERSUBSCRIPTION TIER.
+#
+# v0.86 made APPSMP_OSRATIO a parameter and measured 4:1 exactly once, by hand.
+# No tier used it, so the ratio was tunable but UNDEFENDED -- the same shape of
+# gap that made the hardcoded 2 worth removing in the first place.
+#
+# This needs its own image, unlike every other tier. The others vary QEMU flags
+# over one ISO; the ratio is compile-time, so a 4:1 run is a different kernel.
+#
+# THE TRAILING `make clean` IS LOAD-BEARING, not tidiness. Without it build/
+# would be left holding a 4:1 kernel under the ordinary ISO name, and the next
+# `make gate` would find that ISO up to date and boot it while reporting as
+# though it were the default build. This repository has twice discovered a run
+# that booted a DIFFERENT IMAGE than it claimed -- once invalidating a 20-boot
+# verification. Ending on a clean tree makes that impossible rather than
+# unlikely.
+#
+# smp4-bios because oversubscription needs more runnable workers than cores and
+# 4 is what the gate host provides. GATE_OSR overrides the ratio.
+GATE_OSR ?= 4
+gate-oversub:
+	$(MAKE) clean
+	$(MAKE) EXTRA=-DAPPSMP_OSRATIO=$(GATE_OSR)
+	tools/gate-matrix.sh "$(ISO)" "$(GATE_LOGS)/oversub-$$$$" smp4-bios
+	@echo "  [gate-oversub] ran at $(GATE_OSR):1; cleaning so no later gate boots this image"
+	$(MAKE) clean
 
 # ===========================================================================
 # v0.76: RELEASE PACKAGING — mandatory for every version tag

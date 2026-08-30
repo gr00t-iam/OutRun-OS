@@ -22068,8 +22068,24 @@ static void cmd_vfs_stress(void) {
     {
         static uint8_t osbuf[APPSMP_W * APPSMP_OSRATIO * APPSMP_ITERS * APPSMP_PAY];
         int nw = (int)APPSMP_OSRATIO * n;
+        int nw_want = nw;                       /* v0.87: before any clamping */
         if (nw > (int)(APPSMP_W * APPSMP_OSRATIO)) nw = (int)(APPSMP_W * APPSMP_OSRATIO);
         if (nw < 2) nw = 2;
+        if (nw_want < 2) nw_want = 2;           /* the floor is not a cap */
+#ifdef APPSMP_RATIO_REPRO
+        /* v0.87 FALSIFIER, opt-in (`make EXTRA=-DAPPSMP_RATIO_REPRO`) and never
+         * in a release build: quietly halve the worker count after it has been
+         * computed, which is what the WORKER-COUNT CAP does on its own on any
+         * host with more than APPSMP_W online cores.
+         *
+         * The point is that this failure is SILENT without a check. Every other
+         * assertion in the phase is computed from nw, so they all still pass --
+         * the file is still exactly nw x iters x payload, the blocks are still
+         * intact, the per-pattern counts still add up. The phase reports a clean
+         * pass having tested a ratio nobody asked for. That is what the check
+         * below exists to make impossible. */
+        if (nw > 2) nw /= 2;
+#endif
         uint32_t total = (uint32_t)nw * APPSMP_ITERS * APPSMP_PAY;
         int procs[APPSMP_W * APPSMP_OSRATIO]; int nsp = 0;
         uint32_t ran_mask = 0;
@@ -22102,6 +22118,36 @@ static void cmd_vfs_stress(void) {
             vfscheck("append-oversub: there are MORE WORKERS THAN ONLINE CORES (without this "
                      "the phase is the pinned test again, and proves nothing new)",
                      nw > n);
+
+            /* v0.87: THE TIER MUST RUN AT THE RATIO IT WAS BUILT FOR.
+             *
+             * nw is capped at APPSMP_W * APPSMP_OSRATIO, so on a host with more
+             * than APPSMP_W online cores the cap bites and the EFFECTIVE ratio
+             * silently falls below the configured one. At -DAPPSMP_OSRATIO=4 on
+             * an 8-core host that means nw = 16 against n = 8 -- a ratio of 2,
+             * which is exactly what the DEFAULT tier already runs.
+             *
+             * Nothing would have said so. Every other assertion here is derived
+             * from nw, so all of them still pass; the gate would report a clean
+             * 4:1 tier that had actually re-run the 2:1 one. A gate whose gaps
+             * are invisible is how "verified" drifts from "measured", and this
+             * is that gap in its purest form -- a whole tier testing nothing new
+             * while reporting success.
+             *
+             * Asserted as an exact equality against the pre-clamp value rather
+             * than as "nw is big enough", because the interesting quantity is
+             * whether the CONFIGURATION WAS HONOURED, not whether the number
+             * happens to be large. */
+            kprintf("[vfsstrs] append-oversub: configured ratio %u:1, %d worker(s) on %d core(s) "
+                    "= effective %d:1%s\n",
+                    (uint64_t)APPSMP_OSRATIO, (uint64_t)(int64_t)nw, (uint64_t)(int64_t)n,
+                    (uint64_t)(int64_t)(n ? nw / n : 0),
+                    (nw == nw_want) ? "" : "  *** CAPPED");
+            vfscheck("append-oversub: the phase ran at the ratio it was BUILT for — the worker cap "
+                     "did not silently reduce it (every other check here is derived from the "
+                     "worker count, so a capped run passes them all while testing a ratio nobody "
+                     "asked for)",
+                     nw == nw_want);
 
             int drained = appsmp_drain(APPSMP_WATCH);
             current_proc_idx = save;
