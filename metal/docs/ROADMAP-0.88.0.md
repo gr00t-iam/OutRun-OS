@@ -66,6 +66,113 @@ rather than whether the counters agree with each other.
 passes either way, because recovery restores both halves from the same snapshot
 and they agree with each other. That is exactly how the v0.85 defect shipped.
 
+#### Outcome — the PUT path is now crash-tested, and the hazard is the one v0.48 wrote down
+
+**The question was already stated in the source.** The CAS-metadata journal's own
+header comment names the failure it was added to close: *"index home-write lands,
+then a crash before `cas_flush_meta`'s bitmap/superblock write lands -> index says
+hash X is at block B, bitmap says block B is free -> a future put legitimately
+overwrites block B, silently corrupting a different dedup'd file."* Since v0.48
+the evidence for that guard has been that the ordering reads correctly. v0.86 is
+the milestone that established what such evidence is worth.
+
+**A third injection arm.** `g_cjp_arm`, beside v0.85's `g_cji_arm` (directory
+commit) and `g_cjf_arm` (free), fires inside `cas_put()` after the home index
+write and before `cas_flush_meta()` — the mirror of the free arm's window.
+Separate trigger, for the reason those two are separate from each other.
+
+**A new instrument, and it answers the mirror question.**
+`cas_index_verify_locked()` counts index entries naming a block the bitmap calls
+free. `cas_unreferenced_locked()` — the v0.84/v0.85 instrument — counts allocated
+blocks nothing names. **Neither sweep can see the other's defect**, and the
+standing `used_blocks == popcount(bitmap)` audit sees neither, because the index
+is not party to it. Both report a `live` count alongside the defect count, so a
+zero cannot come from a sweep that looked at nothing.
+
+The index audit is a **standing** assertion, on every boot rather than only under
+`-DCRASH_INJECT_COMMIT_FAIL`: the crash phase proves the journal survives a
+deliberate interruption, and this proves the invariant holds across an ordinary
+boot's whole workload. Different claims; the cheap one is worth keeping.
+
+**The falsifier is not a contrived reorder — it is the shipped pre-v0.48 code.**
+`-DCAS_PUT_NOJOURNAL_REPRO` performs the put with no journal at all: home index
+write, then bitmap and superblock, nothing in between.
+
+| build | fired | dangling | probe block | next put | verdict |
+|---|---|---|---|---|---|
+| journalled (`-DCRASH_INJECT_COMMIT_FAIL`) | 1 | 0 → **0** | 1125 | 1126 | **PASS** 554 / 0 / 0 ranks |
+| falsifier (`+ -DCAS_PUT_NOJOURNAL_REPRO`) | 1 | 0 → **1** | 1125 | **1125** | **FAIL** 552 / 2 — as required |
+
+The falsifier does not merely trip the invariant. **The very next put was handed
+block 1125 while the index still named it** — the corruption the v0.48 comment
+predicts, reproduced end to end rather than argued. Logs, image-stamped:
+`OUTRUN-0.88-put-crash-pass.log` (md5 `3a2f5d76084b3944099f4b53bfe7ba7a`) and
+`OUTRUN-0.88-put-crash-nojournal-repro.log` (md5
+`8ce98513b0d6befb633ae481f6b99035`).
+
+**What the falsifier run also showed about the standing audit — a real limit,
+recorded rather than smoothed over.** In the broken build the *end-of-boot* index
+audit still read **0 dangling**, because by then the next put had reallocated
+block 1125 and the stale entry no longer named a *free* block — it named a block
+belonging to somebody else. The standing audit's shape cannot see the aftermath
+once the block is reissued; only the crash phase's measurement taken immediately
+after recovery catches it. The standing audit is a guard against the state
+persisting, not a detector of the corruption having happened.
+
+Two smaller notes, both deliberate:
+
+- The probe is a **direct `cas_put` with no dirent**, leaving one allocated,
+  indexed, unreferenced block behind. Routing it through `vfs_write_file` would
+  put a dirent commit and its flushes between the injection and the remount, any
+  of which could write the bitmap home and mask the state under test. The residue
+  costs nothing: the phase compiles only under `-DCRASH_INJECT_COMMIT_FAIL`,
+  never in a gate or release build, so the `CAS_UNREF_BUDGET` audit never sees it.
+- The content is **salted from `SB->put_count`**, which is persistent and
+  monotonic. Identical content would dedup, `cas_put` would return before
+  reaching the injection, and the phase would then be asserting over a put that
+  did not happen — on a reused volume, silently.
+
+**Verified.** Default build, image md5 `a868830fd228f72b29eeb47dc2e87226`, clean
+rebuild with zero warnings:
+
+| tier | result |
+|---|---|
+| uniprocessor | **PASS** 542 / 0 / 0 ranks (305 s) |
+| smp2-bios | **PASS** 556 / 0 / 0 ranks (230 s) |
+| smp4-bios | **PASS** 560 / 0 / 0 ranks (245 s) |
+| smp4-iommu | **PASS** 573 / 0 / 0 ranks (250 s) |
+| `gate-selftest` | 17 passed, 0 failed |
+
+Every tier is **+2 on v0.87**, and +2 is the whole of it: the two standing index
+audits. The five crash-phase assertions do not compile into a gate build, which
+is why the counts move by exactly two and not by seven.
+
+Not covered by the above: dirty-volume reuse, bare metal, Proxmox, soak, and any
+intermittent below roughly 1 in 1 boot per configuration. The crash phase itself
+was run **uniprocessor only**, in both its passing and its falsified build.
+
+#### Ruling — the legacy `cas_free` branch is UNREACHABLE, not untested
+
+The second half of §2 asked for crash injection on the pre-journal branch of
+`cas_free`, reached when `g_cas_legacy` is set. **Nothing sets it.** Measured,
+not inferred — `g_cas_legacy` appears at thirteen sites and every one of the
+three assignments writes `0`: its initialiser, `cas_format()`, and `cas_mount()`,
+where the line still carries its own v0.56 explanation (*"pre-v4 volumes no
+longer mount at all"*). Only version 5 mounts; the volume that once set the flag
+is refused outright.
+
+So there are ten branch sites on a variable that is a compile-time constant. A
+crash harness for that arm could only be written by inventing a way to set the
+flag, and it would then be testing a path no volume on disk can produce — the
+`ppid_live()` mistake with the sign reversed: not a counter nothing increments,
+but a branch nothing enters.
+
+**Closed as unreachable.** The remaining question is whether the dead arms should
+be deleted, which is a mechanical ten-site change and a separate commit from this
+one — it is a decision about the code, not about the evidence, and mixing it into
+a measurement commit is how the measurement gets harder to read. Recommended:
+delete them, and keep the v0.48 comment as history.
+
 ### §4 (v0.87). Falsifiers for the three unproven journal-IRQ guards
 
 Of the four checks at `vj_publish()`, only the **premise guard's counter** has
@@ -280,8 +387,13 @@ Carried from v0.87 unchanged unless noted:
   the reset is *complete*; it did **not** establish that anything is *lost* by
   it. The plausible answer remains "nothing the refcount rebuild does not already
   re-derive", and it is unmeasured. This is the open point 3 of v0.87 debt A.
-- **No crash injection on the CAS PUT path or the legacy `cas_free` branch** —
-  §2 above.
+- ~~**No crash injection on the CAS PUT path or the legacy `cas_free` branch**~~
+  — **closed in v0.88**, §2 above. The PUT path now has an injection arm, a
+  falsifier that reproduces the v0.48 corruption end to end, and a standing
+  index/bitmap audit; the legacy branch is ruled **unreachable** rather than
+  untested. What replaces it as open: the standing audit cannot see a dangling
+  entry once the block it names has been reallocated, and the dead `g_cas_legacy`
+  arms have a recommendation but not yet a deletion.
 - **Three of the four journal-IRQ checks have never been observed failing** —
   §4 above.
 - **`lseek`/`SEEK_END` on another user's tmp descriptor discloses that file's

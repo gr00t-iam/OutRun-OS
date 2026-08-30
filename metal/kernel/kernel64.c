@@ -5662,6 +5662,46 @@ static uint64_t cas_unreferenced_locked(void) {
     }
     return n;
 }
+
+/* v0.88: THE OTHER DIRECTION. cas_unreferenced_locked() asks which ALLOCATED
+ * blocks nothing names — the leak shape, and the one the v0.85 free-path defect
+ * produced. This asks the mirror question: which INDEX ENTRIES name a block the
+ * bitmap calls free?
+ *
+ * That is not a leak. It is the hazard the CAS metadata journal was built for in
+ * v0.48, described in that journal's own header comment: "index says hash X is
+ * at block B, bitmap says block B is free -> a future put legitimately
+ * overwrites block B, silently corrupting a different dedup'd file." A dangling
+ * entry is a dedup hit waiting to hand a caller somebody else's bytes.
+ *
+ * Neither sweep can see the other's defect, which is why both exist. And
+ * neither is visible to the standing `used_blocks == popcount(bitmap)` audit:
+ * that compares the bitmap with the superblock, and the index is not party to
+ * it.
+ *
+ * `live` is reported separately so a caller can say the sweep SAW something.
+ * dangling == 0 over an index the walk never populated is the zero that means
+ * "did not look", and this project has read one of those as evidence before.
+ *
+ * Caller holds g_cas_lock. CLOBBERS g_idxbuf — it is the shared index staging
+ * buffer — so this must never run between a cas_index_stage/remove and the home
+ * write that publishes it. Every call site below is outside a transaction. */
+static void cas_index_verify_locked(uint64_t *live, uint64_t *dangling) {
+    uint64_t nlive = 0, bad = 0;
+    uint64_t slots = SB->index_blocks * CAS_SLOTS_PER_BLOCK;
+    for (uint64_t s = 0; s < slots; s++) {
+        uint64_t sec = SB->index_start + s / CAS_SLOTS_PER_BLOCK;
+        uint32_t off = (uint32_t)(s % CAS_SLOTS_PER_BLOCK) * sizeof(struct cas_islot);
+        virtio_read_block(sec, g_idxbuf);
+        struct cas_islot *sl = (struct cas_islot *)(g_idxbuf + off);
+        if (sl->hash == 0) continue;                /* empty slot, or a tombstone */
+        nlive++;
+        uint64_t b = sl->block;
+        if (b < SB->data_start || b >= SB->total_blocks || !bm_get(b)) bad++;
+    }
+    if (live)     *live     = nlive;
+    if (dangling) *dangling = bad;
+}
 /* fwd: defined with the chunk-map walkers whose enumeration it shares, and
  * called from BOTH cas_format() and cas_mount() so every path that establishes
  * a directory also establishes the counts derived from it. */
@@ -5822,6 +5862,26 @@ static void cas_journal_recover(void) {
             h->bitmap_block, h->index_block, (uint64_t)h->seq);
 }
 
+#ifdef CRASH_INJECT_COMMIT_FAIL
+/* v0.88: A THIRD ARM, for the CAS PUT path — the one transaction in this
+ * filesystem that had never been interrupted under test.
+ *
+ * v0.85 built two: g_cji_arm cuts a directory-journal commit, g_cjf_arm cuts a
+ * free's metadata transaction. Both were added because a path nobody had
+ * interrupted was a path whose crash behaviour was an ARGUMENT. The put path
+ * kept its argument for three more milestones: `bm_alloc()` runs BEFORE
+ * `cas_journal_write()`, so all three shadows the journal captures describe the
+ * same post-transaction state, and an interrupted put therefore replays
+ * consistently. That reads correctly. So did the v0.86 journal-interrupt claim,
+ * which was backwards, and which the instrument built to confirm it disproved
+ * on its first boot.
+ *
+ * Separate trigger from the other two, for the same reason they are separate
+ * from each other: arming one must not fire another. */
+static volatile int      g_cjp_arm   = 0;
+static volatile uint64_t g_cjp_fired = 0;
+#endif
+
 /* store content -> return its content hash (address). Deduplicates.          */
 /* v0.41: g_cas_lock (rank 3) serializes the whole put — the index probe, the */
 /* bitmap claim, the shared staging sectors (g_blk/g_idxbuf) and the SB       */
@@ -5849,10 +5909,53 @@ static uint64_t cas_put(const void *data, uint32_t len) {
     if (idx_sec >= 0) {
         if (!g_cas_legacy) {
             uint64_t bitmap_blk = SB->bitmap_start + ((uint64_t)b >> 3) / CAS_BS;
+#ifndef CAS_PUT_NOJOURNAL_REPRO
             cas_journal_write((uint64_t)idx_sec, bitmap_blk);
+#else
+            /* v0.88 REPRODUCER, opt-in (`make EXTRA=-DCAS_PUT_NOJOURNAL_REPRO`)
+             * and never in a release build: perform the put WITHOUT its metadata
+             * journal, which is the exact pre-v0.48 sequence the journal was
+             * introduced to close — home index write, then bitmap and superblock,
+             * with no shadow in between.
+             *
+             * This is not a contrived reordering. It is the shipped code of an
+             * earlier kernel, and the hazard it produces is the one written down
+             * in the CAS-journal header comment above: a crash between the two
+             * writes leaves the index naming a block the bitmap calls free.
+             *
+             * The v0.88 put-crash assertions must go RED on this build. If they
+             * stay green, they are not measuring the journal — they are
+             * measuring something that happens to be true either way, which is
+             * how Carryover 3's harness reported 12/12 against a deliberately
+             * broken kernel for a whole session. */
+            (void)bitmap_blk;
+#endif
             virtio_write_block((uint64_t)idx_sec, g_idxbuf);   /* home index write   */
+#ifdef CRASH_INJECT_COMMIT_FAIL
+            /* v0.88: POWER LOSS HERE, at the mirror of the free arm's window.
+             * The journal is PENDING and the index entry has reached its home
+             * block; the bitmap and superblock have not been flushed. Returning
+             * without clearing the journal is what a crash leaves behind.
+             *
+             * The hash is returned as if the put had completed, which is a lie
+             * the CALLER never gets to act on in practice — the harness calls
+             * cas_put directly and remounts immediately, so nothing builds a map
+             * from it. Returning 0 instead would be a different lie (a full
+             * volume) and would exercise the caller's error path rather than
+             * recovery, which is not what is under test. */
+            if (g_cjp_arm) {
+                g_cjp_arm = 0;
+                g_cjp_fired++;
+                kprintf("[cas    ] CRASH INJECT: put of block %d TRUNCATED after the home "
+                        "index write and BEFORE the bitmap flush\n", (uint64_t)b);
+                klock_release(&g_cas_lock);
+                return h;
+            }
+#endif
             cas_flush_meta();                                  /* home sb+bitmap write */
+#ifndef CAS_PUT_NOJOURNAL_REPRO
             cas_journal_clear();
+#endif
         } else {
             virtio_write_block((uint64_t)idx_sec, g_idxbuf);
             cas_flush_meta();
@@ -21849,6 +21952,126 @@ static void cmd_vfs_stress(void) {
                    rem3 == 1 && fired && fi >= 0 && unref1 <= unref0);
           vfs_unlink("cfree-probe"); }
 
+        /* ===== v0.88: A PUT INTERRUPTED BETWEEN ITS HOME INDEX WRITE AND ITS
+         * BITMAP FLUSH — the last transaction in this filesystem that had never
+         * been cut off under test.
+         *
+         * THE HAZARD IS NOT HYPOTHETICAL AND NOT NEW. It is written down in the
+         * CAS-metadata journal's own header comment, as the reason that journal
+         * was added in v0.48: "index home-write lands, then a crash before
+         * cas_flush_meta's bitmap/superblock write lands -> index says hash X is
+         * at block B, bitmap says block B is free -> a future put legitimately
+         * overwrites block B, silently corrupting a different dedup'd file."
+         *
+         * That is a claim about a guard, and until now the evidence for it was
+         * that the ordering reads correctly. v0.86 is the milestone that
+         * established what such evidence is worth: the journal-interrupt claim
+         * also read correctly, was backwards, and was disproved by the first
+         * instrument pointed at it.
+         *
+         * WHAT IS MEASURED. Not "the put survived" — losing an interrupted put
+         * is correct, exactly as with a commit. The invariant is that the index
+         * and the bitmap agree afterwards: no index entry may name a block the
+         * bitmap calls free. cas_index_verify_locked() asks that question, and
+         * it is the mirror of cas_unreferenced_locked() — neither sweep can see
+         * the other's defect, and the standing `used_blocks == popcount(bitmap)`
+         * audit sees neither, because the index is not party to it.
+         *
+         * AND THE CONSEQUENCE, checked rather than argued: a put made AFTER
+         * recovery must not be handed the probe's block. That is the corruption
+         * the v0.48 comment predicts, one step further along than the invariant
+         * that forbids it, and it costs one extra put to check.
+         *
+         * FALSIFIER: -DCAS_PUT_NOJOURNAL_REPRO, which performs the put with no
+         * journal at all — the shipped pre-v0.48 sequence. These assertions must
+         * go RED on that build.
+         *
+         * The probe is a direct cas_put with no dirent, so it leaves one
+         * allocated, indexed, unreferenced block behind. That is deliberate:
+         * routing it through vfs_write_file would put a dirent commit and its
+         * flushes between the injection and the remount, and any of those could
+         * write the bitmap home and mask the very state under test. The residue
+         * costs nothing, because this whole phase exists only under
+         * -DCRASH_INJECT_COMMIT_FAIL and never in a gate or release build.
+         * ================================================================== */
+        { static uint8_t cp_buf[512], cp_got[512];
+          /* Salted from put_count, which is persistent and monotonic, so the
+           * content is unique on a REUSED volume too. Identical content would
+           * dedup, cas_put would return before ever reaching the injection, and
+           * the phase would then be asserting over a put that did not happen. */
+          uint32_t salt = (uint32_t)SB->put_count;
+          for (uint32_t i = 0; i < sizeof cp_buf; i++)
+              cp_buf[i] = (uint8_t)((i * 131u + salt * 7u + 17u) & 0xFF);
+
+          uint64_t live0, dang0;
+          klock_acquire(&g_cas_lock);
+          cas_index_verify_locked(&live0, &dang0);
+          klock_release(&g_cas_lock);
+
+          g_cjp_arm = 1;
+          uint64_t f0 = g_cjp_fired;
+          uint64_t ph = cas_put(cp_buf, sizeof cp_buf);
+          int fired = (g_cjp_fired > f0);
+
+          g_cas_mounted = 0;
+          int rem4 = cas_mount();
+
+          uint64_t live1, dang1;
+          int64_t  pblk;
+          klock_acquire(&g_cas_lock);
+          cas_index_verify_locked(&live1, &dang1);
+          pblk = ph ? cas_index_find(ph, 0) : -1;
+          klock_release(&g_cas_lock);
+
+          /* If recovery kept the entry, it must produce the bytes it names.
+           * If it dropped it, that is a correctly lost transaction and there is
+           * nothing to read — both are acceptable, a wrong readback is not. */
+          int content_ok = 1;
+          if (pblk >= 0) {
+              int64_t got = cas_get(ph, cp_got, sizeof cp_got);
+              content_ok = (got == (int64_t)sizeof cp_buf);
+              for (uint32_t i = 0; i < sizeof cp_buf && content_ok; i++)
+                  if (cp_got[i] != cp_buf[i]) content_ok = 0;
+          }
+
+          /* THE CONSEQUENCE. A different blob, put after recovery: if the probe
+           * still holds an index entry, the allocator must not hand its block
+           * out again. */
+          static uint8_t cp_next[512];
+          for (uint32_t i = 0; i < sizeof cp_next; i++)
+              cp_next[i] = (uint8_t)((i * 197u + salt * 13u + 59u) & 0xFF);
+          uint64_t nh = cas_put(cp_next, sizeof cp_next);
+          int64_t nblk;
+          klock_acquire(&g_cas_lock);
+          nblk = nh ? cas_index_find(nh, 0) : -1;
+          klock_release(&g_cas_lock);
+          int not_reissued = !(pblk >= 0 && nblk >= 0 && nblk == pblk);
+
+          kprintf("[vfsstrs] crash-inject: interrupted PUT — index entries %u -> %u, "
+                  "dangling %u -> %u, probe block %d, next put block %d "
+                  "(fired=%d, remounted=%d)\n",
+                  live0, live1, dang0, dang1, pblk, nblk,
+                  (uint64_t)(int64_t)fired, (uint64_t)(int64_t)rem4);
+          vfscheck("crash-inject: the PUT injection actually FIRED and the volume remounted "
+                   "(a phase that armed nothing would pass every check below having "
+                   "interrupted nothing)",
+                   fired && rem4 == 1 && ph != 0);
+          vfscheck("crash-inject: the index sweep SAW entries after recovery (dangling == 0 "
+                   "over an index the walk never read is the zero that means 'did not look')",
+                   live1 > 0);
+          vfscheck("crash-inject: after an interrupted PUT no index entry names a block the "
+                   "bitmap calls free — the v0.48 hazard the CAS journal exists to close, "
+                   "measured rather than argued",
+                   dang0 == 0 && dang1 == 0);
+          vfscheck("crash-inject: an index entry that SURVIVES an interrupted put still "
+                   "produces the exact bytes it names (a lost put is correct; a put that "
+                   "comes back readable and wrong is not)",
+                   content_ok);
+          vfscheck("crash-inject: a put made AFTER recovery is not handed the interrupted "
+                   "put's still-indexed block — the silent dedup corruption the journal's "
+                   "own header predicts",
+                   not_reissued); }
+
         vfs_unlink(A); vfs_unlink(B); vfs_unlink("ccrash-c");
         vfs_journal_apply();
     }
@@ -22529,6 +22752,33 @@ static void cmd_vfs_stress(void) {
                "(a climbing count is a reclamation leak; a small steady one is the boot "
                "suites' own direct CAS content)",
                unref <= CAS_UNREF_BUDGET);
+    }
+
+    /* v0.88: THE MIRROR AUDIT, AND IT IS A STANDING ONE.
+     *
+     * The budget check above asks which allocated blocks nothing names. This
+     * asks which index entries name a block the bitmap calls free — the v0.48
+     * hazard, and the shape a put interrupted between its index write and its
+     * bitmap flush would leave if the CAS journal did not close it.
+     *
+     * It runs on EVERY boot, not only under -DCRASH_INJECT_COMMIT_FAIL. The
+     * crash phase proves the journal survives a deliberate interruption; this
+     * proves the invariant holds over an ordinary boot's whole workload, which
+     * is a different claim and the cheaper of the two to keep. `live` is
+     * asserted non-zero for the reason the crash phase asserts it: zero
+     * dangling entries over an index nothing put anything into is the zero that
+     * means "did not look". */
+    { uint64_t ilive, idang;
+      klock_acquire(&g_cas_lock);
+      cas_index_verify_locked(&ilive, &idang);
+      klock_release(&g_cas_lock);
+      kprintf("[vfsstrs] cas index audit: %u live index entr(ies), %u naming a block the "
+              "bitmap calls free\n", ilive, idang);
+      vfscheck("the content index was actually populated this boot (zero entries would make "
+               "the dangling count below INCONCLUSIVE)", ilive > 0);
+      vfscheck("no content-index entry names a block the bitmap calls free (the v0.48 hazard: "
+               "a later put would dedup to it and hand back storage since reallocated)",
+               idang == 0);
     }
 
     vfscheck("the tmp ownership rule was exercised this boot (permission decisions > 0; "
