@@ -21444,6 +21444,7 @@ static int appsmp_drain(uint64_t watchdog) {
 #define CASC_MAXW     32
 #define CASC_WATCH_FOR(nw) ((uint32_t)(nw) * 1200u < 12000u ? 12000u : (uint32_t)(nw) * 1200u)
 
+#ifndef CASC_SKIP
 static int casc_live(void) {
     int c = 0;
     for (int i = 0; i < n_kproc; i++)
@@ -21471,6 +21472,7 @@ static int casc_drain(uint64_t watchdog) {
         __asm__ volatile("pause");
     }
 }
+#endif  /* CASC_SKIP: the soak helpers exist only when the phase does */
 
 /* The worker is lseek_worker() in user/init.c; 42 is its only success value and
  * every other code is decoded at the call site. */
@@ -22802,6 +22804,7 @@ static void cmd_vfs_stress(void) {
     /* ===== v0.89: CAS INDEX/BITMAP CONTENTION SOAK =========================
      * See the header comment at CASC_ROLE for what this contends on and why the
      * append phases above do not. ======================================== */
+#ifndef CASC_SKIP
     {
         int nw = 2 * n;
         if (nw > CASC_MAXW) nw = CASC_MAXW;
@@ -22930,6 +22933,20 @@ static void cmd_vfs_stress(void) {
             kputs("[vfsstrs] cas-contend: one core online, so this boot measures correctness "
                   "without contention — the multi-core premise is asserted only where n > 1\n");
     }
+#else
+    /* v0.89 BISECTION FLAG, opt-in (`make EXTRA=-DCASC_SKIP`) and never in a
+     * release build: omit the contention soak entirely.
+     *
+     * Added while investigating two threadstrs premise guards ("threads were
+     * dispatched on MORE THAN ONE core") that fail intermittently on smp2-bios
+     * in this cycle and did not at v0.87.0 under the same host conditions.
+     * vfsstrs runs BEFORE threadstrs, so a phase that spawns unaffined workers
+     * here is a candidate for changing the scheduler state threadstrs then
+     * measures. This flag is what tells the difference between that and a
+     * coincidence, and it exists because guessing is what the negative-control
+     * convention in CLAUDE.md is there to stop. */
+    kputs("[vfsstrs] cas-contend: SKIPPED (-DCASC_SKIP bisection build)\n");
+#endif
 
     /* ===== v0.86: THE JOURNAL COMMIT IS PREEMPTIBLE ========================
      *

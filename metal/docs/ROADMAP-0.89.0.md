@@ -297,6 +297,82 @@ and nowhere else.
 
 ---
 
+## BLOCKER — the contention soak destabilises `threadstrs` at two CPUs
+
+Found while cutting v0.88.0. **The tag was not created.** The release protocol
+says a version tag is a tag plus an ISO that booted clean, and `release-verify`'s
+own contract fails unless every suite reports zero failures. This one does not.
+
+### What happens
+
+The v0.88.0 release artefact (`725b9b7b229e071aa2cb4a3b5163be5b`) fails
+`smp2-bios` intermittently, on two `threadstrs` assertions:
+
+```
+[threadstrs] FAIL: threads were dispatched on MORE THAN ONE core
+[threadstrs] FAIL: at least two cores were inside ring 3 simultaneously
+```
+
+Both are **premise guards** — "did the scheduler actually use both cores for
+these workers" — not correctness assertions. No byte, count or invariant is
+wrong in a failing boot.
+
+### Localised by measurement, not by reading
+
+| build | `smp2-bios` |
+|---|---|
+| v0.87.0, same host and time window | **4 / 4 PASS** |
+| v0.88 release artefact | **2 / 4 PASS** — 2 failed |
+| v0.88 with `-DCASC_SKIP` (soak omitted) | **4 / 4 PASS** |
+
+The control matters here: the host was measurably slower during this window
+(smp2 at 245–265 s against 130 s earlier the same day), which is the profile of
+the flakiness this tree has blamed on host load before. v0.87.0 going 4/4 under
+those same conditions rules that out. `-DCASC_SKIP` going 4/4 rules in the soak.
+
+`vfsstrs` (where the soak lives) runs at log line ~6119; `threadstrs` at ~7429.
+The soak precedes it, spawns `2 × n` unaffined workers, and adds roughly twelve
+seconds before `threadstrs` starts.
+
+### What this is, most likely — and what it is not
+
+The soak did not break threading. It changed the timing enough to land a
+pre-existing race on its bad side. The sibling suite says so about its own copy
+of this guard, in the source, today:
+
+> v0.80: same family as threadstrs and mcq — see the note there. **At two cpus
+> the whole worker pool can be serviced by one core before the other reaches it,
+> so this is a race rather than a defect.** Skipped with the observation printed,
+> not deleted.
+
+`pthreads_smp` therefore guards this at `n >= 3`. `threadstrs` guards it at
+`n >= 2`, on the strength of 8-of-8 boots measured when the threshold was moved.
+**That 8-of-8 evidence is what this change invalidates**: it was collected
+without a phase that spawns four unaffined workers immediately beforehand.
+
+In a failing boot `mcq` still reports *"ring-3 concurrency high-water mark: 2
+core(s) at once"* — the machine does get both cores into ring 3. The failure is
+specific to `threadstrs`' own worker dispatch.
+
+### Options, and the one I would not take quietly
+
+1. **Align `threadstrs` with `pthreads_smp`**: assert at `n >= 3`, print the
+   observation at `n == 2`. Consistent with the sibling and with its written
+   rationale — but it is also "weaken the assertion until my change passes", and
+   that is precisely the move this repository's conventions exist to make
+   somebody argue for out loud rather than slip in beside a release. It needs a
+   deliberate decision, not a release engineer's judgement call at tag time.
+2. **Restore the conditions the guard was validated under**: run the soak after
+   `threadstrs` rather than before it. Weakens nothing, but only moves the
+   fragility out of sight.
+3. **Investigate the scheduler state the soak leaves behind** — whether cpu 1 is
+   left halted and slow to pick up work after the drain. The most useful answer
+   and the most expensive; it would say whether the guard is fragile or the
+   drain is leaving the machine unbalanced.
+
+Recorded rather than chosen. `-DCASC_SKIP` is kept in the tree as the bisection
+tool that found this.
+
 ## Not covered
 
 - **Bare metal and Proxmox.** Unchanged from every previous cycle.
