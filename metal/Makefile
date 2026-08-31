@@ -276,6 +276,19 @@ appendsoak:
 	$(MAKE) EXTRA=-DAPPSMP_SOAK UEXTRA=-DAPPSMP_SOAK
 	@echo "  [appendsoak] built with 1024 appends; boot it with 'make qemu' or tools/gate-matrix.sh"
 
+# v0.89: the CAS contention soak at full size — 4 workers per online core and 96
+# iterations each, against the gate's 2 and 12. Sets the flag on BOTH halves for
+# the reason appendsoak does: CASC_ITERS reaches the kernel through EXTRA and
+# user/init.c through UEXTRA, and a build with only one side raised makes the
+# worker and the kernel disagree about how many iterations happened — a
+# discrepancy that reads as a lost file rather than as a build mistake.
+.PHONY: cascstress
+cascstress:
+	$(MAKE) clean
+	$(MAKE) EXTRA=-DCASC_STRESS UEXTRA=-DCASC_STRESS
+	@echo "  [cascstress] built at 4 workers/core x 96 iterations; boot with tools/gate-matrix.sh"
+	@echo "  [cascstress] for replay-under-load, run tools/gate-dirty.sh against this image"
+
 .PHONY: gate gate-all gate-selftest gate-oversub
 
 # v0.81: the gate's own reporting logic, tested before it is trusted.

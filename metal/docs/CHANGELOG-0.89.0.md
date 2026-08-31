@@ -67,7 +67,63 @@ Three options were on the table at v0.88.0. Option 1 was taken:
    returns the machine to a balanced state, or leaves the BSP holding everything
    while the AP idles. The most useful answer and the most expensive.
 
-**Option 3 is the v0.89 item.** If the drain is leaving the machine unbalanced,
+### ANSWERED — it is PLACEMENT, not a stall
+
+Measured, on 20 `-smp 2` boots, with the instrument built out of the v0.79
+breadcrumbs (`dbg_where`, `dbg_halts`, `ipi_ping`, `slice_count`, `rq_ran`)
+rather than beside them.
+
+| evidence | reading |
+|---|---|
+| latency from queue to first cpu1 dispatch: **0–5 ticks**, every boot | prompt wake; never the one-timer-period signature of a spent ping |
+| **0 slices** taken by cpu1 in every round | the LAPIC timer never had to rescue anything — the IPI did the work |
+| ~400–460 pings taken per round | delivery is working; this is not a lost-IPI case |
+| gap from soak drain to `threadstrs` queue: **~4,700 ticks (~47 s)** | dozens of suites run in between; no post-soak AP state survives that |
+| the failing boot: latency **0 ticks**, cpu1 ran **6 tasks**, `cores_used = 1` | cpu1 woke instantly and worked — and one core still took the whole pool |
+
+**cpu1 sits at `HALTED` at drain-end and at queue-time in every boot, passing and
+failing alike.** That is ordinary idle, not a stall, and it is why the state
+alone was never going to answer this: the discriminator is the *latency*, and it
+is zero.
+
+The verdict line prints the reading and the numbers behind it on every
+multi-core boot, not only on the bad ones — a number that appears only when
+something goes wrong cannot establish what normal looks like, which is the
+condition that left this question open for two milestones.
+
+#### Two corrections, both to my own instrument
+
+**The first version suppressed the bug it was built to observe.** The marker was
+armed in the three statements immediately before `rq_push_any` — two global
+stores and a `__sync_synchronize()`, a full memory barrier dropped into the exact
+race under test. Fourteen instrumented boots then showed two cores in 14 of 14,
+against roughly half failing on the uninstrumented build. Arming it earlier, so
+the sequence from the last pre-existing statement to the push is untouched,
+restored the failure: **1 of 6**. An instrument that makes the thing it measures
+stop happening has not measured it.
+
+**The verdict string named the wrong core.** It read *"cpu0 had already drained
+the thread pool"*. The first boot that actually reached it disproved that:
+`ran_on mask 2`, so all six threads ran on **CPU 1, the AP**, and cpu0 got none
+of them. The category was right and the detail was invented. The true statement
+is symmetric and more useful — whichever core reaches the queue first takes the
+whole pool, and it is as likely to be the AP as the BSP — which also disposes of
+"the BSP is simply quicker off the mark". The mask is now printed beside the
+verdict so the claim stays checkable against the same line.
+
+#### What this means for the guard
+
+`threadstrs`' `n >= 3` threshold stands, and now on evidence rather than on
+convenience: at two CPUs the pool is small enough that one core routinely takes
+all of it, the other core is neither late nor stalled, and there is nothing to
+fix in the scheduler. Restoring `n >= 2` would require making the *pool* bigger
+or the rendezvous stricter — a change to the suite, not to the kernel — and is
+not proposed here.
+
+**Option 3 is therefore closed.** Options 1 (taken in v0.88.0) and 2 are
+unchanged below for the record.
+
+**Option 3 was the v0.89 item.** If the drain is leaving the machine unbalanced,
 that is a scheduler observation worth having on its own account, and it would let
 `threadstrs` go back to `n >= 2` on evidence rather than on hope. If it is not,
 the honest outcome is to say so and leave the guard where it is — which is a
@@ -75,6 +131,49 @@ result, not a failure, and is the same shape as v0.87's `SYS_FSTAT` prediction
 and v0.86's journal-interrupt claim.
 
 `-DCASC_SKIP` remains in the tree as the bisection tool that found this.
+
+## THE CAS SOAK AT FULL SIZE, AND UNDER ACTIVE REPLAY
+
+`make cascstress` builds the role-61 soak at **4 workers per online core and 96
+iterations each**, against the gate's 2 and 12. It sets the flag on *both* halves
+for the reason `appendsoak` does: `CASC_ITERS` reaches the kernel through `EXTRA`
+and `user/init.c` through `UEXTRA`, and raising only one side makes the worker
+and the kernel disagree about how many iterations happened — a discrepancy that
+reads as a lost file rather than as a build mistake. The phase now prints the
+pair it was compiled with, so the two are distinguishable at a glance.
+
+**Fresh `smp4-bios`, 16 workers on 4 cores, 96 iterations each:**
+
+```
+14 ok, 2 deadline, 0 failed; ran on 4 core(s) (mask f) in 18629 ticks
+unreferenced 2 -> 2, used_blocks 1121 -> 1121, gen bumps 386 -> 3244,
+frees 386 -> 3244, underflow 0 -> 0, dangling 0
+```
+
+**2,858 real frees**, and every block came back — `unreferenced` and
+`used_blocks` return to *exactly* their pre-soak values, not merely close to
+them. Zero underflows, zero dangling index entries, generation table in step.
+All eleven phase assertions PASS, and the suite total is unchanged at 574.
+
+The two deadline expiries are the v0.88 convention working as designed: at 96
+iterations two of sixteen workers ran out their 60 s budget, and because deadline
+expiry carries its own exit code the phase reports it separately and declines to
+call it a defect. The byte-level checks are untouched and still fatal, so this
+cannot hide a lost write.
+
+**Under active journal replay**: the same stress image through
+`gate-dirty --smp 4`, three boots on one volume. **PASS**, with `cas-recovered=1`
+on boots 2 and 3 — so the full-size soak ran on a volume whose CAS metadata
+journal had just been replayed from a real power cut, and the ring-3 worker's own
+per-iteration checks held throughout.
+
+That is the double-write and positional-write claim, verified where it matters:
+each iteration writes twice to one descriptor, reads back **both** halves, and
+exits on a distinct code if either is wrong (1846 for the first payload, 1850 for
+the second). `SYS_WRITE_FILE` being positional since v0.83 is what makes the file
+2 × payload rather than a replacement, and the second half reading back correct
+is what proves the second write did not disturb the first — under contention from
+every core, on a freshly recovered volume.
 
 ## CARRIED FORWARD FROM v0.88
 
@@ -99,11 +198,23 @@ and v0.86's journal-interrupt claim.
 ## WORKSPACE
 
 `.claude/worktrees/v075-tier2-crypto` was carried through v0.87 and v0.88 without
-a decision. It is dated 9 August, is not in `git worktree list`, has no branch,
-and git holds no record of its contents — so removing it is a plain filesystem
-deletion of files nobody has diffed. **v0.88 is the third cycle to carry it.**
-Either delete it this cycle or write down why it is being kept; carrying it a
-fourth time is the habit this section exists to prevent.
+a decision. **Removed in v0.89, after the check that had never been done.**
+
+The three previous entries all said the same thing — *"git holds no record of its
+contents, so removing it is a plain filesystem deletion of files nobody has
+diffed"* — and that was true of `git worktree list`, not of the object database.
+Every file was hashed and asked for by name:
+
+| measured | result |
+|---|---|
+| source blobs (`kernel64.c`, `init.c`, `Makefile`) | **in the repo**, traceable to `c0baf76` / `320acc2` — the v0.75 Tier 2 crypto work, merged as #62 and #68 |
+| 147 `OUTRUN-*.log` files | **zero real content differences**; every one differs from its committed copy only by CRLF, from the checkout's line-ending conversion |
+| 58 files whose blobs git does not hold | all of them `metal/build/*`, `metal/iso/boot/*.elf`, or `.claude/settings.local.json` — build output and local config, both gitignored |
+
+Nothing unique was lost, and that is a measurement rather than the assumption the
+previous three entries were resting on. 119 MB reclaimed; the empty `.worktrees/`
+directory left by the v0-86 removal went with it. `git worktree list` and
+`git status` are both clean.
 
 ## FIRST COMMITS OF THE CYCLE
 

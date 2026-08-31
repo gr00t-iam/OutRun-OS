@@ -3405,7 +3405,11 @@ static void append_smp_worker(u32 idx) {
  * has its own separate code (1849) so a slow host is never decoded as a defect
  * — the kernel half counts deadline expiries apart from failures for exactly
  * the reason v0.88 had to learn twice. */
+#ifdef CASC_STRESS
+#define CASC_ITERS   96u
+#else
 #define CASC_ITERS   12u
+#endif
 #define CASC_PAY     192u
 #define CASC_T       6000u          /* ticks; 100 Hz, so 60 s */
 static void cas_contend_worker(void) {

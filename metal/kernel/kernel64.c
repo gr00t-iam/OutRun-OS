@@ -14319,6 +14319,59 @@ static void smp_preempt_ipi(struct isr_frame *f) {
 #define CPUW_WORK      4   /* running a suite work mode (xadd storm etc.)     */
 #define CPUW_PREHALT   5   /* decided to halt, has NOT halted yet <-- the window */
 #define CPUW_HALTED    6   /* in hlt, waiting for an interrupt                */
+static const char *const CPUW_NAME[7] = { "BOOT", "POP", "EXEC", "SCAN", "WORK",
+                                          "PREHALT", "HALTED" };
+
+/* ===========================================================================
+ * v0.89: AP-1 POST-SOAK PROFILE — why threadstrs stopped seeing two cores
+ * ===========================================================================
+ * v0.88 shipped the role-61 CAS contention soak and, with it, made two
+ * `threadstrs` premise guards fail about half the time on `-smp 2`. The guards
+ * were aligned with pthreads_smp's `n >= 3` and the underlying question was
+ * left open, deliberately and on the record: IS AP 1 STALLED AFTER THE SOAK, OR
+ * DOES CPU 0 SIMPLY DRAIN THE THREAD POOL FIRST?
+ *
+ * Those have different fixes and only one of them is a defect, so guessing
+ * between them is worth nothing. This is the instrument that separates them,
+ * and it is built out of the v0.79 breadcrumbs rather than beside them —
+ * `dbg_where`, `dbg_halts`, `ipi_ping`, `slice_count`, `rq_ran` already exist
+ * and already answer "where is cpu1 and is anything waking it".
+ *
+ * WHAT DISCRIMINATES THE TWO HYPOTHESES, stated before the numbers are in so
+ * the reading is not chosen to fit them:
+ *
+ *   STALL     cpu1 sits at HALTED/PREHALT across the gap, its `rq_ran` does not
+ *             advance during threadstrs, and first pick-up (if it happens) is
+ *             about one LAPIC timer period after the work was queued — the
+ *             signature of a ping that was spent before the halt, which the
+ *             timer then rescued.
+ *   PLACEMENT cpu1 wakes promptly — first pick-up within a tick or two — but
+ *             `rq_ran` shows it ran little or nothing because cpu 0 had already
+ *             popped the pool. Nothing is wrong; the pool is just small enough
+ *             to be consumed before the AP arrives.
+ *
+ * A third possibility the same numbers can show: `ipi_ping` not advancing at
+ * all across the gap, which would mean no ping was ever sent and would be a
+ * dispatch defect rather than either hypothesis.
+ *
+ * The first-run marker is armed by threadstrs and read once. It is a global
+ * rather than a new `struct cpu_local` field on purpose: that struct has four
+ * offsets pinned by assembly and _Static_assert-ed, and a profiling counter is
+ * not a good reason to go near them. */
+static volatile uint64_t g_ap1_first_run_tick = 0;  /* g_ticks at first dispatch  */
+static volatile int      g_ap1_first_arm      = 0;  /* set by threadstrs          */
+
+/* Snapshot of cpu1 taken the instant the soak's drain returns. Zeroed means the
+ * soak did not run this boot (uniprocessor, or -DCASC_SKIP), which the report
+ * says rather than printing a differences-from-nothing. */
+static int      g_casc_profiled    = 0;
+static uint64_t g_casc_end_tick    = 0;
+static uint32_t g_casc_end_where   = 0;
+static uint32_t g_casc_end_halts   = 0;
+static uint32_t g_casc_end_ran     = 0;
+static uint32_t g_casc_end_ping    = 0;
+static uint32_t g_casc_end_slices  = 0;
+static uint64_t g_casc_end_lastrun = 0;
 
 static void __attribute__((noreturn)) ap_main(uint64_t idx) {
     /* the trampoline's private GDT got us here; switch to the KERNEL GDT so  */
@@ -14364,6 +14417,10 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
             g_cpu[idx].dbg_was_idle = 0;               /* leaving idle: reset the latch */
             g_cpu[idx].dbg_where = CPUW_EXEC;
             g_cpu[idx].dbg_last_run_tick = g_ticks;
+            /* v0.89: first dispatch on cpu1 since threadstrs armed the marker.
+             * Two loads and a branch beside a store that is already here. */
+            if (idx == 1 && g_ap1_first_arm && !g_ap1_first_run_tick)
+                g_ap1_first_run_tick = g_ticks;
             cpu_exec_proc((int)idx, p);
             g_cpu[idx].dbg_where = CPUW_POP;
         }
@@ -15339,8 +15396,10 @@ static void cmd_mcpre(void) {
          *
          * slices tells us whether cpu1's own LAPIC timer is delivering at all,
          * which is the thing that would otherwise rescue a spent ping. */
-        static const char *WNAME[] = { "BOOT", "POP", "EXEC", "SCAN", "WORK",
-                                       "PREHALT", "HALTED" };
+        /* v0.89: was a second, local copy of this table. Two tables naming the
+         * same seven states is one rename away from a log that lies about where
+         * a core was, which is the one thing this diagnostic exists to get
+         * right. Now shared with the AP-1 profile — see CPUW_NAME. */
         uint32_t w = g_cpu[1].dbg_where;
         kprintf("[mcpre  ] FAIL  long probe never started on cpu1 — DEADLINE after %u tick(s); "
                 "cpu1 rq depth %d, %u cpu(s) online\n",
@@ -15348,7 +15407,7 @@ static void cmd_mcpre(void) {
                 (uint64_t)g_ncpu_online);
         kprintf("[mcpre  ]   cpu1 state=%s pings=%u slices=%u preempts=%u halts=%u "
                 "ran=%u stolen=%u last-dispatch@tick %u (now %u)\n",
-                (w < 7 ? WNAME[w] : "?"),
+                (w < 7 ? CPUW_NAME[w] : "?"),
                 (uint64_t)g_cpu[1].ipi_ping, (uint64_t)g_cpu[1].slice_count,
                 (uint64_t)g_cpu[1].preempt_count, (uint64_t)g_cpu[1].dbg_halts,
                 (uint64_t)g_cpu[1].rq_ran, (uint64_t)g_cpu[1].rq_stolen,
@@ -21437,7 +21496,24 @@ static int appsmp_drain(uint64_t watchdog) {
  * page-table claim belongs. Saying so here rather than adding an assertion that
  * would pass for reasons unrelated to this phase. */
 #define CASC_ROLE     61u
+/* v0.89: CASC_STRESS raises the soak to every worker slot the phase allows and
+ * multiplies the iteration count. Opt-in (`make casc-stress`, which sets it on
+ * BOTH halves) and never in a gate or release build — at 4:1 with 96 iterations
+ * the phase alone is minutes.
+ *
+ * THESE MUST MATCH THE RING-3 HALF. CASC_ITERS reaches the kernel through EXTRA
+ * and user/init.c through UEXTRA, which are separate variables; building one
+ * side with it and not the other makes the worker and the kernel disagree about
+ * how many iterations happened, and the failure looks like a lost file rather
+ * than a build mistake. That is exactly the trap APPSMP_SOAK documented, so the
+ * Makefile target sets both and the phase prints the pair it was built with. */
+#ifdef CASC_STRESS
+#define CASC_ITERS    96u          /* MUST match user/init.c's CASC_ITERS */
+#define CASC_RATIO    4            /* workers per online core             */
+#else
 #define CASC_ITERS    12u          /* MUST match user/init.c's CASC_ITERS */
+#define CASC_RATIO    2
+#endif
 #define CASC_PAY      192u         /* MUST match user/init.c's CASC_PAY   */
 #define CASC_OK       42
 #define CASC_DEADLINE 1849
@@ -22806,7 +22882,7 @@ static void cmd_vfs_stress(void) {
      * append phases above do not. ======================================== */
 #ifndef CASC_SKIP
     {
-        int nw = 2 * n;
+        int nw = CASC_RATIO * n;
         if (nw > CASC_MAXW) nw = CASC_MAXW;
         if (nw < 2) nw = 2;                    /* a uniprocessor still gets two */
 
@@ -22843,6 +22919,27 @@ static void cmd_vfs_stress(void) {
 
         int drained = casc_drain(CASC_WATCH_FOR(nw));
         current_proc_idx = save;
+
+        /* v0.89: SNAPSHOT CPU 1 THE INSTANT THE DRAIN RETURNS. Taken here and
+         * not a line later because every kprintf between here and threadstrs is
+         * serial output the AP could be woken by; the question is what the soak
+         * left behind, not what the reporting did to it. */
+        if (n > 1) {
+            g_casc_profiled    = 1;
+            g_casc_end_tick    = g_ticks;
+            g_casc_end_where   = g_cpu[1].dbg_where;
+            g_casc_end_halts   = g_cpu[1].dbg_halts;
+            g_casc_end_ran     = g_cpu[1].rq_ran;
+            g_casc_end_ping    = g_cpu[1].ipi_ping;
+            g_casc_end_slices  = g_cpu[1].slice_count;
+            g_casc_end_lastrun = g_cpu[1].dbg_last_run_tick;
+            kprintf("[vfsstrs] cas-contend: cpu1 at drain-end state=%s halts=%u ran=%u pings=%u "
+                    "slices=%u last-dispatch@tick %u (now %u)\n",
+                    CPUW_NAME[g_casc_end_where < 7 ? g_casc_end_where : 0],
+                    (uint64_t)g_casc_end_halts, (uint64_t)g_casc_end_ran,
+                    (uint64_t)g_casc_end_ping, (uint64_t)g_casc_end_slices,
+                    g_casc_end_lastrun, g_casc_end_tick);
+        }
         if (!drained)
             kprintf("[vfsstrs] cas-contend WATCHDOG: %d worker(s) still live\n",
                     (uint64_t)(int64_t)casc_live());
@@ -22887,6 +22984,17 @@ static void cmd_vfs_stress(void) {
             firstbad == 1848 ? "*** unlink refused" :
             firstbad <  0    ? "" : "an unrecognised code";
 
+        /* v0.89: print the build the phase was compiled for. A kernel and a
+         * ring-3 worker that disagree about CASC_ITERS produce a byte count that
+         * looks like a lost file; naming the pair here is what tells the two
+         * apart at a glance. */
+        kprintf("[vfsstrs] cas-contend: built at ratio %d:1, %u iteration(s)/worker, payload %u B%s\n",
+                (uint64_t)(int64_t)CASC_RATIO, (uint64_t)CASC_ITERS, (uint64_t)CASC_PAY,
+#ifdef CASC_STRESS
+                "  [CASC_STRESS]");
+#else
+                "");
+#endif
         kprintf("[vfsstrs] cas-contend: %d worker(s) on %d core(s), %u iteration(s) each — "
                 "%d ok, %d deadline, %d failed%s%s; ran on %d core(s) (mask %x) in %u ticks\n",
                 (uint64_t)(int64_t)nsp, (uint64_t)(int64_t)n, (uint64_t)CASC_ITERS,
@@ -27844,10 +27952,40 @@ static void cmd_thread_stress(void) {
      * old one. */
     uint32_t pid0 = kprocs[p].pid;
 
+    /* v0.89: ARM THE AP-1 MARKER HERE, NOT BESIDE THE PUSH, and the move is the
+     * point rather than tidiness.
+     *
+     * The first version armed it in the three statements immediately before
+     * `rq_push_any` — two global stores and a `__sync_synchronize()` — which is
+     * a full memory barrier inserted into the exact race this instrument exists
+     * to observe. Fourteen instrumented `-smp 2` boots then showed two cores in
+     * 14 of 14, against roughly half failing on the uninstrumented build. An
+     * instrument that makes the thing it measures stop happening has not
+     * measured it.
+     *
+     * Arming it up here, before the round is set up, leaves the sequence from
+     * the last pre-existing statement to the push exactly as it was. The cost is
+     * that the marker is live across a few lines of setup that queue nothing, so
+     * it cannot record a spurious dispatch. */
+    g_ap1_first_run_tick = 0;
+    g_ap1_first_arm      = 1;
+
     struct px_round R;
     for (int i = 0; i < 7; i++) { R.got[i] = 0; R.code[i] = 0; R.pid[i] = 0; }
     R.nchild = 0; R.pid[0] = kprocs[p].pid;
     int procs[1]; procs[0] = p;
+    /* v0.89: the marker itself is armed ABOVE, before the round is set up — see
+     * the note there for why it cannot be armed here. These lines take only the
+     * pre-round BASELINE: cpu1's counters, and the tick the work was queued at,
+     * which is the origin the reported latency is measured from. Nothing here
+     * stores to a global or fences, which is the property that note is
+     * protecting; keep it that way when adding a counter to this list. */
+    uint32_t ts_ran0 = (n > 1) ? g_cpu[1].rq_ran      : 0;
+    uint32_t ts_png0 = (n > 1) ? g_cpu[1].ipi_ping    : 0;
+    uint32_t ts_hlt0 = (n > 1) ? g_cpu[1].dbg_halts   : 0;
+    uint32_t ts_slc0 = (n > 1) ? g_cpu[1].slice_count : 0;
+    uint32_t ts_whr0 = (n > 1) ? g_cpu[1].dbg_where   : 0;
+    uint64_t ts_push_tick = g_ticks;
     rq_push_any(0, p);
     __sync_synchronize();
     if (n > 1) lapic_ipi(0, IPI_PING, 1);
@@ -27855,6 +27993,7 @@ static void cmd_thread_stress(void) {
      * 300-yield settle before the gate opens — under TCG that is slow, and the
      * watchdog has to leave room for it without hiding a genuine stall. */
     int finished = posix_drain(procs, 1, &R, 160000);
+    g_ap1_first_arm = 0;
     current_proc_idx = save;
     if (!finished) kprintf("[threadstrs] WATCHDOG: the driver did not finish\n");
 
@@ -27892,6 +28031,74 @@ static void cmd_thread_stress(void) {
 
     int cores_used = 0;
     for (int c = 0; c < MAX_CPUS; c++) if (g_thr_ran_mask & (1u << c)) cores_used++;
+
+    /* ===== v0.89: AP-1 POST-SOAK PROFILE — the verdict =====================
+     * See the note at g_ap1_first_run_tick for the two hypotheses and what
+     * separates them. Printed on every multi-core boot, not only when the
+     * dispatch guard would have failed: a number that only appears on the bad
+     * runs cannot establish what the good ones looked like, and this whole
+     * question exists because two milestones of hypotheses had no such
+     * baseline. ==================================================== */
+    if (n > 1) {
+        uint32_t d_ran = g_cpu[1].rq_ran      - ts_ran0;
+        uint32_t d_png = g_cpu[1].ipi_ping    - ts_png0;
+        uint32_t d_hlt = g_cpu[1].dbg_halts   - ts_hlt0;
+        uint32_t d_slc = g_cpu[1].slice_count - ts_slc0;
+        int      woke  = (g_ap1_first_run_tick != 0);
+        uint64_t lat   = woke ? (g_ap1_first_run_tick - ts_push_tick) : 0;
+
+        if (g_casc_profiled)
+            kprintf("[threadstrs] AP1 PROFILE: soak drain ended @tick %u, threadstrs queued "
+                    "@tick %u — gap %u tick(s); cpu1 was %s at drain-end and %s at queue-time\n",
+                    g_casc_end_tick, ts_push_tick, ts_push_tick - g_casc_end_tick,
+                    CPUW_NAME[g_casc_end_where < 7 ? g_casc_end_where : 0],
+                    CPUW_NAME[ts_whr0 < 7 ? ts_whr0 : 0]);
+        else
+            kprintf("[threadstrs] AP1 PROFILE: the contention soak did not run this boot "
+                    "(uniprocessor, or -DCASC_SKIP) — no drain-end snapshot to compare against\n");
+
+        kprintf("[threadstrs] AP1 PROFILE: across this round cpu1 ran %u task(s), took %u ping(s), "
+                "%u slice(s), halted %u time(s); first dispatch %s\n",
+                (uint64_t)d_ran, (uint64_t)d_png, (uint64_t)d_slc, (uint64_t)d_hlt,
+                woke ? "YES" : "NEVER");
+        if (woke)
+            kprintf("[threadstrs] AP1 PROFILE: latency from queue to first cpu1 dispatch = "
+                    "%u tick(s)\n", lat);
+
+        /* THE READING, decided by the numbers rather than by which answer would
+         * be convenient. Stated in the log so a future reader gets the verdict
+         * and the evidence together, and so a wrong verdict is falsifiable
+         * against the same line. */
+        const char *verdict;
+        if (d_png == 0 && d_ran == 0)
+            verdict = "NO PING AND NO WORK — cpu1 was never signalled; a dispatch defect, "
+                      "not either hypothesis";
+        else if (!woke)
+            verdict = "STALL — cpu1 never picked anything up despite being signalled";
+        else if (lat >= 10)
+            verdict = "STALL-ish — first pick-up took >= 10 ticks, the shape of a ping spent "
+                      "before the halt and rescued by the LAPIC timer";
+        else if (cores_used < 2)
+            /* v0.89: this said "cpu0 had already drained the thread pool", and
+             * the first boot that actually reached it disproved that wording:
+             * ran_on mask was 2, so all six threads ran on CPU 1 — the AP — and
+             * cpu0 got none of them. The category was right and the detail was
+             * invented.
+             *
+             * The true statement is symmetric and more useful than the one it
+             * replaces: whichever core reaches the queue first takes the whole
+             * pool, and it is as likely to be the AP as the BSP. That rules out
+             * "the BSP is simply quicker off the mark" as well as the stall
+             * hypothesis. The mask is printed below so the claim stays checkable
+             * against the same line. */
+            verdict = "PLACEMENT — cpu1 woke promptly and ran work; ONE core took the whole "
+                      "pool before the other reached it, and nothing is stalled";
+        else
+            verdict = "BOTH CORES USED — cpu1 woke promptly and the pool reached it";
+        kprintf("[threadstrs] AP1 PROFILE: verdict — %s (cores used by threads: %d, ran_on mask %x "
+                "— bit 0 is the BSP, bit 1 is AP 1)\n",
+                verdict, (uint64_t)(int64_t)cores_used, (uint64_t)g_thr_ran_mask);
+    }
     /* v0.80: >= 3 cpus to be RELIABLY OBSERVABLE, not merely true.
      *
      * These two need the thread pool to actually LAND on two different cores
