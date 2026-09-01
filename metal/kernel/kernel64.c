@@ -28182,10 +28182,39 @@ static void cmd_thread_stress(void) {
             kprintf("[threadstrs] OBSERVE: 2-CPU worker dispatch reached %d core(s), ring-3 "
                     "high-water %d — overlap achieved, not asserted (see the n >= 3 note)\n",
                     (uint64_t)(int64_t)cores_used, (uint64_t)(int64_t)g_inr3_max);
-        else
-            kprintf("[threadstrs] OBSERVE: 2-CPU worker dispatch completed on 1 core before AP "
-                    "pick-up (cores %d, ring-3 high-water %d) — a race, not a defect\n",
-                    (uint64_t)(int64_t)cores_used, (uint64_t)(int64_t)g_inr3_max);
+        else {
+            /* v0.89: NAME THE CORE THAT WON, rather than assuming it was the BSP.
+             *
+             * This line used to read "completed on 1 core before AP pick-up",
+             * which asserts a mechanism it never measured: that the BSP drained
+             * the pool and the AP arrived too late. The AP-1 profile disproved
+             * it on the first boot that reached this branch — ran_on mask was 2,
+             * so all six threads ran on CPU 1 and the BSP got none of them. The
+             * category (a placement race) was right; the direction was invented.
+             *
+             * Which core won is the whole content of this observation, so it is
+             * read from the mask that recorded it. See the matching note in the
+             * AP1 PROFILE verdict, which had the same defect and the same fix. */
+            uint32_t won = g_thr_ran_mask;
+            int winner = (won & 1u) ? 0 : ((won & 2u) ? 1 : -1);
+            if (winner < 0)
+                /* Zero cores recorded. Not a placement result at all — the mask
+                 * is fed by departing threads, so an empty one means the round
+                 * did not run rather than that it ran on one core. Saying so is
+                 * the difference between a degraded run and a skipped one. */
+                kprintf("[threadstrs] OBSERVE: 2-CPU worker dispatch recorded NO core at all "
+                        "(ran_on mask %x, cores %d, ring-3 high-water %d) — the round did not "
+                        "run; this is an instrument fault, not a placement race\n",
+                        (uint64_t)won, (uint64_t)(int64_t)cores_used,
+                        (uint64_t)(int64_t)g_inr3_max);
+            else
+                kprintf("[threadstrs] OBSERVE: 2-CPU worker dispatch completed entirely on CPU %d "
+                        "(%s) before the other core reached the pool (ran_on mask %x, cores %d, "
+                        "ring-3 high-water %d) — a race, not a defect\n",
+                        (uint64_t)(int64_t)winner, (winner == 0 ? "the BSP" : "AP 1"),
+                        (uint64_t)won, (uint64_t)(int64_t)cores_used,
+                        (uint64_t)(int64_t)g_inr3_max);
+        }
     } else {
         utcheck("on a uniprocessor every thread ran on cpu 0", g_thr_ran_mask == 1u);
     }
