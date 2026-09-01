@@ -257,8 +257,50 @@ measurement and names the mechanism, and carries a second branch that fires if
 `g_cas_lock` ever *is* contended, telling the reader this note has gone stale.
 
 Making the title true needs a workload that reaches `cas_put` without holding the
-VFS lock. That is a change to the suite, and it is a maintainer's decision rather
-than a side effect of adding telemetry — recorded here as the open item it is.
+VFS lock. That is a change to the suite rather than a side effect of adding
+telemetry, so it was made deliberately and separately — below.
+
+### CLOSED — `cas-direct`, and the A/B that proves the diagnosis
+
+A kernel-side burst (`g_work_go` mode 4, `cas_direct_burst`) drives
+put → retain → free from every online core with no VFS lock held. It runs in the
+same suite, on the same boot, through the same telemetry as the phase above, so
+the only variable between them is the lock nesting:
+
+| tier | soak (through VFS) | direct (VFS out of path) |
+|---|---|---|
+| uniprocessor | 0 / 216 | **0 / 72** |
+| smp2-bios | 0 / 432 | **10 / 144 (6%)** |
+| smp4-bios | 0 / 864 | **136 / 288 (47%)** |
+| smp8-bios | 0 / 1,728 | **412 / 576 (71%)** |
+
+Zero becomes 71% by removing one lock from the path, and the rate climbs
+monotonically with core count. That is the diagnosis being *tested* rather than
+asserted: had the VFS-nesting explanation been wrong, this column would have read
+zero too. Uniprocessor reading 0 is the negative control — one core has nobody to
+wait on, and contention there would be the defect.
+
+**Two things this cost, both worth recording.**
+
+`cas_put` + `cas_free` is not a balanced pair. `cas_put` allocates and indexes but
+never establishes a reference; `g_cas_refs` is owned a layer up by
+`vfs_map_ref_one`. A bare put/free finds `refs[b] == 0`, counts an underflow,
+refuses the free and leaks the block — which would have tripped two of the soak's
+own assertions, correctly. **put → RETAIN → free** is the balanced triple.
+
+It is kernel-side because it has to be. There is no CAS syscall: every ring-3
+route to `cas_put` runs through the VFS. Adding `SYS_CAS_PUT` / `SYS_CAS_FREE`
+would put raw block allocate-and-free in the ABI for a stress test, and
+`cas_free` takes a *hash* — a ring-3 caller could drop the reference on a block
+another file's dirent names. That is a corruption primitive, not a test fixture.
+No role number was spent; role 62 remains free.
+
+**The BSP and AP rows are still not the same unit, and this phase is where it
+shows.** On `-smp 8`: BSP 4,688 retries, each AP 5.4–6.7 *million*. Three orders
+of magnitude, because a BSP retry is a `sched_yield()` and an AP retry is one
+`PAUSE`. The BSP's "worst wait" of 6.0 billion cycles is a yield that ran other
+threads, not time under the lock. Summed into one figure these would read as a
+hold-time signal; they are reported per core, labelled, for exactly that reason.
 
 ## CARRIED FORWARD FROM v0.88
 

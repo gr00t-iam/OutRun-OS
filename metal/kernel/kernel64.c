@@ -7718,6 +7718,61 @@ static void vfs_map_ref_one(uint64_t h, int mode) {
     klock_release(&g_cas_lock);
 }
 
+/* ===========================================================================
+ * v0.89: DIRECT CAS CONTENTION — reaching g_cas_lock without g_vfs_lock
+ * ===========================================================================
+ * The role-61 soak was built to contend `g_cas_lock` and provably does not: its
+ * every path runs under `g_vfs_lock` (rank 2), and `cas_put` is reachable only
+ * from inside it, so exactly one thread can be in the rank-3 critical section.
+ * Measured at 0 contended in 1,728 acquisitions on `-smp 8`, and corroborated by
+ * the kernel's own per-lock counters (`vfs` 75/209, `cas` 0/4539). See the
+ * telemetry note at `struct cas_spin_stat`.
+ *
+ * THIS RUNS IN THE KERNEL, NOT RING 3, AND THAT IS NOT A SHORTCUT. There is no
+ * CAS syscall: every ring-3 route to `cas_put` goes through the VFS, which is
+ * the lock we are trying to get out from under. Adding `SYS_CAS_PUT` /
+ * `SYS_CAS_FREE` would put raw block allocate-and-free in the ABI for the
+ * benefit of a stress test, and `cas_free` takes a *hash* — a ring-3 caller
+ * could drop the reference on a block some other file's dirent names. That is a
+ * corruption primitive, not a test fixture. The contention is a kernel-side
+ * property, so it is exercised from the kernel side.
+ *
+ * THE RETAIN IS LOAD-BEARING, and finding out why is most of what this cost.
+ * `cas_put` allocates and indexes a block but does NOT establish a reference —
+ * `g_cas_refs` is owned one layer up, by `vfs_map_ref_one`. So a bare
+ * put/free pair is not the balanced operation it looks like: the free finds
+ * `g_cas_refs[b] == 0`, counts an underflow and refuses, leaving the block
+ * allocated-but-unreferenced. That would trip two of the soak's own assertions
+ * (`unreferenced` returns exactly, and the refcount never underflowed) — and it
+ * would do so correctly, because it really would be a leak. put -> RETAIN ->
+ * free is the balanced triple, and all three take g_cas_lock with no VFS lock
+ * held, which is the entire point.
+ *
+ * Content is unique per (nonce, cpu, iteration) so no put can DEDUP onto a live
+ * block: a dedup would return a hash this core does not own, and the free that
+ * followed would drop someone else's reference. */
+#define WORK_CAS_ITERS 24
+static volatile uint64_t g_cas_direct_ok[MAX_CPUS];
+static volatile uint64_t g_cas_direct_fail[MAX_CPUS];
+static volatile uint32_t g_cas_direct_nonce = 0;
+
+static void cas_direct_burst(int cpu) {
+    uint8_t blk[128];
+    for (uint32_t it = 0; it < WORK_CAS_ITERS; it++) {
+        for (uint32_t k = 0; k < sizeof blk; k++) blk[k] = (uint8_t)(k * 7u + it);
+        /* The identity stamp. Filler alone repeats across cores. */
+        blk[0] = (uint8_t)cpu;
+        blk[1] = (uint8_t)(it & 0xFFu);
+        blk[2] = (uint8_t)(g_cas_direct_nonce & 0xFFu);
+        blk[3] = (uint8_t)((g_cas_direct_nonce >> 8) & 0xFFu);
+        uint64_t h = cas_put(blk, sizeof blk);
+        if (!h) { g_cas_direct_fail[cpu]++; continue; }   /* volume full: not a defect */
+        vfs_map_ref_one(h, VFS_MAP_RETAIN);
+        cas_free(h);
+        g_cas_direct_ok[cpu]++;
+    }
+}
+
 static void vfs_map_walk_locked(const struct dirent *d, int mode) {
     uint32_t nch = d->nchunks;
     if (nch > VFS_CHUNKS_MAX) nch = VFS_CHUNKS_MAX;
@@ -13824,7 +13879,10 @@ static volatile uint32_t g_shoot_mask  = 0;    /* bit c = "cpu c must ack this s
  * trip; a spinning waiter still has interrupts enabled, so it keeps
  * servicing any IPI aimed at it while it waits — no deadlock. */
 static volatile int      g_shoot_lock  = 0;
-static volatile int      g_work_go = 0;        /* 1 = lock-xadd storm, 2 = probe read */
+/* 1 = lock-xadd storm, 2 = probe read, 3 = parallel job, 4 = direct CAS burst.
+ * The comment listed two of these while the loop implemented three; mode 4 made
+ * that a third, so it is now the whole list. */
+static volatile int      g_work_go = 0;
 static volatile uint64_t g_work_counter = 0;
 static volatile uint64_t g_probe_va = 0;
 #define WORK_XADDS 100000
@@ -14511,6 +14569,8 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
                 g_cpu[idx].probe_val = *(volatile uint64_t *)g_probe_va;
             else if (mode == 3)                           /* parallel job (v0.36) */
                 pjob_run((int)idx);
+            else if (mode == 4)                           /* direct CAS (v0.89)  */
+                cas_direct_burst((int)idx);
             g_cpu[idx].work_done = 1;
         }
         /* v0.79: THE WINDOW, MARKED BUT NOT YET CLOSED.
@@ -23110,6 +23170,86 @@ static void cmd_vfs_stress(void) {
                         "%u acquisition(s) — the rank-2-above-rank-3 nesting described here no "
                         "longer holds; re-read that note before trusting it.\n",
                         tot_con, tot_acq);
+        }
+
+        /* ===== v0.89: DIRECT CAS CONTENTION PHASE ===========================
+         * The A/B for the finding above. Same lock, same boot, same telemetry —
+         * the only thing that changes is whether g_vfs_lock is held on the way
+         * in. If the VFS-nesting explanation is right this phase contends and
+         * the phase above does not; if it is wrong, this one is zero too and the
+         * explanation was never the reason. A finding that cannot be wrong is
+         * not worth writing down, so it is arranged to be checkable.
+         *
+         * See cas_direct_burst for why this is kernel-side and why the retain
+         * between put and free is not optional. */
+        {
+            /* Per-CPU baselines, so every number this phase prints is its own
+             * and not the role-61 phase's still showing through. */
+            uint64_t dacq0[MAX_CPUS], dcon0[MAX_CPUS], dret0[MAX_CPUS];
+            for (int c = 0; c < MAX_CPUS; c++) {
+                dacq0[c] = g_cas_acq_cpu[c];
+                dcon0[c] = g_cas_spin[c].contended;
+                dret0[c] = g_cas_spin[c].retries;
+                g_cas_direct_ok[c] = 0; g_cas_direct_fail[c] = 0;
+                g_cas_spin[c].max_cycles = 0; g_cas_spin[c].max_retries = 0;
+            }
+            g_cas_direct_nonce = (uint32_t)g_ticks;
+            for (int i = 1; i < g_ncpu_online; i++) g_cpu[i].work_done = 0;
+            __sync_synchronize();
+
+            /* cas_put logs every stored block. Eight cores through the serial
+             * port would dominate the boot's wall clock and bury the result. */
+            int q0 = g_quiet; g_quiet = 1;
+            g_work_go = 4;
+            cas_direct_burst(0);                        /* the BSP joins in     */
+            uint64_t t0 = g_ticks;
+            for (;;) {
+                int done = 0;
+                for (int i = 1; i < g_ncpu_online; i++) done += g_cpu[i].work_done;
+                if (done == g_ncpu_online - 1) break;
+                if (g_ticks - t0 > 900) break;          /* DEADLINE, not a spin count */
+                lapic_ipi(0, IPI_PING, 1);              /* keep the APs awake   */
+                uint64_t tw = g_ticks; while (g_ticks - tw < 1) __asm__ volatile("pause");
+            }
+            g_work_go = 0;
+            __sync_synchronize();
+            g_quiet = q0;
+
+            uint64_t dacq = 0, dcon = 0, dret = 0, dok = 0, dbad = 0, dmaxc = 0;
+            int cores_in = 0;
+            for (int c = 0; c < MAX_CPUS; c++) {
+                dacq += g_cas_acq_cpu[c]        - dacq0[c];
+                dcon += g_cas_spin[c].contended - dcon0[c];
+                dret += g_cas_spin[c].retries   - dret0[c];
+                dok  += g_cas_direct_ok[c]; dbad += g_cas_direct_fail[c];
+                if (g_cas_spin[c].max_cycles > dmaxc) dmaxc = g_cas_spin[c].max_cycles;
+                if (g_cas_direct_ok[c]) cores_in++;
+            }
+
+            for (int c = 0; c < n && c < MAX_CPUS; c++)
+                kprintf("[vfsstrs] cas-direct cpu%u%s: %u put/retain/free ok, %u failed, "
+                        "contended %u retries %u worst %u cyc\n",
+                        (uint64_t)(int64_t)c, (c == 0 ? " (BSP)" : " (AP)"),
+                        g_cas_direct_ok[c], g_cas_direct_fail[c],
+                        g_cas_spin[c].contended - dcon0[c],
+                        g_cas_spin[c].retries   - dret0[c],
+                        g_cas_spin[c].max_cycles);
+            kprintf("[vfsstrs] cas-direct TOTAL: %u op(s) on %d core(s), %u acquisition(s), "
+                    "contended %u (%u%%), retries %u, worst wait %u cyc\n",
+                    dok, (uint64_t)(int64_t)cores_in, dacq, dcon,
+                    dacq ? (dcon * 100u) / dacq : 0, dret, dmaxc);
+
+            vfscheck("cas-direct: the burst actually ran on every online core "
+                     "(a phase that reached one core cannot contend anything)",
+                     cores_in >= (n < MAX_CPUS ? n : MAX_CPUS));
+            vfscheck("cas-direct: no put/retain/free triple failed", dbad == 0);
+            /* THE CLAIM THIS PHASE EXISTS TO MAKE, and the one the role-61 soak
+             * could not. Uniprocessor is excluded: one core has nobody to wait
+             * on, and asserting contention there would be asserting a defect. */
+            if (n > 1)
+                vfscheck("cas-direct: g_cas_lock WAS genuinely contended with the VFS lock "
+                         "out of the path (this is what the role-61 soak cannot do)",
+                         dcon > 0);
         }
 
         if (!drained)
