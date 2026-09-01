@@ -111,6 +111,42 @@ whole pool, and it is as likely to be the AP as the BSP — which also disposes 
 "the BSP is simply quicker off the mark". The mask is now printed beside the
 verdict so the claim stays checkable against the same line.
 
+**The same defect had a second instance, in the line the suite actually reports.**
+Fixing the `AP1 PROFILE` verdict left its sibling untouched: the `n == 2` OBSERVE
+line still read *"completed on 1 core before AP pick-up"*, which asserts the same
+unmeasured mechanism — that the BSP drained the pool and the AP arrived late. It
+is the more visible of the two, since it is what `threadstrs` prints on every
+two-core boot whether or not anyone is reading the profile.
+
+It now reads the winner out of `g_thr_ran_mask` and names it (`0aa783a`):
+
+```
+OBSERVE: 2-CPU worker dispatch completed entirely on CPU 1 (AP 1) before the
+other core reached the pool (ran_on mask 2, cores 1, ring-3 high-water 1)
+```
+
+A third case came out of writing it. `cores_used < 2` is also true when *zero*
+cores were recorded, and the mask is fed by departing threads — so an empty mask
+means the round did not run, not that it ran on one core. Reporting that as
+"completed on CPU 0" would dress an instrument fault as a placement result, which
+is the defect being fixed rather than a fix for it. It gets its own line naming
+itself as an instrument fault.
+
+**The branch went 0 for 7 on natural boots** — the single-core case is roughly
+1 in 4 and simply did not come up — so it was exercised with a throwaway
+`-DTS_FORCE_SINGLE` build that substitutes a synthetic mask, once per case:
+
+| forced mask | line printed |
+|---|---|
+| 1 | `completed entirely on CPU 0 (the BSP) … (ran_on mask 1, …)` |
+| 2 | `completed entirely on CPU 1 (AP 1) … (ran_on mask 2, …)` |
+| 0 | `recorded NO core at all (ran_on mask 0, …) — instrument fault` |
+
+That proves the line renders and names the right core; the 7 natural boots are
+what establish the branch is reachable at all. The scaffolding is not in the
+tree — it existed to answer "has this code ever executed", which "it compiles"
+does not, and a branch that has never run has not been checked.
+
 #### What this means for the guard
 
 `threadstrs`' `n >= 3` threshold stands, and now on evidence rather than on
@@ -174,6 +210,55 @@ the second). `SYS_WRITE_FILE` being positional since v0.83 is what makes the fil
 2 × payload rather than a replacement, and the second half reading back correct
 is what proves the second write did not disturb the first — under contention from
 every core, on a freshly recovered volume.
+
+### MEASURED — the soak does not contend `g_cas_lock`, and cannot
+
+Per-CPU telemetry was added to the `cas` acquire path this cycle: contended
+acquisitions, retries, TSC cycles and worst case, per core, baselined at soak
+start so the numbers are the soak's and not the boot's. It was built to quantify
+the contention. It found there is none.
+
+| config | workers | `g_cas_lock` acquisitions | contended |
+|---|---|---|---|
+| uniprocessor | 2 | 216 | 0 |
+| smp2-bios | 4 | 432 | 0 |
+| smp4-bios | 8 | 864 | 0 |
+| smp8-bios | 16 | 1,728 | 0 |
+
+**This is not a dead counter.** `acq` is exactly 108 per worker at every width,
+scaling 216 → 432 → 864 → 1,728; the zero means *did not happen*, not
+*unreachable*, which is the distinction `g_reproc_stale_ppid` cost this project a
+milestone to learn. The kernel's own pre-existing per-lock counters — nothing to
+do with this cycle — agree boot-wide on smp4: `vfs` **75 of 209 contended (36%)**,
+`cas` **0 of 4,539**.
+
+The cause is structural, and is visible in the rank order the tree already
+documents:
+
+```
+klock_acquire(&g_vfs_lock)        rank 2, held across the whole write
+  -> vfs_write_locked()
+     -> cas_put()
+        -> klock_acquire(&g_cas_lock)   rank 3
+```
+
+Only the holder of the VFS lock can reach the CAS lock, so `g_cas_lock` is not
+merely uncontended under this workload — it is **uncontendable** through it. The
+role-61 soak is a real concurrency test and its accounting assertions mean what
+they say (16 workers across 8 cores, mask `ff`, exact recovery of `unreferenced`
+and `used_blocks`, zero underflow, zero dangling). But the lock it stresses is
+`g_vfs_lock`, and both its name and this document's title said otherwise.
+
+**Left as an observation, not an assertion.** `tot_con > 0` fails every boot on a
+correctly working kernel — it did, on smp2, smp4 and smp8, which is how this was
+found. `tot_con == 0` would freeze the current nesting into a requirement and
+make a limitation look like intent. Neither is honest, so the line prints the
+measurement and names the mechanism, and carries a second branch that fires if
+`g_cas_lock` ever *is* contended, telling the reader this note has gone stale.
+
+Making the title true needs a workload that reaches `cas_put` without holding the
+VFS lock. That is a change to the suite, and it is a maintainer's decision rather
+than a side effect of adding telemetry — recorded here as the open item it is.
 
 ## CARRIED FORWARD FROM v0.88
 

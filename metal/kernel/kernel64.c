@@ -3342,6 +3342,51 @@ static inline void krelax(void) {
     else __asm__ volatile("pause");
 }
 
+static inline uint64_t rdtsc64(void) {
+    uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* ===========================================================================
+ * v0.89: PER-CPU CONTENTION TELEMETRY FOR g_cas_lock
+ * ===========================================================================
+ * `struct klock` already counts `acq` and `contended` per LOCK. That answers
+ * "was this lock contended" and nothing about which core paid for it, how long
+ * it waited, or how the wait was distributed — which is the whole question the
+ * role-61 soak exists to ask.
+ *
+ * THE UNITS ARE NOT THE SAME ON EVERY CORE, and reading these numbers without
+ * that in hand will produce a confident wrong answer. `krelax()` above yields on
+ * cpu 0 when the scheduler is up and PAUSEs everywhere else, so:
+ *
+ *   - a RETRY on the BSP is one trip through sched_yield(), which may have run
+ *     other threads for an unbounded time; a retry on an AP is one PAUSE.
+ *   - CYCLES on the BSP therefore include time other threads were running, and
+ *     are NOT a measure of lock hold time. On an AP they are close to it.
+ *
+ * So the BSP row is reported separately from the AP rows rather than summed with
+ * them. This is the same hazard CLAUDE.md records for spin-count timeouts: a
+ * count that means different things at 1 and 4 vCPU is not a measurement.
+ *
+ * Only the owning cpu writes its own slot, so these are plain (non-atomic)
+ * arithmetic — no LOCK prefix, no cache line shared between cores, and nothing
+ * added to the acquire path of any other lock but this one. That matters here
+ * beyond cost: v0.89 has already had one instrument change the race it was
+ * built to observe, and an atomic RMW in the global lock path would be a far
+ * larger perturbation than the barrier that did it. */
+struct cas_spin_stat {
+    uint64_t contended;    /* acquisitions from this cpu that found it held  */
+    uint64_t retries;      /* krelax() trips summed over those acquisitions  */
+    uint64_t cycles;       /* TSC spent spinning, summed                     */
+    uint64_t max_cycles;   /* worst single wait                              */
+    uint64_t max_retries;  /* retries in the worst single wait               */
+};
+static struct cas_spin_stat g_cas_spin[MAX_CPUS];
+/* v0.89: uncontended acquisitions are counted too. A contended count with no
+ * denominator cannot distinguish "rarely contended" from "rarely taken", and
+ * the soak's whole claim is about the ratio. */
+static uint64_t g_cas_acq_cpu[MAX_CPUS];
+
 /* ===========================================================================
  * v0.61: THE EXEC STAGING BUFFER LOCK
  * ===========================================================================
@@ -3536,10 +3581,31 @@ static void klock_acquire(struct klock *l) {
     }
 #endif
     klock_irq_restore(rf);                             /* check done: reopen IF */
+    /* v0.89: `cas` telemetry. ONE spin loop, not one per build shape — a second
+     * copy under an `if` is how a counted loop and the real loop drift apart,
+     * and this lock is the one whose waiting we are trying to describe. The
+     * retry tally is a local increment on every lock (free, and the compiler
+     * drops it where unread); only `cas` pays for the two rdtsc reads. */
+    const int cas_tel = (l == &g_cas_lock);
     if (__sync_lock_test_and_set(&l->v, 1)) {
         __sync_fetch_and_add(&l->contended, 1);
-        do { krelax(); } while (l->v || __sync_lock_test_and_set(&l->v, 1));
+        uint64_t spins = 0, t0 = cas_tel ? rdtsc64() : 0;
+        do { krelax(); spins++; } while (l->v || __sync_lock_test_and_set(&l->v, 1));
+        if (cas_tel) {
+            /* Held now. cpu_idx() is read here rather than before the spin: on
+             * the BSP krelax() yields, so the THREAD may have changed during the
+             * wait — the cpu it resumed on is the one that did the waiting and
+             * the one this must be attributed to. */
+            uint64_t d = rdtsc64() - t0;
+            struct cas_spin_stat *s = &g_cas_spin[cpu_idx()];
+            s->contended++;
+            s->retries += spins;
+            s->cycles  += d;
+            if (d > s->max_cycles)      s->max_cycles  = d;
+            if (spins > s->max_retries) s->max_retries = spins;
+        }
     }
+    if (cas_tel) g_cas_acq_cpu[cpu_idx()]++;           /* under the lock        */
     l->acq++;                                          /* under the lock        */
 #ifdef KERNEL_DEBUG
     /* Held now, so these have exactly one writer until release. */
@@ -22899,6 +22965,26 @@ static void cmd_vfs_stress(void) {
         uint32_t ran_mask = 0;
         uint64_t t_start = g_ticks;
 
+        /* v0.89: BASELINE THE PER-CPU CAS TELEMETRY, so the report below is the
+         * soak's own contention and not the boot's. Mount, replay and every
+         * suite before this one take g_cas_lock; without a delta the numbers
+         * would be dominated by work that is not under test. */
+        struct cas_spin_stat spin0[MAX_CPUS];
+        uint64_t cacq0[MAX_CPUS];
+        for (int c = 0; c < MAX_CPUS; c++) {
+            spin0[c] = g_cas_spin[c];
+            cacq0[c] = g_cas_acq_cpu[c];
+            /* The maxima are running high-waters and cannot be differenced, so
+             * they are zeroed here instead: everything the report prints then
+             * shares one scope (this soak), rather than putting a boot-wide
+             * worst case beside per-soak deltas on the same line. Another core
+             * can be inside a cas acquire right now, so a max set between this
+             * store and the first worker could be lost — a diagnostic high-water
+             * is the right place to accept that rather than lock the path. */
+            g_cas_spin[c].max_cycles = 0;
+            g_cas_spin[c].max_retries = 0;
+        }
+
         for (int i = 0; i < nw; i++) {
             int p = kproc_spawn("cascon", PCAP_FILESYSTEM);
             if (p < 0) break;
@@ -22940,6 +23026,92 @@ static void cmd_vfs_stress(void) {
                     (uint64_t)g_casc_end_ping, (uint64_t)g_casc_end_slices,
                     g_casc_end_lastrun, g_casc_end_tick);
         }
+        /* ===== v0.89: PER-CPU g_cas_lock CONTENTION, AT DRAIN COMPLETION =====
+         * Reported HERE, in the kernel, and not from cas_contend_worker as the
+         * v0.89 plan first had it: the worker is ring 3 and cannot read a kernel
+         * global. Exporting these through a syscall purely to print them from
+         * the other side of the ring boundary would add a syscall to the ABI for
+         * a diagnostic, and would still be measuring the kernel's counters.
+         * Drain completion is observable from here, which is where the two other
+         * drain-end observations already live.
+         *
+         * Printed on every boot including uniprocessor, where the expected
+         * reading is zero contention — a line that only appears under load
+         * cannot establish what no-load looks like. See the units warning at
+         * struct cas_spin_stat: the BSP row is NOT comparable to the AP rows,
+         * because a BSP retry is a sched_yield() and an AP retry is a PAUSE. */
+        {
+            uint64_t tot_acq = 0, tot_con = 0, tot_ret = 0;
+            for (int c = 0; c < n && c < MAX_CPUS; c++) {
+                uint64_t acq = g_cas_acq_cpu[c]      - cacq0[c];
+                uint64_t con = g_cas_spin[c].contended - spin0[c].contended;
+                uint64_t ret = g_cas_spin[c].retries   - spin0[c].retries;
+                uint64_t cyc = g_cas_spin[c].cycles    - spin0[c].cycles;
+                tot_acq += acq; tot_con += con; tot_ret += ret;
+                /* Percent contended in whole units; the ratio is the point and
+                 * this kernel's kprintf has no %f. */
+                uint64_t pct = acq ? (con * 100u) / acq : 0;
+                kprintf("[vfsstrs] cas-lock cpu%u%s: acq %u contended %u (%u%%) retries %u "
+                        "cycles %u worst %u cyc/%u retries\n",
+                        (uint64_t)(int64_t)c, (c == 0 ? " (BSP, retries=yields)" : " (AP, retries=pauses)"),
+                        acq, con, pct, ret, cyc,
+                        g_cas_spin[c].max_cycles, g_cas_spin[c].max_retries);
+            }
+            kprintf("[vfsstrs] cas-lock TOTAL over %d cpu(s): acq %u contended %u (%u%%) "
+                    "retries %u — %d worker(s), ratio %d:1\n",
+                    (uint64_t)(int64_t)n, tot_acq, tot_con,
+                    tot_acq ? (tot_con * 100u) / tot_acq : 0, tot_ret,
+                    (uint64_t)(int64_t)nsp, (uint64_t)(int64_t)CASC_RATIO);
+            /* ===== THE SOAK DOES NOT CONTEND g_cas_lock, AND CANNOT ==========
+             * This began as an assertion — with 2n workers all driving
+             * cas_put/cas_free, zero waits would mean they never overlapped and
+             * the suite was green having tested nothing. It failed on smp2,
+             * smp4 and smp8 alike, and the reason is structural rather than a
+             * scheduling accident:
+             *
+             *     klock_acquire(&g_vfs_lock)      rank 2, held across the write
+             *       -> vfs_write_locked()
+             *          -> cas_put()
+             *             -> klock_acquire(&g_cas_lock)    rank 3
+             *
+             * g_vfs_lock is held for the whole of every file write, so the only
+             * thread that can be inside the CAS critical section is the one
+             * holding the VFS lock. g_cas_lock is not merely uncontended here,
+             * it is UNCONTENDABLE through this path.
+             *
+             * The kernel's own pre-existing per-lock counters say the same thing
+             * independently of anything added this cycle, boot-wide on smp4:
+             *
+             *     lock vfs (rank 2):  209 acquisitions,  75 contended  (36%)
+             *     lock cas (rank 3): 4539 acquisitions,   0 contended
+             *
+             * So the soak is a real concurrency test — it exercises concurrent
+             * put/free, journal transactions and positional writes from every
+             * core, and its accounting assertions are meaningful — but the lock
+             * it stresses is g_vfs_lock, and the name says otherwise.
+             *
+             * OBSERVED, NOT ASSERTED, deliberately. Asserting `tot_con > 0`
+             * would fail every boot on a kernel that is working correctly, and
+             * asserting `tot_con == 0` would freeze a limitation into a
+             * requirement — locking in today's nesting as though it were the
+             * intent. Making the claim true needs a workload that reaches
+             * cas_put WITHOUT the VFS lock, which is a change to the suite and a
+             * maintainer's call, not something to slip in beside a telemetry
+             * commit. The measurement is printed either way, because a property
+             * that is not asserted must still be visible. */
+            if (n > 1 && tot_con == 0)
+                kprintf("[vfsstrs] cas-contend OBSERVE: %u acquisition(s) across %d cpu(s), ZERO "
+                        "contended — g_vfs_lock (rank 2) is held across the write path, so only "
+                        "its holder can reach g_cas_lock (rank 3). This soak stresses the VFS "
+                        "lock; it cannot contend the CAS lock.\n",
+                        tot_acq, (uint64_t)(int64_t)n);
+            else if (n > 1)
+                kprintf("[vfsstrs] cas-contend OBSERVE: g_cas_lock WAS contended %u time(s) in "
+                        "%u acquisition(s) — the rank-2-above-rank-3 nesting described here no "
+                        "longer holds; re-read that note before trusting it.\n",
+                        tot_con, tot_acq);
+        }
+
         if (!drained)
             kprintf("[vfsstrs] cas-contend WATCHDOG: %d worker(s) still live\n",
                     (uint64_t)(int64_t)casc_live());
