@@ -3410,6 +3410,73 @@ static void append_smp_worker(u32 idx) {
 #else
 #define CASC_ITERS   12u
 #endif
+/* ===========================================================================
+ * v0.90 ROLE 62: DESCRIPTOR TABLE CONTENTION — g_ofile_lock, from ring 3
+ * ===========================================================================
+ * v0.89 measured `g_cas_lock` and found it structurally uncontendable; the lock
+ * that is actually hot is one rank down. `g_ofile_lock` (rank 1) is taken by
+ * every descriptor operation in the kernel and its contention has never been
+ * measured by anything. This produces that number.
+ *
+ * WHY THE LOOP IS PIPE/CLOSE AND HOLDS NOTHING.
+ *
+ * `g_ofiles` is SIXTEEN SLOTS, GLOBAL, shared by every process on the machine —
+ * the fd number IS the index into it. A worker that accumulated descriptors
+ * would exhaust the whole system's table inside one iteration on any multi-core
+ * tier, and would do it by the table's design rather than by any defect, while
+ * starving the 44 other suites that share it. So each iteration takes two slots
+ * (a pipe's two ends), and gives them back immediately.
+ *
+ * TABLE-FULL IS NOT A FAILURE. With 2n workers all cycling, `pipe()` returning
+ * -24 means another worker held the last pair for a moment — which is the
+ * contention this exists to create, arriving as a return code. It is counted,
+ * backed off and retried, never decoded as a defect. Same rule this tree already
+ * applies to deadline expiry, and for the same reason.
+ *
+ * Reports by exit code, one sentinel and a distinct code per rule:
+ *   1860 ok    1861 pipe returned a bad fd pair    1862 close refused
+ *   1863 deadline expired (a slow host, NOT a defect) */
+#define R62_ROLE     62u
+/* MUST match the kernel's R62_ITERS in kernel64.c — the two halves are matched
+ * by nothing but the number, same as the role integer itself. Raised from 64:
+ * at 64 the workers finished in 13-74 ticks and the smp2/smp4 collision was a
+ * coin flip (1,541 acquisitions, 0 contended on one boot, 94 on another). More
+ * iterations means overlap by RESIDENCY rather than by luck, which is what v0.84
+ * did for threadstrs instead of widening its guard. */
+#define R62_ITERS    768u
+#define R62_T        6000u          /* ticks; 100 Hz, so 60 s */
+static void role62_ofile_stress(void) {
+    u64 backoff = 0;                /* table-full retries: contention, observed */
+    u64 made    = 0;
+    u32 t0 = osysticks();
+
+    for (u32 it = 0; it < R62_ITERS; it++) {
+        u64 fds[2];
+        for (;;) {
+            if (osysticks() - t0 > R62_T) sysc(SYS_EXIT, 1863, 0, 0);
+            fds[0] = fds[1] = (u64)-1;
+            i64 r = (i64)sysc(SYS_PIPE, (u64)(void *)fds, 0, 0);
+            if (r == 0) break;
+            /* -24 is EMFILE: the pipe pool or the 16-slot ofile table had
+             * nothing free THIS INSTANT because a sibling held it. Yield so the
+             * holder can run — on a uniprocessor this is the only way it ever
+             * will — then try again. */
+            backoff++;
+            oyield();
+        }
+        /* Both ends must be real and distinct; a pipe that handed back the same
+         * slot twice would close once and leak once, and the leak assertion on
+         * the kernel side would fire without naming why. */
+        if (fds[0] == (u64)-1 || fds[1] == (u64)-1 || fds[0] == fds[1])
+            sysc(SYS_EXIT, 1861, 0, 0);
+        if ((i64)sysc(SYS_CLOSE, fds[0], 0, 0) != 0) sysc(SYS_EXIT, 1862, 0, 0);
+        if ((i64)sysc(SYS_CLOSE, fds[1], 0, 0) != 0) sysc(SYS_EXIT, 1862, 0, 0);
+        made++;
+    }
+    (void)made; (void)backoff;
+    sysc(SYS_EXIT, 1860, 0, 0);
+}
+
 #define CASC_PAY     192u
 #define CASC_T       6000u          /* ticks; 100 Hz, so 60 s */
 static void cas_contend_worker(void) {
@@ -6096,6 +6163,7 @@ int main(int argc, const char **argv, const char **envp) {
      * travel that way. */
     if (role >= 56 && role <= 59) { append_smp_worker((u32)(role - 56)); }
     if (role == 60) { meta_worker(); }                 /* v0.85 VFS metadata from ring 3 */
+    if (role == 62) { role62_ofile_stress(); }         /* v0.90 g_ofile_lock descriptor contention */
     if (role == 61) { cas_contend_worker(); }          /* v0.89 CAS index/bitmap contention soak */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
     if (role == 47) { shm_stress_worker(); }           /* v0.63 COW fork + zero-copy shared memory          */
