@@ -1,11 +1,40 @@
 # OutRun OS v0.90.0-metal — descriptor and VFS lock decoupling
 
-Status: **development cycle**. Nothing here is tagged. `VERSION` reads
-`0.90.0-dev` and the ISO is named `outrun-os-0.90.0-dev.iso` for exactly that
-reason — a development image should not be mistakable for a release artefact by
-its filename.
+Status: **RELEASED**, tagged `v0.90.0`.
 
-## THE ARTEFACT THIS CYCLE STARTS FROM
+## THE ARTEFACT THIS CYCLE PRODUCED
+
+| | |
+|---|---|
+| artefact | `outrun-os-0.90.0.iso` |
+| md5 | `33667197c57ab424c081bec880ba9c0e` |
+| sha256 | `7682c69a6a74b0986382ce15e1b26ddf685cde825a16be639972c3b7a9203f7a` |
+| `release-verify` | **PASS** — 45 suites reporting, 0 failing assertions, 0 rank faults, 460 s |
+
+The tag is `v0.90.0`, not `v0.90.0-metal`: every tag in this repository is
+`vN.NN.0`, and `release-version-check` compares `git describe` against
+`v$(VERSION)`, so a `-metal` tag would warn on every later build. The `-metal`
+suffix lives in `KERNEL_VERSION` (`"0.90.0-metal"`), exactly as v0.89.0 does.
+
+The tag points at the `VERSION` bump commit rather than at the last code commit,
+for the same reason recorded under v0.89.0 below.
+
+**Gate coverage for this tag**, all on `99c42fe78cd108972b52762b5027d459` (the
+pre-bump build, identical but for the two version strings):
+
+| tier | fresh | dirty (3 boots, one reused image) |
+|---|---|---|
+| uniprocessor | 563 passed, 0 failed | 45 suites, 0 failed, empty diffs |
+| `-smp 2` | 577 passed, 0 failed | 45 suites, 0 failed, empty diffs |
+| `-smp 4` | 583 passed, 0 failed | 45 suites, 0 failed, empty diffs |
+| `-smp 8` | 583 passed, 0 failed | 45 suites, 0 failed, empty diffs |
+
+**Not covered, said plainly:** `smp4-iommu` was not run this cycle. The
+`append-oversub` preemption assertion flakes on this host in this build AND in a
+pre-v0.90 control (3/4 against 4/4 — see the soak section); it is unresolved and
+is not claimed as passing. The soak ran 3 iterations, not 100.
+
+## THE ARTEFACT THIS CYCLE STARTED FROM
 
 v0.89.0 at `8bb0c8c`, tagged and published.
 
