@@ -403,6 +403,56 @@ never appeared in the log at all, and a broken `vfs_open_for` would have run the
 command and failed rather than made it vanish. `udbpersist`, typed first, worked
 on the same boot.
 
+## THE SOAK — and the append assertion it did NOT convict this change of
+
+`tools/vfs-soak.sh` repeats `cmd_vfs_stress` on one boot, judging each iteration
+by its own `RESULT` line so a hung iteration is a timeout rather than a silent
+pass — a reader-starvation deadlock would surface as exactly that.
+
+`-smp 8`, image `99c42fe78cd108972b52762b5027d459`: **3 of 3 iterations
+completed, zero rank faults, zero rank mismatches, zero panics, no stall.** The
+shared-acquisition interlock does not deadlock and does not starve.
+
+It also reported the `append-oversub` preemption assertion failing on three of
+four runs — **including the boot's own first run**, before any repetition:
+
+```
+FAIL append-oversub: the file is EXACTLY workers x iterations x payload bytes
+     under PREEMPTION (a writer stopped mid-syscall must not lose its append)
+```
+
+**A mechanism pointed straight at this milestone.** The append path resolves
+end-of-file through `vfs_len_of`, which v0.90 converted to shared acquisition.
+Two appenders reading one length concurrently would both write at the same offset
+and one would lose its append — precisely what this assertion checks. The race
+pre-exists (the length read and the write were already separate critical
+sections), but shared access lets readers overlap where they were serialised,
+which could plausibly raise its rate.
+
+**Measured instead of argued.** Control: `3dcb309` — the attribution instrument
+present, `klock_read_acquire` call sites **zero**, exclusive locks throughout —
+same soak, same tier, same host.
+
+| build | shared acquisition | runs | failures |
+|---|---|---|---|
+| `3dcb309` (control) | none | 4 | **4 of 4** |
+| `92c7e87` (this work) | 7 sites | 4 | **3 of 4** |
+
+The failure is *more* frequent on the build that does not contain the code, which
+no defect introduced by that code can produce. **The change is cleared.**
+
+The real variable is the host. These boots reach the prompt in **707–718 s**
+against **330 s** for the same tier in the fresh matrix earlier the same day, on
+an idle machine — the toolchain host was updated between those runs. A preemption
+assertion is exactly what degrades first when the machine slows, and this tree
+has cleared a change this way before (v0.89's `smp4-iommu`, and two "fixes"
+disproven in earlier cycles).
+
+**Recorded as an open flake, not as a v0.90 defect and not as a pass.** The
+assertion is real and the append race it guards is real; what is not established
+is that anything in this milestone made it worse. It should be re-measured on a
+healthy host before anyone acts on it.
+
 ### STILL OPEN
 
 Both items this section carried after Milestone 2 are closed above:
@@ -410,14 +460,17 @@ Both items this section carried after Milestone 2 are closed above:
 every tier), and `g_ofile_lock` has been audited (its 45% is the role-62 hammer
 contending with itself; ordinary traffic is ~1%). What remains:
 
-- **One boot per tier, still.** Three milestones of figures now rest on single
-  boots, and the shared path is new code on the two hottest locks in the tree.
-  These cannot see an intermittent below roughly 1 in 4. **`gate-dirty` and
-  `gate-dirty-smp` have not been run against ANY of the v0.90 lock work** — and
-  a reused volume is exactly where a stale-dirent or double-create bug from the
-  probe would show, since the v0.84 O_TRUNC map bug was found by that tier and
-  hidden completely by a fresh one. That is the next verification, before any
-  further optimisation.
+- **The `append-oversub` preemption assertion flakes on a degraded host**, in
+  this build and in a pre-v0.90 control alike (4/4 against 3/4 — see the soak
+  section). It needs re-measuring on a healthy machine, and if it persists there
+  it is its own investigation: `vfs_write_append` resolves end-of-file and writes
+  in two separate critical sections, which is a real race independent of this
+  milestone.
+- **The soak ran 3 iterations, not 100.** The harness is verified and the full
+  run is a matter of wall clock (~700 s to the prompt, then ~400 s per
+  iteration at `-smp 8` on this host), but a 100-iteration figure on a machine
+  that already fails a timing assertion at iteration 1 would measure the host,
+  not the kernel.
 - **The probe widened a window that already existed.** `vfs_open_for` has always
   released the lock before `ofile_claim`; it now also drops and retakes it
   between the lookup and the create. The re-check makes the create safe, but any
