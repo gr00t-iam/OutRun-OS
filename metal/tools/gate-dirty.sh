@@ -111,7 +111,25 @@ feed_boot1() {
     done
     sleep 2
     printf 'udbpersist\n'
-    sleep 25                            # one 4096-round KDF, then the save
+    # v0.90: WAIT FOR THE PROMPT, do not guess at how long udbpersist takes.
+    #
+    # This was `sleep 25`, described as "one 4096-round KDF, then the save". On a
+    # host busy enough that the KDF ran long, cascrashwrite was typed while the
+    # shell was still working and was DROPPED — the command never echoed at all,
+    # boot 1 created no 'vfs-reboot-test', and the CAS cross-reboot probe then
+    # silently tested nothing on boots 2 and 3 while the gate still exited 0.
+    # Observed exactly that way, with an unrelated QEMU sharing the host.
+    #
+    # A fixed sleep is a budget, and CLAUDE.md is explicit that a timing budget
+    # in this tree must be a DEADLINE: the same 25 seconds means different
+    # amounts of work on a quiet host and a loaded one. udbpersist announces its
+    # own completion, so wait for that and cap the wait instead.
+    u=0
+    while [ "$u" -lt 180 ]; do
+        grep -aq "created 'udbreboot'" "$1" 2>/dev/null && break
+        sleep 2; u=$((u+2))
+    done
+    sleep 3                             # let the prompt be re-issued
     printf 'cascrashwrite\n'            # LAST: halts the machine by design
     sleep 10
 }

@@ -350,6 +350,59 @@ answer came back no. The three sites above are still where any future work would
 go — the two linear scans especially — but a scan over 16 slots is not obviously
 worth replacing to serve a workload nothing but a stress test generates.
 
+## THE DIRTY-VOLUME GATE — and a harness that could report green on nothing
+
+Every v0.90 figure before this point came from a **fresh** image per boot. The
+lock work touches `vfs_open_for`'s create path and the whole read path, and a
+reused volume is where a stale dirent or a double-create shows: the v0.84 O_TRUNC
+map bug was found by this tier and hidden completely by fresh images.
+
+Image `99c42fe78cd108972b52762b5027d459`, three boots per tier on ONE image:
+
+| tier | boots | suites | failing | boot-to-boot diffs | cross-boot artefacts |
+|---|---|---|---|---|---|
+| uniprocessor | 3 | 45 | 0 | empty | `udbreboot` + `vfs-reboot-test` + CAS replay |
+| `-smp 2` | 3 | 45 | 0 | empty | all present |
+| `-smp 4` | 3 | 45 | 0 | empty | all present |
+| `-smp 8` | 3 | 45 | 0 | empty | all present |
+
+Empty consecutive-boot assertion diffs at every width, `cas-pending=1` on boot 1
+becoming `cas-recovered=1` on boots 2 and 3. **No stale dirent, no double
+allocation, no corruption across open/truncate on a populated volume**, with
+shared acquisition and the optimistic probe live. `vfs_open_for`'s create path
+runs on boot 1 and its lookup path on the reboots, against state that already
+exists — which is the case the fresh tiers structurally cannot produce.
+
+`-smp 8` needed `GATE_DIRTY_CAP=1500`; at the 480 s default its boot never
+reached the prompt and the gate reported the resulting nothing. That is the same
+"raise the cap and re-run rather than reading the assertions it printed" case
+CLAUDE.md already records for `smp4-iommu`.
+
+### The harness bug this tier surfaced
+
+The first UP run reported `vfs-reboot-test=0`, said in its own output that the
+CAS cross-reboot probe's **five assertions tested nothing** on boots 2 and 3 —
+and **exited 0**.
+
+`gate-dirty.sh` typed its two console commands with a fixed `sleep 25` between
+them, commented "one 4096-round KDF, then the save". On a host loaded enough for
+the KDF to run long, `cascrashwrite` was typed while the shell was still busy and
+was **dropped** — the command never echoed at all. Reproduced with an unrelated
+QEMU sharing the host.
+
+That is a budget, not a deadline, and CLAUDE.md is explicit that a timing budget
+in this tree must be a deadline: the same 25 seconds is a different amount of
+work on a quiet host and a loaded one. It now waits for `udbpersist`'s own
+completion marker, capped at 180 s. Every tier above produced its artefacts after
+the fix; none did reliably before it.
+
+**The kernel was the prime suspect and was cleared by evidence, not assumption.**
+`cascrashwrite` creates its file through `vfs_open_for` — the function this
+milestone rewrote — so it was the obvious cause. It is not: the command text
+never appeared in the log at all, and a broken `vfs_open_for` would have run the
+command and failed rather than made it vanish. `udbpersist`, typed first, worked
+on the same boot.
+
 ### STILL OPEN
 
 Both items this section carried after Milestone 2 are closed above:
