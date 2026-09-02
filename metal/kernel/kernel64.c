@@ -3347,6 +3347,35 @@ static inline uint64_t rdtsc64(void) {
     return ((uint64_t)hi << 32) | lo;
 }
 
+/* v0.90: g_vfs_lock contention, attributed to the CALLER that had to wait.
+ *
+ * A fixed table with a linear scan. Sixteen slots is more than the lock has hot
+ * sites and the scan runs only when an acquire is already spinning, so the cost
+ * lands on a path that is by definition not the fast one. Slots are claimed with
+ * a CAS so two cores cannot take the same one; the count is a plain atomic add.
+ *
+ * If the table fills, further callers are counted in an overflow bucket rather
+ * than silently dropped — a hot spot that vanished because the table was full
+ * would be exactly the kind of invisible gap this tree keeps finding. */
+#define VFSC_SLOTS 16
+static volatile uint64_t g_vfsc_caller[VFSC_SLOTS];
+static volatile uint64_t g_vfsc_hits[VFSC_SLOTS];
+static volatile uint64_t g_vfsc_overflow = 0;
+
+static void vfs_con_note(uint64_t caller) {
+    for (int i = 0; i < VFSC_SLOTS; i++) {
+        uint64_t c = g_vfsc_caller[i];
+        if (c == caller) { __sync_fetch_and_add(&g_vfsc_hits[i], 1); return; }
+        if (c == 0) {
+            if (__sync_bool_compare_and_swap(&g_vfsc_caller[i], 0, caller)) {
+                __sync_fetch_and_add(&g_vfsc_hits[i], 1); return;
+            }
+            i--; continue;                 /* lost the claim: re-read this slot */
+        }
+    }
+    __sync_fetch_and_add(&g_vfsc_overflow, 1);
+}
+
 /* ===========================================================================
  * v0.89: PER-CPU CONTENTION TELEMETRY FOR g_cas_lock
  * ===========================================================================
@@ -3589,6 +3618,15 @@ static void klock_acquire(struct klock *l) {
     const int cas_tel = (l == &g_cas_lock);
     if (__sync_lock_test_and_set(&l->v, 1)) {
         __sync_fetch_and_add(&l->contended, 1);
+        /* v0.90: WHO IS WAITING ON g_vfs_lock. The lock has 35 acquisition sites
+         * and reads 36% contended; "decouple the read paths" is a guess until it
+         * is known which sites those waits come from. Attribution is by return
+         * address rather than by tagging 35 call sites — the same technique the
+         * rank-violation report uses, resolvable with addr2line on the ELF, and
+         * it cannot drift out of step with the call sites because there is
+         * nothing at them to drift. Recorded ONLY on the contended path, which
+         * is already the slow one, so the uncontended acquire is untouched. */
+        if (l == &g_vfs_lock) vfs_con_note((uint64_t)__builtin_return_address(0));
         uint64_t spins = 0, t0 = cas_tel ? rdtsc64() : 0;
         do { krelax(); spins++; } while (l->v || __sync_lock_test_and_set(&l->v, 1));
         if (cas_tel) {
@@ -20464,6 +20502,32 @@ static void cmd_cio(void) {
         if (ls[i]->v) held++;
     }
     ciocheck("no lock left held at quiescence", held == 0);
+
+    /* v0.90 MILESTONE 2: WHERE g_vfs_lock's WAITS ACTUALLY COME FROM.
+     *
+     * The line above says the lock is contended; it has never said BY WHOM, and
+     * with 35 acquisition sites that is the whole question. Addresses resolve
+     * with `addr2line -f -e build/outrun-kernel.elf <addr>` — the same
+     * convention the rank-violation report already uses.
+     *
+     * Printed unconditionally, including when every count is zero: a table that
+     * appears only under contention cannot establish what an uncontended boot
+     * looked like, which is the mistake v0.89 spent two milestones undoing. */
+    {
+        int shown = 0;
+        for (int i = 0; i < VFSC_SLOTS; i++) {
+            if (!g_vfsc_caller[i]) continue;
+            kprintf("[cio    ]   vfs-wait caller=%X hits=%u\n",
+                    g_vfsc_caller[i], g_vfsc_hits[i]);
+            shown++;
+        }
+        if (!shown)
+            kputs("[cio    ]   vfs-wait: no contended acquisition of g_vfs_lock this boot\n");
+        if (g_vfsc_overflow)
+            kprintf("[cio    ]   vfs-wait: %u wait(s) from MORE than %d distinct callers — "
+                    "the table is full and this figure is unattributed\n",
+                    g_vfsc_overflow, (uint64_t)(int64_t)VFSC_SLOTS);
+    }
     ciocheck("ZERO rank violations across the whole run (lock order held everywhere)",
              g_rank_violations == 0);
 

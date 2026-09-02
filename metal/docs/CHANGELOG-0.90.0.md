@@ -128,6 +128,91 @@ The last one is the premise guard. v0.89 spent most of its length on two
 instruments that reported confidently about work that had not happened; a
 descriptor stress that never contends is the same failure one layer over.
 
+## MILESTONE 2 — THE `g_vfs_lock` AUDIT
+
+### The 35 acquisition sites
+
+| class | sites |
+|---|---|
+| **read / lookup** | `vfs_read_range`, `vfs_read_file`, `vfs_len_of`, `tmp_len_of`, `tmp_read_range`, `tmp_read_file`, `SYS_FSTAT` (×2), `cmd_cio` (×3) |
+| **write / mutation** | `vfs_write_file`, `vfs_write_by_dirent`, `vfs_write_at`, `vfs_write_append` (×3), `vfs_truncate`, `vfs_rename`, `vfs_unlink` (×2), `tmp_write_at`, `tmp_write_append`, `tmp_write_file`, `tmp_truncate`, `SYS_WRITE_FILE`, `SYS_VFS_SYNC`, `SYS_VFS_UNLINK`, `SYS_CHOWN`, `SYS_FTRUNCATE` |
+| **open (lookup, may create)** | `vfs_open_for` (×2) |
+| **suite code, not a production path** | `cmd_vfs_stress` (×2), `cmd_users_stress` |
+
+Counting sites is the cheap half and on its own it is misleading — writes
+outnumber reads nearly two to one, which would argue against read decoupling.
+What matters is which sites the *waits* come from, and that is measured.
+
+### Measured: who actually waits
+
+`klock_acquire` now records `__builtin_return_address(0)` on the **contended path
+only** for `g_vfs_lock`, into a 16-slot table with an overflow bucket, reported by
+`cmd_cio` and resolved with `addr2line` on the ELF. Attribution by return address
+rather than by tagging 35 call sites: there is nothing at the sites to drift out
+of step. smp4-bios, 207 acquisitions, 72 contended, five distinct callers, no
+overflow:
+
+| caller | what the critical section does | hits | share |
+|---|---|---|---|
+| `vfs_open_for:9866` | `vfs_find(name)` — scans DENTS | 25 | 35% |
+| `SYS_WRITE_FILE:16939` | `vfs_permit(&DENTS[di], …)` — reads mode/uid/gid | 21 | 29% |
+| `vfs_read_range:8389` | reads the chunk list | 20 | 28% |
+| `SYS_WRITE_FILE:16969` → `vfs_write_at` → `vfs_len_of` | reads `DENTS[di].len` | 5 | 7% |
+| `vfs_write_by_dirent:8072` | **mutates** | 1 | 1% |
+
+**Seventy-one of seventy-two contended waits are on READ-ONLY critical sections.
+Exactly one is a mutation.**
+
+Reproduced across the whole matrix rather than argued from one boot — the same
+four callers dominate at every width, and the one mutating site appears in a
+single tier at four hits:
+
+| tier | acquisitions | contended | read-only share |
+|---|---|---|---|
+| uniprocessor | 214 | **0** | — (no second acquirer; the correct reading) |
+| smp2-bios | 212 | 36 (17%) | 36 / 36 — **100%** |
+| smp4-bios | 209 | 69 (33%) | 69 / 69 — **100%** |
+| smp8-bios | 209 | 66 (32%) | 62 / 66 — **94%** |
+
+Acquisition count is flat at ~210 across every tier while contention climbs from
+0 to a third: the workload is not doing more VFS work on more cores, it is
+queueing for the same lock. The uniprocessor zero is the negative control.
+
+Two of those rows would have been classified wrongly without the inline chain.
+`addr2line` without `-i` attributes `0x146cdd` to `cred_egid` and `0x14a7e3` to
+`vfs_len_of`, which reads as "a credential helper and a length getter". The chain
+shows both are inlined inside `case 7: SYS_WRITE_FILE` — so by *syscall* they are
+writes, while by *critical section* they are reads. The second reading is the one
+that governs whether reader/writer semantics can help, and the first would have
+sent the decoupling at the wrong target. **Resolve with `-i` or do not resolve.**
+
+### What this says about the strategy
+
+Read-path decoupling is the right instinct and the measurement raises its ceiling
+sharply: not the ~28% a naive read/write split predicts, but ~99% of observed
+waits. The contention is overwhelmingly **readers blocking readers** — a
+permission check, a name scan, a length fetch and a chunk-list walk, none of
+which mutate anything, all serialised against each other by one exclusive lock.
+
+That makes reader/writer semantics on `g_vfs_lock` the indicated change, and it
+is a change to the lock rather than to the call sites.
+
+**Not implemented in this commit, and the reason is not caution for its own
+sake.** `struct klock` is exclusive by construction and carries rank tracking,
+IRQ save/restore, self-deadlock detection and the `rank_st`/`rank_spp` machinery
+that exists because acquire and release must agree on where the rank entry lives.
+A reader/writer variant has to preserve all of it, and reader-shared acquisition
+breaks the "held by exactly one context" assumption that note rests on. Shipping
+that at the end of an audit and calling it verified because 45 suites still
+passed would be precisely the reasoning this cycle's own goal text rules out:
+
+> No decoupling lands without a before/after contention number from the same
+> instrument. A refactor whose only evidence is that the suites still pass has not
+> been shown to do anything.
+
+The instrument to produce that before/after now exists and its baseline is the
+table above. The refactor is the next piece of work, with its own verification.
+
 ## OPEN, CARRIED FROM v0.89
 
 - **The role-61 soak is named for a lock it cannot contend.** It remains a real
