@@ -3381,24 +3381,45 @@ static inline uint64_t rdtsc64(void) {
  *
  * If the table fills, further callers are counted in an overflow bucket rather
  * than silently dropped — a hot spot that vanished because the table was full
- * would be exactly the kind of invisible gap this tree keeps finding. */
+ * would be exactly the kind of invisible gap this tree keeps finding.
+ *
+ * v0.90 M3: TWO LOCKS, ONE TABLE. Milestone 1 measured g_ofile_lock at 45%
+ * contended under the role-62 hammer and could not say from where, which is the
+ * same gap this instrument was built to close for g_vfs_lock. Indexed rather
+ * than duplicated: a second copy of the scan is a second thing to keep in step,
+ * and the storage is 16 slots per lock. */
 #define VFSC_SLOTS 16
-static volatile uint64_t g_vfsc_caller[VFSC_SLOTS];
-static volatile uint64_t g_vfsc_hits[VFSC_SLOTS];
-static volatile uint64_t g_vfsc_overflow = 0;
+#define VFSC_LOCKS 2                       /* 0 = vfs, 1 = ofile               */
+#define VFSC_VFS   0
+#define VFSC_OFILE 1
+static volatile uint64_t g_vfsc_caller[VFSC_LOCKS][VFSC_SLOTS];
+static volatile uint64_t g_vfsc_hits[VFSC_LOCKS][VFSC_SLOTS];
+static volatile uint64_t g_vfsc_overflow[VFSC_LOCKS];
 
-static void vfs_con_note(uint64_t caller) {
+/* v0.90 M3: dump one lock's attribution table.
+ *
+ * A function rather than a loop inside cmd_cio because WHERE it is called turns
+ * out to matter more than what it prints. cmd_cio runs BEFORE cmd_vfs_stress in
+ * the boot order, so the ofile table it prints holds early-boot traffic only —
+ * the role-62 phase that put g_ofile_lock at 45% has not run yet when cio
+ * reports. Reading that table as "where the 45% comes from" would have been an
+ * answer to a question nobody asked, and it is exactly the class of error this
+ * cycle has already made twice: a number measured correctly over the wrong
+ * window. The role-62 phase therefore dumps it again, after its own workload. */
+static void vfsc_dump(int which, const char *ln, const char *tag);
+
+static void vfs_con_note(int which, uint64_t caller) {
     for (int i = 0; i < VFSC_SLOTS; i++) {
-        uint64_t c = g_vfsc_caller[i];
-        if (c == caller) { __sync_fetch_and_add(&g_vfsc_hits[i], 1); return; }
+        uint64_t c = g_vfsc_caller[which][i];
+        if (c == caller) { __sync_fetch_and_add(&g_vfsc_hits[which][i], 1); return; }
         if (c == 0) {
-            if (__sync_bool_compare_and_swap(&g_vfsc_caller[i], 0, caller)) {
-                __sync_fetch_and_add(&g_vfsc_hits[i], 1); return;
+            if (__sync_bool_compare_and_swap(&g_vfsc_caller[which][i], 0, caller)) {
+                __sync_fetch_and_add(&g_vfsc_hits[which][i], 1); return;
             }
             i--; continue;                 /* lost the claim: re-read this slot */
         }
     }
-    __sync_fetch_and_add(&g_vfsc_overflow, 1);
+    __sync_fetch_and_add(&g_vfsc_overflow[which], 1);
 }
 
 /* ===========================================================================
@@ -3651,7 +3672,8 @@ static void klock_acquire(struct klock *l) {
          * it cannot drift out of step with the call sites because there is
          * nothing at them to drift. Recorded ONLY on the contended path, which
          * is already the slow one, so the uncontended acquire is untouched. */
-        if (l == &g_vfs_lock) vfs_con_note((uint64_t)__builtin_return_address(0));
+        if (l == &g_vfs_lock)        vfs_con_note(VFSC_VFS,   (uint64_t)__builtin_return_address(0));
+        else if (l == &g_ofile_lock) vfs_con_note(VFSC_OFILE, (uint64_t)__builtin_return_address(0));
         uint64_t spins = 0, t0 = cas_tel ? rdtsc64() : 0;
         do { krelax(); spins++; } while (l->v || __sync_lock_test_and_set(&l->v, 1));
         if (cas_tel) {
@@ -3857,6 +3879,22 @@ static void klock_release(struct klock *l) {
  * here, where the measured write share of contended acquires is small and the
  * alternative (reader starvation) would penalise the case this exists for. */
 struct klock_rtok { uint8_t *st; uint8_t *spp; uint8_t idx; uint8_t pushed; };
+
+static void vfsc_dump(int which, const char *ln, const char *tag) {
+    int shown = 0;
+    for (int i = 0; i < VFSC_SLOTS; i++) {
+        if (!g_vfsc_caller[which][i]) continue;
+        kprintf("[%s]   %s-wait caller=%X hits=%u\n",
+                tag, ln, g_vfsc_caller[which][i], g_vfsc_hits[which][i]);
+        shown++;
+    }
+    if (!shown)
+        kprintf("[%s]   %s-wait: no contended acquisition yet this boot\n", tag, ln);
+    if (g_vfsc_overflow[which])
+        kprintf("[%s]   %s-wait: %u wait(s) from MORE than %d distinct callers — the table "
+                "is full and this figure is unattributed\n",
+                tag, ln, g_vfsc_overflow[which], (uint64_t)(int64_t)VFSC_SLOTS);
+}
 
 static struct klock_rtok klock_read_acquire(struct klock *l) {
     struct klock_rtok t = { 0, 0, 0, 0 };
@@ -9989,8 +10027,49 @@ static int vfs_open_for(const char *name, int owner, uint32_t oflags) {
     if (path_has_prefix(name, "dev/"))
         return ofile_claim(owner, VOL_DEV, 0);     /* dirent unused: a live view, not a file */
 
+    /* v0.72: whose open this is — computed before either acquisition, because it
+     * reads kprocs and not DENTS, so it never needed the VFS lock at all. */
+    uint32_t o_uid = (owner >= 0 && owner < n_kproc) ? cred_euid(owner) : 0;
+    uint32_t o_gid = (owner >= 0 && owner < n_kproc) ? cred_egid(owner) : 0;
+
+    /* ===== v0.90 MILESTONE 3: OPTIMISTIC PROBE ==========================
+     * After Milestone 2 this function was ALL of the remaining g_vfs_lock
+     * contention — 23 of 23 contended acquires on smp4 — because it was the one
+     * audited hot spot whose critical section could not simply become shared:
+     * its lookup is followed by dirent creation, and sharing that races two
+     * creators for one name.
+     *
+     * The split is by OUTCOME rather than by call site. An open that FINDS its
+     * file and is not truncating mutates nothing: vfs_find scans, vfs_permit
+     * reads mode/uid/gid, and the fd claim happens after the lock is dropped.
+     * That is the overwhelmingly common case and it is a pure reader. Everything
+     * else — the name is missing (may create), or O_TRUNC (empties the file) —
+     * mutates, and takes the lock exclusively exactly as before.
+     *
+     * THE SECOND vfs_find IS THE WHOLE CORRECTNESS ARGUMENT. Between dropping
+     * the shared lock and taking the exclusive one, another core may have
+     * created this very name; the probe's answer is stale by then and acting on
+     * it would reintroduce the duplicate-creation race the v0.56 note below
+     * warns about. So the slow path re-resolves the name under exclusion and
+     * uses only that result — the probe is a hint, never a decision. */
+    {
+        struct klock_rtok pt = klock_read_acquire(&g_vfs_lock);
+        int pdi = vfs_find(name);
+        if (pdi >= 0 && !trunc) {
+            /* Existing file, no truncation: read-only from here. The permission
+             * check is the same one the exclusive path applies to a file it did
+             * not create, on the same fields, under a lock that still excludes
+             * every writer. */
+            int ok = vfs_permit(&DENTS[pdi], o_uid, o_gid, VFS_P_READ);
+            klock_read_release(&g_vfs_lock, pt);
+            if (!ok) return -13;                                   /* EACCES */
+            return vfs_apply_oflags(ofile_claim(owner, VOL_ROOT, pdi), oflags);
+        }
+        klock_read_release(&g_vfs_lock, pt);
+    }
+
     klock_acquire(&g_vfs_lock);
-    int di = vfs_find(name);
+    int di = vfs_find(name);          /* v0.90: RE-CHECK. See the probe note. */
     /* v0.56: O_CREAT for ROOT. A toolchain has to be able to AUTHOR files — a
      * compiler that can only overwrite names the kernel pre-seeded is not a
      * toolchain — but creation must be REQUESTED, never implicit: making plain
@@ -9998,13 +10077,13 @@ static int vfs_open_for(const char *name, int owner, uint32_t oflags) {
      * "prove this name is gone" check silently created the name it was checking
      * for. The new dirent is claimed under the same lock that found it missing,
      * so two cores opening the same new path cannot both claim a slot. */
-    /* v0.72: whose open this is. `owner` is already the thread-group leader,
-     * so a thread and its process always answer identically. */
-    /* v0.74: the EFFECTIVE pair. A setuid program's whole purpose is that the
-     * files it opens are judged against the identity it assumed, not the one
-     * its caller logged in as. */
-    uint32_t o_uid = (owner >= 0 && owner < n_kproc) ? cred_euid(owner) : 0;
-    uint32_t o_gid = (owner >= 0 && owner < n_kproc) ? cred_egid(owner) : 0;
+    /* v0.72: whose open this is. `owner` is already the thread-group leader, so
+     * a thread and its process always answer identically.
+     * v0.74: the EFFECTIVE pair. A setuid program's whole purpose is that the
+     * files it opens are judged against the identity it assumed, not the one its
+     * caller logged in as.
+     * v0.90: both are now resolved ABOVE, before the probe, so the two paths
+     * judge an open against exactly the same identity. */
     int created = 0;
     if (di < 0 && creat && name[0]) {   /* never create an unnamed dirent */
         for (int i = 0; i < VFS_MAXFILES; i++) if (!DENTS[i].used) {
@@ -20650,21 +20729,8 @@ static void cmd_cio(void) {
      * Printed unconditionally, including when every count is zero: a table that
      * appears only under contention cannot establish what an uncontended boot
      * looked like, which is the mistake v0.89 spent two milestones undoing. */
-    {
-        int shown = 0;
-        for (int i = 0; i < VFSC_SLOTS; i++) {
-            if (!g_vfsc_caller[i]) continue;
-            kprintf("[cio    ]   vfs-wait caller=%X hits=%u\n",
-                    g_vfsc_caller[i], g_vfsc_hits[i]);
-            shown++;
-        }
-        if (!shown)
-            kputs("[cio    ]   vfs-wait: no contended acquisition of g_vfs_lock this boot\n");
-        if (g_vfsc_overflow)
-            kprintf("[cio    ]   vfs-wait: %u wait(s) from MORE than %d distinct callers — "
-                    "the table is full and this figure is unattributed\n",
-                    g_vfsc_overflow, (uint64_t)(int64_t)VFSC_SLOTS);
-    }
+    vfsc_dump(VFSC_VFS,   "vfs",   "cio    ");
+    vfsc_dump(VFSC_OFILE, "ofile", "cio    ");
     ciocheck("ZERO rank violations across the whole run (lock order held everywhere)",
              g_rank_violations == 0);
 
@@ -23698,6 +23764,12 @@ static void cmd_vfs_stress(void) {
                 "slots used %d -> %d, stranded owner_mask bits %d\n",
                 (uint64_t)oacq, (uint64_t)ocon, (uint64_t)(oacq ? (ocon * 100u) / oacq : 0),
                 (uint64_t)(int64_t)used0, (uint64_t)(int64_t)used1, (uint64_t)(int64_t)stranded);
+
+        /* v0.90 M3: WHERE THE ofile WAITS COME FROM, dumped HERE because this is
+         * the only place in the boot where they happen in bulk. cmd_cio reports
+         * the same table 1,300 log lines earlier and before this phase has run,
+         * so its version answers a different question. */
+        vfsc_dump(VFSC_OFILE, "ofile", "vfsstrs");
 
         vfscheck("ofilestrs: no worker FAILED (table-full is retried in ring 3 and deadline "
                  "expiry has its own code — a slow or busy host is never decoded as a defect)",

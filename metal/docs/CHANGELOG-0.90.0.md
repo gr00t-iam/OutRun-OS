@@ -273,21 +273,106 @@ readers waiting on a **writer**, which is correct exclusion, not queueing.
 `cmd_cio`'s quiescence check now also fails a lock left held in shared mode —
 which would otherwise have passed invisibly.
 
+## MILESTONE 3 — THE OPTIMISTIC PROBE, AND WHAT `g_ofile_lock` IS ACTUALLY DOING
+
+### `vfs_open_for`: exclusive contention to zero
+
+Milestone 2 left this function as **all** of the remaining contention (23 of 23
+on smp4) because its lookup is followed by dirent creation and sharing that
+races two creators for one name.
+
+Split by **outcome**, not by call site. An open that FINDS its file and is not
+truncating mutates nothing — `vfs_find` scans, `vfs_permit` reads, and the fd
+claim happens after the lock is dropped — so that case takes the lock shared.
+Everything else (name missing, so possibly creating; or `O_TRUNC`, which empties
+the file) takes it exclusively, exactly as before.
+
+**The second `vfs_find` is the whole correctness argument.** Between dropping the
+shared lock and taking the exclusive one another core may have created this very
+name, so the probe's answer is stale by then: the slow path re-resolves under
+exclusion and uses only that result. The probe is a hint, never a decision.
+
+| tier | M2 contended | M3 contended |
+|---|---|---|
+| uniprocessor | 0 | **0** |
+| smp2-bios | 12 | **0** |
+| smp4-bios | 23 | **0** |
+| smp8-bios | 29 | **0** |
+
+`vfs-wait` reports **no contended acquisition at all** on every tier. Across the
+three milestones: 36/69/66 → 12/23/29 → 0/0/0. `shared-waits` (19/53/62) is
+readers waiting on a genuine writer, which is the exclusion working.
+
+45/45 suites on all four tiers, `g_rank_violations == 0`, zero rank mismatches.
+
+### `g_ofile_lock`: the 45% is the hammer measuring itself
+
+**The first attempt at this audit measured the wrong window, and that is the
+finding worth recording.** The attribution instrument was attached to
+`g_ofile_lock` and dumped from `cmd_cio` — which runs at kernel64.c:33070, while
+`cmd_vfs_stress` runs at :33077. So the table reported 10 waits from early boot
+while the role-62 phase that produced the 45% had not run yet, 1,300 log lines
+later. Reporting those 10 as "the sites responsible" would have been a number
+measured correctly over the wrong window — the third time this cycle has produced
+that exact shape. The dump is now also called from the role-62 phase, after its
+own workload.
+
+Measured there, `-smp 8`: **73,745 acquisitions, 33,047 contended (44%)**, eleven
+distinct callers, no overflow. The top four are 99.9% of it:
+
+| caller | site | hits | share |
+|---|---|---|---|
+| `SYS_CLOSE` (case 8) | `fd_owner` → `cpu_idx`, :17231 | 13,748 | 42% |
+| `ofile_claim:9691` | the 16-slot `for (fd = 0; fd < 16; fd++)` scan | 8,675 | 26% |
+| `pipe_create_for:9909` | the `MAX_PIPES` free-slot scan | 6,826 | 21% |
+| `pipe_create_for:9928` | wiring the two ends | 3,829 | 12% |
+
+Every one of them is `pipe()` or `close()` — which is **exactly and only what
+role 62 does**. Set against ordinary suite traffic on the same boots:
+
+| tier | ordinary traffic (`cmd_cio`) | role-62 hammer |
+|---|---|---|
+| uniprocessor | 0 / 1,128 (0%) | — |
+| smp2-bios | 4 / 1,110 (0.4%) | — |
+| smp4-bios | 9 / 1,080 (0.8%) | 16% |
+| smp8-bios | 13 / 1,133 (1.1%) | 44% |
+
+**So the 45% is not evidence that `g_ofile_lock` is a bottleneck.** It is a
+purpose-built pipe/close hammer contending with itself; the same lock under the
+rest of the boot's forty-odd suites sits near 1%. The honest reading of
+Milestone 1's number is "this is what the lock does when you attack it", not
+"this is what the lock costs" — and the v0.90 goal text that called it a
+candidate for optimisation was written before this distinction existed.
+
+That makes descriptor-layer optimisation **unjustified on current evidence**, and
+recording that is the point: the measurement was taken to find out, and the
+answer came back no. The three sites above are still where any future work would
+go — the two linear scans especially — but a scan over 16 slots is not obviously
+worth replacing to serve a workload nothing but a stress test generates.
+
 ### STILL OPEN
 
-- **`vfs_open_for` is now the whole of the remaining contention** (23 of 23 on
-  smp4). Splitting its lookup from its creation — probe shared, then re-acquire
-  exclusively and re-check before claiming a slot — is the obvious next move and
-  is a change to that function's logic rather than to the lock. It needs the
-  double-check written carefully, since the whole point of the v0.56 comment is
-  that the window between lookup and claim is where two creators race.
-- **Only `g_vfs_lock` has readers.** `g_ofile_lock` (rank 1) reached 45% under
-  Milestone 1's role-62 hammer and has had no equivalent audit; the attribution
-  instrument is per-lock and would need one line to point at it.
-- **One boot per tier.** These figures cannot see an intermittent below roughly
-  1 in 4, and the shared path is new code on a hot lock. A soak is the honest
-  next verification, and `gate-dirty`/`gate-dirty-smp` have not been run against
-  this change at all.
+Both items this section carried after Milestone 2 are closed above:
+`vfs_open_for` now probes shared and re-checks under exclusion (contention 0 on
+every tier), and `g_ofile_lock` has been audited (its 45% is the role-62 hammer
+contending with itself; ordinary traffic is ~1%). What remains:
+
+- **One boot per tier, still.** Three milestones of figures now rest on single
+  boots, and the shared path is new code on the two hottest locks in the tree.
+  These cannot see an intermittent below roughly 1 in 4. **`gate-dirty` and
+  `gate-dirty-smp` have not been run against ANY of the v0.90 lock work** — and
+  a reused volume is exactly where a stale-dirent or double-create bug from the
+  probe would show, since the v0.84 O_TRUNC map bug was found by that tier and
+  hidden completely by a fresh one. That is the next verification, before any
+  further optimisation.
+- **The probe widened a window that already existed.** `vfs_open_for` has always
+  released the lock before `ofile_claim`; it now also drops and retakes it
+  between the lookup and the create. The re-check makes the create safe, but any
+  future code added between probe and slow path must not assume the probe's
+  answer still holds.
+- **No reader/writer support for `g_ofile_lock`.** Deliberately: the audit says
+  it is not a bottleneck under real traffic, so adding shared acquisition there
+  would be optimising a number no workload produces.
 
 This milestone met the bar its own goal text set:
 
