@@ -197,21 +197,106 @@ which mutate anything, all serialised against each other by one exclusive lock.
 That makes reader/writer semantics on `g_vfs_lock` the indicated change, and it
 is a change to the lock rather than to the call sites.
 
-**Not implemented in this commit, and the reason is not caution for its own
-sake.** `struct klock` is exclusive by construction and carries rank tracking,
-IRQ save/restore, self-deadlock detection and the `rank_st`/`rank_spp` machinery
-that exists because acquire and release must agree on where the rank entry lives.
-A reader/writer variant has to preserve all of it, and reader-shared acquisition
-breaks the "held by exactly one context" assumption that note rests on. Shipping
-that at the end of an audit and calling it verified because 45 suites still
-passed would be precisely the reasoning this cycle's own goal text rules out:
+### CORRECTION — the audit's own classification was wrong
+
+The table above says "71 of 72 contended waits are on READ-ONLY critical
+sections". **That was measured correctly and classified wrongly**, and the error
+is worth naming because it is the same shape this cycle keeps finding: a return
+address tells you where the acquire happened, not what the critical section goes
+on to do, and the classification was made from the statement at the address.
+
+Read against the whole section instead:
+
+| caller | hits | the section actually | convertible |
+|---|---|---|---|
+| `vfs_open_for:9866` | 25 | `vfs_find`, then **CREATES a dirent** under the same acquire | **NO** |
+| `SYS_WRITE_FILE:16939` | 21 | `vfs_permit` — `const struct dirent *`, pure | yes |
+| `vfs_read_range:8389` | 20 | chunk walk + one `uint32_t` relatime store | yes |
+| `vfs_len_of` | 5 | reads one field | yes |
+| `vfs_write_by_dirent` | 1 | mutates | **NO** |
+
+`vfs_open_for` is the largest hot spot and it is the one that cannot move: the
+code says why in a v0.56 comment — *"The new dirent is claimed under the same
+lock that found it missing, so two cores opening the same new path cannot both
+claim a slot."* Shared mode there is a race that lets two cores create one name.
+
+So the convertible share was **46 of 72 (64%)**, not 99%. The strategy survives
+the correction — 64% is still most of the contention — but the ceiling was
+overstated and the corrected figure is what the result below should be judged
+against.
+
+### IMPLEMENTED — shared acquisition, and what it bought
+
+`struct klock` gains `rdrs` (contexts inside a shared acquire) and `rcon`
+(shared acquires that had to wait). `v` keeps its exact meaning, so all 13 locks
+that never take a reader behave as before and pay one predictable load.
+
+**The rank slot could not be extended; it had to move.** `rank_st`/`rank_spp`/
+`rank_idx` live *in the lock*, which is sound only because a klock is held by
+exactly one context at a time — precisely the assumption shared acquisition
+breaks. Two readers would overwrite each other's slot and then pop entries
+belonging to someone else, which is the "push and pop went to different stacks"
+fault the v0.75 notes already describe, reintroduced one layer up. Readers
+therefore carry the slot in a **token on their own stack**; `klock_read_release`
+pops from the token. Nothing is shared, so nothing can be clobbered, and two
+readers pushing rank 2 onto *different* context stacks is why this raises no
+false `g_rank_violations`.
+
+Interlock: the writer takes `v` then drains `rdrs`; the reader waits for `v`,
+increments `rdrs`, then **re-checks `v`** and backs out if a writer slipped in.
+Neither can be starved into deadlock and both cannot be inside at once.
+
+**Before (`3dcb309`) → after, same instrument, same tiers:**
+
+| tier | acq | contended before | contended after | change |
+|---|---|---|---|---|
+| uniprocessor | ~210 | 0 | **0** | — (negative control) |
+| smp2-bios | ~211 | 36 | **12** | **−67%** |
+| smp4-bios | ~210 | 69 | **23** | **−67%** |
+| smp8-bios | ~212 | 66 | **29** | **−56%** |
+
+Measured reduction lands on the corrected 64% prediction rather than the
+overstated one, which is the check that the corrected classification was right.
+
+**What remains is exclusion that has to exist.** The contended callers after the
+change are only two, both resolved with `addr2line -i`:
+
+| caller | why it must stay exclusive |
+|---|---|
+| `vfs_open_for:9993` | lookup-then-create; sharing it races two creators |
+| `vfs_write_by_dirent:8187` | a mutation |
+
+Every reader-on-reader wait is gone. `shared-waits` (7/33/32 across the tiers) is
+readers waiting on a **writer**, which is correct exclusion, not queueing.
+
+45/45 suites at every tier, `g_rank_violations == 0`, zero rank mismatches, and
+`cmd_cio`'s quiescence check now also fails a lock left held in shared mode —
+which would otherwise have passed invisibly.
+
+### STILL OPEN
+
+- **`vfs_open_for` is now the whole of the remaining contention** (23 of 23 on
+  smp4). Splitting its lookup from its creation — probe shared, then re-acquire
+  exclusively and re-check before claiming a slot — is the obvious next move and
+  is a change to that function's logic rather than to the lock. It needs the
+  double-check written carefully, since the whole point of the v0.56 comment is
+  that the window between lookup and claim is where two creators race.
+- **Only `g_vfs_lock` has readers.** `g_ofile_lock` (rank 1) reached 45% under
+  Milestone 1's role-62 hammer and has had no equivalent audit; the attribution
+  instrument is per-lock and would need one line to point at it.
+- **One boot per tier.** These figures cannot see an intermittent below roughly
+  1 in 4, and the shared path is new code on a hot lock. A soak is the honest
+  next verification, and `gate-dirty`/`gate-dirty-smp` have not been run against
+  this change at all.
+
+This milestone met the bar its own goal text set:
 
 > No decoupling lands without a before/after contention number from the same
 > instrument. A refactor whose only evidence is that the suites still pass has not
 > been shown to do anything.
 
-The instrument to produce that before/after now exists and its baseline is the
-table above. The refactor is the next piece of work, with its own verification.
+The before came from `3dcb309`, the after from this commit, both from the same
+per-caller instrument on the same four tiers.
 
 ## OPEN, CARRIED FROM v0.89
 

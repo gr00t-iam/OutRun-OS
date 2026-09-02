@@ -3283,6 +3283,23 @@ struct klock {
     uint8_t          *rank_st;               /* the stack it was pushed on     */
     uint8_t          *rank_spp;              /* that stack's depth cursor      */
     uint8_t           rank_idx;              /* the index it was pushed at     */
+    /* v0.90: SHARED (READER) ACQUISITION.
+     *
+     * `v` remains the exclusive gate and its meaning is unchanged, so every lock
+     * in this tree that never takes a reader behaves exactly as before — `rdrs`
+     * is then permanently 0 and the writer's drain check is one predictable
+     * load. Appended rather than inserted, so the positional initialisers above
+     * keep zero-filling correctly (the same reasoning the v0.75 and v0.81 fields
+     * carry).
+     *
+     * THE RANK SLOT CANNOT LIVE IN THE LOCK FOR READERS. `rank_st`/`rank_spp`/
+     * `rank_idx` work because a klock is held by exactly one context at a time;
+     * that is the assumption shared acquisition breaks, and two readers would
+     * overwrite each other's bookkeeping and then pop the wrong slots. Readers
+     * therefore carry their slot in a token on their own stack — see
+     * klock_read_acquire. Nothing about the writer path changes. */
+    volatile uint32_t rdrs;                  /* contexts inside a shared acquire */
+    volatile uint32_t rcon;                  /* shared acquires that had to wait */
 #ifdef KERNEL_DEBUG
     /* v0.81: OWNERSHIP AND CONTEXT, under -DKERNEL_DEBUG.
      *
@@ -3315,17 +3332,25 @@ struct klock {
 #else
 #define KLOCK_DBG_INIT
 #endif
-static struct klock g_ofile_lock = { 0, "ofile", 1, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
-static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
-static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
-static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
-static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+/* v0.90: the same treatment for `rdrs`/`rcon`, and for the same reason the note
+ * above records — appending fields is correct and still fires
+ * -Wmissing-field-initializers on all thirteen initialisers under -Werror. These
+ * are unconditional, so unlike KLOCK_DBG_INIT the macro has one definition; it
+ * exists so the initialisers below name the zeroes rather than relying on a
+ * silent fill, and so the next appended field has an obvious place to go.
+ * ORDER MATTERS: it must come before KLOCK_DBG_INIT, matching field order. */
+#define KLOCK_RW_INIT , 0, 0
+static struct klock g_ofile_lock = { 0, "ofile", 1, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 /* v0.66. Rank 12: ABOVE every lock this ever needs, because it is never held
  * across one. Filling a page reads the VFS and flushing one writes it, and
  * both happen with this released — collect under the lock, do the I/O outside
  * it, re-check on the way back in. Holding it across g_vfs_lock (rank 2) would
  * be a real inversion, not a bookkeeping nicety. */
-static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static volatile uint32_t g_rank_violations = 0;
 #ifdef KERNEL_DEBUG
 /* v0.81: counted so a boot can report ZERO rather than merely not printing.
@@ -3643,6 +3668,12 @@ static void klock_acquire(struct klock *l) {
             if (spins > s->max_retries) s->max_retries = spins;
         }
     }
+    /* v0.90: EXCLUSION AGAINST READERS. `v` is ours now, which stops any FURTHER
+     * reader entering (klock_read_acquire re-checks `v` after it increments and
+     * backs out if a writer has claimed it). What remains is to wait for readers
+     * already inside to leave. On a lock nobody reads this is one load of a line
+     * that is already hot. */
+    while (l->rdrs) krelax();
     if (cas_tel) g_cas_acq_cpu[cpu_idx()]++;           /* under the lock        */
     l->acq++;                                          /* under the lock        */
 #ifdef KERNEL_DEBUG
@@ -3792,6 +3823,90 @@ static void klock_release(struct klock *l) {
     }
     klock_irq_restore(rf);
     __sync_lock_release(&l->v);
+}
+
+/* ===========================================================================
+ * v0.90: SHARED (READER) ACQUISITION
+ * ===========================================================================
+ * Measured motivation, not a general-purpose feature: v0.90's audit attributed
+ * g_vfs_lock's contended acquires to five callers, and the ones whose critical
+ * section provably does not mutate the directory are readers waiting on other
+ * readers. See CHANGELOG-0.90.0.md for the per-caller table.
+ *
+ * THE TOKEN IS THE WHOLE DESIGN. The exclusive path records its rank slot in the
+ * LOCK, which is sound only because one context holds it at a time. Two readers
+ * would overwrite each other's `rank_st`/`rank_idx` and then pop slots belonging
+ * to someone else — the exact "push and pop went to different stacks" fault the
+ * v0.75 notes above describe, reintroduced one layer over. So a reader keeps its
+ * slot in a token on its own stack, and release pops from the token. Nothing is
+ * shared, so nothing can be overwritten, and the depth-8 ceiling behaves as it
+ * does for writers (record nothing, pop nothing).
+ *
+ * The rank CHECK is unchanged and still applies: taking rank 2 while holding
+ * rank 3 is an inversion whether or not it is shared. Two readers on one lock
+ * push identical ranks onto DIFFERENT context stacks, which is why that raises
+ * no false positive — each context sees only its own held set.
+ *
+ * INTERLOCK WITH THE WRITER, and why it cannot deadlock or admit both:
+ *   writer  takes `v`, then waits for `rdrs` to fall to 0.
+ *   reader  waits for `v` to clear, increments `rdrs`, then RE-CHECKS `v`.
+ * If a writer claims `v` between the reader's check and its increment, the
+ * writer sees rdrs > 0 and waits, while the reader sees v == 1, decrements and
+ * backs off — so the writer always makes progress and the two are never inside
+ * together. Writers can be delayed by a stream of readers; that is acceptable
+ * here, where the measured write share of contended acquires is small and the
+ * alternative (reader starvation) would penalise the case this exists for. */
+struct klock_rtok { uint8_t *st; uint8_t *spp; uint8_t idx; uint8_t pushed; };
+
+static struct klock_rtok klock_read_acquire(struct klock *l) {
+    struct klock_rtok t = { 0, 0, 0, 0 };
+    uint8_t *sp, *st = rank_ctx(&sp);
+    uint64_t rf = klock_irq_save();
+    if (*sp > 0 && st[*sp - 1] >= l->rank) {
+        __sync_fetch_and_add(&g_rank_violations, 1);
+        kprintf("[klock  ] RANK VIOLATION (shared): acquiring '%s' (rank %d) while holding "
+                "rank %d | caller=%X cpu=%u depth=%u\n",
+                l->name, (uint64_t)l->rank, (uint64_t)st[*sp - 1],
+                (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx(), (uint64_t)*sp);
+    }
+    klock_irq_restore(rf);
+
+    int waited = 0;
+    for (;;) {
+        while (l->v) { waited = 1; krelax(); }         /* a writer holds it     */
+        __sync_fetch_and_add(&l->rdrs, 1);
+        if (!l->v) break;                              /* no writer slipped in  */
+        __sync_fetch_and_sub(&l->rdrs, 1);             /* one did: stand aside  */
+        waited = 1;
+        krelax();
+    }
+    if (waited) __sync_fetch_and_add(&l->rcon, 1);
+    /* Shared acquisitions are counted in `acq` alongside exclusive ones so the
+     * per-lock line keeps meaning "times this lock was taken"; `rcon` is the
+     * shared-mode wait count, kept apart because a reader waiting on a WRITER is
+     * a different fact from a writer waiting on anyone. */
+    __sync_fetch_and_add(&l->acq, 1);
+
+    rf = klock_irq_save();
+    if (*sp < 8) { t.st = st; t.spp = sp; t.idx = *sp; t.pushed = 1; st[(*sp)++] = l->rank; }
+    klock_irq_restore(rf);
+    return t;
+}
+
+static void klock_read_release(struct klock *l, struct klock_rtok t) {
+    uint64_t rf = klock_irq_save();
+    if (t.pushed && t.spp) {
+        if (t.st[t.idx] != l->rank) {
+            __sync_fetch_and_add(&g_rank_mismatch, 1);
+            kprintf("[klock  ] RANK MISMATCH (shared): releasing '%s' (rank %d); its recorded "
+                    "slot %u holds rank %d | caller=%X cpu=%u\n",
+                    l->name, (uint64_t)l->rank, (uint64_t)t.idx, (uint64_t)(int64_t)t.st[t.idx],
+                    (uint64_t)__builtin_return_address(0), (uint64_t)cpu_idx());
+        }
+        if (*t.spp > t.idx) *t.spp = t.idx;
+    }
+    klock_irq_restore(rf);
+    __sync_fetch_and_sub(&l->rdrs, 1);
 }
 
 static void sched_init(void) {
@@ -7031,7 +7146,7 @@ static struct udbent g_udb[UDB_MAX];
  * complaint through a null pointer. It never fired, because every acquisition
  * here happens with no other lock held — which is exactly the kind of latent
  * fault that surfaces years later when someone adds the first caller that does. */
-static struct klock  g_udb_lock = { 0, "udb", 13, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+static struct klock  g_udb_lock = { 0, "udb", 13, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static volatile uint64_t g_auth_ok = 0, g_auth_bad = 0, g_auth_lockouts = 0;
 /* v0.80: accounts migrated from PBKDF2 to scrypt, counted because a silent
  * migration is indistinguishable from one that never happened. */
@@ -8385,12 +8500,24 @@ static void thread_tlb_release(uint64_t va, uint32_t pages);      /* fwd: v0.66 
  * rule on a missing chunk, and returns the byte count actually produced. */
 static int64_t vfs_read_range(int di, uint64_t off, void *out, uint32_t len) {
     if (di < 0 || di >= VFS_MAXFILES || !out) return -1;
-    klock_acquire(&g_vfs_lock);
+    /* v0.90: SHARED. The chunk-map walk and cas_get are reads; cas_get takes
+     * g_cas_lock (rank 3) beneath this one, which is the correct order and is
+     * still exclusive there, so concurrent readers serialise inside the CAS
+     * layer exactly as before.
+     *
+     * THE ONE STORE, AND WHY IT IS STILL A READER. `d->atime` is an aligned
+     * uint32_t, written with a relatime stamp that is never journalled and that
+     * no invariant is derived from — SYS_FSTAT reports it and nothing asserts on
+     * it. Two concurrent readers racing it produce last-writer-wins between two
+     * timestamps taken microseconds apart, which is the same answer. It is
+     * called out rather than glossed: this section is not literally read-only,
+     * and a future store added beside it would NOT be safe by the same argument. */
+    struct klock_rtok rt = klock_read_acquire(&g_vfs_lock);
     struct dirent *d = &DENTS[di];
-    if (!d->used) { klock_release(&g_vfs_lock); return -1; }
+    if (!d->used) { klock_read_release(&g_vfs_lock, rt); return -1; }
     d->atime = vfs_now();                      /* v0.85: lazy, never journalled */
     uint32_t flen = d->len;
-    if (off >= flen) { klock_release(&g_vfs_lock); return 0; }   /* wholly past EOF */
+    if (off >= flen) { klock_read_release(&g_vfs_lock, rt); return 0; }  /* past EOF */
     uint32_t want = len;
     if (off + want > flen) want = (uint32_t)(flen - off);
     uint8_t *dst = (uint8_t *)out;
@@ -8407,7 +8534,7 @@ static int64_t vfs_read_range(int di, uint64_t off, void *out, uint32_t len) {
         for (uint32_t i = 0; i < n; i++) dst[got + i] = tmp[within + i];
         got += n;
     }
-    klock_release(&g_vfs_lock);
+    klock_read_release(&g_vfs_lock, rt);
     return (int64_t)got;
 }
 
@@ -10379,7 +10506,7 @@ static struct ipc_shmem g_ipc_shm[MAX_IPC_SHMEM];
  * unrelated raw spinlock, not part of this ranked array — no actual
  * collision, just two independent numbering schemes that happen to reuse
  * the same next integer.) */
-static struct klock g_ipc_lock = { 0, "ipc", 6, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+static struct klock g_ipc_lock = { 0, "ipc", 6, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 
 static void ipc_queue_clear(int idx) {
     struct ipc_queue *q = &g_ipc_q[idx];
@@ -10672,7 +10799,7 @@ struct vgpu_resource_unref {
     uint32_t resource_id, padding;
 } __attribute__((packed));
 
-static struct klock g_gpu_lock = { 0, "gpu", 7, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+static struct klock g_gpu_lock = { 0, "gpu", 7, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static volatile uint8_t *g_gpu_common = 0, *g_gpu_notify = 0;
 static uint32_t          g_gpu_notify_mul = 0;
 static struct vq         g_gpu_ctrl;
@@ -11349,7 +11476,7 @@ struct virtio_snd_pcm_set_params {
 struct virtio_snd_pcm_status { uint32_t status, latency_bytes; } __attribute__((packed));
 struct virtio_snd_pcm_xfer   { uint32_t stream_id; } __attribute__((packed));
 
-static struct klock g_audio_lock = { 0, "audio", 8, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+static struct klock g_audio_lock = { 0, "audio", 8, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static volatile uint8_t *g_snd_common = 0, *g_snd_notify = 0;
 static uint32_t g_snd_notify_mul = 0;
 /* g_snd_isr / snd_isr_drain() are forward-declared above, right before
@@ -11794,7 +11921,7 @@ static void sock_slot_wipe(int si) {
     g_sock[si].gen = g + 1;
 }
 static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len); /* fwd: v0.67 */
-static struct klock g_net_lock = { 0, "net", 9, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+static struct klock g_net_lock = { 0, "net", 9, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static volatile uint64_t g_net_tx_frames = 0;
 static volatile uint64_t g_net_loop_deliveries = 0;
 /* v0.65: the numbers the suite cannot see from ring 3. An EAGAIN count that
@@ -12723,7 +12850,7 @@ static int wg_focused(int wi) {
     return k;
 }
 static uint64_t g_wm_pagetab[NWMWIN][WIN_SURF_MAXPG];   /* phys of each window's surface pages */
-static struct klock g_wm_lock = { 0, "wm", 10, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+static struct klock g_wm_lock = { 0, "wm", 10, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static int g_wm_focus = -1;              /* window index with keyboard focus, or -1     */
 static int g_wm_znext = 1;               /* monotonically increasing z stamp            */
 static int g_wm_drag = -1, g_wm_drag_dx = 0, g_wm_drag_dy = 0;   /* window being dragged */
@@ -16598,7 +16725,7 @@ static void posix_sigcheck_on_return(struct sysframe *sf, uint64_t rv) {
  * could not fully read. */
 #define REDIR_STAGE_MAX 32768
 static uint8_t g_redir_stage[REDIR_STAGE_MAX];
-static struct klock g_redir_lock = { 0, "redir", 0, 0, 0, 0, 0, 0 KLOCK_DBG_INIT };
+static struct klock g_redir_lock = { 0, "redir", 0, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 
 static int64_t redirect_write_bytes(int fd, const void *data, uint32_t len) {
     int vol = VOL_ROOT;
@@ -16631,9 +16758,10 @@ static int64_t redirect_write_bytes(int fd, const void *data, uint32_t len) {
  * path exists to avoid. */
 static uint32_t vfs_len_of(int di) {
     if (di < 0 || di >= VFS_MAXFILES) return 0;
-    klock_acquire(&g_vfs_lock);
+    /* v0.90: SHARED. Two field reads and no store — provably a reader. */
+    struct klock_rtok t = klock_read_acquire(&g_vfs_lock);
     uint32_t n = DENTS[di].used ? DENTS[di].len : 0;
-    klock_release(&g_vfs_lock);
+    klock_read_release(&g_vfs_lock, t);
     return n;
 }
 
@@ -16935,9 +17063,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                  * owns therefore holds a perfectly valid descriptor it cannot
                  * write through, which is the correct and useful outcome. */
                 int L = tg_of((int)current_proc_idx);
-                klock_acquire(&g_vfs_lock);
+                /* v0.90: SHARED. This is a WRITE syscall, but this critical
+                 * section is not: vfs_permit takes `const struct dirent *` and
+                 * reads mode/uid/gid. The write itself follows, outside, and
+                 * takes the lock exclusively on its own. Measured at 21 of 72
+                 * contended acquires on smp4 — the largest convertible share. */
+                struct klock_rtok pt = klock_read_acquire(&g_vfs_lock);
                 int ok = vfs_permit(&DENTS[di], cred_euid(L), cred_egid(L), VFS_P_WRITE);
-                klock_release(&g_vfs_lock);
+                klock_read_release(&g_vfs_lock, pt);
                 /* v0.83: POSITIONAL, and the cursor advances. This was
                  * vfs_write_by_dirent(), which replaces a file's ENTIRE
                  * contents — so every write started at byte 0 and truncated
@@ -20497,11 +20630,15 @@ static void cmd_cio(void) {
     struct klock *ls[5] = { &g_ofile_lock, &g_vfs_lock, &g_cas_lock, &g_vblk_lock, &g_surf_lock };
     int held = 0;
     for (int i = 0; i < 5; i++) {
-        kprintf("[cio    ]   lock %s (rank %d): %u acquisitions, %u contended\n",
-                ls[i]->name, (uint64_t)ls[i]->rank, (uint64_t)ls[i]->acq, (uint64_t)ls[i]->contended);
-        if (ls[i]->v) held++;
+        kprintf("[cio    ]   lock %s (rank %d): %u acquisitions, %u contended, "
+                "%u shared-waits, %u reader(s) in\n",
+                ls[i]->name, (uint64_t)ls[i]->rank, (uint64_t)ls[i]->acq,
+                (uint64_t)ls[i]->contended, (uint64_t)ls[i]->rcon, (uint64_t)ls[i]->rdrs);
+        /* v0.90: a lock left held in SHARED mode is as much a leak as one left
+         * held exclusively, and would otherwise pass this check invisibly. */
+        if (ls[i]->v || ls[i]->rdrs) held++;
     }
-    ciocheck("no lock left held at quiescence", held == 0);
+    ciocheck("no lock left held at quiescence (exclusive or shared)", held == 0);
 
     /* v0.90 MILESTONE 2: WHERE g_vfs_lock's WAITS ACTUALLY COME FROM.
      *
