@@ -7,9 +7,28 @@ Status: **RELEASED**, tagged `v0.90.0`.
 | | |
 |---|---|
 | artefact | `outrun-os-0.90.0.iso` |
-| md5 | `33667197c57ab424c081bec880ba9c0e` |
-| sha256 | `7682c69a6a74b0986382ce15e1b26ddf685cde825a16be639972c3b7a9203f7a` |
+| md5 | `c94e3f5e170d62f63c95aef6ea0462d5` |
+| sha256 | `1a28456f01801a9dd8c3e108d575cc5ce2fb5d4a8239e85d5ef27ee9c27f7a21` |
 | `release-verify` | **PASS** — 45 suites reporting, 0 failing assertions, 0 rank faults, 460 s |
+
+**THE ISO IS NOT REPRODUCIBLE, AND `make clean` DESTROYS IT.** Measured here
+rather than assumed: building twice from one unchanged tree gave
+`33667197c57ab424c081bec880ba9c0e` and then `e89d1255a4ced951c37abed1fb9beb82`.
+`grub-mkrescue` embeds non-deterministic data, so a checksum names one specific
+**artefact** and never a source state — "rebuild it and compare" is not a
+recovery path.
+
+That matters because `make clean` removes `build/release/` along with everything
+else. A first v0.90.0 artefact was built, verified and checksummed, and was then
+deleted by a `make clean` run to test the reproducibility question above — which
+answered it, and left the recorded checksum naming an image that no longer
+existed and could not be recreated. The table above is the rebuilt artefact,
+re-verified, and present on disk beside its `.md5` and `.sha256`.
+
+`build/release/` should be treated as output only `make release` creates and
+nothing else removes. `gate-oversub` already ends with a deliberate `make clean`
+for the opposite reason — so no non-default kernel lingers under the ordinary ISO
+name — and both facts point the same way.
 
 The tag is `v0.90.0`, not `v0.90.0-metal`: every tag in this repository is
 `vN.NN.0`, and `release-version-check` compares `git describe` against
