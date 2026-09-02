@@ -23259,15 +23259,61 @@ static void cmd_vfs_stress(void) {
                     (uint64_t)APPSMP_PAY, (uint64_t)flen, (uint64_t)total, got,
                     (uint64_t)(g_ticks - t_start), (uint64_t)ran_mask);
 
-            vfscheck("append-oversub: the file is EXACTLY workers x iterations x payload bytes "
-                     "under PREEMPTION (a writer stopped mid-syscall must not lose its append)",
-                     flen == total && got == (int64_t)total);
+            /* ===== v0.90.1: THE EXPECTED LENGTH DEPENDS ON WHO FINISHED =====
+             * This asserted `flen == total` unconditionally, and `total` is
+             * nw x APPSMP_ITERS x APPSMP_PAY — a figure that is only reachable
+             * if EVERY worker completed EVERY iteration. Six lines above, the
+             * phase deliberately TOLERATES a worker expiring on its deadline
+             * ("a slow host must not be decoded as a defect"). The two claims
+             * cannot both hold: a worker that expires writes fewer appends, so
+             * the file is legitimately short, and the exact-length assertion
+             * then reports a lost append that never happened.
+             *
+             * Measured, 8 runs on a degraded host across two builds: every run
+             * that logged a deadline expiry produced a short file and failed
+             * this assertion; the single run with no expiry produced exactly
+             * 8192 B and passed. Deficits were 64..448 B, always under the
+             * 512 B one expired worker can owe.
+             *
+             * THE KERNEL IS NOT LOSING APPENDS. SYS_WRITE_FILE routes an
+             * O_APPEND write to vfs_write_append, which takes the offset from
+             * the dirent INSIDE the lock that performs the write; see the v0.84
+             * note there for the race that design exists to prevent.
+             *
+             * So the expectation becomes: exact when nothing expired, and
+             * bounded by what expiry can account for when something did. With
+             * n_slow == 0 this reduces to `flen == total` — the original
+             * assertion, unweakened, which is the case every healthy host hits.
+             * With n_slow > 0 a deficit larger than the expired workers could
+             * possibly owe is still a lost append, and still fatal. */
+            uint32_t owed = (uint32_t)n_slow * APPSMP_ITERS * APPSMP_PAY;
+            uint32_t missing = (flen <= total) ? (total - flen) : 0;
+            if (n_slow)
+                kprintf("[vfsstrs] append-oversub: %d worker(s) expired owing at most %u B; "
+                        "file is short by %u B\n",
+                        (uint64_t)(int64_t)n_slow, (uint64_t)owed, (uint64_t)missing);
+            vfscheck("append-oversub: no append was LOST under preemption — the file is exactly "
+                     "workers x iterations x payload when every worker finished, and short by no "
+                     "more than the expired workers could owe when one did not",
+                     flen == (uint32_t)got && flen <= total &&
+                     (flen % APPSMP_PAY) == 0 && missing <= owed);
 
-            if (got == (int64_t)total) {
+            /* v0.90.1: the byte-level checks used to run only when the file was
+             * the full length, so a single expired worker skipped the torn-block
+             * and interleave checks entirely — the run lost its real coverage
+             * exactly when the host was most loaded and concurrency most
+             * stressed. They now run on whatever was actually written. */
+            if (got > 0) {
                 uint32_t counts[APPSMP_W]; for (uint32_t i = 0; i < APPSMP_W; i++) counts[i] = 0;
                 uint32_t torn = 0, first_bad = 0, transitions = 0, alien = 0;
                 int prev_pat = -1;
-                for (uint32_t b = 0; b < total; b += APPSMP_PAY) {
+                /* v0.90.1: bound by what was READ, not by the nominal total.
+                 * Walking to `total` over a short file would read past the
+                 * bytes vfs_read_file produced and count uninitialised buffer
+                 * as torn blocks — manufacturing the very defect this is
+                 * looking for. */
+                uint32_t scanned = (uint32_t)got - ((uint32_t)got % APPSMP_PAY);
+                for (uint32_t b = 0; b < scanned; b += APPSMP_PAY) {
                     uint8_t p0 = osbuf[b];
                     int uniform = 1;
                     for (uint32_t k = 1; k < APPSMP_PAY; k++)
@@ -23283,13 +23329,26 @@ static void cmd_vfs_stress(void) {
                             (uint64_t)torn, (uint64_t)first_bad);
                 /* Two workers share a pattern when nw > APPSMP_W, so the
                  * expectation is COMPUTED. Asserting "ITERS each" would be
-                 * wrong the moment the worker count stops dividing evenly. */
+                 * wrong the moment the worker count stops dividing evenly.
+                 *
+                 * v0.90.1: and when a worker expired, "all present" is not a
+                 * claim this phase can make — it did not finish writing them.
+                 * The exact equality is kept for the case that can support it
+                 * (nothing expired, which is every healthy run) and becomes an
+                 * upper bound otherwise: a pattern appearing MORE often than its
+                 * workers could have written it is corruption either way, and
+                 * the totals must still add up to the bytes on disk. */
                 int counts_ok = 1;
+                uint32_t counted = 0;
                 for (uint32_t k = 0; k < APPSMP_W; k++) {
                     uint32_t wants = ((uint32_t)nw / APPSMP_W) +
                                      ((k < (uint32_t)nw % APPSMP_W) ? 1u : 0u);
-                    if (counts[k] != wants * APPSMP_ITERS) counts_ok = 0;
+                    wants *= APPSMP_ITERS;
+                    counted += counts[k];
+                    if (n_slow == 0) { if (counts[k] != wants) counts_ok = 0; }
+                    else             { if (counts[k] >  wants) counts_ok = 0; }
                 }
+                if (counted != scanned / APPSMP_PAY) counts_ok = 0;
                 kprintf("[vfsstrs] append-oversub: per-pattern block counts %u/%u/%u/%u, "
                         "%u interleave transition(s)\n",
                         (uint64_t)counts[0], (uint64_t)counts[1], (uint64_t)counts[2],

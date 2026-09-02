@@ -76,11 +76,14 @@ feeder() {
     echo "  [soak] prompt reached after $((SECONDS - t0))s; typing $ITERS iteration(s)" >&2
     sleep 3
     for i in $(seq 1 "$ITERS"); do
-        before=$(grep -ac '^\[vfsstrs\] RESULT:' "$log" 2>/dev/null || echo 0)
+        # NOT `|| echo 0`: grep -c PRINTS 0 and EXITS 1 when it matches nothing,
+        # so the fallback appended a second value and the later [ -gt ] saw
+        # "0\n0". Harmless to the result, noisy in the log, and wrong.
+        before=$(grep -ac '^\[vfsstrs\] RESULT:' "$log" 2>/dev/null); before=${before:-0}
         printf 'vfsstress\n'
         t1=$SECONDS
         while :; do
-            now=$(grep -ac '^\[vfsstrs\] RESULT:' "$log" 2>/dev/null || echo 0)
+            now=$(grep -ac '^\[vfsstrs\] RESULT:' "$log" 2>/dev/null); now=${now:-0}
             [ "$now" -gt "$before" ] && break
             if [ $((SECONDS - t1)) -gt "$ITER_CAP" ]; then
                 echo "STALL $i" >> "$STATUS"; return
