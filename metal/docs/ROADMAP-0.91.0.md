@@ -37,7 +37,90 @@ that reached the shell prompt in ~330 s began taking 405–719 s, on an idle
 machine, with the toolchain host updated in between. Nothing in the kernel
 accounts for it and nothing has ruled it in or out.
 
-So this objective has a precondition, and the precondition is the first task:
+### 1a — TRIAGED: the host is slower, and no kernel change is responsible
+
+**Measured with an identical-image control**, which is the only thing that could
+separate "the kernel got slower" from "the machine got slower":
+
+| image | md5 | before | now |
+|---|---|---|---|
+| `v90-m2f.iso` | `411d1695…` | **310 s** | **460 s** |
+| `v91-open.iso` (current tip) | `4bf81ec2…` | — | 465 s |
+
+The *same bytes* that booted in 310 s now take 460 s — 48% slower — and the
+current build is statistically indistinguishable from that control (465 s vs
+460 s). **Nothing in v0.90 or v0.91 made the kernel slower.** This matters
+beyond bookkeeping: without the control, the obvious reading was that v0.90's
+shared acquisition on the hottest lock in the tree had cost throughput, and
+Objective 3 would have started from a false premise.
+
+Eliminated, each by evidence rather than argument:
+
+| hypothesis | finding |
+|---|---|
+| KVM / accelerator change | `/dev/kvm` now EXISTS, but the build user is not in the `kvm` group, so QEMU cannot open it and still falls back to TCG |
+| host background load | load average 0.24 on 16 vCPUs, no other guest running |
+| memory pressure | 12 Gi free of 15 Gi, swap entirely unused |
+| CPU capability | Ryzen 7 7800X3D, 16 vCPUs, 8384 BogoMIPS |
+| QEMU or grub regression | both binaries unchanged — qemu-system-x86_64 dated 2026-06-24, grub-mkrescue 2025-03-17; the apt upgrades of 2026-09-01 were console-setup, krb5-locales, python3.12, diffutils and udisks2 |
+
+**Still open, and not resolvable from inside WSL2:** CPU frequency and power
+state. `/sys/devices/system/cpu/cpu0/cpufreq` does not exist here — the governor
+is a Windows-side setting — so a host power plan, thermal state or battery mode
+cannot be inspected or excluded from the guest side. That is the leading
+remaining hypothesis and it needs checking on the Windows host.
+
+**Recorded baseline for the next comparison**, since none existed and its
+absence is what made this triage expensive: a 3,000,000-iteration bash
+arithmetic loop takes **3.37 / 3.55 / 3.52 s** on this host today. Re-run it
+before blaming a future slowdown on anything.
+
+**CLAUDE.md is now stale on one point.** It states "QEMU here is TCG-only — there
+is no KVM". `/dev/kvm` exists; only the group membership withholds it. Adding the
+build user to `kvm` would make these boots dramatically faster — and would
+invalidate every timing budget in the tree at once, since deadlines, `GATE_CAP`
+and the `append-oversub` worker expiry were all calibrated under TCG. It is a
+decision to take deliberately, with a re-baselining pass, not a convenience to
+switch on.
+
+### 1b — PARTIAL: 10 iterations pass, the full 100 still gated
+
+Run on the degraded host **deliberately**, because that is where the v0.90.1
+tolerant branch actually executes: on a healthy host no worker expires and the
+branch never runs, which is exactly what happened in the v0.90.1 four-tier
+matrix. A correctness run, not the performance baseline this objective gates.
+
+`tools/vfs-soak.sh .logs/v91-open.iso 10 '-smp 8'`, image `4bf81ec2…`:
+
+| | |
+|---|---|
+| iterations completed | **10 of 10** |
+| failing assertions | **0** (was 3 on this host before v0.90.1) |
+| rank faults / panics | 0 / 0 |
+| per-iteration result | 11 × `RESULT: 91 passed, 0 failed`, identical every round |
+| wall clock | 5,021 s (722 s to prompt, ~430 s per iteration) |
+
+**The tolerant branch was exercised in all 11 rounds**, not once by chance: one
+worker expired every time, owing at most 512 B, with actual deficits of
+112–464 B — each correctly read as expiry rather than a lost append. That is the
+v0.90.1 fix doing its job under sustained load, on the host whose slowness
+exposed the original defect.
+
+`tools/vfs-soak.sh`'s counter fix is clean: zero `integer expression expected`
+errors across ten iterations, against one per iteration before.
+
+**Side finding worth keeping:** all eleven rounds returned an identical
+`91 passed, 0 failed`. `vfsstress` is fully idempotent *within* a boot. The suite
+set was historically non-idempotent *across* boots — the reason `gate-dirty`
+exists — so the two are now separately established.
+
+**The 100-iteration run remains open** and is still gated on 1a's unresolved
+half. At this host's speed it is ~14 hours; on a healthy host it is closer to
+five, and the per-iteration cost is dominated by the same slowdown.
+
+### The remaining preconditions
+
+
 
 1. **Establish what "healthy" means here.** Boot each tier and record time to
    prompt. A tier is healthy when it matches the v0.90 fresh-matrix figures
