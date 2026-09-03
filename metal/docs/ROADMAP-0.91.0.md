@@ -169,6 +169,88 @@ default. On the currently degraded host that budget is a guess.
 **Do not report the audit as done because the tier booted.** Those are different
 claims — the v0.89 lesson about a soak named for a lock it could not contend.
 
+### 2a — DONE: the tier runs, and its live-DMA assertion is unsound
+
+`GATE_CAP=5400` is ample; the tier completes in **425–450 s**, 47 suites (two more
+than any other tier — these assertions exist nowhere else). First completion
+since before v0.89.
+
+**`capdma` fails about half the time, on every build, and the failure is not a
+confinement defect.** Ten of its eleven assertions are page-table checks and all
+pass in every run: the device's domain excludes kernel memory, another process's
+page, the virtqueue, and device MMIO. The one that flakes is the *live* probe —
+kick the confined NIC, then poll the DMAR fault registers.
+
+**Four attributions were made and all four were falsified.** Recorded because the
+sequence is the finding:
+
+| attribution | how it died |
+|---|---|
+| a regression in `92c7e87` (the optimistic probe) | five configurations at n=1 each split cleanly by build; re-running two of them twice **inverted both arms** — the "failing" image passed 2/2, the "passing" one failed 2/2 |
+| the `2000000`-iteration poll budget | replaced with a 3-second tick deadline: no change, 3 fails of 4 |
+| missing IOMMU cache invalidation | `iommu_attach_proc_domain` already calls `iommu_invalidate_all`, a global context-cache + IOTLB flush |
+| "confinement works, the device never completed the transfer" | the instrument could not see a completion: `struct vring_used` is not volatile and the poll body was a bare `pause`, so gcc hoists the load at -O2 |
+
+**What the last one exposed is the real defect in the test.** A positive control
+was added — *the unconfined device must complete this same transfer* — and it
+**fails**, with the volatile read corrected and with the device provably not yet
+confined (capdma's own grant is the first confinement event in the boot). The NIC
+does not complete a TX at this point in the boot at all. `vfiostrs` runs earlier
+and takes the device through VFIO.
+
+So the probe's only ever evidence was a fault that may or may not be recorded,
+against a device that may not be transacting. **It cannot distinguish "the
+hardware blocked the access" from "nothing was attempted"**, which is why it
+flakes and why every mechanical explanation for the flake was wrong.
+
+**Nothing was changed in the kernel.** Three candidate fixes were built and
+measured; none produced a sound assertion, and shipping an unvalidated change to
+a security-relevant check is worse than leaving it documented. The tree is at
+`014a7f9` on this path.
+
+**What the next attempt needs**, in order:
+
+1. Establish the NIC is transacting at that point — restore or re-initialise it
+   after `vfiostrs`, and assert an unconfined TX completes. Without that control
+   nothing downstream means anything.
+2. Only then assert the confined TX does **not** complete. That is the security
+   property, stated directly, and it does not depend on the emulated IOMMU
+   choosing to record a fault.
+3. Keep the fault report as corroboration, printed either way, asserted only for
+   source-ID correctness when present.
+4. Make the wait a deadline. It is not the cause, but a spin count is the wrong
+   shape for a hardware wait and CLAUDE.md forbids it.
+
+**Not established either way: whether a confined device is actually blocked.**
+The page tables say it should be. The live proof has never worked. That gap is
+the whole reason this assertion exists and it is still open.
+
+### 2b — DONE: DMA mapping bounds audit
+
+Every site that hands a length to a device, traced to where the length comes
+from:
+
+| surface | length source | verdict |
+|---|---|---|
+| `SYS_AUDIO_WRITE` → `snd_tx_fill_and_notify` | **ring 3** | **bounded** — clamped to `bufsize`; the address is `g_audio_phys`, kernel-owned, never caller-supplied; ownership and `PCAP_AUDIO` both checked |
+| virtio-blk request chain | fixed 16 / 512 / 1 | bounded by construction |
+| virtio-net rx/tx | fixed buffers | bounded by construction |
+| **virtio-gpu** `gpu_fill_desc_and_notify` | caller `cmdlen` | **unchecked** |
+
+The GPU path `cmemcpy`s `cmdlen` bytes into `g_gpu_cmdbuf[64]` and then publishes
+a descriptor of that length to the device, with no validation. All seven callers
+pass `sizeof` a fixed struct; the largest is `transfer_to_host_2d` at **56
+bytes**. Safe today by the callers' construction rather than by enforcement,
+with **8 bytes of headroom**.
+
+That margin is the finding. One added 16-byte field to a command struct —
+ordinary for a scanout or 3D extension — overflows a static kernel buffer *and*
+hands the device a descriptor longer than the region backing it. Under VT-d with
+`intremap=on` that is a DMA read past the mapped range rather than a benign
+over-read. No ring-3 input reaches `cmdlen` today, so this is a latent bound and
+not a live vulnerability; a `if (cmdlen > sizeof g_gpu_cmdbuf) return;` guard
+closes it.
+
 ---
 
 ## Objective 3 — VFS throughput and latency after the decoupling
