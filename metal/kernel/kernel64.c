@@ -10970,7 +10970,32 @@ static int virtio_gpu_probe(uint8_t bus, uint8_t dev, uint8_t fn) {
     return 1;
 }
 
-static void gpu_fill_desc_and_notify(const void *cmd, uint32_t cmdlen) {
+/* v0.91: REFUSE A COMMAND THAT DOES NOT FIT, rather than trusting the caller.
+ *
+ * `cmdlen` was copied into a 64-byte static buffer unchecked, and then published
+ * to the device as the descriptor's length. Every one of the seven call sites
+ * passes `sizeof` a fixed struct and the largest is transfer_to_host_2d at 56
+ * bytes, so this was safe by the callers' construction rather than by
+ * enforcement — with eight bytes of headroom.
+ *
+ * Eight bytes is one field. Adding a 16-byte member to a command struct, which
+ * is ordinary for a scanout or 3D extension, would overflow a static kernel
+ * buffer AND hand the device a descriptor longer than the region backing it.
+ * Under VT-d with intremap=on that is a DMA read past the mapped range, not a
+ * benign over-read — which is exactly the class of defect the smp4-iommu tier
+ * exists to catch, and the tier had not run for three milestones.
+ *
+ * Returns 0 on success and -1 if the command does not fit; both callers already
+ * have a failure path and neither can proceed meaningfully without a submitted
+ * command. This cannot fire in the current tree: it is the guard that makes the
+ * next command struct safe to add. */
+static int gpu_fill_desc_and_notify(const void *cmd, uint32_t cmdlen) {
+    if (cmdlen > sizeof g_gpu_cmdbuf) {
+        kprintf("[vgpu   ] REFUSED command of %u byte(s): the staging buffer is %u — a longer "
+                "descriptor would be published to the device than the buffer backing it\n",
+                (uint64_t)cmdlen, (uint64_t)sizeof g_gpu_cmdbuf);
+        return -1;
+    }
     cmemcpy(g_gpu_cmdbuf, cmd, cmdlen);
     cmemset(g_gpu_respbuf, 0, sizeof g_gpu_respbuf);
     g_gpu_ctrl.desc[0].addr = (uint64_t)g_gpu_cmdbuf; g_gpu_ctrl.desc[0].len = cmdlen;
@@ -10983,6 +11008,7 @@ static void gpu_fill_desc_and_notify(const void *cmd, uint32_t cmdlen) {
     volatile uint16_t *notify =
         (volatile uint16_t *)(g_gpu_notify + (uint32_t)g_gpu_ctrl.notify_off * g_gpu_notify_mul);
     *notify = 0; barrier();
+    return 0;
 }
 
 /* Non-blocking: advances g_gpu_seq_completed if the device has finished the
@@ -11020,7 +11046,10 @@ static int gpu_submit_wait(const void *cmd, uint32_t cmdlen, struct virtio_gpu_c
     while (g_gpu_seq_submitted != g_gpu_seq_completed) {
         klock_release(&g_gpu_lock); krelax(); klock_acquire(&g_gpu_lock);
     }
-    gpu_fill_desc_and_notify(cmd, cmdlen);
+    /* v0.91: a refused command must not advance the sequence — the wait below
+     * gates on submitted == completed, and counting a submission the device
+     * never saw would hang every later administrative command. */
+    if (gpu_fill_desc_and_notify(cmd, cmdlen) != 0) { klock_release(&g_gpu_lock); return -1; }
     g_gpu_seq_submitted++;
     while (g_gpu_ctrl.used->idx == g_gpu_ctrl.last_used) {
         klock_release(&g_gpu_lock); krelax(); klock_acquire(&g_gpu_lock);
@@ -11049,7 +11078,9 @@ static uint64_t gpu_submit_async(const void *cmd, uint32_t cmdlen) {
     while (g_gpu_seq_submitted != g_gpu_seq_completed) {
         klock_release(&g_gpu_lock); gpu_poll_completion(); krelax(); klock_acquire(&g_gpu_lock);
     }
-    gpu_fill_desc_and_notify(cmd, cmdlen);
+    /* v0.91: same reasoning as gpu_submit_wait — 0 is this function's documented
+     * failure value, and the fence is never issued for a command not sent. */
+    if (gpu_fill_desc_and_notify(cmd, cmdlen) != 0) { klock_release(&g_gpu_lock); return 0; }
     uint64_t seq = ++g_gpu_seq_submitted;
     klock_release(&g_gpu_lock);
     return seq;
