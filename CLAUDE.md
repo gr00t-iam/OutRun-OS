@@ -5,9 +5,41 @@ Repository conventions for anyone (human or agent) working in this tree.
 The kernel is a single large C file, `metal/kernel/kernel64.c`; ring-3 test
 drivers live in `metal/user/init.c`. Build and test targets are in
 `metal/Makefile`. The toolchain is Linux-hosted (gcc, nasm, rustc,
-grub-mkrescue, qemu). QEMU here is **TCG-only** — there is no KVM — which is why
-timing budgets in this tree must be expressed as deadlines rather than as
-iteration counts.
+grub-mkrescue, qemu). **QEMU here runs under TCG**, which is why timing budgets
+in this tree must be expressed as deadlines rather than as iteration counts.
+
+### TCG is a policy, not just a fact of the machine
+
+This said "there is no KVM" until v0.91, and that is no longer true of the
+hardware: `/dev/kvm` **exists**, and `qemu-system-x86_64 -accel help` lists
+`kvm`. What keeps QEMU on TCG is that the build user is not a member of the
+`kvm` group, so QEMU cannot open the device and falls back.
+
+**Keep it that way, and change it only as a deliberate, re-baselined decision.**
+Every timing budget in this tree was calibrated under TCG and they are not
+independent of each other:
+
+- suite deadlines in `metal/user/init.c` (`APPSMP_T`, `CASC_T`, `R62_T`, …)
+- `GATE_CAP`, `GATE_DIRTY_CAP`, and the soak's `BOOT_CAP` / `ITER_CAP`
+- every watchdog expressed in `g_ticks`
+
+Enabling KVM would make boots several times faster and silently invalidate all
+of them at once. Budgets that currently expire on a slow host would stop
+expiring; a genuine stall would sit far inside a budget sized for emulation and
+stop being reported. The first symptom would be tests that pass for the wrong
+reason, which is the failure mode this whole file is organised against.
+
+If it is ever switched on: add the user to `kvm`, re-measure every tier's time
+to prompt, re-derive the budgets above from those numbers, and record the new
+baseline the way v0.91 records the TCG one — in one commit, not incrementally.
+
+**Do not diagnose a slow run by reaching for KVM.** v0.91 found the same ISO
+booting 48% slower than it had a day earlier (310 s → 460 s, identical md5) and
+proved by that control that no kernel change was responsible. The cause was
+host-side and remains partly open — CPU frequency and power state are not
+inspectable from inside WSL2, where `/sys/devices/system/cpu/*/cpufreq` does not
+exist. See `metal/docs/ROADMAP-0.91.0.md` §1a for the full elimination, and for
+the host benchmark recorded there so the next comparison has a baseline.
 
 ---
 
