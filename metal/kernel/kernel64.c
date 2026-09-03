@@ -3896,6 +3896,28 @@ static void vfsc_dump(int which, const char *ln, const char *tag) {
                 tag, ln, g_vfsc_overflow[which], (uint64_t)(int64_t)VFSC_SLOTS);
 }
 
+/* v0.91: VFS_EXCLUSIVE_ONLY — the A/B control for Objective 3.
+ *
+ * Makes every shared acquisition take the lock EXCLUSIVELY instead, which turns
+ * the four v0.90 reader sites back into what they were before the decoupling
+ * without editing any of them. That is the point: the comparison must differ in
+ * the lock discipline and in nothing else, and a hand-reverted copy of four call
+ * sites would differ in whatever the hand got wrong.
+ *
+ * Never in a shipping build. It exists so "the decoupling made reads faster"
+ * can be measured against its own absence on one host in one window, rather
+ * than asserted from the contention count going to zero — which says the lock
+ * stopped being waited on, not that the filesystem got quicker. */
+#ifdef VFS_EXCLUSIVE_ONLY
+static struct klock_rtok klock_read_acquire(struct klock *l) {
+    struct klock_rtok t = { 0, 0, 0, 1 };   /* pushed=1 marks it as exclusive-held */
+    klock_acquire(l);
+    return t;
+}
+static void klock_read_release(struct klock *l, struct klock_rtok t) {
+    (void)t; klock_release(l);
+}
+#else
 static struct klock_rtok klock_read_acquire(struct klock *l) {
     struct klock_rtok t = { 0, 0, 0, 0 };
     uint8_t *sp, *st = rank_ctx(&sp);
@@ -3946,6 +3968,7 @@ static void klock_read_release(struct klock *l, struct klock_rtok t) {
     klock_irq_restore(rf);
     __sync_fetch_and_sub(&l->rdrs, 1);
 }
+#endif  /* VFS_EXCLUSIVE_ONLY */
 
 static void sched_init(void) {
     for (int i = 0; i < MAX_THREADS; i++) { g_threads[i].state = T_FREE; g_threads[i].id = i; }
@@ -14154,10 +14177,12 @@ static volatile uint32_t g_shoot_mask  = 0;    /* bit c = "cpu c must ack this s
  * trip; a spinning waiter still has interrupts enabled, so it keeps
  * servicing any IPI aimed at it while it waits — no deadlock. */
 static volatile int      g_shoot_lock  = 0;
-/* 1 = lock-xadd storm, 2 = probe read, 3 = parallel job, 4 = direct CAS burst.
- * The comment listed two of these while the loop implemented three; mode 4 made
- * that a third, so it is now the whole list. */
+/* 1 = lock-xadd storm, 2 = probe read, 3 = parallel job, 4 = direct CAS burst,
+ * 5 = VFS throughput bench (v0.91). The comment listed two of these while the
+ * loop implemented three; mode 4 made that a third, so it is now the whole
+ * list and every addition since has kept it that way. */
 static volatile int      g_work_go = 0;
+static void vbench_run(int cpu);   /* fwd: defined with the VFS read paths */
 static volatile uint64_t g_work_counter = 0;
 static volatile uint64_t g_probe_va = 0;
 #define WORK_XADDS 100000
@@ -14846,6 +14871,8 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
                 pjob_run((int)idx);
             else if (mode == 4)                           /* direct CAS (v0.89)  */
                 cas_direct_burst((int)idx);
+            else if (mode == 5)                           /* VFS bench (v0.91)   */
+                vbench_run((int)idx);
             g_cpu[idx].work_done = 1;
         }
         /* v0.79: THE WINDOW, MARKED BUT NOT YET CLOSED.
@@ -16873,6 +16900,68 @@ static uint32_t vfs_len_of(int di) {
     uint32_t n = DENTS[di].used ? DENTS[di].len : 0;
     klock_read_release(&g_vfs_lock, t);
     return n;
+}
+
+/* ===========================================================================
+ * v0.91 OBJECTIVE 3: VFS THROUGHPUT AND LATENCY
+ * ===========================================================================
+ * v0.90 took g_vfs_lock's exclusive contention from 36/69/66 waits at 2/4/8
+ * cores to ZERO on every tier, and never measured whether the filesystem got
+ * FASTER. Those are different claims. The shared path costs an atomic
+ * increment, a re-check of `v` and a rank push/pop per acquisition; on a lock
+ * contended a third of the time that should pay for itself, and on an
+ * uncontended one it is pure overhead. Nobody has weighed them.
+ *
+ * WHAT IS MEASURABLE HERE, and what is not. `g_ticks` is the only clock this
+ * kernel has and it runs at 100 Hz — 10 ms granularity, so sub-millisecond
+ * percentiles cannot come from it. rdtsc does give cycle resolution and is
+ * already trusted for the v0.89 CAS spin telemetry. Under TCG those are not
+ * true guest cycles, so they are meaningful COMPARED BETWEEN BUILDS ON ONE HOST
+ * IN ONE WINDOW and meaningless as an absolute figure. IOPS and MB/s are not
+ * reported for the same reason: on an emulated host currently 48% slower than
+ * this cycle's own baseline, they would measure the machine, not the kernel.
+ *
+ * Latency is therefore reported in TSC cycles from a log2 histogram, and
+ * throughput as operations per tick. Percentiles are bucket-accurate, not
+ * exact — a 32-bucket log2 histogram costs one bsr and one increment per op,
+ * which is what keeps the instrument from dominating what it measures. */
+#define VBENCH_BUCKETS 32
+static uint64_t g_vbench_hist[MAX_CPUS][VBENCH_BUCKETS];
+static uint64_t g_vbench_ops[MAX_CPUS];
+static uint64_t g_vbench_cyc[MAX_CPUS];
+static volatile int g_vbench_mode = 0;      /* 1 = read-heavy, 2 = write-heavy */
+static int      g_vbench_di = -1;
+
+static inline int vbench_bucket(uint64_t cycles) {
+    int b = 0;
+    while (cycles > 1 && b < VBENCH_BUCKETS - 1) { cycles >>= 1; b++; }
+    return b;
+}
+
+/* One worker's slice. Read mode touches ONLY shared-acquisition paths
+ * (vfs_len_of, vfs_read_range); write mode touches the exclusive one. Both are
+ * timed per operation so the two lock disciplines can be compared directly. */
+#define VBENCH_ITERS 400u
+static void vbench_run(int cpu) {
+    if (g_vbench_di < 0 || cpu < 0 || cpu >= MAX_CPUS) return;
+    static uint8_t sink[512];
+    for (uint32_t i = 0; i < VBENCH_ITERS; i++) {
+        uint64_t t0 = rdtsc64();
+        if (g_vbench_mode == 1) {
+            uint32_t n = vfs_len_of(g_vbench_di);
+            if (n > sizeof sink) n = sizeof sink;
+            (void)vfs_read_range(g_vbench_di, 0, sink, n);
+        } else {
+            /* the exclusive path, for contrast; appends are the mutation this
+             * lock still serialises and always will */
+            uint8_t b = (uint8_t)i;
+            (void)vfs_write_append(g_vbench_di, &b, 1, 0);
+        }
+        uint64_t d = rdtsc64() - t0;
+        g_vbench_hist[cpu][vbench_bucket(d)]++;
+        g_vbench_ops[cpu]++;
+        g_vbench_cyc[cpu] += d;
+    }
 }
 
 /* v0.83: WRITE AT AN OFFSET, tail preserved.
@@ -22019,6 +22108,91 @@ static int role_drain(uint64_t role, uint64_t watchdog, const char *label) {
 #define LSEEK_WORKER_ROLE  55u
 #define LSEEK_WORKER_OK    42
 #define LSEEK_WORKER_T   3000u   /* 30 s: a small file, a pipe and one fork    */
+
+/* v0.91 OBJECTIVE 3: drive vbench_run on every core and report the result.
+ *
+ * A shell command rather than a suite phase: this is a measurement, not an
+ * assertion, and it needs to be runnable repeatedly on one boot and against
+ * two builds without a 400-second suite run in between. See the note at
+ * VBENCH_BUCKETS for why latency is in TSC cycles and throughput in ops/tick,
+ * and why IOPS and MB/s are deliberately not reported. */
+static void vbench_report(const char *what, int n, uint64_t ticks) {
+    uint64_t tot_ops = 0, tot_cyc = 0, hist[VBENCH_BUCKETS];
+    for (int b = 0; b < VBENCH_BUCKETS; b++) hist[b] = 0;
+    for (int c = 0; c < MAX_CPUS; c++) {
+        tot_ops += g_vbench_ops[c]; tot_cyc += g_vbench_cyc[c];
+        for (int b = 0; b < VBENCH_BUCKETS; b++) hist[b] += g_vbench_hist[c][b];
+    }
+    if (!tot_ops) { kprintf("[vfsbench] %s: NO OPERATIONS RECORDED — the phase did not run\n", what); return; }
+
+    /* Percentiles from the histogram: the reported value is the UPPER bound of
+     * the bucket the percentile falls in, so it is an over-estimate bounded by
+     * a factor of two. Stated rather than smoothed over — a precise-looking
+     * number this instrument cannot support would be worse than a coarse one. */
+    uint64_t p50 = 0, p95 = 0, p99 = 0, seen = 0;
+    uint64_t n50 = tot_ops / 2, n95 = (tot_ops * 95) / 100, n99 = (tot_ops * 99) / 100;
+    for (int b = 0; b < VBENCH_BUCKETS; b++) {
+        uint64_t before = seen; seen += hist[b];
+        uint64_t ub = (b == 0) ? 1 : (1ull << b);
+        if (before < n50 && seen >= n50) p50 = ub;
+        if (before < n95 && seen >= n95) p95 = ub;
+        if (before < n99 && seen >= n99) p99 = ub;
+    }
+    kprintf("[vfsbench] %s on %d core(s): %u ops in %u tick(s) — %u ops/tick, mean %u cyc\n",
+            what, (uint64_t)(int64_t)n, tot_ops, ticks,
+            ticks ? tot_ops / ticks : tot_ops, tot_cyc / tot_ops);
+    kprintf("[vfsbench] %s latency (TSC cycles, bucket upper bounds): p50 <= %u, p95 <= %u, "
+            "p99 <= %u\n", what, p50, p95, p99);
+    for (int c = 0; c < n && c < MAX_CPUS; c++)
+        if (g_vbench_ops[c])
+            kprintf("[vfsbench]   cpu%u: %u ops, mean %u cyc\n",
+                    (uint64_t)(int64_t)c, g_vbench_ops[c], g_vbench_cyc[c] / g_vbench_ops[c]);
+}
+
+static void cmd_vfs_bench(void) {
+    kputs("-- VFS BENCH: throughput and latency, shared vs exclusive paths --\n");
+    int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
+
+    const char *path = "vfsbench-target";
+    static uint8_t seed[512];
+    for (uint32_t i = 0; i < sizeof seed; i++) seed[i] = (uint8_t)(i * 31u);
+    vfs_write_file(path, seed, sizeof seed);
+    g_vbench_di = vfs_find(path);
+    if (g_vbench_di < 0) { kputs("[vfsbench] could not create the target file\n"); return; }
+
+    for (int pass = 1; pass <= 2; pass++) {
+        for (int c = 0; c < MAX_CPUS; c++) {
+            g_vbench_ops[c] = 0; g_vbench_cyc[c] = 0;
+            for (int b = 0; b < VBENCH_BUCKETS; b++) g_vbench_hist[c][b] = 0;
+        }
+        g_vbench_mode = pass;                     /* 1 = read-heavy, 2 = write */
+        for (int i = 1; i < g_ncpu_online; i++) g_cpu[i].work_done = 0;
+        __sync_synchronize();
+        int q0 = g_quiet; g_quiet = 1;            /* cas_put logs every block  */
+        uint64_t t0 = g_ticks;
+        g_work_go = 5;
+        vbench_run(0);                            /* the BSP joins in         */
+        uint64_t tw = g_ticks;
+        for (;;) {
+            int done = 0;
+            for (int i = 1; i < g_ncpu_online; i++) done += g_cpu[i].work_done;
+            if (done == g_ncpu_online - 1) break;
+            if (g_ticks - tw > 3000) break;       /* DEADLINE, not a spin count */
+            lapic_ipi(0, IPI_PING, 1);
+            uint64_t ts = g_ticks; while (g_ticks - ts < 1) __asm__ volatile("pause");
+        }
+        g_work_go = 0;
+        __sync_synchronize();
+        uint64_t ticks = g_ticks - t0;
+        g_quiet = q0;
+        vbench_report(pass == 1 ? "READ  (shared acquisition)"
+                                : "WRITE (exclusive acquisition)", n, ticks);
+    }
+    kprintf("[vfsbench] g_vfs_lock totals: %u acquisitions, %u contended, %u shared-waits\n",
+            (uint64_t)g_vfs_lock.acq, (uint64_t)g_vfs_lock.contended, (uint64_t)g_vfs_lock.rcon);
+    vfs_unlink(path);
+    kputs("-- done --\n");
+}
 
 static void cmd_vfs_stress(void) {
     kputs("-- VFS STRESS: journaling, unlink/reclamation, multi-volume mounts, driver churn --\n");
@@ -32856,6 +33030,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "ipcstress")) cmd_ipc_stress();
     else if (!kstrcmp(argv[0], "vfiostress")) cmd_vfio_stress();
     else if (!kstrcmp(argv[0], "vfsstress")) cmd_vfs_stress();
+    else if (!kstrcmp(argv[0], "vfsbench")) cmd_vfs_bench();
     else if (!kstrcmp(argv[0], "gpustress")) cmd_gpu_stress();
     else if (!kstrcmp(argv[0], "audiostress")) cmd_audio_stress();
     else if (!kstrcmp(argv[0], "netstress")) cmd_net_stress();

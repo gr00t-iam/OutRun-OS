@@ -280,6 +280,73 @@ kind of comparison during the v0.90.1 investigation.
 **The result may be "no measurable difference", and that is a result.** v0.89
 recorded a measured no on descriptor-layer optimisation and was better for it.
 
+### 3a — DONE: the decoupling is worth about 4% on reads, and 2.6x on contention
+
+**Steps 1 and 2 of this objective were already complete** and are recorded here
+so nobody redoes them: v0.90 M2/M3 converted the four read-heavy sites
+(`vfs_read_range`, `vfs_len_of`, `vfs_permit` under `SYS_WRITE_FILE`, and
+`vfs_open_for`'s probe) to shared acquisition, kept mutations exclusive, and took
+measured exclusive contention from 36/69/66 waits at 2/4/8 cores to **zero on
+every tier**. There is no coarse lock left blocking concurrent readers.
+
+What was never measured is whether any of that made the filesystem FASTER. Zero
+contention says the lock stopped being waited on; it does not say reads got
+quicker, and the shared path is not free — an atomic increment, a re-check of
+`v`, and a rank push/pop per acquisition.
+
+**The instrument.** `vfsbench`, a shell command rather than a suite phase
+because this is a measurement and not an assertion. Each core runs 400 timed
+operations; latency goes into a 32-bucket log2 histogram of TSC cycles;
+throughput is reported as operations per tick.
+
+**The control is `-DVFS_EXCLUSIVE_ONLY`**, which makes `klock_read_acquire`
+itself take the lock exclusively. The two builds therefore differ in the lock
+discipline and in nothing else — a hand-reverted copy of four call sites would
+also differ in whatever the hand got wrong.
+
+`-smp 4`, three benchmark passes per build, both builds on one host in one
+window:
+
+| workload | shared build | exclusive build |
+|---|---|---|
+| **READ**, ticks for 1,600 ops | **130 / 132 / 132** | 137 / 135 / 137 |
+| READ, ops per tick | **12** | 11 |
+| READ, mean cycles/op | 10.03 M / 10.16 M / 9.91 M | 10.20 M / 10.03 M / 10.04 M |
+| READ, p50 / p95 (TSC) | 2.1 M / 16.8 M | 2.1 M / 16.8 M |
+| **WRITE**, ticks for 1,600 ops | 19,924 / 20,069 / 19,716 | 20,351 / 19,921 / 20,060 |
+| `g_vfs_lock` contended, per pass | **813 / 471 / 541** | 2,565 / 1,283 / 1,350 |
+
+**Reads are ~3.7% faster** — 131.3 ticks against 136.3 on the mean, with the two
+ranges not overlapping across three runs each. Small, but real and repeatable.
+
+**Contended acquisitions fall about 2.6x**, which is the mechanism the throughput
+gain comes from and the thing the v0.90 contention numbers were already showing.
+
+**Writes are unchanged**, 19,903 against 20,111 ticks — about 1%, inside the
+run-to-run spread. That is the experiment's internal control rather than a
+disappointment: writes take the exclusive lock in BOTH builds, so if they had
+moved, the switch would have been changing something it was not supposed to
+touch and the read comparison would be untrustworthy.
+
+**Why the read gain is modest, stated so the number is not oversold.** Each
+benchmark read is a `vfs_len_of` plus a 512-byte `vfs_read_range`, and the latter
+spends most of its time in `cas_get` hashing and copying under the rank-3 CAS
+lock. Lock acquisition is a small fraction of the operation, so a 2.6x reduction
+in contention moves the total by single digits. A workload with more lock traffic
+per unit of work would show more; this one is honest about what it measured.
+
+**Latency percentiles show no difference** between builds — p50 and p95 land in
+the same buckets. The histogram is factor-of-two granular, so it can only say
+the distributions are not different by more than that. It is not evidence they
+are identical.
+
+**Absolute figures are not reported, deliberately.** IOPS and MB/s on TCG
+emulation, on a host currently 48% slower than this cycle's own baseline (§1a,
+unresolved), would measure the machine. Sub-millisecond percentiles cannot come
+from `g_ticks` at all — it is 100 Hz, the only clock this kernel has. The
+cycle counts above are TCG-derived and are comparable between these two builds
+in this window and nowhere else.
+
 ---
 
 ## STANDING DEBT, carried in rather than restated per objective
