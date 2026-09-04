@@ -421,6 +421,65 @@ in this window and nowhere else.
   sixteen expiring at `-smp 8` is itself the right behaviour, or a sign the
   budget is too tight for that width.
 
+---
+
+## KNOWN HOST ENVIRONMENT CONSTRAINT
+
+**The toolchain host is ~48% slower than this cycle's own baseline, and the cause
+is not established.** Recorded as a constraint rather than a diagnosis, because
+this cycle produced five confident attributions that were later falsified and the
+discipline that caught each of them was refusing to write down an untested cause.
+
+What IS measured (§1a): an identical image — same md5, same bytes — that booted
+uniprocessor in 310 s before the toolchain host was updated now takes 460 s, and
+the current tip takes 465 s. No kernel change is responsible. Host load, memory
+pressure, CPU capability, KVM availability and the QEMU/grub binaries were each
+eliminated with evidence.
+
+What is NOT established: **CPU frequency and power state.** It is the leading
+hypothesis and it is untested, because `/sys/devices/system/cpu/*/cpufreq` does
+not exist under WSL2 — the governor is a Windows-side setting that cannot be
+inspected or excluded from inside the guest. Calling frequency scaling the cause
+would be an assumption wearing a finding's clothes.
+
+### What this constraint does to the suites
+
+Wall-clock budgets degrade first. `langstrs` compiles and runs a program under a
+compiler time budget, and it failed once in four `smp4-iommu` boots (exit 970)
+while passing 10/0 in the others.
+
+That failure is **not evidence of a kernel defect**, and the reasons are
+specific rather than a blanket claim of soundness:
+
+- it is a wall-clock budget, the first thing to break when the machine slows;
+- the suite passed 10/0 on the other three boots of the same image;
+- it touches nothing v0.91 changed — not the VFS locks, not the GPU path, not
+  `capdma`;
+- `toolstrs` and `pipestrs` share the same budget shape and the same documented
+  sensitivity to host load.
+
+What is fair to say is that the failure is consistent with the host constraint
+and inconsistent with a defect in the code under test. What is **not** fair to
+say is that the kernel is proven sound by it — a suite that times out has
+measured nothing, in either direction. The deterministic evidence for v0.91's
+changes is elsewhere: four clean `capdma` runs, six clean full-tier runs, and the
+A/B in §3a.
+
+---
+
+## DELIVERED IN v0.91.0
+
+| | commit | what it is |
+|---|---|---|
+| **GPU safety** | `9e94f5e` | `gpu_fill_desc_and_notify` refuses a command longer than the 64-byte staging buffer instead of copying it and publishing a descriptor the buffer cannot back. Latent, not live — the largest caller is 56 bytes, eight bytes of headroom — so this is the guard that makes the next command struct safe to add. Under VT-d an over-long descriptor is a DMA read past the mapped range. |
+| **VFS optimisation** | `a052543` | The v0.90 rwlock decoupling, measured rather than assumed: reads **~3.7% faster** (130/132/132 ticks against 137/135/137) and contended acquisitions **2.6x lower**, from an A/B whose two builds differ in lock discipline and nothing else. Writes unchanged, which is the experiment's internal control. |
+| **Hardware DMA confinement** | `3876722` | `capdma` went from a ~50% flake to **12 of 12 across four boots**. The NIC was arriving in virtio's broken state from a DMA refused earlier in the boot; `vnet_reinit()` clears it. The suite can now make the claim it exists to make. |
+
+Two of the three began as something other than what they became. The GPU guard
+came out of an audit that found no live vulnerability and said so. The `capdma`
+fix came after five falsified root causes, and the roadmap keeps the failed ones
+because the sequence is more useful to the next reader than the answer alone.
+
 ## NOT IN THIS CYCLE
 
 No new ring-3 roles, no new lock modes, no descriptor-layer work — v0.89 measured
