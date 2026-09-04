@@ -127,6 +127,86 @@ this instrument cannot tell. Confirming it needs the third clock. This cycle has
 already produced several confident timing attributions that were later
 falsified; this one is left explicitly unresolved rather than joining them.
 
+### 1d — RESOLVED: the ACPI PM timer, and which clock was lying
+
+The third clock exists now. `acpi_pm_init()` parses the FADT (`FACP`) through the
+`acpi_find_table()` walker already used for DMAR and MADT, reading `PM_TMR_BLK`
+(offset 76), `PM_TMR_LEN` (91) and the `TMR_VAL_EXT` flag (bit 8 of offset 112)
+to tell a 24-bit counter from a 32-bit one, with `X_PM_TMR_BLK` as a fallback for
+System-I/O space only. It enumerates here at **I/O port 0x608, 24-bit**.
+
+It is the right referee because its rate is fixed by specification at 3,579,545 Hz
+— one third of the NTSC colour burst — independent of CPU frequency, of power
+state, and of the PIT divisor, and it cannot be reprogrammed.
+
+`time_calibrate_clocks()` runs at boot, after `multiboot_scan()` supplies the
+RSDP and before `iommu_init()` and `pci_init()`.
+
+**THE ANSWER: the PIT is sound; the TSC is not.**
+
+| | boot | run 1 | run 2 | run 3 |
+|---|---|---|---|---|
+| **PIT** | 9997 | 9999 | 10003 | 9999 centi-Hz |
+| **TSC** | 4.252 | 3.966 | 4.192 | 4.192 GHz |
+
+The PIT holds **99.97–100.03 Hz, ±0.03%**. The TSC spans **3.966–4.252 GHz, a
+7.2% spread**, on one host across one boot. §1b's "7.6% anomaly" was the TSC all
+along; with two clocks it was unattributable, and with three it took one boot.
+
+**This closes §1c.** A `g_ticks` budget is a real-time budget, because the PIT
+really does deliver 100 Hz. So the duller reading there is now supported: a
+slower host completes less work inside a real-time budget until the compile no
+longer fits. It is no longer "a reading, not a finding".
+
+**And it means the TSC must not be trusted for intervals.** Every cycle figure
+this tree prints — the v0.89 CAS spin telemetry, v0.91's `vfsbench` histograms,
+`timebench`'s own — is drawn from a clock that moves 7% within a boot. They
+remain valid for A/B comparison inside one measurement window and are not
+absolute.
+
+#### The measurement was wrong before it was right
+
+The first version of this calibration ran a fixed ~50 ms window on the PM timer
+and counted PIT edges inside it. At 100 Hz such a window holds four or five
+edges depending on where it starts — and four versus five *is* 7997 versus 9997
+centi-Hz. It reported 9995–10000 on four boots, which looked like precision, and
+7997 on the fifth, which exposed it: the figure was reporting edge alignment, not
+rate. A conclusion had already been drawn from the first four and had to be
+withdrawn.
+
+The window is now bounded by **tick edges** — exact by construction, no partial
+period at either end — with the PM timer supplying the resolution across them.
+What caught it was the calibration printing a loud warning about its own
+surprising output rather than a plausible number.
+
+### 1e — spin budgets converted to deadlines
+
+`HW_WAIT(cond, us)` waits for a time and returns whether the condition arrived.
+It falls back to an iteration cap when no PM timer was found, because a deadline
+with no clock is an unbounded loop, and an unbounded wait on a device that never
+answers hangs the machine with no output — the worst failure mode this project
+recognises.
+
+`udelay()`/`mdelay()` are driven by the **PM timer directly, not by a calibrated
+TSC constant**, precisely because of the 7.2% intra-boot drift above: a delay
+built on a boot-time TSC figure would run ~7% long for the rest of the boot.
+
+Audit of hardcoded spin budgets, 13 hardware waits in total:
+
+| site | disposition |
+|---|---|
+| `iommu_enable` ×4 (RTPS, CCMD, IOTLB, TES) | **converted**, 100 ms deadlines |
+| `iommu_invalidate_all` ×2 | **converted** — runs on every device grant and revoke, and an invalidation that has not completed leaves the device translating through stale entries, so this is a correctness hazard and not only a timing one |
+| xHCI ×4 | **not converted.** CLAUDE.md keeps xHCI out of the main gate because its emulated microframe timer makes a full boot impractical, so converting it would change driver code the gate never exercises |
+| `ps2_wait_in` / `ps2_wait_out` | **not converted.** They run before ACPI is parsed, so `HW_WAIT` would take its iteration-cap fallback and nothing would improve |
+| `sha256` benchmark loop, `capdma` refault poll | **not converted** — workloads and a bounded poll, not hardware waits |
+
+**Still uncalibrated and deliberately untouched:** the AP slice timer's hardcoded
+LAPIC initial count of 3,000,000 (divider 16). Deriving it from the PIT is
+straightforward now that a reference exists, but it changes AP preemption
+frequency for every suite at once, and that belongs in its own change with its
+own verification rather than folded into this one.
+
 ### The KVM decision sits underneath this
 
 `/dev/kvm` exists on this host; only the build user's group membership keeps QEMU

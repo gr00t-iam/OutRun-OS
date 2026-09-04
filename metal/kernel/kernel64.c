@@ -4176,6 +4176,238 @@ static uint64_t acpi_find_table(const char *sig, bool print) {
 }
 
 /* ===========================================================================
+ * v0.92: THE ACPI PM TIMER — a clock that is not the PIT and not the TSC
+ * ===========================================================================
+ * v0.92's first measurement found the TSC and the PIT disagreeing by up to 7.6%
+ * within a single boot, and could not say which one drifted: with exactly two
+ * clocks, their ratio is measurable and their truth is not. This is the third
+ * clock that breaks the tie.
+ *
+ * It is the right one for the job because its rate is FIXED BY SPECIFICATION at
+ * 3.579545 MHz — one third of the NTSC colour burst, inherited from the PC's
+ * ancestry — and is independent of CPU frequency, of power state, and of the
+ * PIT's divisor. It cannot be reprogrammed. Under emulation QEMU drives it from
+ * the host monotonic clock, which is exactly the property wanted: a reference
+ * that does not slow down when the emulation does.
+ *
+ * It is a POOR clock in every other respect — 24 bits is ~4.6 seconds before
+ * wraparound (32-bit where the FADT says so, ~20 minutes), reads are port I/O
+ * and cost far more than rdtsc, and it has no interrupt. It is a ruler, not a
+ * stopwatch: used to calibrate the two fast clocks at boot and then left alone.
+ *
+ * FADT layout (ACPI 6.x, table signature "FACP"):
+ *   offset  76  PM_TMR_BLK   32-bit I/O port address of the counter
+ *   offset 112  Flags        bit 8 (TMR_VAL_EXT) set => 32-bit counter, else 24
+ *   offset  91  PM_TMR_LEN   must be 4 for the block to be usable
+ * X_PM_TMR_BLK (offset 208, a GAS) is preferred where present and non-zero, but
+ * QEMU populates the legacy field and this kernel is an x86 PC target, so the
+ * legacy field is read first and the GAS is used only as a fallback. */
+#define ACPI_PM_HZ 3579545u
+
+static uint16_t g_pmt_port = 0;      /* 0 = unavailable                         */
+static int      g_pmt_32bit = 0;     /* 1 = 32-bit counter, 0 = 24-bit          */
+
+static int acpi_pm_init(void) {
+    uint64_t fadt = acpi_find_table("FACP", false);
+    if (!fadt) return 0;
+    uint8_t *f = (uint8_t *)fadt;
+    struct acpi_sdt *h = (struct acpi_sdt *)fadt;
+    if (h->length < 116) return 0;                     /* too short to hold Flags */
+    uint32_t blk = *(uint32_t *)(f + 76);
+    uint8_t  len = f[91];
+    uint32_t flags = *(uint32_t *)(f + 112);
+    if ((!blk || len != 4) && h->length >= 244) {
+        /* X_PM_TMR_BLK: a Generic Address Structure. Only a System-I/O space id
+         * (0) is usable here; a memory-mapped timer would need a mapping and
+         * QEMU does not present one. */
+        uint8_t  space = f[208];
+        uint64_t addr  = *(uint64_t *)(f + 208 + 4);
+        if (space == 1 && addr && addr < 0x10000) blk = (uint32_t)addr;
+    }
+    if (!blk || blk >= 0x10000) return 0;
+    g_pmt_port  = (uint16_t)blk;
+    g_pmt_32bit = (flags & (1u << 8)) ? 1 : 0;
+    return 1;
+}
+
+/* Raw counter. Masked to the width the FADT declares, so a 24-bit timer never
+ * returns the undefined upper byte — comparing against it would produce
+ * enormous phantom intervals exactly once per wrap. */
+static inline uint32_t acpi_pm_read(void) {
+    if (!g_pmt_port) return 0;
+    uint32_t v = inl(g_pmt_port);
+    return g_pmt_32bit ? v : (v & 0x00FFFFFFu);
+}
+
+/* Elapsed counts between two reads, wrap included. The mask is the whole trick:
+ * (b - a) in the counter's own width is correct across exactly one wrap, and a
+ * 24-bit counter wraps every ~4.68 s, which is well inside the intervals this
+ * is used for. Longer than one wrap is unrecoverable and callers must not do
+ * it — every caller here measures tens of milliseconds. */
+static inline uint32_t acpi_pm_delta(uint32_t a, uint32_t b) {
+    uint32_t mask = g_pmt_32bit ? 0xFFFFFFFFu : 0x00FFFFFFu;
+    return (b - a) & mask;
+}
+
+/* ---- calibrated clock facts, established once at boot --------------------- */
+static uint64_t g_tsc_hz      = 0;   /* measured TSC frequency, 0 = uncalibrated */
+static uint32_t g_pit_hz_m100 = 0;   /* measured PIT rate x100, so 10000 = 100.00 Hz */
+static uint64_t g_tsc_per_us  = 0;   /* derived; 0 disables the delay primitives */
+
+/* v0.92: measure the two fast clocks against the one that cannot be wrong.
+ *
+ * Called once, after the PIT is running and interrupts are on, because the PIT
+ * arm of this needs g_ticks to advance. The window is ~50 ms: long enough that
+ * the PM timer's 279 ns resolution is noise (>170,000 counts) and that a whole
+ * number of PIT ticks fits, short enough to stay far inside a 24-bit wrap.
+ *
+ * A host preemption inside the window inflates both the TSC and the PM counts
+ * together — the PM timer is host-monotonic under emulation — so the RATIO
+ * survives it even though neither absolute figure does. That is the property
+ * that makes this worth doing at all. */
+static void time_calibrate_clocks(void) {
+    if (!acpi_pm_init()) {
+        kputs("[time   ] no ACPI PM timer (no FACP, or PM_TMR_BLK unusable) — the TSC and the "
+              "PIT remain uncalibrated and mutually unverifiable\n");
+        return;
+    }
+    kprintf("[time   ] ACPI PM timer at I/O port %X, %u-bit counter, %u Hz by specification\n",
+            (uint64_t)g_pmt_port, (uint64_t)(g_pmt_32bit ? 32 : 24), (uint64_t)ACPI_PM_HZ);
+
+    /* THE WINDOW IS BOUNDED BY TICK EDGES, NOT BY THE PM TIMER, and getting this
+     * backwards cost a wrong conclusion.
+     *
+     * The first version ran a fixed ~50 ms PM window and counted the tick edges
+     * inside it. At 100 Hz that window holds four or five edges depending on
+     * where it starts, and four versus five IS 79.97 versus 99.97 Hz — so the
+     * figure reported whether an edge happened to land inside the window, not
+     * the PIT's rate. It read 9995-10000 on four boots and 7997 on the fifth,
+     * and the conclusion drawn from the first four ("the PIT is accurate to
+     * 0.05%") was alignment luck rather than a measurement.
+     *
+     * Starting AND ending on an edge makes the tick count exact by construction
+     * — there is no partial period at either end — and moves all the resolution
+     * onto the PM timer, which has 279 ns granularity and accumulates ~358,000
+     * counts over the interval. Ten ticks keeps boot cost at 100 ms. */
+    uint64_t k_edge = g_ticks; while (g_ticks == k_edge) __asm__ volatile("pause");
+    uint32_t pm0 = acpi_pm_read();
+    uint64_t ts0 = rdtsc64(), k0 = g_ticks;
+    while (g_ticks - k0 < 10) __asm__ volatile("pause");   /* exactly 10 tick edges */
+    uint32_t pm1 = acpi_pm_read();
+    uint64_t ts1 = rdtsc64(), k1 = g_ticks;
+
+    uint32_t pmd = acpi_pm_delta(pm0, pm1);
+    uint64_t tsd = ts1 - ts0, kd = k1 - k0;
+    if (!pmd) { kputs("[time   ] PM timer did not advance — calibration abandoned\n"); return; }
+
+    /* TSC Hz = cycles / seconds, seconds = pmd / ACPI_PM_HZ. Ordered to keep the
+     * multiply inside 64 bits: tsd is ~2e8 for 50 ms at 4 GHz, so tsd * 3.58e6
+     * would overflow. Divide first, at a cost of a few parts per million. */
+    g_tsc_hz = (tsd / pmd) * ACPI_PM_HZ + ((tsd % pmd) * ACPI_PM_HZ) / pmd;
+    /* PIT rate x100: ticks / seconds, same shape. */
+    g_pit_hz_m100 = (uint32_t)(((kd * ACPI_PM_HZ * 100ull) / pmd));
+    g_tsc_per_us = g_tsc_hz / 1000000ull;
+
+    /* NOTE: this kernel's kprintf supports %s %c %d %u %x %X only — no width and
+     * no zero padding. "%u.%02u" is not a format it implements: it emits the
+     * literal text AND leaves the argument unconsumed, which shifts every value
+     * after it. That produced a first run of this calibration reporting a TSC
+     * frequency in the PIT field. Rates are therefore printed as the x100
+     * integer, which needs no padding to be unambiguous. */
+    kprintf("[time   ] calibrated over %u PM count(s) (%u us): TSC %u Hz (%u cyc/us), "
+            "PIT %u centi-Hz (10000 == exactly 100 Hz) over %u tick(s)\n",
+            (uint64_t)pmd, (uint64_t)((uint64_t)pmd * 1000000ull / ACPI_PM_HZ),
+            g_tsc_hz, g_tsc_per_us, (uint64_t)g_pit_hz_m100, kd);
+    /* The PIT is PROGRAMMED to 100 Hz and has never been checked. Anything
+     * outside 99-101 Hz means every g_ticks budget in this tree is scaled by
+     * that error, which is the open question v0.92 §1c could not close. */
+    if (g_pit_hz_m100 < 9900 || g_pit_hz_m100 > 10100)
+        kprintf("[time   ] *** the PIT is NOT delivering 100 Hz (%u centi-Hz) — every g_ticks "
+                "deadline in this tree is scaled by that error\n", (uint64_t)g_pit_hz_m100);
+}
+
+/* ---- calibrated delays ---------------------------------------------------
+ * v0.92: a delay in microseconds, not in iterations.
+ *
+ * Every hardcoded spin budget in this tree is a wall-clock interval multiplied
+ * by an unknown: v0.92 measured PAUSE at ~380 cycles under TCG against ~10-140
+ * on real hardware, so a 2,000,000-iteration wait meant 0.2 s here and would
+ * mean something else entirely on another host. These express the interval and
+ * let the calibration supply the conversion.
+ *
+ * SAFE BEFORE CALIBRATION: if neither clock is characterised it falls back to a
+ * bounded PAUSE loop — the old behaviour, explicitly, rather than a wait of
+ * accidental length.
+ *
+ * DRIVEN BY THE PM TIMER, NOT BY THE TSC, and the measurement is why. The TSC
+ * frequency is NOT constant across a boot here: calibration at boot reads
+ * ~4.19 GHz while three steady-state runs read ~3.91 GHz, agreeing with each
+ * other to 0.05% and sitting 7.2% below it. A udelay built on a boot-time TSC
+ * constant would therefore be ~7% long for the rest of the boot. The PM timer
+ * has no such problem — its rate is fixed by specification and cannot be
+ * reprogrammed — so it is used directly and the TSC is not trusted for
+ * intervals at all.
+ *
+ * The cost is a port-I/O read per poll, which is far more expensive than rdtsc.
+ * That is the right trade for a delay: the caller is waiting regardless, and
+ * paying for accuracy out of time that was going to be spent anyway. */
+static void udelay(uint64_t us) {
+    if (g_pmt_port) {
+        /* 24-bit wrap is ~4.68 s; anything longer is chunked so the delta stays
+         * inside exactly one wrap, which is the only case acpi_pm_delta can
+         * resolve. */
+        while (us) {
+            uint64_t chunk = us > 4000000ull ? 4000000ull : us;
+            uint32_t want = (uint32_t)((chunk * ACPI_PM_HZ) / 1000000ull);
+            if (!want) want = 1;
+            uint32_t start = acpi_pm_read();
+            while (acpi_pm_delta(start, acpi_pm_read()) < want) __asm__ volatile("pause");
+            us -= chunk;
+        }
+        return;
+    }
+    if (g_tsc_per_us) {
+        uint64_t target = rdtsc64() + us * g_tsc_per_us;
+        while ((int64_t)(rdtsc64() - target) < 0) __asm__ volatile("pause");
+        return;
+    }
+    /* Neither clock characterised: the pre-calibration fallback, stated
+     * explicitly rather than a wait of accidental length. */
+    for (uint64_t i = 0; i < us * 100ull; i++) __asm__ volatile("pause");
+}
+static inline void mdelay(uint64_t ms) { udelay(ms * 1000ull); }
+
+/* Microseconds elapsed since a PM-timer reading. 0 when there is no PM timer,
+ * so callers must not use it as a deadline on its own — see HW_WAIT. */
+static inline uint64_t acpi_pm_us_since(uint32_t start) {
+    if (!g_pmt_port) return 0;
+    return (uint64_t)acpi_pm_delta(start, acpi_pm_read()) * 1000000ull / ACPI_PM_HZ;
+}
+
+/* v0.92: WAIT ON HARDWARE FOR A TIME, NOT FOR A NUMBER OF LOOPS.
+ *
+ * Returns 1 if `cond` became true, 0 if `us` microseconds elapsed first. Every
+ * hardware wait in this kernel was written as `for (i = 0; i < 1000000; i++)`,
+ * which is a wall-clock interval multiplied by an unknown: v0.92 measured PAUSE
+ * at ~380 cycles under TCG against ~10-140 on real hardware, so the same loop
+ * means ~0.1 s here and something else entirely elsewhere. A device that needs
+ * 5 ms does not care how many times we asked.
+ *
+ * FALLS BACK TO AN ITERATION CAP when no PM timer was found, because a deadline
+ * with no clock is an unbounded loop, and an unbounded wait on a device that
+ * never answers hangs the machine with no output — the worst failure this
+ * project has (invariant 4). The fallback is the old behaviour, chosen
+ * deliberately rather than inherited by accident. */
+#define HW_WAIT(cond, us) ({                                                     \
+    int _ok = 0; uint32_t _t0 = acpi_pm_read(); uint64_t _n = 0;                 \
+    for (;;) {                                                                   \
+        if (cond) { _ok = 1; break; }                                            \
+        if (g_pmt_port) { if (acpi_pm_us_since(_t0) >= (uint64_t)(us)) break; }   \
+        else if (++_n > (uint64_t)(us) * 20ull) break;                           \
+        __asm__ volatile("pause");                                               \
+    } _ok; })
+
+/* ===========================================================================
  * INTEL VT-d IOMMU (DMA REMAPPING)
  * ===========================================================================
  * Parses the ACPI DMAR table, maps the remapping hardware registers, builds
@@ -4501,16 +4733,21 @@ static void iommu_init(void) {
 
     /* program the root table pointer and enable translation                    */
     dmar_w64(DMAR_RTADDR, g_iommu_root);
+    /* v0.92: these four were `for (i = 0; i < 1000000; i++)`. The hardware needs
+     * a TIME, not a number of our loop iterations — at ~380 cycles per PAUSE
+     * under TCG that loop was ~0.1 s here and would be something else on any
+     * other host. 100 ms is far beyond what these registers need and bounds the
+     * boot if the unit never answers. */
     dmar_w32(DMAR_GCMD, GCMD_SRTP);
-    for (int i = 0; i < 1000000 && !(dmar_r32(DMAR_GSTS) & GSTS_RTPS); i++) __asm__ volatile("pause");
+    HW_WAIT(dmar_r32(DMAR_GSTS) & GSTS_RTPS, 100000);
     /* global context-cache + IOTLB invalidation before enabling                */
     dmar_w64(DMAR_CCMD, (1ull << 63) | (1ull << 61));
-    for (int i = 0; i < 1000000 && (dmar_r64(DMAR_CCMD) & (1ull << 63)); i++) __asm__ volatile("pause");
+    HW_WAIT(!(dmar_r64(DMAR_CCMD) & (1ull << 63)), 100000);
     uint32_t iro = (uint32_t)(((g_dmar_ecap >> 8) & 0x3FF) * 16);
     dmar_w64(iro + 8, (1ull << 63) | (1ull << 60));    /* IOTLB global invalidate */
-    for (int i = 0; i < 1000000 && (dmar_r64(iro + 8) & (1ull << 63)); i++) __asm__ volatile("pause");
+    HW_WAIT(!(dmar_r64(iro + 8) & (1ull << 63)), 100000);
     dmar_w32(DMAR_GCMD, GCMD_TE);
-    for (int i = 0; i < 1000000 && !(dmar_r32(DMAR_GSTS) & GSTS_TES); i++) __asm__ volatile("pause");
+    HW_WAIT(dmar_r32(DMAR_GSTS) & GSTS_TES, 100000);
 
     g_iommu_on = (dmar_r32(DMAR_GSTS) & GSTS_TES) ? 1 : 0;
     kprintf("[iommu  ] second-level tables: %d-level, %s pages, identity-mapped %M MiB\n",
@@ -22264,8 +22501,31 @@ static void cmd_timebench(void) {
     uint64_t per_tick = elapsed ? cyc / elapsed : 0;
     kprintf("[timebench] TSC vs PIT: %u cycle(s) over %u tick(s) — %u cyc/tick, implied %u Hz\n",
             cyc, elapsed, per_tick, per_tick * 100u);
-    kprintf("[timebench]   (the PIT is programmed to 100 Hz and never verified; if it is not\n"
-            "[timebench]    delivering 100 Hz, this figure is wrong in the same proportion)\n");
+
+    /* v0.92: THE SAME INTERVAL, MEASURED AGAINST THE CLOCK THAT CANNOT BE
+     * REPROGRAMMED. The PIT-derived figure above assumes 100 Hz; this one
+     * assumes only the ACPI specification. Where they disagree, this is the one
+     * to believe, and the disagreement is the measurement. */
+    if (g_pmt_port) {
+        /* Tick-edge bounded, for the reason recorded in time_calibrate_clocks:
+         * counting edges inside a fixed PM window quantises to +/-20% at 100 Hz. */
+        uint64_t ke = g_ticks; while (g_ticks == ke) __asm__ volatile("pause");
+        uint32_t pm0 = acpi_pm_read();
+        uint64_t t0 = rdtsc64(), kk0 = g_ticks;
+        while (g_ticks - kk0 < 10) __asm__ volatile("pause");
+        uint32_t pm1 = acpi_pm_read();
+        uint64_t t1 = rdtsc64(), kk1 = g_ticks;
+        uint32_t pmd = acpi_pm_delta(pm0, pm1);
+        uint64_t us = (uint64_t)pmd * 1000000ull / ACPI_PM_HZ;
+        uint64_t tsc_hz = pmd ? ((t1 - t0) / pmd) * ACPI_PM_HZ + (((t1 - t0) % pmd) * ACPI_PM_HZ) / pmd : 0;
+        uint32_t pit_m100 = pmd ? (uint32_t)(((kk1 - kk0) * ACPI_PM_HZ * 100ull) / pmd) : 0;
+        kprintf("[timebench] ACPI PM: %u count(s) = %u us — TSC %u Hz, PIT %u centi-Hz "
+                "(boot said TSC %u Hz, PIT %u centi-Hz)\n",
+                (uint64_t)pmd, us, tsc_hz, (uint64_t)pit_m100,
+                g_tsc_hz, (uint64_t)g_pit_hz_m100);
+    } else {
+        kputs("[timebench] ACPI PM timer unavailable — the PIT figure above is unverifiable\n");
+    }
 
     /* (2) BACK-TO-BACK rdtsc DELTAS. The distribution, not the mean: the mean of
      * a distribution with host-preemption outliers describes neither the common
@@ -32596,11 +32856,16 @@ static void icheck2(const char *name, int cond) {
 
 /* Global context-cache + IOTLB invalidation (after changing translation state). */
 static void iommu_invalidate_all(void) {
+    /* v0.92: deadlines, not spin counts — see HW_WAIT. This one matters beyond
+     * tidiness: it runs on every device grant and revoke, so a wait whose length
+     * depends on host speed is a correctness hazard as well as a timing one.
+     * An invalidation that is not complete when this returns leaves the device
+     * translating through stale entries. */
     dmar_w64(DMAR_CCMD, (1ull << 63) | (1ull << 61));
-    for (int i = 0; i < 1000000 && (dmar_r64(DMAR_CCMD) & (1ull << 63)); i++) __asm__ volatile("pause");
+    HW_WAIT(!(dmar_r64(DMAR_CCMD) & (1ull << 63)), 100000);
     uint32_t iro = (uint32_t)(((g_dmar_ecap >> 8) & 0x3FF) * 16);
     dmar_w64(iro + 8, (1ull << 63) | (1ull << 60));
-    for (int i = 0; i < 1000000 && (dmar_r64(iro + 8) & (1ull << 63)); i++) __asm__ volatile("pause");
+    HW_WAIT(!(dmar_r64(iro + 8) & (1ull << 63)), 100000);
 }
 
 /* Clear all recorded faults + the fault status register.                        */
@@ -33514,6 +33779,12 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     kprintf("[kernel ] consoles: VGA text + COM1 serial (115200 8N1) — both live\n");
 
     multiboot_scan(mb_info, true);
+
+    /* v0.92: as early as the RSDP allows. Everything downstream that reasons in
+     * cycles — the CAS spin telemetry, vfsbench, timebench — is uncalibrated
+     * until this runs, and every g_ticks deadline in the tree rests on a PIT
+     * rate nothing had ever verified. */
+    time_calibrate_clocks();
 
     kprintf("[kernel ] capability table initialized (%d slots, kernel-owned)\n", MAX_CAPS);
 
