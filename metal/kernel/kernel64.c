@@ -6170,10 +6170,18 @@ struct dirent {
      * and cas_mount's restore all keep working and an older volume still mounts.
      *
      * BOOT-RELATIVE TICKS, NOT WALL TIME, and the distinction is not pedantry.
-     * g_ticks at 100 Hz is the only clock this kernel has; there is no RTC and
-     * no epoch. A uint32_t of ticks covers ~497 days, far past any boot. Calling
-     * these seconds-since-1970 would be inventing a number, so they are ticks
-     * since THIS boot and every consumer has to know that.
+     * g_ticks at 100 Hz was the only clock this kernel had when these fields
+     * were defined, and there was no epoch. A uint32_t of ticks covers ~497
+     * days, far past any boot. Calling these seconds-since-1970 would have been
+     * inventing a number, so they are ticks since THIS boot and every consumer
+     * has to know that.
+     *
+     * v0.93: an epoch now EXISTS — see rtc_init — but these fields deliberately
+     * do not use it. They are on-disk dirent timestamps: changing their meaning
+     * would silently reinterpret every timestamp already written to every
+     * existing volume, and a v0.92 volume mounted by a v0.93 kernel would read
+     * boot-relative ticks as absolute seconds. Migrating them needs a format
+     * decision and a mount-time conversion, not a redefinition.
      *
      * ZERO MEANS UNKNOWN, following the rule v0.72 wrote for mode: on a volume
      * written by an older kernel these read as 0, and 0 must not be read as "the
@@ -14730,6 +14738,145 @@ static inline void lapic_eoi(void) { lapic_w(0xB0, 0); }
  * place that would change is obvious. */
 static uint64_t g_realtime_off_ns = 0;
 
+/* ===========================================================================
+ * v0.93: THE CMOS RTC — where CLOCK_REALTIME's epoch comes from
+ * ===========================================================================
+ * v0.92 wired CLOCK_REALTIME and had to return the monotonic value, because
+ * nothing in this kernel knew what year it was. That was recorded as "there is
+ * no RTC", which was true of the DRIVER and not of the machine: the MC146818
+ * CMOS RTC has been at ports 0x70/0x71 since the PC/AT, and QEMU emulates it.
+ * This reads it once at boot and gives the epoch a real value.
+ *
+ * IMPLEMENTED HERE RATHER THAN IN kernel/drivers/rtc.c. The kernel is one
+ * source file by design — CLAUDE.md states it, `kernel/` contains exactly
+ * kernel64.c, and a new file would need Makefile object-list surgery for no
+ * benefit. It sits next to the ACPI PM timer because it is the same kind of
+ * thing: a hardware clock read through port I/O.
+ *
+ * THE UPDATE-IN-PROGRESS RACE IS THE WHOLE DIFFICULTY. The RTC increments its
+ * registers in place, so a read that straddles an update can return 01:59:60 or
+ * 02:00:00 with the hour from before the carry — a value that is wrong by an
+ * hour rather than by a second, and wrong only occasionally, which is the worst
+ * shape a bug can have. Two defences, both standard and both necessary:
+ *
+ *   1. Wait for Status Register A's UIP bit to clear before reading, which
+ *      guarantees at least 244 us of stable registers on real hardware.
+ *   2. Read the whole set TWICE and accept it only when both agree. An update
+ *      that begins between the UIP check and the last register still produces
+ *      two differing reads, and the retry costs a microsecond.
+ *
+ * Bounded, because an RTC that never settles must not hang the boot: this tree
+ * has an invariant about that. Failure leaves the epoch at zero and says so —
+ * CLOCK_REALTIME then behaves exactly as it did in v0.92 rather than reporting
+ * a fabricated date. */
+#define CMOS_ADDR 0x70
+#define CMOS_DATA 0x71
+
+static inline uint8_t cmos_read(uint8_t reg) {
+    /* Bit 7 of the index port is the NMI-disable line. It is preserved as 0
+     * here (NMI enabled) rather than blindly written, because leaving NMI
+     * masked after a CMOS read is a classic way to lose a machine-check. */
+    outb(CMOS_ADDR, reg & 0x7Fu);
+    return inb(CMOS_DATA);
+}
+static inline int cmos_update_in_progress(void) { return cmos_read(0x0A) & 0x80; }
+
+/* BCD -> binary. The RTC may present either; Status Register B bit 2 says which. */
+static inline uint8_t bcd_to_bin(uint8_t v) { return (uint8_t)((v & 0x0F) + ((v >> 4) * 10)); }
+
+struct rtc_time { uint32_t year; uint8_t mon, day, hour, min, sec; };
+
+static int rtc_read_raw(struct rtc_time *t) {
+    /* Wait for any in-flight update to finish, bounded. */
+    uint32_t guard = 0;
+    while (cmos_update_in_progress()) { if (++guard > 1000000u) return 0; __asm__ volatile("pause"); }
+
+    uint8_t s = cmos_read(0x00), mi = cmos_read(0x02), h = cmos_read(0x04);
+    uint8_t d = cmos_read(0x07), mo = cmos_read(0x08), y = cmos_read(0x09);
+    uint8_t cent = cmos_read(0x32);            /* century; 0 if unimplemented   */
+    uint8_t regb = cmos_read(0x0B);
+
+    /* Second pass: accept only when the registers agree, which rules out an
+     * update that started after the UIP check above. */
+    uint32_t tries = 0;
+    for (;;) {
+        while (cmos_update_in_progress()) { if (++guard > 1000000u) return 0; __asm__ volatile("pause"); }
+        uint8_t s2 = cmos_read(0x00), mi2 = cmos_read(0x02), h2 = cmos_read(0x04);
+        uint8_t d2 = cmos_read(0x07), mo2 = cmos_read(0x08), y2 = cmos_read(0x09);
+        uint8_t c2 = cmos_read(0x32);
+        if (s == s2 && mi == mi2 && h == h2 && d == d2 && mo == mo2 && y == y2 && cent == c2) break;
+        s = s2; mi = mi2; h = h2; d = d2; mo = mo2; y = y2; cent = c2;
+        if (++tries > 16u) return 0;           /* never settles: give up, do not hang */
+    }
+
+    int bcd    = !(regb & 0x04);               /* bit 2 set = binary, clear = BCD */
+    int h24    =  (regb & 0x02);               /* bit 1 set = 24-hour             */
+    int pm     = 0;
+    if (!h24) { pm = h & 0x80; h &= 0x7Fu; }   /* 12-hour: bit 7 is the PM flag   */
+
+    if (bcd) {
+        s = bcd_to_bin(s); mi = bcd_to_bin(mi); h = bcd_to_bin(h);
+        d = bcd_to_bin(d); mo = bcd_to_bin(mo); y = bcd_to_bin(y);
+        cent = bcd_to_bin(cent);
+    }
+    /* 12-hour conversion AFTER the BCD decode, because 12 AM is stored as 12
+     * and must become 0, and 12 PM must stay 12 — the usual pair of edge cases
+     * that a naive `if (pm) h += 12` gets wrong at noon and midnight. */
+    if (!h24) { if (pm) { if (h != 12) h = (uint8_t)(h + 12); } else if (h == 12) h = 0; }
+
+    uint32_t year = y;
+    if (cent >= 19 && cent <= 21) year += (uint32_t)cent * 100u;
+    else                          year += (y >= 70u) ? 1900u : 2000u;  /* no century reg */
+
+    t->year = year; t->mon = mo; t->day = d; t->hour = h; t->min = mi; t->sec = s;
+    return (mo >= 1 && mo <= 12 && d >= 1 && d <= 31 && h < 24 && mi < 60 && s < 60);
+}
+
+/* Civil date -> seconds since 1970-01-01 UTC. Howard Hinnant's days_from_civil,
+ * which is exact for the whole proleptic Gregorian range and needs no table and
+ * no loop over years — a loop would be fine here but this is shorter to verify
+ * against the reference than a hand-rolled leap-year accumulation. */
+static uint64_t civil_to_epoch(uint32_t y, uint32_t m, uint32_t d,
+                               uint32_t hh, uint32_t mm, uint32_t ss) {
+    int64_t yy = (int64_t)y - (m <= 2);
+    int64_t era = (yy >= 0 ? yy : yy - 399) / 400;
+    int64_t yoe = yy - era * 400;                                   /* [0, 399]  */
+    int64_t doy = (153 * ((int64_t)m + (m > 2 ? -3 : 9)) + 2) / 5 + (int64_t)d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;            /* [0, 146096] */
+    int64_t days = era * 146097 + doe - 719468;                     /* 1970 epoch  */
+    return (uint64_t)(days * 86400 + (int64_t)hh * 3600 + (int64_t)mm * 60 + (int64_t)ss);
+}
+
+static uint64_t g_rtc_boot_epoch = 0;          /* seconds at boot, 0 = unknown   */
+
+static void rtc_init(void) {
+    struct rtc_time t;
+    if (!rtc_read_raw(&t)) {
+        kputs("[rtc    ] CMOS RTC did not return a settled, plausible time — "
+              "CLOCK_REALTIME stays boot-relative\n");
+        return;
+    }
+    uint64_t epoch = civil_to_epoch(t.year, t.mon, t.day, t.hour, t.min, t.sec);
+    /* Sanity floor: 1,700,000,000 is 2023-11-14. A CMOS that reads 1980 because
+     * the battery is flat, or 1970 because nothing set it, is worse than no
+     * epoch at all — a caller would trust it. Rejected loudly. */
+    if (epoch < 1700000000ull) {
+        kprintf("[rtc    ] CMOS RTC reads %u-%u-%u %u:%u:%u = epoch %u, before 2023 — "
+                "REJECTED as implausible; CLOCK_REALTIME stays boot-relative\n",
+                (uint64_t)t.year, (uint64_t)t.mon, (uint64_t)t.day,
+                (uint64_t)t.hour, (uint64_t)t.min, (uint64_t)t.sec, epoch);
+        return;
+    }
+    g_rtc_boot_epoch = epoch;
+    /* CLOCK_REALTIME = this epoch + monotonic time since boot. The offset is
+     * captured against ktime_get_ns's current value so the two stay consistent
+     * however much of the boot has already elapsed. */
+    g_realtime_off_ns = epoch * 1000000000ull - ktime_get_ns();
+    kprintf("[rtc    ] CMOS RTC: %u-%u-%u %u:%u:%u UTC — epoch %u, CLOCK_REALTIME anchored\n",
+            (uint64_t)t.year, (uint64_t)t.mon, (uint64_t)t.day,
+            (uint64_t)t.hour, (uint64_t)t.min, (uint64_t)t.sec, epoch);
+}
+
 static void ksleep_us(uint64_t us) {
     if (!us) return;
     if (us < KSLEEP_POLL_THRESHOLD_US) { udelay(us); return; }
@@ -23066,6 +23213,8 @@ static void cmd_timebench(void) {
                                 : c == 1871 ? "CLOCK WENT BACKWARDS"
                                 : c == 1872 ? "clock did not advance"
                                 : c == 1873 ? "a sleep returned SHORT"
+                                : c == 1874 ? "CLOCK_REALTIME is not a real epoch"
+                                : c == 1875 ? "CLOCK_MONOTONIC carries the wall-clock offset"
                                             : "undecoded exit code";
                 kprintf("[timebench] ring-3 clock probe: %s (exit %u)%s\n",
                         why, (uint64_t)c, ok ? "" : " — WATCHDOG, it never finished");
@@ -34274,6 +34423,9 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
      * until this runs, and every g_ticks deadline in the tree rests on a PIT
      * rate nothing had ever verified. */
     time_calibrate_clocks();
+    /* v0.93: AFTER the clocks are calibrated, because the realtime offset is
+     * anchored against ktime_get_ns() and that needs g_tsc_khz to be set. */
+    rtc_init();
 
     kprintf("[kernel ] capability table initialized (%d slots, kernel-owned)\n", MAX_CAPS);
 

@@ -3552,6 +3552,33 @@ static void role63_clock_probe(void) {
     if (omono_us() <= t0) { print("  [r63] CLOCK_MONOTONIC did not advance\n");
                             sysc(SYS_EXIT, 1872, 0, 0); }
 
+    /* v0.93: CLOCK_REALTIME must be a real epoch, and MONOTONIC must not be.
+     *
+     * 1,700,000,000 is 2023-11-14. A kernel that anchored REALTIME to a flat
+     * CMOS battery, or forgot to anchor it at all, returns something far below
+     * that — and the failure is silent unless something checks, because a small
+     * number is still a number.
+     *
+     * The second half matters as much: MONOTONIC must NOT jump when REALTIME is
+     * anchored. They are different clocks and a caller timing an interval with
+     * MONOTONIC must not see the wall-clock offset appear in it. */
+    {
+        u64 rt = oclock_ns(CLOCK_REALTIME) / 1000000000ull;   /* seconds */
+        u64 m1 = omono_us();
+        print("  [r63] CLOCK_REALTIME epoch seconds "); hex(rt); print("\n");
+        if (rt < 1700000000ull) {
+            print("  [r63] CLOCK_REALTIME is before 2023 — not anchored to a real epoch\n");
+            sysc(SYS_EXIT, 1874, 0, 0);
+        }
+        /* MONOTONIC must still be small relative to the epoch: if the anchor had
+         * leaked into it, it would be ~1.7e15 us rather than a boot-relative
+         * figure of at most a few minutes. */
+        if (m1 > 86400000000ull) {
+            print("  [r63] CLOCK_MONOTONIC carries the wall-clock offset\n");
+            sysc(SYS_EXIT, 1875, 0, 0);
+        }
+    }
+
     /* (3) sleep fidelity, measured with the clock the caller would use */
     static const u64 want[3] = { 100, 1000, 10000 };
     int short_sleep = 0;
