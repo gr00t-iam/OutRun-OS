@@ -4280,6 +4280,79 @@ static uint64_t g_tsc_per_us  = 0;   /* derived; 0 disables the delay primitives
  * together — the PM timer is host-monotonic under emulation — so the RATIO
  * survives it even though neither absolute figure does. That is the property
  * that makes this worth doing at all. */
+/* ===========================================================================
+ * v0.92 OBJECTIVE 3: A TSC CLOCKSOURCE THAT RE-ANCHORS
+ * ===========================================================================
+ * The motivation is real: ktime_get_us is monotonic but overshoots by 8-21%,
+ * because it is built on g_ticks and the emulated PIT delivers coalesced
+ * catch-up interrupts after a host stall. A TSC-derived clock does not have
+ * that problem — rdtsc is read directly and nothing can bunch it up.
+ *
+ * BUT THE TSC HERE IS NOT A STABLE OSCILLATOR, which section 1d measured before
+ * this was built: 3.966-4.252 GHz across one boot, a 7.2% spread. A clock
+ * scaled by a single boot-time frequency would therefore drift by up to 7%,
+ * trading the PIT's burst error for a frequency error of the same order.
+ *
+ * RE-ANCHORING IS WHAT MAKES IT WORK, and it is why this is not simply
+ * "rdtsc / khz". The clock keeps an anchor pair — a TSC reading and the
+ * nanosecond value published at that instant — and reports
+ *
+ *     ns = anchor_ns + (rdtsc() - anchor_tsc) * 1e6 / khz
+ *
+ * The PIT tick re-anchors it against the ACPI PM timer roughly once a second.
+ * Between anchors the TSC supplies resolution the PM timer cannot (its reads
+ * are port I/O); at each anchor the PM timer supplies the accuracy the TSC
+ * cannot. Drift is bounded by one anchor interval rather than accumulating.
+ *
+ * MONOTONICITY ACROSS AN ANCHOR is the one thing that can go wrong, and it is
+ * handled explicitly: the new anchor is never allowed to publish a value below
+ * what the old anchor would have reported for the same instant. If the PM timer
+ * says less time passed than the TSC claimed, the anchor is advanced to the
+ * larger of the two. That makes the clock monotonic by construction and lets it
+ * run slightly fast rather than ever going backwards — the same trade
+ * ktime_get_us makes, for the same reason. */
+static uint64_t ktime_get_us(void);           /* fwd: the tick-based coarse clock */
+
+static volatile uint64_t g_tsc_khz     = 0;   /* 0 until calibrated             */
+static volatile uint64_t g_anchor_tsc  = 0;
+static volatile uint64_t g_anchor_ns   = 0;
+static volatile uint32_t g_anchor_pm   = 0;
+static volatile uint64_t g_anchor_count = 0;  /* re-anchors performed           */
+
+/* Called from the PIT tick. Cheap: one comparison on most ticks. */
+static void ktime_reanchor(void) {
+    if (!g_tsc_khz || !g_pmt_port) return;
+    uint32_t pm = acpi_pm_read();
+    uint32_t d  = acpi_pm_delta(g_anchor_pm, pm);
+    if (d < ACPI_PM_HZ) return;                       /* ~1 s between anchors    */
+    uint64_t now_tsc = rdtsc64();
+    /* True elapsed since the last anchor, from the clock that cannot bunch up. */
+    uint64_t true_ns = ((uint64_t)d * 1000000000ull) / ACPI_PM_HZ;
+    uint64_t tsc_ns  = ((now_tsc - g_anchor_tsc) * 1000000ull) / g_tsc_khz;
+    /* Never step backwards: take whichever says more time has passed. */
+    uint64_t adv = true_ns > tsc_ns ? true_ns : tsc_ns;
+    g_anchor_ns   = g_anchor_ns + adv;
+    g_anchor_tsc  = now_tsc;
+    g_anchor_pm   = pm;
+    g_anchor_count++;
+}
+
+/* Lockless, IRQ-safe, SMP-safe. The anchor triple is published by the PIT ISR
+ * on the BSP only; a reader that sees the anchor change mid-read simply
+ * retries, using g_anchor_count as the sequence. */
+static uint64_t ktime_get_ns(void) {
+    if (!g_tsc_khz) return ktime_get_us() * 1000ull;   /* pre-calibration        */
+    for (;;) {
+        uint64_t c0 = g_anchor_count;
+        uint64_t a_ns = g_anchor_ns, a_tsc = g_anchor_tsc;
+        __sync_synchronize();
+        uint64_t now = rdtsc64();
+        uint64_t ns = a_ns + ((now - a_tsc) * 1000000ull) / g_tsc_khz;
+        __sync_synchronize();
+        if (g_anchor_count == c0) return ns;
+    }
+}
+
 static void time_calibrate_clocks(void) {
     if (!acpi_pm_init()) {
         kputs("[time   ] no ACPI PM timer (no FACP, or PM_TMR_BLK unusable) — the TSC and the "
@@ -4329,6 +4402,14 @@ static void time_calibrate_clocks(void) {
      * after it. That produced a first run of this calibration reporting a TSC
      * frequency in the PIT field. Rates are therefore printed as the x100
      * integer, which needs no padding to be unambiguous. */
+    /* v0.92 Objective 3: seed the TSC clocksource from the same window. kHz
+     * rather than Hz because ns = cycles * 1e6 / khz keeps the multiply inside
+     * 64 bits for any realistic uptime, where cycles * 1e9 / hz would not. */
+    g_tsc_khz    = g_tsc_hz / 1000ull;
+    g_anchor_tsc = rdtsc64();
+    g_anchor_pm  = acpi_pm_read();
+    g_anchor_ns  = 0;
+
     kprintf("[time   ] calibrated over %u PM count(s) (%u us): TSC %u Hz (%u cyc/us), "
             "PIT %u centi-Hz (10000 == exactly 100 Hz) over %u tick(s)\n",
             (uint64_t)pmd, (uint64_t)((uint64_t)pmd * 1000000ull / ACPI_PM_HZ),
@@ -4444,7 +4525,13 @@ static inline uint64_t acpi_pm_us_since(uint32_t start) {
  * the PM timer's 24 bits in software, which nothing here yet needs. */
 static volatile uint32_t g_tick_pm = 0;      /* PM counter at the last tick edge */
 
-static void ktime_tick_stamp(void) { if (g_pmt_port) g_tick_pm = acpi_pm_read(); }
+static void ktime_reanchor(void);   /* fwd: defined with the TSC clocksource */
+
+static void ktime_tick_stamp(void) {
+    if (!g_pmt_port) return;
+    g_tick_pm = acpi_pm_read();
+    ktime_reanchor();               /* ~1 s apart; a comparison on other ticks */
+}
 
 static uint64_t ktime_get_us(void) {
     for (;;) {
@@ -4910,7 +4997,14 @@ static int virtio_blk_probe(uint8_t bus, uint8_t dev, uint8_t fn) {
 
     /* --- reset and status handshake --- */
     mw8(g_vblk_common, VCC_DEV_STATUS, 0);                  /* reset             */
-    while (mr8(g_vblk_common, VCC_DEV_STATUS) != 0) { }
+    /* v0.92: BOUNDED. This was `while (status != 0) { }` — no bound at all, so a
+     * device that never cleared its status register hung the machine here with
+     * no output, which is the failure this project ranks worst (a lost wake must
+     * cost a failed assertion, not the machine). The virtio specification says
+     * reset completes promptly; 100 ms is far beyond that and still finite. */
+    if (!HW_WAIT(mr8(g_vblk_common, VCC_DEV_STATUS) == 0, 100000))
+        kprintf("[vblk   ] device did not clear status within 100000 us after reset — "
+                "continuing, but the handshake below may fail\n");
     mw8(g_vblk_common, VCC_DEV_STATUS, VSTAT_ACK);
     mw8(g_vblk_common, VCC_DEV_STATUS, VSTAT_ACK | VSTAT_DRIVER);
 
@@ -5416,7 +5510,10 @@ static int virtionet_probe(uint8_t bus, uint8_t dev, uint8_t fn) {
 
     /* reset + feature negotiation (VERSION_1 + MAC) */
     mw8(g_vnet_common, VCC_DEV_STATUS, 0);
-    while (mr8(g_vnet_common, VCC_DEV_STATUS)) { }
+    /* v0.92: bounded — see the vblk reset. vnet_reinit already bounded its own
+     * copy of this wait in v0.91; this is the probe-time original. */
+    if (!HW_WAIT(mr8(g_vnet_common, VCC_DEV_STATUS) == 0, 100000))
+        kprintf("[vnet   ] device did not clear status within 100000 us after reset\n");
     mw8(g_vnet_common, VCC_DEV_STATUS, VSTAT_ACK);
     mw8(g_vnet_common, VCC_DEV_STATUS, VSTAT_ACK | VSTAT_DRIVER);
     mw32(g_vnet_common, VCC_DEV_FEAT_SEL, 0);
@@ -11334,7 +11431,10 @@ static int virtio_gpu_probe(uint8_t bus, uint8_t dev, uint8_t fn) {
     }
 
     mw8(g_gpu_common, VCC_DEV_STATUS, 0);
-    while (mr8(g_gpu_common, VCC_DEV_STATUS) != 0) { }
+    /* v0.92: bounded — see the vblk reset for why an unbounded status wait is
+     * the worst shape this can take. */
+    if (!HW_WAIT(mr8(g_gpu_common, VCC_DEV_STATUS) == 0, 100000))
+        kprintf("[vgpu   ] device did not clear status within 100000 us after reset\n");
     mw8(g_gpu_common, VCC_DEV_STATUS, VSTAT_ACK);
     mw8(g_gpu_common, VCC_DEV_STATUS, VSTAT_ACK | VSTAT_DRIVER);
 
@@ -11919,11 +12019,25 @@ static int xhci_probe(uint8_t bus, uint8_t dev, uint8_t fn) {
     kprintf("[xhci   ] caplen %u maxslots %u maxports %u dboff %x rtsoff %x\n",
             (uint64_t)caplength, maxslots, maxports, dboff, rtsoff);
 
+    /* v0.92: deadlines rather than iteration counts. The xHCI specification
+     * gives the controller 16 ms for reset and 500 ms to clear Controller Not
+     * Ready; these bounds are those, rounded up, instead of a loop count that
+     * meant ~0.1 s on the machine this was written on and something else on
+     * every other. Each failure now says how long it actually waited.
+     *
+     * NOT EXERCISED BY THE GATE: CLAUDE.md keeps xHCI out of the standard boot
+     * because its emulated microframe timer makes a full suite run impractical,
+     * so these paths are verified by `make qemu-usb` and not by the matrix. The
+     * change is still strictly safer than what it replaces — every branch is
+     * bounded either way, and now bounded in time. */
     mw32(g_xhci_op, XHCI_USBCMD, 0);
-    for (int i = 0; i < 1000000 && !(mr32(g_xhci_op, XHCI_USBSTS) & XHCI_STS_HCH); i++) __asm__ volatile("pause");
+    if (!HW_WAIT(mr32(g_xhci_op, XHCI_USBSTS) & XHCI_STS_HCH, 100000))
+        kprintf("[xhci   ] controller did not halt within 100000 us\n");
     mw32(g_xhci_op, XHCI_USBCMD, XHCI_CMD_HCRST);
-    for (int i = 0; i < 1000000 && (mr32(g_xhci_op, XHCI_USBCMD) & XHCI_CMD_HCRST); i++) __asm__ volatile("pause");
-    for (int i = 0; i < 1000000 && (mr32(g_xhci_op, XHCI_USBSTS) & XHCI_STS_CNR); i++) __asm__ volatile("pause");
+    if (!HW_WAIT(!(mr32(g_xhci_op, XHCI_USBCMD) & XHCI_CMD_HCRST), 100000))
+        kprintf("[xhci   ] reset bit did not clear within 100000 us\n");
+    if (!HW_WAIT(!(mr32(g_xhci_op, XHCI_USBSTS) & XHCI_STS_CNR), 500000))
+        kprintf("[xhci   ] controller still Not Ready after 500000 us\n");
 
     g_xhci_dcbaa = (uint64_t *)alloc_frame();
     cmemset(g_xhci_dcbaa, 0, 4096);
@@ -11948,7 +12062,8 @@ static int xhci_probe(uint8_t bus, uint8_t dev, uint8_t fn) {
     /* Polling only, no MSI/INTx wired — see changelog (same trade-off v0.50's */
     /* GPU driver made, for the same reason: infrequent commands, low risk).   */
     mw32(g_xhci_op, XHCI_USBCMD, XHCI_CMD_RS);
-    for (int i = 0; i < 1000000 && (mr32(g_xhci_op, XHCI_USBSTS) & XHCI_STS_HCH); i++) __asm__ volatile("pause");
+    if (!HW_WAIT(!(mr32(g_xhci_op, XHCI_USBSTS) & XHCI_STS_HCH), 100000))
+        kprintf("[xhci   ] controller did not leave the halted state within 100000 us\n");
 
     g_xhci_ready = !(mr32(g_xhci_op, XHCI_USBSTS) & XHCI_STS_HCH);
     kprintf("[xhci   ] %s — %u slots enabled, %u ports\n",
@@ -12087,7 +12202,9 @@ static int virtio_sound_probe(uint8_t bus, uint8_t dev, uint8_t fn) {
         g_snd_isr = (volatile uint8_t *)(VBLK_MMIO_V + 0x90000 + isr_off);
 
     mw8(g_snd_common, VCC_DEV_STATUS, 0);
-    while (mr8(g_snd_common, VCC_DEV_STATUS) != 0) { }
+    /* v0.92: bounded — see the vblk reset. */
+    if (!HW_WAIT(mr8(g_snd_common, VCC_DEV_STATUS) == 0, 100000))
+        kprintf("[vsnd   ] device did not clear status within 100000 us after reset\n");
     mw8(g_snd_common, VCC_DEV_STATUS, VSTAT_ACK);
     mw8(g_snd_common, VCC_DEV_STATUS, VSTAT_ACK | VSTAT_DRIVER);
 
@@ -22747,6 +22864,29 @@ static void cmd_timebench(void) {
         }
         kprintf("[timebench] ktime_get_us: advanced %u us over a %u us delay (delta %u us), "
                 "%u backward step(s) in 200000 reads\n", kd, pm_us, diff, (uint64_t)(int64_t)back);
+
+        /* (5) v0.92 Objective 3: the TSC clocksource, measured the same way and
+         * against the same reference. Its whole claim is that it does NOT
+         * inherit the PIT's catch-up bursts, so the number to watch is the
+         * delta against the PM timer — if it matches ktime_get_us's 8-21%
+         * overshoot, the re-anchoring is not doing its job. */
+        uint64_t n0 = ktime_get_ns();
+        uint32_t r0 = acpi_pm_read();
+        udelay(50000);
+        uint64_t n1 = ktime_get_ns();
+        uint64_t pm_us2 = (uint64_t)acpi_pm_delta(r0, acpi_pm_read()) * 1000000ull / ACPI_PM_HZ;
+        uint64_t ns_us = (n1 - n0) / 1000ull;
+        uint64_t d2 = ns_us > pm_us2 ? ns_us - pm_us2 : pm_us2 - ns_us;
+        int back2 = 0;
+        uint64_t last2 = ktime_get_ns();
+        for (uint32_t i = 0; i < 200000u; i++) {
+            uint64_t n = ktime_get_ns();
+            if (n < last2) back2++;
+            last2 = n;
+        }
+        kprintf("[timebench] ktime_get_ns: advanced %u us over a %u us delay (delta %u us), "
+                "%u backward step(s) in 200000 reads, %u re-anchor(s) so far, TSC %u kHz\n",
+                ns_us, pm_us2, d2, (uint64_t)(int64_t)back2, g_anchor_count, g_tsc_khz);
     }
     kputs("-- done --\n");
 }

@@ -327,6 +327,91 @@ hard way.
 
 ---
 
+### 1h — driver timeouts, and four waits that had no bound at all
+
+The brief asked for NVMe, AHCI, VirtIO and xHCI. **NVMe and AHCI do not exist in
+this kernel** — zero references. What the audit found instead was worse than the
+spin counts it went looking for:
+
+```c
+mw8(common, VCC_DEV_STATUS, 0);          /* reset */
+while (mr8(common, VCC_DEV_STATUS) != 0) { }
+```
+
+**Four completely unbounded waits** — virtio-blk, virtio-net, virtio-gpu,
+virtio-snd. A device that never clears its status register hangs the machine
+there with no output, which is invariant 4 ("a lost wake must cost a failed
+assertion, not the machine") and is strictly worse than a miscalibrated spin
+count, because a spin count at least terminates.
+
+| site | before | after |
+|---|---|---|
+| virtio blk/net/gpu/snd reset | **unbounded** `while` | `HW_WAIT(..., 100000)` + diagnostic |
+| xHCI halt / reset-bit / CNR / run | 1,000,000 iterations | 100 ms / 100 ms / 500 ms / 100 ms |
+| IOMMU enable ×4, invalidate ×2 | 1,000,000 iterations | 100 ms (done in §1e) |
+
+xHCI bounds come from the specification — 16 ms for reset, 500 ms for Controller
+Not Ready — rounded up, rather than invented. Every failure path now reports the
+microseconds it waited instead of a loop count that means nothing on another
+host. **No deadline fired in verification**: every handshake completed inside its
+bound, so these are guards rather than workarounds.
+
+`ps2_wait_in`/`ps2_wait_out` remain unconverted: they run before ACPI is parsed,
+so `HW_WAIT` would take its iteration-cap fallback and nothing would improve.
+
+### 1i — `ktime_get_ns()`: the TSC clocksource, re-anchored
+
+**Why re-anchoring is the design and not a refinement.** A TSC clock does avoid
+the PIT's catch-up bursts — `rdtsc` is read directly and nothing can bunch it
+up. But §1d measured this TSC at 3.966–4.252 GHz *within one boot*, a 7.2%
+spread, so a clock scaled by one boot-time frequency would simply trade the
+PIT's burst error for a frequency error of the same order.
+
+So the clock keeps an anchor pair and the PIT tick refreshes it against the PM
+timer about once a second:
+
+```
+ns = anchor_ns + (rdtsc() - anchor_tsc) * 1e6 / khz
+```
+
+The TSC supplies resolution between anchors, which the PM timer cannot (its
+reads are port I/O). The PM timer supplies accuracy at each anchor, which the
+TSC cannot. Drift is bounded by one anchor interval instead of accumulating.
+
+**Monotonicity across an anchor** is the one thing that can break, and it is
+handled rather than hoped for: a new anchor may never publish a value below what
+the old anchor would have reported for the same instant, so the update takes
+whichever of TSC-elapsed and PM-elapsed is larger. The clock runs marginally
+fast rather than ever stepping backwards.
+
+Measured at `-smp 4`, three runs, against 50 ms intervals timed on the PM timer:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `ktime_get_us` error | +8,144 us (**16.3%**) | +2,221 us (4.4%) | +1,118 us (2.2%) |
+| `ktime_get_ns` error | **+16 us (0.03%)** | **+29 us (0.06%)** | **+29 us (0.06%)** |
+| backward steps / 200,000 reads | 0 / 0 | 0 / 0 | 0 / 0 |
+
+**Roughly 100x to 500x more accurate, with monotonicity intact** — 1.2 million
+reads across the two clocks and six runs, zero regressions. 716–720 re-anchors
+had been performed by the time of measurement, so the mechanism is demonstrably
+live rather than dormant. Calibrated TSC: 3,813,101 kHz.
+
+`ktime_get_us` is kept as the coarse clock and its limits are documented at the
+definition; `ktime_get_ns` is the one to use when the number matters.
+
+### 1j — verification for the LAPIC and timeout work
+
+| tier | result |
+|---|---|
+| `smp4-bios` | 45 suites, 583 passed, 0 failed, 0 ranks |
+| `smp4-iommu` | 47 suites, 597 passed, 0 failed, 0 ranks |
+| `mcq` / `mcpre` / `threadstrs` | 6/0, 5/0, 14/0 |
+
+The dispatch suites matter specifically here: they run with APs preempting 4.8x
+more often than before §1f, which is real added scheduler pressure rather than a
+cosmetic change, and with every driver handshake now time-bounded.
+
 ## STANDING DEBT, carried forward
 
 - **v0.91's Objective 1b is unfinished** — 10 soak iterations passed, 100 was
