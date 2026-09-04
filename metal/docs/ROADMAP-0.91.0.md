@@ -467,6 +467,40 @@ A/B in §3a.
 
 ---
 
+## THE ARTEFACT
+
+Tagged `v0.91.0`.
+
+| | |
+|---|---|
+| artefact | `outrun-os-0.91.0.iso` |
+| md5 | `3706bb7a5ccfcd20f75e2f7ff4997cdd` |
+| sha256 | `8824b5914bc35320aaf56fa72e4a7906d75936085dae1f97783d7fc255d35922` |
+| `release-verify` | **PASS** — 45 suites reporting, 0 failing assertions, 0 rank faults, 475 s |
+
+Built from a clean tree by `make release`, checksummed, and booted from a fresh
+volume before these numbers were written down. The `.md5` and `.sha256` sit
+beside the image in `build/release/`.
+
+**The ISO is not reproducible and `make clean` destroys it** — measured during
+v0.90.0, where two builds of one unchanged tree produced different checksums
+because `grub-mkrescue` embeds non-deterministic data. A checksum names one
+artefact and never a source state.
+
+**Gate coverage for this tag**, on the pre-bump build (identical but for the two
+version strings):
+
+| tier | result |
+|---|---|
+| smp4-bios | 45 suites, 583 passed, 0 failed, 0 ranks |
+| smp4-iommu ×4 | 47 suites, `capdma` 12/0 every boot; 3 of 4 fully clean |
+| release-verify (uniprocessor) | 45 suites, 0 failing, 0 ranks |
+
+**Not covered, said plainly:** `gate-dirty` and `gate-dirty-smp` were not run for
+this tag — they last ran at v0.90.0. `uniprocessor`, `smp2` and `smp8` fresh
+tiers were not re-run after the version bump. One of four `smp4-iommu` boots
+failed `langstrs` on a wall-clock budget; see the host constraint above.
+
 ## DELIVERED IN v0.91.0
 
 | | commit | what it is |
