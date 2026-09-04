@@ -221,8 +221,68 @@ a security-relevant check is worse than leaving it documented. The tree is at
 4. Make the wait a deadline. It is not the cause, but a spin count is the wrong
    shape for a hardware wait and CLAUDE.md forbids it.
 
-**Not established either way: whether a confined device is actually blocked.**
-The page tables say it should be. The live proof has never worked. That gap is
+### 2c — RESOLVED: the NIC arrived broken, and a reset fixes it
+
+**Correction first, because it was recorded above as fact and was not.** §2a says
+"`vfiostrs` runs earlier and takes the device through VFIO". That is **wrong**.
+`vfiostrs` registers a *synthetic* device (`g_vfio_test_dev` at `n_kdev`, BAR
+magic `0xCAFEBABE`) precisely so no real device IRQ line is hijacked; it never
+touches the NIC. That claim was inferred from suite ordering and stated without
+being checked, and it is the fifth attribution in this investigation to be
+falsified.
+
+**Measured, at last.** A probe placed in `capdma` BEFORE any confinement:
+
+```
+PRE-CONFINE probe: avail 2 -> 3, used 2 -> 2 after 300 tick(s)
+```
+
+The driver published a descriptor and kicked; the device consumed nothing, for
+three full seconds, entirely unconfined. **The NIC arrives at `capdma` already
+broken**, and the kernel's own `[iommu]` banner, printed immediately before, says
+why:
+
+> *"a blocked DMA puts a virtio device into its broken state, so it is exercised
+> exactly once"*
+
+That is virtio `DEVICE_NEEDS_RESET`: a device whose DMA is refused stops
+servicing its queues permanently, and only a full reset clears it. A DMA gets
+refused earlier in the boot, around the IOMMU suite enabling translation. Whether
+that lands is timing-dependent — which is the whole flake, and why every
+explanation assuming the fault was inside `capdma` was wrong.
+
+**The fix** is `vnet_reinit()`: status reset, feature renegotiation, queue
+re-registration, `DRIVER_OK`, all tick-bounded, called before the probe and
+asserted (a reset that did not take is not a working NIC). The fault poll is now
+a 3-second deadline rather than a 2,000,000-iteration spin.
+
+| | before | after |
+|---|---|---|
+| `capdma` result | ~50% flake, 10 or 11 of 11 | **12 of 12, four boots of four** |
+| fault recorded | ~50% of boots | **4 of 4** |
+| verdict line | alternated | `CAPABILITY-BOUND DMA VERIFIED` ×4 |
+
+**The original assertion was restored, and calling it unsound was an
+overcorrection.** `caught && sid == bdf` is not a proxy: a DMAR fault carrying
+this device's source-id IS the hardware reporting it refused that device's
+access. It was only ever unreliable because no DMA was attempted on a broken
+NIC, so no fault could exist — which read as a confinement failure and was not
+one.
+
+An attempt to assert non-completion via the used ring was tried and **abandoned
+on evidence**: even after a successful reset the NIC does not retire a TX
+descriptor at this point in the boot, unconfined, within three seconds. An
+assertion built on that would test nothing. It remains as a printed observation
+labelled as unusable, so the next reader does not re-derive it.
+
+**So: a confined device IS blocked, and the proof now works.** That reverses the
+open question §2a left.
+
+**Not covered:** one of the four boots failed `langstrs` (exit 970, a compiler
+wall-clock budget) while passing 10/0 in the others. That suite touches nothing
+here and the failure is this host's documented slow-host symptom, but it is
+recorded rather than filtered out — 3 of 4 boots were clean across all 47 suites,
+not 4 of 4. That gap is
 the whole reason this assertion exists and it is still open.
 
 ### 2b — DONE: DMA mapping bounds audit
