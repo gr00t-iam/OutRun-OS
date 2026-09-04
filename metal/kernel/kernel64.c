@@ -14692,6 +14692,78 @@ extern char ap_tramp_start[], ap_tramp_end[];
 static inline uint32_t lapic_r(uint32_t off) { return *(volatile uint32_t *)(LAPIC_V + off); }
 static inline void lapic_w(uint32_t off, uint32_t v) { *(volatile uint32_t *)(LAPIC_V + off) = v; }
 static inline void lapic_eoi(void) { lapic_w(0xB0, 0); }
+/* ===========================================================================
+ * v0.92 OBJECTIVE 4: SUB-MILLISECOND SLEEP
+ * ===========================================================================
+ * WHAT THIS IS NOT, first, because the name invites the wrong assumption: this
+ * is not a blocking sleep at sub-millisecond resolution. It cannot be, on this
+ * kernel, and the reason is structural rather than a shortcut.
+ *
+ * Ring-3 parking exists (block_ring3_locked) and it is real — threads genuinely
+ * leave the run queue. But `wait_deadline` is expressed in g_ticks and the scan
+ * that honours it, futex_timeout_scan, runs from the 100 Hz PIT tick. A parked
+ * thread therefore cannot be woken sooner than the next tick: the wakeup
+ * granularity is 10 ms no matter what deadline is asked for. Sleeping 100 us by
+ * parking would sleep somewhere between 0 and 10 ms, which is not a sleep.
+ *
+ * Making it a true block would mean waking on something finer than the tick —
+ * reprogramming the LAPIC one-shot per deadline, i.e. a tickless timer wheel.
+ * That is a scheduler change, it would reprogram the very timer v0.92 just
+ * calibrated to a uniform 100 Hz quantum, and it is not something to fold into
+ * a sleep primitive.
+ *
+ * SO THIS IS A YIELDING POLL against a ktime_get_ns deadline, and it is honest
+ * about the trade: accurate to microseconds, and it keeps the caller runnable.
+ *   - under 100 us: udelay, a straight PM-timer poll. Nothing else is worth a
+ *     scheduling decision at that scale.
+ *   - 100 us and above: poll the deadline through krelax(), which yields on the
+ *     BSP with the scheduler up, so other threads make progress while this one
+ *     waits. It occupies a run-queue slot; it does not occupy a core spinning.
+ *
+ * A caller that wants to give the core up entirely for a long wait should park
+ * on a futex with a tick deadline, which is what that mechanism is for. */
+#define KSLEEP_POLL_THRESHOLD_US 100ull
+
+/* v0.92: CLOCK_REALTIME's offset from CLOCK_MONOTONIC. Zero, and it stays zero
+ * until something can supply a real epoch: there is no RTC on this machine and
+ * no time protocol. Kept as a named variable rather than folded away so the one
+ * place that would change is obvious. */
+static uint64_t g_realtime_off_ns = 0;
+
+static void ksleep_us(uint64_t us) {
+    if (!us) return;
+    if (us < KSLEEP_POLL_THRESHOLD_US) { udelay(us); return; }
+    /* THE DEADLINE COMES FROM THE PM TIMER, NOT FROM ktime_get_ns, and that is a
+     * correction rather than a preference. The first version used ktime_get_ns
+     * and a 10 ms sleep came back 720 us SHORT, which is the one outcome a sleep
+     * must never produce — an overshoot means the machine was busy, but an early
+     * return means the deadline was wrong.
+     *
+     * ktime_get_ns is monotonic by construction because each re-anchor takes
+     * max(pm_elapsed, tsc_elapsed); that guarantee is exactly what lets it
+     * RATCHET AHEAD of real time and never settle back, and it was measured
+     * running 8.7% fast in the window where the short sleep happened. A deadline
+     * computed from a clock that runs fast expires early.
+     *
+     * The PM timer cannot run fast: its rate is fixed by specification. So the
+     * sleep polls it directly, exactly as udelay does, and yields between reads
+     * so other threads still make progress. ktime_get_ns remains the right clock
+     * for timestamping and ordering; it is not the right clock for a deadline. */
+    if (!g_pmt_port) {                       /* no ground truth: the old path   */
+        uint64_t target = ktime_get_ns() + us * 1000ull;
+        while ((int64_t)(ktime_get_ns() - target) < 0) krelax();
+        return;
+    }
+    while (us) {
+        uint64_t chunk = us > 4000000ull ? 4000000ull : us;   /* stay inside one wrap */
+        uint32_t want = (uint32_t)((chunk * ACPI_PM_HZ) / 1000000ull);
+        if (!want) want = 1;
+        uint32_t start = acpi_pm_read();
+        while (acpi_pm_delta(start, acpi_pm_read()) < want) krelax();
+        us -= chunk;
+    }
+}
+
 /* v0.92: LAPIC TIMER CALIBRATION, per core.
  *
  * The AP slice timer was armed with a hardcoded initial count of 3,000,000 at
@@ -20834,6 +20906,67 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         cmemcpy((void *)a1, &st, sizeof st);
         return 0;
     }
+    /* ===== v0.92 OBJECTIVE 4: POSIX TIMEKEEPING ==========================
+     * timespec here is TWO 64-BIT WORDS, { tv_sec, tv_nsec }, because occ's
+     * `int` is a machine word and the tree's other two-word out-buffers
+     * (SYS_STAT, SYS_PIPE) set that precedent. A 32-bit tv_nsec would pack
+     * wrong when written from a C kernel and read by an occ-compiled program.
+     *
+     * CLOCK_REALTIME IS NOT WALL-CLOCK TIME ON THIS MACHINE, and it says so
+     * rather than inventing an epoch. There is no RTC — the kernel states that
+     * outright where g_ticks is defined — and no NTP, so nothing here knows
+     * what year it is. REALTIME therefore returns the same monotonic value as
+     * MONOTONIC, measured from boot. It is wired because the syscall shape is
+     * what ring 3 needs and a later RTC or a set-time call can supply the
+     * offset in one place; it is not wired to pretend the number means more
+     * than it does. */
+    case 104: {  /* SYS_CLOCK_GETTIME(clockid, timespec*) -> 0, or negative */
+        if (a0 != 0 && a0 != 1) return (uint64_t)-22;          /* EINVAL       */
+        if (!access_ok(kprocs[current_proc_idx].cr3, a1, 16, 1)) return (uint64_t)-14;
+        uint64_t ns = ktime_get_ns() + (a0 == 1 ? g_realtime_off_ns : 0);
+        ((uint64_t *)a1)[0] = ns / 1000000000ull;              /* tv_sec       */
+        ((uint64_t *)a1)[1] = ns % 1000000000ull;              /* tv_nsec      */
+        return 0;
+    }
+    case 105: {  /* SYS_CLOCK_GETRES(clockid, timespec*) -> 0, or negative
+                  *
+                  * REPORTS WHAT THE CLOCK CAN ACTUALLY RESOLVE, not the unit it
+                  * is expressed in. Returning 1 ns because the value is in
+                  * nanoseconds would be a lie a caller could act on: the clock
+                  * is a TSC scaled by a calibrated kHz figure, so one TSC tick
+                  * is the floor. At the measured ~3.81 GHz that is 1 ns after
+                  * rounding, but it is DERIVED here rather than asserted, and
+                  * on a slower TSC it would honestly report more. */
+        if (a0 != 0 && a0 != 1) return (uint64_t)-22;
+        if (!access_ok(kprocs[current_proc_idx].cr3, a1, 16, 1)) return (uint64_t)-14;
+        uint64_t res_ns = g_tsc_khz ? (1000000ull / g_tsc_khz) : 10000000ull;
+        if (!res_ns) res_ns = 1;                               /* sub-ns floors to 1 */
+        ((uint64_t *)a1)[0] = 0;
+        ((uint64_t *)a1)[1] = res_ns;
+        return 0;
+    }
+    case 106: {  /* SYS_NANOSLEEP(const timespec *req, timespec *rem) -> 0, or negative
+                  *
+                  * `rem` is written as zero on the normal return. This kernel
+                  * delivers no signals to a sleeping ring-3 thread, so a sleep
+                  * here is never interrupted early and a non-zero remainder
+                  * cannot arise. Zeroing it rather than ignoring it keeps a
+                  * caller that checks `rem` correct if interruption is ever
+                  * added. */
+        if (!access_ok(kprocs[current_proc_idx].cr3, a0, 16, 0)) return (uint64_t)-14;
+        uint64_t sec = ((const uint64_t *)a0)[0], nsec = ((const uint64_t *)a0)[1];
+        if (nsec >= 1000000000ull) return (uint64_t)-22;        /* EINVAL       */
+        /* Cap at 60 s. A ring-3 process cannot be allowed to pin a scheduler
+         * slot for an unbounded time on a request it may have computed wrongly,
+         * and every suite in this tree finishes far inside that. */
+        if (sec > 60) sec = 60;
+        uint64_t us = sec * 1000000ull + nsec / 1000ull;
+        ksleep_us(us);
+        if (a1 && access_ok(kprocs[current_proc_idx].cr3, a1, 16, 1)) {
+            ((uint64_t *)a1)[0] = 0; ((uint64_t *)a1)[1] = 0;
+        }
+        return 0;
+    }
     case 67:     /* SYS_GETTID() -> this THREAD's own id.
                   * 0 for a process that never called SYS_THREAD_CREATE, so
                   * single-threaded code sees a stable, meaningful value rather
@@ -22887,6 +23020,57 @@ static void cmd_timebench(void) {
         kprintf("[timebench] ktime_get_ns: advanced %u us over a %u us delay (delta %u us), "
                 "%u backward step(s) in 200000 reads, %u re-anchor(s) so far, TSC %u kHz\n",
                 ns_us, pm_us2, d2, (uint64_t)(int64_t)back2, g_anchor_count, g_tsc_khz);
+
+        /* (6) v0.92 Objective 4: ksleep_us fidelity at the three scales the
+         * brief names, each timed on the PM timer rather than on the clock the
+         * sleep itself uses — measuring a sleep with its own deadline source
+         * would only prove the arithmetic, not the outcome. 100 us sits below
+         * KSLEEP_POLL_THRESHOLD_US and takes the udelay path; the other two
+         * take the yielding-poll path, so both branches are exercised. */
+        static const uint64_t want_us[3] = { 100, 1000, 10000 };
+        for (int s = 0; s < 3; s++) {
+            uint32_t s0 = acpi_pm_read();
+            ksleep_us(want_us[s]);
+            uint64_t got = (uint64_t)acpi_pm_delta(s0, acpi_pm_read()) * 1000000ull / ACPI_PM_HZ;
+            uint64_t over = got > want_us[s] ? got - want_us[s] : 0;
+            uint64_t under = got < want_us[s] ? want_us[s] - got : 0;
+            kprintf("[timebench] ksleep_us(%u): actually %u us (%s%u us) via the %s path\n",
+                    want_us[s], got, under ? "SHORT by " : "over by ", under ? under : over,
+                    want_us[s] < KSLEEP_POLL_THRESHOLD_US ? "udelay" : "yielding-poll");
+        }
+    }
+    /* (7) v0.92 Objective 4: the same clock, as RING 3 sees it. Everything above
+     * runs in the kernel; this crosses the syscall boundary, which adds a
+     * context switch, a possible migration and a re-anchor between two reads —
+     * places a backward step could appear that the kernel-side test cannot
+     * reach. See role63_clock_probe. */
+    {
+        int save = (int)current_proc_idx;
+        int p = kproc_spawn("clkprobe", PCAP_FILESYSTEM);
+        if (p < 0) { kputs("[timebench] could not spawn the ring-3 clock probe\n"); }
+        else {
+            kprocs[p].role = 63;
+            kprocs[p].affinity = 0;
+            uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+            current_proc_idx = save;
+            if (!e) kputs("[timebench] ring-3 clock probe: ELF load failed\n");
+            else {
+                kprocs[p].entry = e;
+                rq_push_any(0, p);
+                __sync_synchronize();
+                if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);
+                int ok = role_drain(63, 6000, "clkprobe");
+                current_proc_idx = save;
+                int c = kprocs[p].exit_code;
+                const char *why = c == 1870 ? "OK"
+                                : c == 1871 ? "CLOCK WENT BACKWARDS"
+                                : c == 1872 ? "clock did not advance"
+                                : c == 1873 ? "a sleep returned SHORT"
+                                            : "undecoded exit code";
+                kprintf("[timebench] ring-3 clock probe: %s (exit %u)%s\n",
+                        why, (uint64_t)c, ok ? "" : " — WATCHDOG, it never finished");
+            }
+        }
     }
     kputs("-- done --\n");
 }

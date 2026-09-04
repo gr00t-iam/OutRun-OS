@@ -412,6 +412,95 @@ The dispatch suites matter specifically here: they run with APs preempting 4.8x
 more often than before §1f, which is real added scheduler pressure rather than a
 cosmetic change, and with every driver handshake now time-bounded.
 
+### 1k — sub-millisecond sleep, and POSIX clocks in ring 3
+
+**`ksleep_us` is a yielding poll, not a block, and that is structural.** Ring-3
+parking exists (`block_ring3_locked`) and is real, but `wait_deadline` is
+expressed in `g_ticks` and `futex_timeout_scan` runs off the 100 Hz tick, so a
+parked thread cannot wake sooner than **10 ms** whatever deadline it asks for.
+Sleeping 100 us by parking would sleep somewhere between 0 and 10 ms. A true
+sub-millisecond block needs a tickless LAPIC one-shot per deadline — a scheduler
+change that would reprogram the timer §1f just calibrated to a uniform 100 Hz,
+and not something to fold into a sleep primitive.
+
+So: `udelay` below 100 us, and above it a poll that yields through `krelax()`, so
+the caller occupies a run-queue slot rather than a core.
+
+**THE FIRST VERSION RETURNED SHORT, WHICH IS THE ONE OUTCOME A SLEEP MUST NOT
+PRODUCE.** It derived its deadline from `ktime_get_ns()`, and one run gave:
+
+```
+ksleep_us(10000): actually 9280 us (SHORT by 720 us)
+ktime_get_ns: advanced 54369 us over a 50001 us delay   <- 8.7% fast
+```
+
+Both from the same run, and the second explains the first. `ktime_get_ns`
+guarantees monotonicity by taking `max(pm_elapsed, tsc_elapsed)` at every
+re-anchor — and that guarantee is precisely what lets it **ratchet ahead of real
+time and never settle back**. A deadline computed from a clock running fast
+expires early.
+
+The fix is not to weaken the monotonicity guarantee, which callers depend on: it
+is to stop using that clock for deadlines. `ksleep_us` now polls the PM timer
+directly, whose rate is fixed by specification and cannot run fast.
+**`ktime_get_ns` is the right clock for timestamping and ordering; it is not the
+right clock for a deadline**, and that is now stated at both definitions.
+
+After the fix, 15 measurements across five rounds at `-smp 4`:
+
+| request | measured range | short sleeps |
+|---|---|---|
+| 100 us | 158–338 us | **0** |
+| 1 ms | 1021–1150 us | **0** |
+| 10 ms | 10008–10117 us | **0** |
+
+Overshoot is 8–238 us and is the poll's own granularity plus whatever the
+scheduler was doing; it never returns early. The 10 ms case lands within 0.1% on
+its best runs.
+
+**The ring-3 probe passed both runs even while the defect was live** — its sleeps
+overshot by 54–111 us because the syscall round trip masked the drift. Only the
+kernel-side test, timed against the PM timer rather than against the clock under
+test, exposed it. That is the argument for measuring against an independent
+reference, in one line.
+
+#### The syscalls
+
+`SYS_CLOCK_GETTIME` (104), `SYS_CLOCK_GETRES` (105), `SYS_NANOSLEEP` (106).
+`timespec` is two 64-bit words `{tv_sec, tv_nsec}` — occ's `int` is a machine
+word and `SYS_STAT`/`SYS_PIPE` set that precedent; a 32-bit `tv_nsec` would pack
+wrong between a C kernel and an occ-compiled reader.
+
+**`CLOCK_REALTIME` is boot-relative, and says so rather than inventing an
+epoch.** There is no RTC on this machine — the kernel states that where `g_ticks`
+is defined — and no time protocol, so nothing here knows what year it is.
+REALTIME returns the monotonic value; `g_realtime_off_ns` exists as a named zero
+so a future RTC or set-time call changes exactly one place.
+
+**`clock_getres` reports what the clock can resolve**, derived from `g_tsc_khz`
+rather than hardcoded to 1 ns. At the measured ~3.8 GHz that rounds to 1 ns, but
+on a slower TSC it would honestly report more.
+
+`SYS_NANOSLEEP` caps at 60 s: a ring-3 process should not pin a run-queue slot
+for an unbounded time on a value it may have computed wrongly, and every suite
+here finishes far inside that. `rem` is zeroed rather than ignored — this kernel
+delivers no signals to a sleeping thread so a remainder cannot arise today, and
+zeroing keeps a caller that checks it correct if interruption is ever added.
+
+#### Ring 3, and role 63
+
+`oclock_ns` / `omono_us` / `onanosleep_us` give ring 3 microseconds for the first
+time; every ring-3 budget in this tree was previously `osysticks()` at 10 ms
+granularity, subject to the catch-up bursts of §1g.
+
+Role 63 checks the two properties that only exist across the syscall boundary —
+monotonicity, where a context switch, a migration and a re-anchor can all fall
+between two reads, and sleep fidelity at the three scales. It treats a **short**
+sleep as the failure and an overshoot as tolerable, and it separately checks the
+clock *advances*, because a clock stuck at one value never goes backwards either
+and would otherwise pass. Five runs, all `OK (exit 1870)`, zero backward steps in
+200,000 ring-3 reads per run.
+
 ## STANDING DEBT, carried forward
 
 - **v0.91's Objective 1b is unfinished** — 10 soak iterations passed, 100 was

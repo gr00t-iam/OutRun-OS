@@ -160,6 +160,15 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_FTRUNCATE          101          /* v0.84: (fd, length) -> 0, or -errno     */
 #define SYS_RENAME             102          /* v0.85: (oldpath, newpath) -> 0, or -errno */
 #define SYS_FSTAT              103          /* v0.85: (fd, out) -> 0; out has timestamps */
+/* v0.92: POSIX timekeeping. timespec is TWO 64-BIT WORDS { tv_sec, tv_nsec } —
+ * occ's int is a machine word, and SYS_STAT/SYS_PIPE set that precedent.
+ * CLOCK_REALTIME is boot-relative on this machine: there is no RTC, so it
+ * carries the same value as CLOCK_MONOTONIC rather than a fabricated epoch. */
+#define SYS_CLOCK_GETTIME      104          /* v0.92: (clockid, timespec*) -> 0        */
+#define SYS_CLOCK_GETRES       105          /* v0.92: (clockid, timespec*) -> 0        */
+#define SYS_NANOSLEEP          106          /* v0.92: (req, rem) -> 0                  */
+#define CLOCK_MONOTONIC        0
+#define CLOCK_REALTIME         1
 
 /* v0.82: the three POSIX whence values, in POSIX's order and with POSIX's
  * numbers. They are not an internal encoding to be chosen freely — a ring-3
@@ -1720,6 +1729,31 @@ static i64 owaitpid(u32 pid, int spins) {
  * owaitpid() itself is left alone: every other caller's spin budget keeps its
  * current behaviour rather than being silently reinterpreted into a new unit. */
 #define TICKS_PER_SEC 100u
+
+/* v0.92: MICROSECONDS FROM RING 3, at last.
+ *
+ * Every ring-3 timing budget in this tree is expressed in osysticks() — g_ticks
+ * at 100 Hz, so 10 ms granularity, and (v0.92 section 1g) subject to the
+ * emulated PIT's catch-up bursts, which make a tick count overstate elapsed
+ * time by 8-21% across a stall. These read the TSC clocksource instead, which
+ * measured 0.03-0.06% against the ACPI PM timer.
+ *
+ * Returns 0 if the syscall fails, which a caller must treat as "no measurement"
+ * rather than "no time passed" — the same trap osysticks documents. */
+static u64 oclock_ns(u64 clkid) {
+    u64 ts[2];
+    if ((i64)sysc(SYS_CLOCK_GETTIME, clkid, (u64)(void *)ts, 0) != 0) return 0;
+    return ts[0] * 1000000000ull + ts[1];
+}
+static u64 omono_us(void) { u64 ns = oclock_ns(CLOCK_MONOTONIC); return ns / 1000ull; }
+
+/* Sleep. Sub-millisecond requests are honoured by the kernel as a yielding
+ * poll rather than a park — see ksleep_us — so they are accurate but keep this
+ * thread runnable. */
+static void onanosleep_us(u64 us) {
+    u64 req[2]; req[0] = us / 1000000ull; req[1] = (us % 1000000ull) * 1000ull;
+    sysc(SYS_NANOSLEEP, (u64)(const void *)req, 0, 0);
+}
 
 static u32 osysticks(void) {
     /* 24-byte header + up to 12 x 32-byte entries. */
@@ -3445,6 +3479,65 @@ static void append_smp_worker(u32 idx) {
  * did for threadstrs instead of widening its guard. */
 #define R62_ITERS    768u
 #define R62_T        6000u          /* ticks; 100 Hz, so 60 s */
+/* ===========================================================================
+ * v0.92 ROLE 63: THE CLOCK, AS RING 3 SEES IT
+ * ===========================================================================
+ * Everything v0.92 measured about the clocks was measured in the kernel. This
+ * checks the two properties that only matter once the numbers cross into ring 3
+ * through a syscall, and it checks them under whatever SMP contention the
+ * phase's other workers are producing.
+ *
+ *   MONOTONICITY. A clock that steps backwards breaks any ring-3 program that
+ *   subtracts two readings, and the syscall path adds a place for it to happen
+ *   that the kernel-side test cannot see: two reads can be separated by a
+ *   context switch, a migration to another core, and a re-anchor.
+ *
+ *   SLEEP FIDELITY at the three scales the kernel-side test uses, so the two
+ *   can be compared and the syscall's own overhead is visible as the
+ *   difference.
+ *
+ * Reports by exit code, one sentinel and a distinct code per rule, and prints
+ * the measurements so a failure says which number was wrong.
+ *   1870 ok   1871 clock went backwards   1872 clock did not advance
+ *   1873 a sleep was SHORT (worse than long: a deadline that returns early is
+ *        a broken deadline, where an overshoot is a busy machine) */
+#define R63_READS 200000u
+static void role63_clock_probe(void) {
+    /* (1) monotonicity across the syscall boundary */
+    u64 back = 0, last = omono_us();
+    if (!last) sysc(SYS_EXIT, 1872, 0, 0);
+    for (u32 i = 0; i < R63_READS; i++) {
+        u64 n = omono_us();
+        if (n < last) back++;
+        last = n;
+    }
+    if (back) { print("  [r63] CLOCK_MONOTONIC went BACKWARDS from ring 3\n");
+                sysc(SYS_EXIT, 1871, 0, 0); }
+
+    /* (2) it must actually advance — a clock stuck at one value never goes
+     * backwards either, and would pass the check above having proved nothing */
+    u64 t0 = omono_us();
+    onanosleep_us(2000);
+    if (omono_us() <= t0) { print("  [r63] CLOCK_MONOTONIC did not advance\n");
+                            sysc(SYS_EXIT, 1872, 0, 0); }
+
+    /* (3) sleep fidelity, measured with the clock the caller would use */
+    static const u64 want[3] = { 100, 1000, 10000 };
+    int short_sleep = 0;
+    for (int s = 0; s < 3; s++) {
+        u64 a = omono_us();
+        onanosleep_us(want[s]);
+        u64 got = omono_us() - a;
+        print("  [r63] nanosleep "); hex(want[s]);
+        print(" us -> "); hex(got); print(" us\n");
+        /* A short sleep is the real failure. Allow one microsecond of slack for
+         * the read-to-read overhead of the two syscalls that bracket it. */
+        if (got + 1 < want[s]) short_sleep = 1;
+    }
+    if (short_sleep) sysc(SYS_EXIT, 1873, 0, 0);
+    sysc(SYS_EXIT, 1870, 0, 0);
+}
+
 static void role62_ofile_stress(void) {
     u64 backoff = 0;                /* table-full retries: contention, observed */
     u64 made    = 0;
@@ -6163,6 +6256,7 @@ int main(int argc, const char **argv, const char **envp) {
      * travel that way. */
     if (role >= 56 && role <= 59) { append_smp_worker((u32)(role - 56)); }
     if (role == 60) { meta_worker(); }                 /* v0.85 VFS metadata from ring 3 */
+    if (role == 63) { role63_clock_probe(); }          /* v0.92 CLOCK_MONOTONIC + nanosleep from ring 3 */
     if (role == 62) { role62_ofile_stress(); }         /* v0.90 g_ofile_lock descriptor contention */
     if (role == 61) { cas_contend_worker(); }          /* v0.89 CAS index/bitmap contention soak */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
