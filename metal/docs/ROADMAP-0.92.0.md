@@ -1,7 +1,57 @@
 # OutRun OS v0.92 — subsystem isolation, memory reclamation, IPC latency
 
-Status: **draft, cycle not opened.** `VERSION` still reads `0.91.0` at the time
-of writing; nothing here is a commitment and nothing has been measured.
+Status: **RELEASED**, tagged `v0.92.0`.
+
+## THE ARTEFACT
+
+| | |
+|---|---|
+| artefact | `outrun-os-0.92.0.iso` |
+| md5 | `becf2d8e24902349e4e3542c1240e50c` |
+| sha256 | `e73f8a6435146a3c3a29b3f673ca3969d9c7a9d494b4312c216c9d8ec653b8cc` |
+| `release-verify` | **PASS** — 45 suites reporting, 0 failing assertions, 0 rank faults, 455 s |
+
+Built from a clean tree by `make release`, checksummed, and booted from a fresh
+volume before these numbers were written down.
+
+**`VERSION` had been left at `0.91.0` for this entire cycle**, so every build in
+it produced `outrun-os-0.91.0.iso`. The tag therefore points at the bump commit
+rather than at the last code commit — tagging the latter would have published
+v0.91.0-named artefacts under a `v0.92.0` tag, which is the v0.75.0 failure the
+release protocol exists to make impossible. Caught by the protocol, not by luck.
+
+**Gate coverage for this tag:**
+
+| tier | result |
+|---|---|
+| `smp4-bios` | 45 suites, 583 passed, 0 failed, 0 ranks |
+| `smp4-iommu` | 47 suites, 597 passed, 0 failed, 0 ranks |
+| soak `-smp 4`, 4 iterations | 0 failing, 0 ranks, 0 panics |
+| soak `-smp 8`, 3 iterations | 0 failing, 0 ranks, 0 panics |
+| `release-verify` (uniprocessor) | 45 suites, 0 failing, 0 ranks |
+
+**Not covered, said plainly:** `uniprocessor`, `smp2-bios` and `smp8-bios` fresh
+tiers were not re-run against the final build; `gate-dirty` and `gate-dirty-smp`
+have not run since v0.90.0. The soaks above are the closest thing this cycle has
+to sustained-load evidence.
+
+## WHAT THIS CYCLE ACTUALLY FOUND
+
+Five objectives were set. What they produced, in one place:
+
+| | finding |
+|---|---|
+| **§1d** | The TSC and PIT disagreed by 7.6% within a boot and nothing could say which was wrong. A third clock — the ACPI PM timer at port 0x608 — settled it in one boot: **the PIT is accurate to ±0.03%; the TSC spans 7.2%.** |
+| **§1f** | The AP preemption quantum was **48 ms, not 10 ms** — the hardcoded LAPIC count was 4.8x too large, so APs preempted at ~21 Hz against the BSP's 100 Hz for the entire life of the AP scheduler. |
+| **§1g** | The emulated PIT delivers **coalesced catch-up bursts**; a tick count overstates elapsed time by 8–21%. |
+| **§1h** | **Four virtio reset waits had no bound at all** — `while (status != 0) { }`. A device that never cleared status would hang the machine with no output. |
+| **§1i** | A re-anchored TSC clocksource is **~100–500x more accurate** than the tick-derived one (0.03–0.06% vs 8–21%), with zero backward steps in 1.2 M reads. |
+| **§1l** | A stated prediction — that real-time deadlines would reduce worker expiries — was **falsified**. The expiries are real: `append-oversub` needs 82–87 s against a 60 s budget on this host. |
+
+Three of those six are things that had been wrong for milestones and that no
+suite could see, because nothing measured them. One is a prediction of mine that
+the measurement destroyed. Both categories are why the cycle is written up this
+way.
 
 ## WHERE THIS STARTS
 
@@ -294,39 +344,6 @@ moment to weigh the switch, with the re-baselining pass it requires.
 
 ---
 
-## Objective 2 — scheduling and memory reclamation
-
-**Deliberately unspecified until something is measured.** v0.89 recorded a
-measured *no* on descriptor-layer optimisation after finding `g_ofile_lock` at
-~1% under real traffic; v0.90 shipped a lock decoupling whose benefit turned out
-to be ~4% and said so rather than rounding up. The pattern worth keeping is that
-the measurement chooses the work.
-
-Candidates, in the order the existing evidence supports them:
-
-1. **Where the time actually goes.** v0.91 built `vfsbench` and it reports that
-   a 512-byte read spends most of its time in `cas_get` — hashing and copying
-   under the rank-3 CAS lock — not in the VFS layer that was optimised. That is
-   a lead nobody has followed. The same instrument extended to attribute time
-   per layer would say whether the CAS hash, the block copy, or the journal is
-   the cost.
-2. **Frame reclamation.** `alloc_frame` has no counterpart in the audited paths;
-   what the kernel does under sustained allocation pressure over a long boot has
-   never been measured. `role 62` and the CAS soak both allocate heavily and both
-   only assert that accounting returns to its pre-phase value, which is a
-   correctness claim and not a fragmentation one.
-3. **IPC latency across cores.** The `mcq`/`mcpre` suites establish correctness
-   of cross-core dispatch and say nothing about its cost. `vfsbench`'s histogram
-   is reusable: the same log2-bucket approach applied to a ring-3 round trip
-   would give p50/p95/p99 in TSC cycles.
-
-**None of these is committed to.** Objective 1 comes first for a concrete
-reason: any latency figure taken before the host is characterised measures the
-host, and this cycle has already spent a great deal of effort learning that the
-hard way.
-
----
-
 ### 1h — driver timeouts, and four waits that had no bound at all
 
 The brief asked for NVMe, AHCI, VirtIO and xHCI. **NVMe and AHCI do not exist in
@@ -572,6 +589,39 @@ every expiry correctly tolerated rather than decoded as a defect.
 **Sub-millisecond spans no longer round to zero:** `ofilestrs` completes 768
 iterations across 16 workers in 77–81 ticks, a span that a 10 ms clock can barely
 resolve and that `omono_us()` reports in microseconds.
+
+## Objective 2 — scheduling and memory reclamation
+
+**Deliberately unspecified until something is measured.** v0.89 recorded a
+measured *no* on descriptor-layer optimisation after finding `g_ofile_lock` at
+~1% under real traffic; v0.90 shipped a lock decoupling whose benefit turned out
+to be ~4% and said so rather than rounding up. The pattern worth keeping is that
+the measurement chooses the work.
+
+Candidates, in the order the existing evidence supports them:
+
+1. **Where the time actually goes.** v0.91 built `vfsbench` and it reports that
+   a 512-byte read spends most of its time in `cas_get` — hashing and copying
+   under the rank-3 CAS lock — not in the VFS layer that was optimised. That is
+   a lead nobody has followed. The same instrument extended to attribute time
+   per layer would say whether the CAS hash, the block copy, or the journal is
+   the cost.
+2. **Frame reclamation.** `alloc_frame` has no counterpart in the audited paths;
+   what the kernel does under sustained allocation pressure over a long boot has
+   never been measured. `role 62` and the CAS soak both allocate heavily and both
+   only assert that accounting returns to its pre-phase value, which is a
+   correctness claim and not a fragmentation one.
+3. **IPC latency across cores.** The `mcq`/`mcpre` suites establish correctness
+   of cross-core dispatch and say nothing about its cost. `vfsbench`'s histogram
+   is reusable: the same log2-bucket approach applied to a ring-3 round trip
+   would give p50/p95/p99 in TSC cycles.
+
+**None of these is committed to.** Objective 1 comes first for a concrete
+reason: any latency figure taken before the host is characterised measures the
+host, and this cycle has already spent a great deal of effort learning that the
+hard way.
+
+---
 
 ## STANDING DEBT, carried forward
 
