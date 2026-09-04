@@ -479,6 +479,13 @@ static void pit_init(void) {
 
 static volatile uint64_t g_ticks = 0;
 
+/* v0.92: records the ACPI PM counter at each PIT tick edge, giving ktime_get_us
+ * its sub-tick resolution. Declared here for the same reason as the IRQ state
+ * below — the tick ISR is defined near the top of this file and the PM timer
+ * some 3,500 lines further down. Defined with the PM timer, called from the
+ * tick. A no-op until the PM timer is found. */
+static void ktime_tick_stamp(void);
+
 /* v0.47: IRQ-line pending state for ring-3 VFIO waiters, declared here (not
  * with the rest of the v0.47 VFIO section further down) because isr_dispatch
  * — defined just below, long before struct kproc/kdev exist — needs to bump
@@ -709,6 +716,14 @@ void isr_dispatch(struct isr_frame *f) {
     }
     if (f->vector == 32) {
         g_ticks++; sweep_tick();                     /* PIT + incremental audit */
+        /* v0.92: publish the PM reading at this tick edge so ktime_get_us can
+         * refine g_ticks to microseconds. One port read per tick at 100 Hz, and
+         * it happens here — immediately after the increment, before anything
+         * below can divert — so the baseline and the tick it belongs to are
+         * always published together. A call rather than the read inline: the
+         * PM timer is defined some 3,500 lines further down and this ISR is
+         * near the top of the file. */
+        ktime_tick_stamp();
         /* v0.47: cmd_vfio_stress's simulated device interrupt — fires once,   */
         /* from the SAME timer path that already drives everything else here,  */
         /* rather than a separate injection mechanism. */
@@ -4382,6 +4397,70 @@ static inline void mdelay(uint64_t ms) { udelay(ms * 1000ull); }
 static inline uint64_t acpi_pm_us_since(uint32_t start) {
     if (!g_pmt_port) return 0;
     return (uint64_t)acpi_pm_delta(start, acpi_pm_read()) * 1000000ull / ACPI_PM_HZ;
+}
+
+/* ===========================================================================
+ * v0.92: MONOTONIC MICROSECONDS
+ * ===========================================================================
+ * The kernel had no wall-clock primitive: g_ticks at 100 Hz is a 10 ms counter,
+ * and the TSC was shown in section 1d to move 7.2% within a single boot, so
+ * neither answers "how long has it been" on its own.
+ *
+ * This combines them the way each is good: g_ticks supplies a monotonic 64-bit
+ * base that cannot wrap in any realistic uptime, and the PM timer supplies
+ * sub-tick resolution. The PIT ISR records the PM reading at each tick edge,
+ * one port read per tick at 100 Hz, and this reads the offset since it.
+ *
+ * LOCKLESS AND IRQ-SAFE BY CONSTRUCTION, using g_ticks as its own sequence
+ * counter — the seqlock idiom without a lock. The tick and its PM baseline are
+ * published by the same ISR, so re-reading g_ticks and finding it unchanged
+ * proves the baseline belongs to that tick. A concurrent tick on another core
+ * cannot corrupt the pair because only the BSP's PIT ISR writes either.
+ *
+ * The sub-tick offset is CLAMPED to one tick. If a tick is delivered late —
+ * which under emulation happens whenever the host deschedules qemu — the raw
+ * offset can exceed 10 ms, and returning it unclamped would let the clock run
+ * ahead of the next tick and then appear to go backwards. Clamping loses
+ * accuracy across a stall and preserves monotonicity, which is the property
+ * callers actually depend on.
+ *
+ * MEASURED, AND IT IS MONOTONIC BUT NOT ACCURATE. Over three 50 ms intervals
+ * timed against the PM timer it reported 55,417 / 60,491 / 54,104 us — an
+ * overshoot of 8% to 21% — while taking ZERO backward steps in 200,000 reads
+ * per run.
+ *
+ * The overshoot is inherited from g_ticks and is not fixable here. Across a
+ * genuine 50 ms window this clock saw g_ticks advance five edges sometimes and
+ * six others: the emulated PIT delivers COALESCED CATCH-UP interrupts after the
+ * host deschedules qemu, several ticks arriving back-to-back, so tick-derived
+ * time runs ahead of real time. Boot calibration reads 99.99 Hz because its
+ * window is short and edge-bounded; a window containing a stall is where this
+ * shows.
+ *
+ * SO: use this for ordering and for coarse elapsed time, where monotonicity is
+ * the requirement. Do NOT use it to measure a duration that matters — the PM
+ * timer itself (acpi_pm_us_since) is the accurate instrument and is what
+ * udelay and HW_WAIT are built on. A caller wanting both would have to extend
+ * the PM timer's 24 bits in software, which nothing here yet needs. */
+static volatile uint32_t g_tick_pm = 0;      /* PM counter at the last tick edge */
+
+static void ktime_tick_stamp(void) { if (g_pmt_port) g_tick_pm = acpi_pm_read(); }
+
+static uint64_t ktime_get_us(void) {
+    for (;;) {
+        uint64_t t0 = g_ticks;
+        uint32_t base = g_tick_pm;
+        __sync_synchronize();
+        uint64_t sub = 0;
+        if (g_pmt_port && base) {
+            uint64_t d = (uint64_t)acpi_pm_delta(base, acpi_pm_read());
+            sub = (d * 1000000ull) / ACPI_PM_HZ;
+            if (sub > 9999ull) sub = 9999ull;    /* clamp: never cross the tick   */
+        }
+        __sync_synchronize();
+        if (g_ticks == t0) return t0 * 10000ull + sub;
+        /* a tick landed mid-read: the baseline is stale, take the next one */
+    }
 }
 
 /* v0.92: WAIT ON HARDWARE FOR A TIME, NOT FOR A NUMBER OF LOOPS.
@@ -14496,6 +14575,46 @@ extern char ap_tramp_start[], ap_tramp_end[];
 static inline uint32_t lapic_r(uint32_t off) { return *(volatile uint32_t *)(LAPIC_V + off); }
 static inline void lapic_w(uint32_t off, uint32_t v) { *(volatile uint32_t *)(LAPIC_V + off) = v; }
 static inline void lapic_eoi(void) { lapic_w(0xB0, 0); }
+/* v0.92: LAPIC TIMER CALIBRATION, per core.
+ *
+ * The AP slice timer was armed with a hardcoded initial count of 3,000,000 at
+ * divider 16, commented "~tens of ms" — a number derived from nothing, so the
+ * preemption quantum was whatever that happened to produce on whatever machine
+ * it was written for. Every scheduling figure this tree has ever reported rests
+ * on it.
+ *
+ * Measured against the PM timer rather than g_ticks, because only the BSP's PIT
+ * ISR advances g_ticks and this has to run on an AP that has not yet joined
+ * anything. The PM timer is readable from any core, needs no lock, and is the
+ * ground truth established in section 1d.
+ *
+ * Returns the initial count for a 10 ms (100 Hz) period, or 0 if it could not
+ * measure — in which case the caller keeps the historical constant rather than
+ * arming a timer of unknown period. */
+static uint32_t lapic_timer_calibrate(uint32_t *hz_out) {
+    if (hz_out) *hz_out = 0;
+    if (!g_pmt_port) return 0;
+    lapic_w(0x3E0, 0x3);                       /* divider 16, as before         */
+    lapic_w(0x320, 0x10000 | 51);              /* one-shot, MASKED while we count */
+    lapic_w(0x380, 0xFFFFFFFFu);               /* count down from the top        */
+
+    uint32_t pm0 = acpi_pm_read();
+    uint32_t want = ACPI_PM_HZ / 100;          /* ~10 ms of PM counts            */
+    while (acpi_pm_delta(pm0, acpi_pm_read()) < want) __asm__ volatile("pause");
+    uint32_t remaining = lapic_r(0x390);       /* current count                  */
+    uint32_t pmd = acpi_pm_delta(pm0, acpi_pm_read());
+    lapic_w(0x380, 0);                         /* stop                           */
+
+    if (!pmd || remaining == 0) return 0;      /* wrapped or no progress: unusable */
+    uint64_t elapsed = 0xFFFFFFFFull - (uint64_t)remaining;
+    uint64_t us = ((uint64_t)pmd * 1000000ull) / ACPI_PM_HZ;
+    if (!us) return 0;
+    uint64_t per_sec = (elapsed * 1000000ull) / us;
+    if (hz_out) *hz_out = (uint32_t)per_sec;
+    uint64_t per_10ms = per_sec / 100ull;
+    if (per_10ms < 1000 || per_10ms > 0xFFFFFFFFull) return 0;   /* implausible   */
+    return (uint32_t)per_10ms;
+}
 
 static uint32_t cpu_idx(void) {
     if (!g_gs_ready) return 0;
@@ -15125,9 +15244,30 @@ static void __attribute__((noreturn)) ap_main(uint64_t idx) {
     /* v0.40: MY periodic slice timer (vector 51). Always armed, but the       */
     /* handler ignores ticks while g_slice_on is 0 — preemption on demand,     */
     /* the same discipline as the BSP's gated PIT preemption.                  */
+    /* v0.92: CALIBRATED, not guessed. This was `lapic_w(0x380, 3000000)`
+     * commented "~tens of ms" — a constant derived from nothing, so the AP
+     * preemption quantum was whatever that produced on whatever machine it was
+     * written for, and every scheduling figure this tree reports rested on it.
+     *
+     * Each core measures its OWN LAPIC against the ACPI PM timer, because that
+     * is the only reference readable from an AP that has not joined anything
+     * yet: g_ticks is advanced solely by the BSP's PIT ISR.
+     *
+     * The historical constant remains the fallback. If the PM timer is missing
+     * or the measurement is implausible, arming a timer of unknown period is
+     * still better than arming none, and the log says which happened. */
+    uint32_t lapic_hz = 0;
+    uint32_t quantum = lapic_timer_calibrate(&lapic_hz);
+    int calibrated = (quantum != 0);
+    if (!calibrated) quantum = 3000000;
     lapic_w(0x3E0, 0x3);                                 /* timer divider: 16  */
     lapic_w(0x320, 0x20000 | 51);                        /* LVT: periodic, vec 51 */
-    lapic_w(0x380, 3000000);                             /* initial count (~tens of ms) */
+    lapic_w(0x380, quantum);                             /* 10 ms when calibrated */
+    kprintf("[time   ] cpu%u LAPIC timer: %s — %u Hz at divider 16, initial count %u "
+            "(%s 100 Hz quantum)\n",
+            (uint64_t)idx, calibrated ? "calibrated vs ACPI PM" : "NOT calibrated, using the "
+            "historical constant", (uint64_t)lapic_hz, (uint64_t)quantum,
+            calibrated ? "10 ms /" : "period UNKNOWN, not");
     g_cpu[idx].apic_id = lapic_r(0x20) >> 24;
     kprintf("[smp    ] cpu%u online: long mode, own TSS (sel %X)+SYSCALL, LAPIC id %u, gs %X\n",
             (uint64_t)idx, (uint64_t)TSS_SEL(idx), (uint64_t)g_cpu[idx].apic_id, (uint64_t)&g_cpu[idx]);
@@ -22583,6 +22723,31 @@ static void cmd_timebench(void) {
     kprintf("[timebench] PAUSE: %u cyc mean over 100000 — a spin budget of N iterations is "
             "worth about N x this, and that product is what changes when the host does\n",
             (p1 - p0) / 100000u);
+    /* (4) v0.92: ktime_get_us against the clock it is built on. A monotonic
+     * primitive that drifts from its own reference is worse than none, and
+     * "it compiles" is not evidence it advances correctly. Two properties are
+     * checked here rather than assumed: that it MOVES FORWARD across a known
+     * interval by about the right amount, and that it never goes BACKWARDS
+     * across many rapid reads — the failure a naive tick+offset composition
+     * produces when a tick lands between the two halves of a read. */
+    if (g_pmt_port) {
+        uint64_t k0 = ktime_get_us();
+        uint32_t q0 = acpi_pm_read();
+        udelay(50000);                                    /* 50 ms by the PM timer */
+        uint64_t k1 = ktime_get_us();
+        uint64_t pm_us = (uint64_t)acpi_pm_delta(q0, acpi_pm_read()) * 1000000ull / ACPI_PM_HZ;
+        uint64_t kd = k1 - k0;
+        uint64_t diff = kd > pm_us ? kd - pm_us : pm_us - kd;
+        int back = 0;
+        uint64_t last = ktime_get_us();
+        for (uint32_t i = 0; i < 200000u; i++) {
+            uint64_t n = ktime_get_us();
+            if (n < last) back++;
+            last = n;
+        }
+        kprintf("[timebench] ktime_get_us: advanced %u us over a %u us delay (delta %u us), "
+                "%u backward step(s) in 200000 reads\n", kd, pm_us, diff, (uint64_t)(int64_t)back);
+    }
     kputs("-- done --\n");
 }
 

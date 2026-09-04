@@ -201,11 +201,88 @@ Audit of hardcoded spin budgets, 13 hardware waits in total:
 | `ps2_wait_in` / `ps2_wait_out` | **not converted.** They run before ACPI is parsed, so `HW_WAIT` would take its iteration-cap fallback and nothing would improve |
 | `sha256` benchmark loop, `capdma` refault poll | **not converted** — workloads and a bounded poll, not hardware waits |
 
-**Still uncalibrated and deliberately untouched:** the AP slice timer's hardcoded
+**Still uncalibrated at the time of writing:** the AP slice timer's hardcoded
 LAPIC initial count of 3,000,000 (divider 16). Deriving it from the PIT is
 straightforward now that a reference exists, but it changes AP preemption
 frequency for every suite at once, and that belongs in its own change with its
-own verification rather than folded into this one.
+own verification rather than folded into this one. **Done in §1f below.**
+
+### 1f — THE AP PREEMPTION QUANTUM WAS 48 ms, NOT 10 ms
+
+`lapic_timer_calibrate()` arms a masked one-shot counting down from
+`0xFFFFFFFF` at divider 16 and measures elapsed LAPIC ticks across a ~10 ms
+window bounded by the ACPI PM timer. It runs per core, and it measures against
+the PM timer rather than `g_ticks` because only the BSP's PIT ISR advances
+`g_ticks` — an AP calibrating during bring-up has no other readable reference.
+
+| core | measured LAPIC | initial count for 10 ms |
+|---|---|---|
+| cpu1 | 62,578,894 Hz | 625,788 |
+| cpu2 | 62,474,068 Hz | 624,740 |
+| cpu3 | 62,503,643 Hz | 625,036 |
+
+**The hardcoded 3,000,000 was 4.8x too large.** At ~62.5 MHz it produced a
+**48 ms** period, so the APs were preempting at about **21 Hz while the BSP ran
+at 100 Hz**. That asymmetry existed for the whole life of the AP scheduler,
+behind a comment reading "~tens of ms" — accidentally accurate, and never
+stating which tens or against what.
+
+Every multi-core scheduling result this project has published ran under it: the
+v0.89 AP-1 placement investigation, `mcq`/`mcpre` dispatch, and the `threadstrs`
+two-core guards that consumed two milestones. It does not invalidate those
+conclusions, which were about *whether* work landed on a second core rather than
+how often it was interrupted — but it was a silent per-core asymmetry in every
+one of them.
+
+Cross-core spread is now **0.17%**, so the quantum is uniform as well as correct.
+The historical constant remains as an explicit fallback if the PM timer is
+absent or the measurement implausible, and the boot log states which path was
+taken rather than leaving it ambiguous.
+
+**Only one site existed.** The brief asked for the constant to be replaced "across
+both BSP and secondary AP cores"; the BSP arms no LAPIC timer at all — it
+preempts from the PIT on vector 32, which is why `g_slice_on` gates only vector
+51.
+
+### 1g — `ktime_get_us()`: monotonic, and NOT accurate
+
+Composes `g_ticks` (monotonic 64-bit base) with the PM timer for sub-tick
+resolution, the PIT ISR publishing the PM reading at each tick edge. Lockless
+and IRQ-safe by construction, using `g_ticks` as its own sequence counter — the
+seqlock idiom without a lock, sound because only the BSP's ISR writes either
+field.
+
+Measured rather than assumed, three runs at `-smp 4`:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| reported | 55,417 us | 60,491 us | 54,104 us |
+| true interval (PM) | 50,036 us | 50,001 us | 50,002 us |
+| error | +10.8% | **+21.0%** | +8.2% |
+| backward steps / 200,000 reads | **0** | **0** | **0** |
+
+**Monotonicity holds absolutely** — zero regressions in 600,000 reads. **Accuracy
+does not**: it overshoots by 8–21%.
+
+The overshoot is inherited from `g_ticks` and cannot be fixed at this layer.
+Across a genuine 50 ms window the clock saw `g_ticks` advance five edges
+sometimes and six others, because the emulated PIT delivers **coalesced catch-up
+interrupts** after the host deschedules qemu — several ticks arriving
+back-to-back, so tick-derived time runs ahead of real time. Boot calibration
+reads 99.99 Hz because its window is short and edge-bounded; a window containing
+a stall is where this appears.
+
+**This is the tick compression the brief in §1c asked about**, found at last — but
+running the opposite way to the hypothesis. Ticks are not compressed into less
+time; they are *deferred and then delivered in a burst*, so a tick count
+overstates elapsed time rather than understating it. It does not change §1c's
+conclusion: `langstrs` budgets in ticks, and a burst makes a tick budget expire
+*sooner* in real terms, which is another way for a loaded host to fail it.
+
+So `ktime_get_us` is for ordering and coarse elapsed time. The accurate
+instrument is the PM timer directly (`acpi_pm_us_since`), which is what `udelay`
+and `HW_WAIT` are built on. Making it both would require extending the PM
+timer's 24 bits in software; nothing here needs that yet.
 
 ### The KVM decision sits underneath this
 
