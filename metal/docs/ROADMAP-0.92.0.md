@@ -50,6 +50,83 @@ host varying, not making the host fast.
 result.** It would let every subsequent measurement be normalised instead of
 argued about.
 
+### 1a — AUDIT: what this kernel's clocks actually are
+
+| clock | state |
+|---|---|
+| PIT @ 100 Hz | `pit_init()` writes divisor 11932 (1193182/100); `g_ticks++` in the ISR. The only wall-clock reference. |
+| TSC | `rdtsc64()` exists; used for **relative deltas only** |
+| LAPIC timer | periodic, vector 51, **hardcoded** initial count 3,000,000, divider 16 |
+| ACPI PM timer | **does not exist** — zero references |
+| `rdtscp` | **not used** — zero references |
+
+**`g_ticks` is not calibrated against anything.** The PIT is *programmed* to
+100 Hz and trusted; nothing verifies it delivers 100 Hz, and the TSC has no
+established relationship to it anywhere in the kernel. Every cycle figure this
+tree has ever printed — the v0.89 CAS spin telemetry, v0.91's `vfsbench`
+histograms — is therefore uncalibrated.
+
+**Second finding, unprompted:** the AP slice timer's LAPIC initial count is a
+hardcoded 3,000,000 with divider 16, commented "~tens of ms". It is derived from
+nothing. The AP preemption period is unknown and would drift with host speed
+exactly like the budgets under investigation.
+
+### 1b — MEASURED: `cmd_timebench`, six runs
+
+Three uniprocessor, three `-smp 4`, one boot each configuration.
+
+| metric | uniprocessor ×3 | `-smp 4` ×3 |
+|---|---|---|
+| TSC per PIT tick | 38,697,338 / 38,696,938 / **41,634,941** | 39,218,903 / 39,219,921 / 38,695,238 |
+| implied TSC Hz | 3.870 / 3.870 / **4.163** GHz | 3.922 / 3.922 / 3.870 GHz |
+| `rdtsc` back-to-back, mean | 88 / 88 / 89 cyc | 91 / 110 / 92 cyc |
+| `rdtsc` p50 / p99.9 | ≤64 / ≤128 | ≤64 / ≤128–256 |
+| **max delta** | 137k / 82k / 146k | **376k / 305k / 277k** |
+| spikes >1k cyc | 30 / 22 / 43 ppm | 41 / 43 / 42 ppm |
+| `klock` acquire+release | 647 / 636 / 650 cyc | 681 / 679 / 664 cyc |
+| `PAUSE` | 379 / 391 / 377 cyc | 356 / 391 / 335 cyc |
+
+**THE HEADLINE: the TSC and the PIT disagree by up to 7.6%, within a single
+boot.** Five of six readings cluster at 38.70–39.22 M cyc/tick (1.35% spread);
+one reads 41.63 M. Nothing changed between runs but time.
+
+**And there is no third clock to say which one drifted.** This kernel has exactly
+two time sources, so their *ratio* is measurable and their *truth* is not. An
+ACPI PM timer — fixed 3.579545 MHz, independent of both CPU frequency and the
+PIT — is the standard tiebreaker, and it does not exist here. **Adding one is now
+the highest-value item in this objective**, because without it no amount of
+further measurement can attribute the drift.
+
+**`PAUSE` costs ~380 cycles** under TCG, against ~10–140 on real hardware. That
+retroactively explains a class of bug this tree keeps finding: `capdma`'s old
+2,000,000-iteration wait was ~760 M cycles ≈ 0.2 s at 3.87 GHz, and that product
+moves with host speed. A spin count is not a budget; it is a budget multiplied by
+an unknown.
+
+**Host preemption is rare, large, and larger under SMP.** 22–43 events per
+million samples in both configurations, but the worst case grows from 82–146 k
+cycles (21–38 µs) uniprocessor to 277–376 k (71–96 µs) at four vCPUs — four
+guest threads competing for host cores. Rare enough that it cannot by itself
+explain a 48% throughput drop.
+
+### 1c — the `langstrs` question, and what this data does NOT settle
+
+The brief asked whether the compiler timeouts come from TSC drift or from VM
+tick compression. **On this evidence, neither.** `langstrs` budgets in `g_ticks`
+via `SYS_SYSINFO` and never reads the TSC, so TSC drift cannot reach it; and
+tick *compression* would make a tick budget cover more work, not less.
+
+The reading this data supports is duller: if the PIT delivers real 100 Hz, a
+tick budget is a real-time budget, and a slower host simply completes less work
+per tick until the compile no longer fits.
+
+**That is a reading, not a finding, and the difference matters here.** It rests
+on the PIT being accurate, which is precisely what the 7.6% disagreement above
+leaves open — with only two clocks, the excursion could be the TSC or the PIT and
+this instrument cannot tell. Confirming it needs the third clock. This cycle has
+already produced several confident timing attributions that were later
+falsified; this one is left explicitly unresolved rather than joining them.
+
 ### The KVM decision sits underneath this
 
 `/dev/kvm` exists on this host; only the build user's group membership keeps QEMU

@@ -22216,6 +22216,116 @@ static void vbench_report(const char *what, int n, uint64_t ticks) {
                     (uint64_t)(int64_t)c, g_vbench_ops[c], g_vbench_cyc[c] / g_vbench_ops[c]);
 }
 
+/* ===========================================================================
+ * v0.92 OBJECTIVE 1: WHAT THIS MACHINE'S CLOCKS ACTUALLY DO
+ * ===========================================================================
+ * v0.91 proved with an identical-image control that the toolchain host became
+ * ~48% slower mid-cycle, and could not say why: CPU frequency and power state
+ * are not inspectable from inside WSL2. Every timing budget in this tree —
+ * GATE_CAP, the ring-3 suite deadlines, every g_ticks watchdog — was calibrated
+ * on the fast host and has never been re-derived. This is the instrument that
+ * makes "the machine is slow today" a number instead of an impression.
+ *
+ * WHAT THE AUDIT FOUND, and it shapes what is measured here:
+ *
+ *   - g_ticks is a PIT at 100 Hz, divisor 11932 (1193182/100). It is PROGRAMMED,
+ *     never calibrated: nothing checks the PIT actually delivers 100 Hz.
+ *   - The TSC has NO known relationship to g_ticks anywhere in the kernel.
+ *     rdtsc64() is used for relative deltas only (the v0.89 CAS telemetry, the
+ *     v0.91 vfsbench histograms), so every cycle figure this tree has ever
+ *     printed is uncalibrated.
+ *   - The AP slice timer is armed with a HARDCODED LAPIC initial count of
+ *     3,000,000 and divider 16, commented "~tens of ms". It is not derived from
+ *     the PIT or from anything else. Its real period is unknown.
+ *   - There is no ACPI PM timer and no rdtscp in this kernel.
+ *
+ * WHAT CANNOT BE MEASURED HERE, said plainly because the brief asked for it:
+ * this guest does not run under hardware virtualisation. The kernel's own
+ * [virt] line reports CPUID.1:ECX.VMX = 0 and QEMU runs it under TCG, so there
+ * are no guest VM exits to count and no hypervisor context switches to attribute
+ * TSC reads to. rdtsc is an emulated instruction. What the outliers below
+ * actually represent is the HOST descheduling QEMU — Windows preempting the
+ * WSL2 VM, or the WSL2 kernel preempting the qemu process — which surfaces
+ * inside the guest as a gap between two adjacent instructions. That is a real
+ * and useful signal for the budget question; it is simply not a VM exit. */
+#define TB_SAMPLES 1000000u
+
+static void cmd_timebench(void) {
+    kputs("-- TIME BENCH: TSC behaviour, tick calibration, primitive costs --\n");
+
+    /* (1) TSC AGAINST THE PIT. The first calibration this kernel has ever had.
+     * Both edges are taken on a tick boundary so the interval is a whole number
+     * of PIT periods and the sample does not straddle one. */
+    uint64_t t_edge = g_ticks; while (g_ticks == t_edge) __asm__ volatile("pause");
+    uint64_t c0 = rdtsc64(), k0 = g_ticks;
+    while (g_ticks - k0 < 100) __asm__ volatile("pause");     /* one second at 100 Hz */
+    uint64_t c1 = rdtsc64(), k1 = g_ticks;
+    uint64_t elapsed = k1 - k0, cyc = c1 - c0;
+    uint64_t per_tick = elapsed ? cyc / elapsed : 0;
+    kprintf("[timebench] TSC vs PIT: %u cycle(s) over %u tick(s) — %u cyc/tick, implied %u Hz\n",
+            cyc, elapsed, per_tick, per_tick * 100u);
+    kprintf("[timebench]   (the PIT is programmed to 100 Hz and never verified; if it is not\n"
+            "[timebench]    delivering 100 Hz, this figure is wrong in the same proportion)\n");
+
+    /* (2) BACK-TO-BACK rdtsc DELTAS. The distribution, not the mean: the mean of
+     * a distribution with host-preemption outliers describes neither the common
+     * case nor the tail. */
+    uint64_t hist[VBENCH_BUCKETS];
+    for (int b = 0; b < VBENCH_BUCKETS; b++) hist[b] = 0;
+    uint64_t mn = ~0ull, mx = 0, sum = 0, prev = rdtsc64();
+    for (uint32_t i = 0; i < TB_SAMPLES; i++) {
+        uint64_t now = rdtsc64();
+        uint64_t d = now - prev;
+        prev = now;
+        hist[vbench_bucket(d)]++;
+        sum += d;
+        if (d < mn) mn = d;
+        if (d > mx) mx = d;
+    }
+    uint64_t p50 = 0, p99 = 0, p999 = 0, seen = 0;
+    uint64_t n50 = TB_SAMPLES / 2, n99 = (TB_SAMPLES / 100) * 99,
+             n999 = (TB_SAMPLES / 1000) * 999;
+    for (int b = 0; b < VBENCH_BUCKETS; b++) {
+        uint64_t before = seen; seen += hist[b];
+        uint64_t ub = (b == 0) ? 1 : (1ull << b);
+        if (before < n50  && seen >= n50 ) p50  = ub;
+        if (before < n99  && seen >= n99 ) p99  = ub;
+        if (before < n999 && seen >= n999) p999 = ub;
+    }
+    kprintf("[timebench] rdtsc delta over %u samples: min %u, mean %u, p50 <= %u, p99 <= %u, "
+            "p99.9 <= %u, MAX %u\n",
+            (uint64_t)TB_SAMPLES, mn, sum / TB_SAMPLES, p50, p99, p999, mx);
+
+    /* A SPIKE is a delta far above the median — the host taking the CPU away
+     * mid-loop. Counted at two thresholds so the shape is visible rather than a
+     * single arbitrary cutoff. */
+    uint64_t spikes_1k = 0, spikes_100k = 0;
+    for (int b = 0; b < VBENCH_BUCKETS; b++) {
+        uint64_t ub = (b == 0) ? 1 : (1ull << b);
+        if (ub > 1000)   spikes_1k   += hist[b];
+        if (ub > 100000) spikes_100k += hist[b];
+    }
+    kprintf("[timebench] host-preemption spikes: %u over 1k cyc, %u over 100k cyc "
+            "(%u ppm of samples) — these are the HOST descheduling qemu, not guest VM exits\n",
+            spikes_1k, spikes_100k, (spikes_1k * 1000000ull) / TB_SAMPLES);
+
+    /* (3) PRIMITIVE COSTS, in the same units, so a budget can be reasoned about.
+     * An uncontended klock round trip is the floor every lock-taking path pays. */
+    uint64_t l0 = rdtsc64();
+    for (uint32_t i = 0; i < 100000u; i++) { klock_acquire(&g_surf_lock); klock_release(&g_surf_lock); }
+    uint64_t l1 = rdtsc64();
+    kprintf("[timebench] klock acquire+release (uncontended): %u cyc mean over 100000\n",
+            (l1 - l0) / 100000u);
+
+    uint64_t p0 = rdtsc64();
+    for (uint32_t i = 0; i < 100000u; i++) __asm__ volatile("pause");
+    uint64_t p1 = rdtsc64();
+    kprintf("[timebench] PAUSE: %u cyc mean over 100000 — a spin budget of N iterations is "
+            "worth about N x this, and that product is what changes when the host does\n",
+            (p1 - p0) / 100000u);
+    kputs("-- done --\n");
+}
+
 static void cmd_vfs_bench(void) {
     kputs("-- VFS BENCH: throughput and latency, shared vs exclusive paths --\n");
     int n = g_ncpu_online; if (n > MAX_CPUS) n = MAX_CPUS;
@@ -33177,6 +33287,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "vfiostress")) cmd_vfio_stress();
     else if (!kstrcmp(argv[0], "vfsstress")) cmd_vfs_stress();
     else if (!kstrcmp(argv[0], "vfsbench")) cmd_vfs_bench();
+    else if (!kstrcmp(argv[0], "timebench")) cmd_timebench();
     else if (!kstrcmp(argv[0], "gpustress")) cmd_gpu_stress();
     else if (!kstrcmp(argv[0], "audiostress")) cmd_audio_stress();
     else if (!kstrcmp(argv[0], "netstress")) cmd_net_stress();
