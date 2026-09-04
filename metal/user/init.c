@@ -1750,6 +1750,34 @@ static u64 omono_us(void) { u64 ns = oclock_ns(CLOCK_MONOTONIC); return ns / 100
 /* Sleep. Sub-millisecond requests are honoured by the kernel as a yielding
  * poll rather than a park — see ksleep_us — so they are accurate but keep this
  * thread runnable. */
+/* v0.92 Objective 5: A DEADLINE THAT A TICK BURST CANNOT SHORTEN.
+ *
+ * Every worker deadline in this tree was `osysticks() - t0 >= BUDGET`, and
+ * section 1g measured why that is not the same as a real-time budget: the
+ * emulated PIT delivers COALESCED CATCH-UP interrupts after the host
+ * deschedules qemu, so several ticks arrive back-to-back and a tick count
+ * OVERSTATES elapsed time by 8-21%. A worker with a 60 s tick budget can
+ * therefore see it "expire" after appreciably less than 60 s of real time —
+ * which is exactly the shape of the append-oversub expiries that cost v0.90.1 a
+ * defect and are still carried as standing debt.
+ *
+ * These read CLOCK_MONOTONIC instead, which is TSC-derived and re-anchored
+ * against the ACPI PM timer, and cannot be bunched up.
+ *
+ * DEGRADES SAFELY. If the syscall fails omono_us() returns 0, and a deadline
+ * built on a clock that reads zero would fire instantly — turning a timing
+ * fallback into a guaranteed spurious expiry. So the start value is captured
+ * once and a zero start disables the deadline for that worker: no clock means
+ * no timeout, not an immediate one. The workers all have other bounds (iteration
+ * counts, the kernel-side drain watchdog), so this cannot hang a suite. */
+static u64 odeadline_start(void) { return omono_us(); }
+static int odeadline_expired(u64 start_us, u64 budget_us) {
+    if (!start_us) return 0;                  /* no clock: no deadline          */
+    u64 now = omono_us();
+    if (!now) return 0;
+    return (now - start_us) >= budget_us;
+}
+
 static void onanosleep_us(u64 us) {
     u64 req[2]; req[0] = us / 1000000ull; req[1] = (us % 1000000ull) * 1000ull;
     sysc(SYS_NANOSLEEP, (u64)(const void *)req, 0, 0);
@@ -3390,7 +3418,9 @@ static void append_smp_worker(u32 idx) {
     u8 pat = (u8)(0xA0u + idx);
     for (u32 k = 0; k < APPSMP_PAY; k++) blk[k] = pat;
 
-    u32 t0 = osysticks();
+    /* v0.92: CLOCK_MONOTONIC, not ticks. A tick budget can expire early when the
+     * PIT delivers catch-up bursts (section 1g) — see odeadline_expired. */
+    u64 t0 = odeadline_start();
     for (u32 i = 0; i < APPSMP_ITERS; i++) {
         /* NO USER-SPACE SYNCHRONISATION. That is the point: nothing here
          * serialises the writers, so if the kernel does not make each append
@@ -3399,7 +3429,8 @@ static void append_smp_worker(u32 idx) {
         if (w != (i64)APPSMP_PAY) sysc(SYS_EXIT, 1910 + (u64)idx, 0, 0);
         /* A deadline, not a spin budget. Its own exit code, so a slow host is
          * never decoded as a torn write. */
-        if (osysticks() - t0 >= APPSMP_T) sysc(SYS_EXIT, 1920 + (u64)idx, 0, 0);
+        if (odeadline_expired(t0, (u64)APPSMP_T * 10000ull))
+            sysc(SYS_EXIT, 1920 + (u64)idx, 0, 0);
     }
     oclose(f);
     sysc(SYS_EXIT, 42, 0, 0);
@@ -3541,12 +3572,12 @@ static void role63_clock_probe(void) {
 static void role62_ofile_stress(void) {
     u64 backoff = 0;                /* table-full retries: contention, observed */
     u64 made    = 0;
-    u32 t0 = osysticks();
+    u64 t0 = odeadline_start();     /* v0.92: real time, not tick count */
 
     for (u32 it = 0; it < R62_ITERS; it++) {
         u64 fds[2];
         for (;;) {
-            if (osysticks() - t0 > R62_T) sysc(SYS_EXIT, 1863, 0, 0);
+            if (odeadline_expired(t0, (u64)R62_T * 10000ull)) sysc(SYS_EXIT, 1863, 0, 0);
             fds[0] = fds[1] = (u64)-1;
             i64 r = (i64)sysc(SYS_PIPE, (u64)(void *)fds, 0, 0);
             if (r == 0) break;
@@ -3587,7 +3618,7 @@ static void cas_contend_worker(void) {
     path[6] = 0;
 
     u8 blk[CASC_PAY];
-    u32 t0 = osysticks();
+    u64 t0 = odeadline_start();   /* v0.92: real time, not tick count */
 
     for (u32 it = 0; it < CASC_ITERS; it++) {
         /* Content unique to (pid, iteration): no two writes anywhere in the
@@ -3635,7 +3666,7 @@ static void cas_contend_worker(void) {
         if (ounlink(path) != 0)                       sysc(SYS_EXIT, 1848, 0, 0);
 
         /* Deadline, not a spin budget, and on its own exit code. */
-        if (osysticks() - t0 >= CASC_T)               sysc(SYS_EXIT, 1849, 0, 0);
+        if (odeadline_expired(t0, (u64)CASC_T * 10000ull)) sysc(SYS_EXIT, 1849, 0, 0);
     }
     sysc(SYS_EXIT, 42, 0, 0);
 }

@@ -501,6 +501,78 @@ clock *advances*, because a clock stuck at one value never goes backwards either
 and would otherwise pass. Five runs, all `OK (exit 1870)`, zero backward steps in
 200,000 ring-3 reads per run.
 
+### 1l — ring-3 deadlines on CLOCK_MONOTONIC, and a hypothesis that failed
+
+**The brief's Phase 1 had no target, and that is worth recording before the rest.**
+It asked to migrate ring-3 throughput calculations (MB/s, ops/sec) off
+`osysticks()`. There are none: zero references to MB/s, ops/sec or throughput
+anywhere in `user/`. `sha256` is a FIPS 180-4 correctness vector in the *kernel*
+and is untimed. `timebench` is kernel-side and already reads the PM timer and the
+TSC. **All 31 `osysticks()` uses are deadlines or bounded waits**, not
+measurements.
+
+So the work done instead was the one the measurements pointed at: §1g found the
+emulated PIT delivering catch-up bursts that make a tick count overstate elapsed
+time by 8–21%, which means a tick deadline can expire EARLY in real terms. The
+four worker deadlines carrying expiry exit codes — `append_smp_worker`,
+`role62_ofile_stress`, `cas_contend_worker` — now use `CLOCK_MONOTONIC` through
+`odeadline_expired()`.
+
+**The fallback needed inverting relative to the brief.** A zero from
+`omono_us()` in a *measurement* degrades to "no measurement"; in a *deadline* it
+degrades to **fires instantly**, turning a clock failure into a guaranteed
+spurious expiry. A zero start therefore disables the deadline: no clock means no
+timeout, not an immediate one. The workers keep their iteration counts and the
+kernel-side drain watchdog, so nothing can hang.
+
+#### THE PREDICTION, AND ITS FALSIFICATION
+
+The migration was made with a stated, falsifiable claim: if catch-up bursts were
+shortening deadlines, expiries should drop. **They did not.**
+
+| configuration | before | after |
+|---|---|---|
+| smp4-bios | 0 expiries | 0 expiries |
+| historical smp8-bios | 0 expiries | — |
+| **smp8 soak, 4 rounds** | 1-of-16 every round (v0.90.1) | **1-of-16 every round** |
+
+smp4 could never have tested it — it showed zero both before and after, and a
+single smp8 boot shows zero historically too. The signal exists only in the soak,
+and there the result is unchanged.
+
+**The tick counts explain it and close the question.** `append-oversub` takes
+**8,175–8,680 ticks — 82 to 87 seconds** — against a 60 s budget. A worker that
+runs the whole phase genuinely exhausts 60 s of real time. The expiries were
+never a clock artifact; they are real, and this host is simply slow enough to
+produce them.
+
+**So the standing-debt item "is one worker in sixteen expiring at -smp 8 the
+right behaviour, or a budget too tight for that width" now has an answer: the
+budget is too tight for that width ON THIS HOST.** Not a defect, and not a
+measurement error either. Raising `APPSMP_TSCALE` would mask it; the v0.90.1
+tolerant branch already handles it correctly, which is why every one of these
+runs passes with zero failing assertions.
+
+The migration is kept regardless. A deadline expressed in real time is the right
+shape whatever the cause of expiry turns out to be, and §1g's burst measurement
+is unaffected — it simply was not what was driving this.
+
+### 1m — verification
+
+| | result |
+|---|---|
+| `smp4-bios` | 45 suites, 583 passed, 0 failed, 0 ranks |
+| `smp4-iommu` | 47 suites, 597 passed, 0 failed, 0 ranks |
+| soak, `-smp 4`, 4 iterations | 0 failing assertions, 0 rank faults, 0 panics |
+| soak, `-smp 8`, 3 iterations | 0 failing assertions, 0 rank faults, 0 panics |
+
+Seven soak iterations across two widths, every worker deadline now real-time, and
+every expiry correctly tolerated rather than decoded as a defect.
+
+**Sub-millisecond spans no longer round to zero:** `ofilestrs` completes 768
+iterations across 16 workers in 77–81 ticks, a span that a 10 ms clock can barely
+resolve and that `omono_us()` reports in microseconds.
+
 ## STANDING DEBT, carried forward
 
 - **v0.91's Objective 1b is unfinished** — 10 soak iterations passed, 100 was
