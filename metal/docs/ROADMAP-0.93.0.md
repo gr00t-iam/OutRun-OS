@@ -1,6 +1,6 @@
 # OutRun OS v0.93 — real time, and what an epoch is worth
 
-Status: **cycle open.** Nothing here is tagged.
+Status: **TAGGED v0.93.0.** See the ARTEFACT section at the end.
 
 ## WHERE THIS STARTS
 
@@ -535,3 +535,57 @@ most of the project's life, for the same reason `grub.cfg` was: nothing checks
 them. They now read `outrun-os-<VERSION>.iso` with a note naming
 `metal/Makefile` as the source. A placeholder cannot go stale; a pinned number
 would simply restart the decay.
+
+---
+
+## ARTEFACT — v0.93.0
+
+    build/release/outrun-os-0.93.0.iso
+    md5     88299d3fdb44e1a1870e3cf5fe0a7d11
+    sha256  158b6650952b25dcf98383f03cf149134b4363a6f15aee70cfcfd7a8d9b7c105
+
+Built from a clean tree by `make release` (which runs `make clean` first, so no
+object can survive from a source state that no longer exists). Zero compiler
+warnings or errors.
+
+### Gate table
+
+| target | result |
+|---|---|
+| `make release-verify` (the published artefact) | **PASS** — 45 suites, 0 failing assertions, RESULT tally 0, 0 rank faults, 460 s |
+| `smp4-bios` (fresh image) | PASS — 45 suites, 583 passed, 0 failed, 0 ranks |
+| `smp4-iommu` (q35 + VT-d, `intremap=on`) | PASS — 47 suites, 597 passed, 0 failed, 0 ranks |
+| role 63 probe, `smp4-bios` | OK (1870) |
+| role 63 probe, `smp4-iommu` | OK (1870) |
+
+The two matrix tiers ran on `2b6d863dff11616d59db101b75ce3736`, an image built
+from the same tree as this artefact before the version strings were bumped; the
+bump changes three string literals and nothing else. `release-verify` ran on the
+published artefact itself.
+
+### What this release does NOT cover, stated so the gaps are visible
+
+- `gate-dirty` and `gate-dirty-smp` — **last run at v0.90.0**, three releases
+  back. Persisted-state reuse across boots is therefore unverified for this tag.
+- `smp2-bios` and `smp8-bios` were not run this cycle.
+- One boot per fresh configuration. This cannot see an intermittent below
+  roughly 1 in 10 boots — and one was observed during the cycle: a `posixstrs`
+  hang that did not reproduce on either a control or a re-run.
+- `ITIMER_PROF` is rejected with `-EINVAL` rather than aliased onto VIRTUAL.
+  There is no utime/stime split in this kernel, so PROF cannot be answered
+  honestly; `ITIMER_VIRTUAL` gets process CPU time rather than user time alone,
+  which for a syscall-heavy workload differs by the cost of its syscalls.
+- `timer_create`/`timer_settime` (POSIX-1b) are not implemented.
+
+### The cycle in one line each
+
+- **Objective 1** — CMOS RTC anchors `CLOCK_REALTIME` to a real epoch.
+- **Objective 2** — POSIX clock ids corrected, `clock_getres`, `TIMER_ABSTIME`.
+- **Objective 3** — `setitimer`/`getitimer`, CPU-time clocks, in-flight accounting.
+- **Pre-release** — `ITIMER_VIRTUAL` made to actually fire; sleep charging made
+  correct for a concurrent observer.
+
+Four defects in this cycle were found only because a test was written for a path
+that had already shipped, and two of them were in code committed one objective
+earlier. The standing lesson is the one already in CLAUDE.md: an untested path
+is not a passing one, and "wired but never armed" is a defect report, not a note.
