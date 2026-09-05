@@ -167,8 +167,18 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_CLOCK_GETTIME      104          /* v0.92: (clockid, timespec*) -> 0        */
 #define SYS_CLOCK_GETRES       105          /* v0.92: (clockid, timespec*) -> 0        */
 #define SYS_NANOSLEEP          106          /* v0.92: (req, rem) -> 0                  */
-#define CLOCK_MONOTONIC        0
-#define CLOCK_REALTIME         1
+#define SYS_CLOCK_NANOSLEEP    107          /* v0.93: (clk, flags, req, rem) -> 0      */
+/* v0.93: THE POSIX NUMBERS, CORRECTED. v0.92 defined these as MONOTONIC 0 and
+ * REALTIME 1, which is backwards: every C library uses REALTIME 0, MONOTONIC 1,
+ * and the SEEK_* comment immediately below states exactly why that matters —
+ * "not an internal encoding to be chosen freely". The same argument applies here
+ * and was missed three lines above it. Changed rather than kept: the only caller
+ * is in this tree, so the ABI break costs nothing now and would cost every
+ * future ring-3 program later. */
+#define CLOCK_REALTIME         0
+#define CLOCK_MONOTONIC        1
+#define CLOCK_MONOTONIC_RAW    4
+#define TIMER_ABSTIME          1
 
 /* v0.82: the three POSIX whence values, in POSIX's order and with POSIX's
  * numbers. They are not an internal encoding to be chosen freely — a ring-3
@@ -1776,6 +1786,26 @@ static int odeadline_expired(u64 start_us, u64 budget_us) {
     u64 now = omono_us();
     if (!now) return 0;
     return (now - start_us) >= budget_us;
+}
+
+/* v0.93: the POSIX-shaped bindings. timespec is two machine words here, so
+ * these take and return the pair directly rather than a struct the occ compiler
+ * would lay out differently from the C kernel. */
+static i64 oclock_gettime(u64 clkid, u64 *ts_out) {
+    return (i64)sysc(SYS_CLOCK_GETTIME, clkid, (u64)(void *)ts_out, 0);
+}
+static i64 oclock_getres(u64 clkid, u64 *ts_out) {
+    return (i64)sysc(SYS_CLOCK_GETRES, clkid, (u64)(void *)ts_out, 0);
+}
+/* Presents POSIX's four arguments over a three-argument kernel ABI. `rem` is
+ * zeroed HERE because the kernel cannot take a fourth argument and because a
+ * sleep on this system is never interrupted — no signal reaches a sleeping
+ * thread, so the remainder is always zero. Writing it keeps a caller that
+ * checks `rem` correct. */
+static i64 oclock_nanosleep(u64 clkid, u64 flags, const u64 *req, u64 *rem) {
+    i64 r = (i64)sysc(SYS_CLOCK_NANOSLEEP, clkid, flags, (u64)(const void *)req);
+    if (rem) { rem[0] = 0; rem[1] = 0; }
+    return r;
 }
 
 static void onanosleep_us(u64 us) {
@@ -3576,6 +3606,70 @@ static void role63_clock_probe(void) {
         if (m1 > 86400000000ull) {
             print("  [r63] CLOCK_MONOTONIC carries the wall-clock offset\n");
             sysc(SYS_EXIT, 1875, 0, 0);
+        }
+    }
+
+    /* v0.93: clock_getres must report a resolution the clock can actually
+     * deliver. 1 ns is what a TSC-derived clock above 1 GHz resolves to, and
+     * both clocks must agree because they are the same counter with an offset. */
+    {
+        u64 rr[2], rm[2];
+        if (oclock_getres(CLOCK_MONOTONIC, rr) != 0 ||
+            oclock_getres(CLOCK_REALTIME,  rm) != 0) {
+            print("  [r63] clock_getres failed\n"); sysc(SYS_EXIT, 1876, 0, 0);
+        }
+        print("  [r63] getres MONOTONIC nsec "); hex(rr[1]);
+        print("  REALTIME nsec "); hex(rm[1]); print("\n");
+        if (rr[0] != 0 || rr[1] != 1 || rm[0] != 0 || rm[1] != 1) {
+            print("  [r63] clock_getres is not 1 ns\n"); sysc(SYS_EXIT, 1876, 0, 0);
+        }
+        /* An unsupported id must be refused, not silently answered. A clock
+         * layer that accepts anything is one that will quietly return the wrong
+         * clock the first time a caller passes a constant this kernel lacks. */
+        u64 junk[2];
+        if (oclock_getres(99, junk) != -22) {
+            print("  [r63] clock_getres accepted an invalid clock id\n");
+            sysc(SYS_EXIT, 1877, 0, 0);
+        }
+    }
+
+    /* v0.93: TIMER_ABSTIME. The whole reason clock_nanosleep exists next to
+     * nanosleep is that a caller can name an instant instead of a duration, so
+     * the read-subtract-sleep gap lives inside the kernel rather than in the
+     * caller's uncorrectable drift. Two failures are checked: waking EARLY,
+     * which means the deadline arithmetic is wrong, and a target already in the
+     * past, where an unsigned subtraction would wrap to ~584 years. */
+    {
+        u64 t[2];
+        if (oclock_gettime(CLOCK_MONOTONIC, t) != 0) sysc(SYS_EXIT, 1872, 0, 0);
+        /* MEASURE FROM THE INSTANT THE TARGET WAS DERIVED FROM, not from a
+         * later reading. The first version took a second omono_us() here as its
+         * baseline, which is already after t — so it measured (t + 5000) minus
+         * (t + one syscall) and reported a short sleep every time, by exactly
+         * the cost of that call. It read 4191 and 4963 us on two runs, and the
+         * 772 us spread between them was the tell: a kernel waking early would
+         * not vary by the duration of a syscall the kernel never made. */
+        u64 start = t[0] * 1000000ull + t[1] / 1000ull;          /* t, in us */
+        u64 tgt_ns = t[0] * 1000000000ull + t[1] + 5000000ull;   /* +5000 us */
+        u64 req[2]; req[0] = tgt_ns / 1000000000ull; req[1] = tgt_ns % 1000000000ull;
+        u64 rem[2];
+        if (oclock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, req, rem) != 0)
+            sysc(SYS_EXIT, 1878, 0, 0);
+        u64 slept = omono_us() - start;
+        print("  [r63] ABSTIME +5000 us -> slept "); hex(slept); print(" us\n");
+        if (slept + 1 < 5000ull) {           /* one us of slack for the two reads */
+            print("  [r63] TIMER_ABSTIME woke EARLY\n"); sysc(SYS_EXIT, 1878, 0, 0);
+        }
+        if (rem[0] || rem[1]) { print("  [r63] rem not zeroed\n"); sysc(SYS_EXIT, 1878, 0, 0); }
+
+        /* A target already past must return at once, not sleep for an age. */
+        u64 p0 = omono_us();
+        u64 past[2]; past[0] = 0; past[1] = 0;              /* the epoch: long gone */
+        if (oclock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, past, 0) != 0)
+            sysc(SYS_EXIT, 1879, 0, 0);
+        if (omono_us() - p0 > 100000ull) {                  /* 100 ms is generous */
+            print("  [r63] TIMER_ABSTIME slept on a target in the PAST\n");
+            sysc(SYS_EXIT, 1879, 0, 0);
         }
     }
 

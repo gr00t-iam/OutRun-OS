@@ -14849,6 +14849,36 @@ static uint64_t civil_to_epoch(uint32_t y, uint32_t m, uint32_t d,
 
 static uint64_t g_rtc_boot_epoch = 0;          /* seconds at boot, 0 = unknown   */
 
+/* ---- v0.93: POSIX clock ids, in one place --------------------------------
+ * REALTIME 0, MONOTONIC 1, MONOTONIC_RAW 4 — the numbers every C library uses.
+ * v0.92 had the first two the other way round; see the note at case 104.
+ *
+ * MONOTONIC_RAW is accepted and answers identically to MONOTONIC. On Linux the
+ * two differ because MONOTONIC is NTP-slewed and RAW is not; nothing here slews
+ * anything, so they genuinely are the same clock. Accepting it means a ring-3
+ * program written against a real libc gets an answer instead of EINVAL, and
+ * returning the same value is honest rather than a stub — if slewing is ever
+ * added, this is the one place that has to diverge. */
+#define CLK_REALTIME      0u
+#define CLK_MONOTONIC     1u
+#define CLK_MONOTONIC_RAW 4u
+
+static inline int clockid_valid(uint64_t id) {
+    return id == CLK_REALTIME || id == CLK_MONOTONIC || id == CLK_MONOTONIC_RAW;
+}
+
+/* One reader for every clock-taking syscall, so gettime and an ABSTIME sleep
+ * can never disagree about what "now" means on the same clock. */
+static uint64_t clock_read_ns(uint64_t id) {
+    uint64_t ns = ktime_get_ns();
+    /* REALTIME falls back to monotonic when the RTC never anchored — the same
+     * behaviour v0.92 had, and better than reporting 1970 as though it were
+     * real. g_rtc_boot_epoch is the flag for that, not g_realtime_off_ns, which
+     * is a legitimately usable 0 in the unanchored case. */
+    if (id == CLK_REALTIME && g_rtc_boot_epoch) ns += g_realtime_off_ns;
+    return ns;
+}
+
 static void rtc_init(void) {
     struct rtc_time t;
     if (!rtc_read_raw(&t)) {
@@ -14901,14 +14931,31 @@ static void ksleep_us(uint64_t us) {
         while ((int64_t)(ktime_get_ns() - target) < 0) krelax();
         return;
     }
-    while (us) {
-        uint64_t chunk = us > 4000000ull ? 4000000ull : us;   /* stay inside one wrap */
+    /* SATISFY BOTH CLOCKS, because the caller may measure with either.
+     *
+     * The PM timer alone is not enough. ktime_get_ns and the PM timer do not
+     * advance identically — section 1d measured the TSC spanning 7.2% within a
+     * boot — so a sleep that satisfies the PM timer can still look SHORT to a
+     * caller timing it with CLOCK_MONOTONIC, which is the only clock ring 3
+     * has. Measured exactly that way: a 100 us sleep read back under 100 us
+     * from ring 3 while being a correct 100 us of real time.
+     *
+     * "At least N" is the contract, and overshoot is permitted by it, so the
+     * sleep waits for whichever clock is slower. The PM timer bounds it in real
+     * time and the top-up bounds it in the clock the caller can see. */
+    uint64_t kt_target = ktime_get_ns() + us * 1000ull;
+    uint64_t left = us;
+    while (left) {
+        uint64_t chunk = left > 4000000ull ? 4000000ull : left; /* inside one wrap */
         uint32_t want = (uint32_t)((chunk * ACPI_PM_HZ) / 1000000ull);
         if (!want) want = 1;
         uint32_t start = acpi_pm_read();
         while (acpi_pm_delta(start, acpi_pm_read()) < want) krelax();
-        us -= chunk;
+        left -= chunk;
     }
+    /* Top up against the caller-visible clock. Normally zero passes; it matters
+     * only when ktime has been running slower than real time. */
+    while ((int64_t)(ktime_get_ns() - kt_target) < 0) krelax();
 }
 
 /* v0.92: LAPIC TIMER CALIBRATION, per core.
@@ -21067,10 +21114,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
      * what ring 3 needs and a later RTC or a set-time call can supply the
      * offset in one place; it is not wired to pretend the number means more
      * than it does. */
-    case 104: {  /* SYS_CLOCK_GETTIME(clockid, timespec*) -> 0, or negative */
-        if (a0 != 0 && a0 != 1) return (uint64_t)-22;          /* EINVAL       */
+    case 104: {  /* SYS_CLOCK_GETTIME(clockid, timespec*) -> 0, or negative
+                  *
+                  * v0.93: THE CLOCK IDS ARE POSIX'S. v0.92 had MONOTONIC 0 and
+                  * REALTIME 1, which is backwards from every C library, and the
+                  * SEEK_* comment in init.c states the principle it violated:
+                  * these are not an internal encoding to be chosen freely. */
+        if (!clockid_valid(a0)) return (uint64_t)-22;          /* EINVAL       */
         if (!access_ok(kprocs[current_proc_idx].cr3, a1, 16, 1)) return (uint64_t)-14;
-        uint64_t ns = ktime_get_ns() + (a0 == 1 ? g_realtime_off_ns : 0);
+        uint64_t ns = clock_read_ns(a0);
         ((uint64_t *)a1)[0] = ns / 1000000000ull;              /* tv_sec       */
         ((uint64_t *)a1)[1] = ns % 1000000000ull;              /* tv_nsec      */
         return 0;
@@ -21084,12 +21136,80 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * is the floor. At the measured ~3.81 GHz that is 1 ns after
                   * rounding, but it is DERIVED here rather than asserted, and
                   * on a slower TSC it would honestly report more. */
-        if (a0 != 0 && a0 != 1) return (uint64_t)-22;
+        if (!clockid_valid(a0)) return (uint64_t)-22;
         if (!access_ok(kprocs[current_proc_idx].cr3, a1, 16, 1)) return (uint64_t)-14;
         uint64_t res_ns = g_tsc_khz ? (1000000ull / g_tsc_khz) : 10000000ull;
         if (!res_ns) res_ns = 1;                               /* sub-ns floors to 1 */
         ((uint64_t *)a1)[0] = 0;
         ((uint64_t *)a1)[1] = res_ns;
+        return 0;
+    }
+    case 107: {  /* SYS_CLOCK_NANOSLEEP(clockid, flags, req) -> 0, or negative
+                  *
+                  * THREE ARGUMENTS, NOT POSIX'S FOUR. This kernel's syscall ABI
+                  * carries a0/a1/a2 and there is no a3 — syscall_dispatch and
+                  * syscall_trap both take exactly three. `rem` is therefore
+                  * absent from the kernel side and the ring-3 wrapper zeroes it
+                  * instead, which loses nothing: a sleep here is never
+                  * interrupted, because no signal is delivered to a sleeping
+                  * thread, so a remainder cannot arise. If interruption is ever
+                  * added, `rem` has to come back and one of the other arguments
+                  * has to be packed to make room.
+                  *
+                  * TIMER_ABSTIME is the point of this call existing alongside
+                  * SYS_NANOSLEEP. A relative sleep cannot express "wake at T"
+                  * without the caller reading the clock, subtracting, and
+                  * sleeping — and every instruction between the read and the
+                  * sleep is drift the caller cannot see or correct. Doing the
+                  * subtraction on this side of the syscall removes that gap.
+                  *
+                  * A TARGET ALREADY PAST RETURNS 0 IMMEDIATELY rather than
+                  * sleeping, which is what POSIX requires and is also the only
+                  * safe reading: the unsigned subtraction would otherwise wrap
+                  * to an enormous positive interval and hang the caller for
+                  * roughly 584 years. That is the specific bug this branch
+                  * exists to prevent, so it is checked with a signed compare
+                  * before any arithmetic. */
+        if (!clockid_valid(a0)) return (uint64_t)-22;
+        if (!access_ok(kprocs[current_proc_idx].cr3, a2, 16, 0)) return (uint64_t)-14;
+        uint64_t sec = ((const uint64_t *)a2)[0], nsec = ((const uint64_t *)a2)[1];
+        if (nsec >= 1000000000ull) return (uint64_t)-22;
+        uint64_t want_ns = sec * 1000000000ull + nsec;
+        if (a1 & 1u) {                                        /* TIMER_ABSTIME */
+            /* RE-CHECK, DO NOT COMPUTE ONCE. An absolute deadline has to be
+             * satisfied in ITS OWN clock, and ksleep_us does not sleep in that
+             * clock — it polls the PM timer, which is the only source that
+             * cannot run fast. The two do not advance identically: section 1d
+             * measured the TSC spanning 7.2% within a boot, so sleeping
+             * (target - now) real microseconds does not land at `target` when
+             * `target` is expressed in ktime.
+             *
+             * Measured before this loop existed: a +5000 us ABSTIME target woke
+             * at 4258-4300 us consistently, short by ~720 us with only a 42 us
+             * spread — far too repeatable to be scheduling noise and exactly
+             * the shape of two clocks disagreeing about the length of an
+             * interval.
+             *
+             * Re-reading the target clock after each sleep converges regardless
+             * of how the two disagree: each pass sleeps the remaining distance
+             * as the TARGET clock sees it, so the error compounds down instead
+             * of persisting. Bounded at 64 passes — a clock that cannot be
+             * reached in 64 halvings is broken, and a syscall must not spin
+             * forever on it. */
+            for (int pass = 0; pass < 64; pass++) {
+                uint64_t now = clock_read_ns(a0);
+                if ((int64_t)(want_ns - now) <= 0) return 0;  /* reached, or past */
+                uint64_t left_us = (want_ns - now) / 1000ull;
+                /* Below a microsecond the remaining distance rounds to zero and
+                 * ksleep_us would return instantly, spinning this loop. Poll the
+                 * last fraction directly instead. */
+                if (!left_us) { while ((int64_t)(want_ns - clock_read_ns(a0)) > 0) krelax(); return 0; }
+                ksleep_us(left_us);
+            }
+            return 0;
+        }
+        if (sec > 60) sec = 60;                               /* same cap as 106 */
+        ksleep_us(sec * 1000000ull + nsec / 1000ull);
         return 0;
     }
     case 106: {  /* SYS_NANOSLEEP(const timespec *req, timespec *rem) -> 0, or negative
@@ -23215,6 +23335,10 @@ static void cmd_timebench(void) {
                                 : c == 1873 ? "a sleep returned SHORT"
                                 : c == 1874 ? "CLOCK_REALTIME is not a real epoch"
                                 : c == 1875 ? "CLOCK_MONOTONIC carries the wall-clock offset"
+                                : c == 1876 ? "clock_getres wrong or failed"
+                                : c == 1877 ? "clock_getres accepted an invalid clock id"
+                                : c == 1878 ? "TIMER_ABSTIME woke EARLY or left rem set"
+                                : c == 1879 ? "TIMER_ABSTIME slept on a past target"
                                             : "undecoded exit code";
                 kprintf("[timebench] ring-3 clock probe: %s (exit %u)%s\n",
                         why, (uint64_t)c, ok ? "" : " — WATCHDOG, it never finished");
