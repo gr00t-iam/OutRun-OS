@@ -449,3 +449,89 @@ test arms it. `uniprocessor`, `smp2-bios`, `smp8-bios` and both dirty-volume
 gates were not run for this objective. Role 63's sleeps carry no per-core
 attribution, so the drift figures above are per-process, not per-core; the LAPIC
 table is the per-core measurement.
+
+---
+
+## Pre-release hardening — ITIMER_VIRTUAL was broken, and the probe is what found it
+
+Objective 3 shipped `ITIMER_VIRTUAL` in `d319e51` with the note that no ring-3
+test armed it. Writing that test found **two real kernel defects**. Both were in
+shipped code. Neither would have been caught by tagging on the Objective 3
+evidence, because nothing in that evidence ever armed the timer.
+
+### Defect 1 — the timer could never fire for the workload it exists to serve
+
+`sig_check_alarms` compared the target against `proc_cpu_ns(i)`, the ACCUMULATED
+CPU total. That total only advances when a ring-3 excursion CLOSES, and a
+CPU-bound process can run its entire life inside one open excursion. Measured
+directly, with the comparison instrumented:
+
+    [vtdbg] SCAN pid 763 used=0 vd=383999 delta=-383999 exited=0
+
+`used` reads **zero** while that same process ended with 423,993 us of CPU
+accumulated — all of it in flight, none of it closed. `vd` decomposes as
+`0 accumulated + 333,999 in flight + 50,000 requested`, which is the same fact
+from the other side.
+
+This is the SAME defect fixed for `clock_gettime` earlier in this cycle
+(`cpu_ns_inflight`, Objective 3). The clock was fixed; the timer scan was left
+reading the stale basis. Arming already used the live total, so the two halves
+were comparing different quantities and could never meet. Both now use
+`proc_cpu_ns(i) + cpu_ns_inflight(i)`.
+
+### Defect 2 — sleep-charge granularity is invisible to the sleeper and obvious to an observer
+
+With defect 1 fixed the timer fired — **in the middle of a 100 ms sleep**,
+remaining going 49,778 -> 0.
+
+`ksleep_charge_to` charged once, on completion. `cpu_ns_inflight` computes
+`elapsed - slept`, so for the whole duration of a sleep `elapsed` climbs while
+`slept` stays flat. The sleeping task itself never notices — it reads its own
+clock only after the final charge lands. Any CONCURRENT observer sees its CPU
+time racing at wall-clock rate, and `sig_check_alarms` running on another core
+is exactly that observer.
+
+**This is the change an earlier control told me to revert.** That control was
+correctly run and correctly reported: charge-at-end gave 83 us against the split
+loop's 91 us across a 50 ms sleep. It was also narrower than the conclusion
+drawn from it — it measured only `clock_gettime` called by the sleeping task
+itself, which cannot distinguish the two designs. The distinguishing case is an
+observer reading mid-sleep, and no such observer existed until this probe
+created one. The incremental loop is restored, and the comment in `ksleep_us`
+records why so it is not reverted again on the same reasoning.
+
+### Measured, after both fixes
+
+| check | result |
+|---|---|
+| `ITIMER_VIRTUAL` across a 100,000 us sleep | remaining 49,931 -> 49,904 (**27 us**) |
+| fired during that sleep | no |
+| armed 50,000 us of CPU | **fired after 50,114 us of CPU** |
+| probe verdict | OK (1870) |
+
+Late by 114 us, never early — the same standard applied to sleeps and to
+`ITIMER_REAL` throughout this cycle.
+
+### A harness failure worth recording, because it cost four hours
+
+A probe run sat for 3 h 49 m. Two causes, compounding:
+
+- The guest hung in `posixstrs` waiting for a child (~840 s of spin) and never
+  reached the prompt. It did NOT reproduce: a control on the committed HEAD
+  image and a re-run of the same image both booted clean. Intermittent, and
+  consistent with the host degradation recorded in ROADMAP-0.91 §1a.
+- The feeder waited for the prompt with an unbounded `while ! grep`. `timeout`
+  bounded QEMU, not the feeder, so when the marker never appeared the wait ran
+  forever. **A timeout must be a deadline** — the same rule this tree already
+  states for ring-3 waits applies to the harness driving it.
+
+`.logs/probe.sh` now bounds every wait and prints `PROMPT: NEVER REACHED`
+instead of hanging.
+
+### Documentation
+
+`README.md` and `metal/INSTALL.md` referenced `outrun-os-0.2.0.iso` — stale for
+most of the project's life, for the same reason `grub.cfg` was: nothing checks
+them. They now read `outrun-os-<VERSION>.iso` with a note naming
+`metal/Makefile` as the source. A placeholder cannot go stale; a pinned number
+would simply restart the decay.

@@ -13880,7 +13880,18 @@ static void sig_check_alarms(void) {
          * deliver one signal per thread for a single expiry. */
         uint64_t vd = kprocs[i].it_virt_ns;
         if (vd && tg_of(i) == i) {
-            uint64_t used = proc_cpu_ns(i);
+            /* THE LIVE TOTAL, NOT THE ACCUMULATED ONE. cpu_grp_ns only advances
+             * when a ring-3 excursion CLOSES, and a CPU-bound process — exactly
+             * the workload a virtual timer exists to measure — can run its whole
+             * life inside one open excursion. Measured: the probe's accumulated
+             * total read 0 while 334 ms of its CPU time sat in flight, so the
+             * deadline was never reached and the timer never fired.
+             *
+             * This is the same defect fixed for clock_gettime in d319e51; the
+             * timer scan was left on the old basis. Arming (case 108) also uses
+             * the live total, so the two now agree and the timer expires exactly
+             * at the requested amount of CPU rather than never. */
+            uint64_t used = proc_cpu_ns(i) + cpu_ns_inflight(i);
             if (kprocs[i].exited || (int64_t)(used - vd) >= 0) {
                 uint64_t nxt = kprocs[i].exited
                              ? 0 : itimer_next(vd, kprocs[i].it_virt_iv_ns, used);
@@ -15110,33 +15121,42 @@ static void ksleep_us(uint64_t us) {
      * time and the top-up bounds it in the clock the caller can see. */
     uint64_t kt_target = ktime_get_ns() + us * 1000ull;
     uint64_t left = us;
+    uint64_t charged_to = charge_t0;
+    /* CHARGE AS THE SLEEP PROGRESSES, because someone else may look mid-sleep.
+     *
+     * cpu_ns_inflight computes (elapsed - slept) for a task inside an open
+     * excursion. If the sleep is charged only on completion, `slept` stays flat
+     * for the whole sleep while `elapsed` climbs — so any CONCURRENT observer
+     * sees the task's CPU time racing up at wall-clock rate while it is in fact
+     * asleep. sig_check_alarms is exactly such an observer, running on another
+     * core, and ITIMER_VIRTUAL duly expired in the middle of a 100 ms sleep.
+     *
+     * An earlier control appeared to show this loop made no difference and it
+     * was reverted. That control was sound but narrower than the conclusion
+     * drawn from it: it measured only clock_gettime called by the SLEEPING TASK
+     * ITSELF, which necessarily reads after the final charge has landed. It
+     * never had an observer looking in mid-sleep, which is the only case that
+     * distinguishes the two designs. */
     while (left) {
-        uint64_t chunk = left > 4000000ull ? 4000000ull : left; /* inside one wrap */
+        uint64_t chunk = left > 2000ull ? 2000ull : left;   /* charge granularity */
         uint32_t want = (uint32_t)((chunk * ACPI_PM_HZ) / 1000000ull);
         if (!want) want = 1;
         uint32_t start = acpi_pm_read();
         while (acpi_pm_delta(start, acpi_pm_read()) < want) krelax();
         left -= chunk;
+        uint64_t nowc = ktime_get_ns();
+        if ((int64_t)(nowc - charged_to) > 0) { ksleep_charge_to(who, nowc - charged_to);
+                                                charged_to = nowc; }
     }
     /* Top up against the caller-visible clock. Normally zero passes; it matters
      * only when ktime has been running slower than real time. */
     while ((int64_t)(ktime_get_ns() - kt_target) < 0) krelax();
-    /* ONE CHARGE, AT THE END, AND THAT WAS MEASURED RATHER THAN ASSUMED.
-     *
-     * An earlier version split this loop into 2 ms steps and charged after each,
-     * reasoning that a sleep longer than a scheduling quantum is preempted
-     * partway through and the excursion would close with elapsed time counted
-     * and no slept time yet subtracted. The control says otherwise: with the
-     * charge back at the end and a single 4,000,000 us chunk, a 50,053 us sleep
-     * advanced CLOCK_PROCESS_CPUTIME_ID by 83 us against 91 us for the split
-     * version — no difference. The extra machinery was reverted rather than
-     * kept on a plausible story, and the reason is recorded so the idea is not
-     * re-derived from scratch next time.
-     *
-     * Charge what ELAPSED, not what was requested: the two differ by the
-     * overshoot, and billing the request leaves the overshoot counted as CPU
-     * time the task never spent computing. */
-    ksleep_charge_to(who, ktime_get_ns() - charge_t0);
+    /* Charge the remainder — the overshoot and any top-up above. Charge what
+     * ELAPSED, not what was requested: the two differ by the overshoot, and
+     * billing the request leaves the overshoot counted as CPU time the task
+     * never spent computing. */
+    uint64_t fin = ktime_get_ns();
+    if ((int64_t)(fin - charged_to) > 0) ksleep_charge_to(who, fin - charged_to);
 }
 
 /* v0.92: LAPIC TIMER CALIBRATION, per core.
@@ -21391,8 +21411,17 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         uint64_t now;
         if (a0 == 0) { dlp = &kprocs[p].it_real_ns; ivp = &kprocs[p].it_real_iv_ns;
                        now = ktime_get_ns(); }
+        /* VIRTUAL arms against the LIVE cpu total — accumulated plus the
+         * excursion in flight — while sig_check_alarms compares the accumulated
+         * total alone. That asymmetry is deliberate and it errs in the safe
+         * direction: the target is set from the larger number, so the timer can
+         * only fire LATE (by at most one excursion), never early. Arming from
+         * the accumulated total would let the in-flight time land the instant
+         * the excursion closes and consume part of the interval the caller had
+         * just asked for. Early is the failure that matters here, exactly as it
+         * is for a sleep. */
         else         { dlp = &kprocs[p].it_virt_ns; ivp = &kprocs[p].it_virt_iv_ns;
-                       now = proc_cpu_ns(p); }
+                       now = proc_cpu_ns(p) + cpu_ns_inflight(p); }
 
         if (num == 109) {
             if (!access_ok(cr3, a1, 32, 1)) return (uint64_t)-14;   /* EFAULT */
@@ -23637,6 +23666,11 @@ static void cmd_timebench(void) {
                 kprintf("[timebench] r63 accounting: cpu_ns=%u grp=%u excl=%u (us)\n",
                         kprocs[p].cpu_ns / 1000ull, kprocs[p].cpu_grp_ns / 1000ull,
                         kprocs[p].cpu_excl_ns / 1000ull);
+                kprintf("[timebench] r63 timers: it_virt=%u us  tg_of=%d self=%d  "
+                        "armed_gate=%d  pending=%x\n",
+                        kprocs[p].it_virt_ns / 1000ull, (uint64_t)(int64_t)tg_of(p),
+                        (uint64_t)(int64_t)p, (uint64_t)(int64_t)g_alarms_armed,
+                        (uint64_t)kprocs[p].sig_pending);
                 int c = kprocs[p].exit_code;
                 const char *why = c == 1870 ? "OK"
                                 : c == 1871 ? "CLOCK WENT BACKWARDS"
@@ -23656,6 +23690,10 @@ static void cmd_timebench(void) {
                                 : c == 1885 ? "CPU TIME ADVANCED WHILE ASLEEP"
                                 : c == 1886 ? "CPU time ran ahead of the wall clock"
                                 : c == 1887 ? "clock_nanosleep accepted a CPU-time clock"
+                                : c == 1888 ? "setitimer/getitimer refused ITIMER_VIRTUAL"
+                                : c == 1889 ? "ITIMER_VIRTUAL RAN DOWN DURING A SLEEP"
+                                : c == 1890 ? "ITIMER_VIRTUAL never fired under load"
+                                : c == 1891 ? "ITIMER_VIRTUAL FIRED EARLY"
                                             : "undecoded exit code";
                 kprintf("[timebench] ring-3 clock probe: %s (exit %u)%s\n",
                         why, (uint64_t)c, ok ? "" : " — WATCHDOG, it never finished");

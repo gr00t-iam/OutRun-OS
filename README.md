@@ -61,7 +61,11 @@ is selling something; what you have here is the honest foundation — a kernel
 you own completely, that boots on real firmware, that you can extend phase by
 phase per docs/ROADMAP.md.
 Proxmox VE deployment
-Upload `metal/build/outrun-os-0.2.0.iso` to your Proxmox node (Datacenter →
+`<VERSION>` is whatever `VERSION` in `metal/Makefile` says; the build prints the
+exact filename when it finishes. It is written this way because a version pinned
+here goes stale silently - this line read `0.2.0` for most of the project's life.
+
+Upload `metal/build/outrun-os-<VERSION>.iso` to your Proxmox node (Datacenter →
 node → local storage → ISO Images → Upload, or scp it to
 `/var/lib/vz/template/iso/`). Create a VM with these settings: OS type Other,
 the Outrun ISO attached as CD/DVD, BIOS either SeaBIOS (default) or OVMF —
@@ -78,7 +82,7 @@ the exception handler contain a deliberate CPU fault, `reboot` to warm-reset.
 Bare metal / NVMe deployment
 The ISO is a hybrid image (El Torito BIOS + UEFI entries plus an MBR boot
 sector), so it can be written directly to any raw block device:
-    dd if=outrun-os-0.2.0.iso of=/dev/nvme0n1 bs=4M status=progress
+    dd if=outrun-os-<VERSION>.iso of=/dev/nvme0n1 bs=4M status=progress
     sync
 
 Double-check the target device name first — dd overwrites everything on it,

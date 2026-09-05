@@ -319,6 +319,8 @@ static i64 oeventfd_read(int fd, u64 *out) {
 #define SIGALRM 14
 #define SIGTERM 15
 #define SIGCHLD 17
+/* v0.93: ITIMER_VIRTUAL's signal, at POSIX's number. */
+#define SIGVTALRM 26
 #define NSIG    32
 
 #define PCAP_SMP_ADMIN (1ull << 9)
@@ -3605,7 +3607,11 @@ static void append_smp_worker(u32 idx) {
  *   1884 CPU time did not advance while the process was computing
  *   1885 CPU time advanced while the process was ASLEEP
  *   1886 CPU time ran ahead of wall-clock time
- *   1887 clock_nanosleep accepted a CPU-time clock (it can never wake) */
+ *   1887 clock_nanosleep accepted a CPU-time clock (it can never wake)
+ *   1888 setitimer/getitimer refused ITIMER_VIRTUAL
+ *   1889 ITIMER_VIRTUAL ran down, or fired, during a SLEEP
+ *   1890 ITIMER_VIRTUAL never fired under sustained compute
+ *   1891 ITIMER_VIRTUAL fired EARLY */
 #define R63_READS 200000u
 
 /* Signal-delivery evidence for the ITIMER_REAL test. Counted rather than
@@ -3613,6 +3619,8 @@ static void append_smp_worker(u32 idx) {
  * never fires, and a bare flag cannot tell those apart. */
 static volatile u64 g_r63_alrm = 0;
 static void r63_on_alrm(int s) { (void)s; g_r63_alrm++; }
+static volatile u64 g_r63_vtalrm = 0;
+static void r63_on_vtalrm(int s) { (void)s; g_r63_vtalrm++; }
 static void role63_clock_probe(void) {
     /* (1) monotonicity across the syscall boundary */
     u64 back = 0, last = omono_us();
@@ -3862,6 +3870,73 @@ static void role63_clock_probe(void) {
             print("  [r63] clock_nanosleep accepted a CPU-time clock\n");
             sysc(SYS_EXIT, 1887, 0, 0);
         }
+    }
+
+    /* ------------------------------------------------------------------ *
+     * (6) v0.93: ITIMER_VIRTUAL counts CPU, not wall clock.
+     *
+     * The claim that makes this timer worth having is the NEGATIVE one: it
+     * must not run down while the process is asleep. A virtual timer that
+     * decrements through a sleep is ITIMER_REAL with extra steps, and the only
+     * way to show it is not is to sleep for longer than the interval and find
+     * it still armed.
+     * ------------------------------------------------------------------ */
+    {
+        if (osigaction(SIGVTALRM, r63_on_vtalrm) != 0) sysc(SYS_EXIT, 1888, 0, 0);
+        g_r63_vtalrm = 0;
+        u64 want_cpu = 50000ull;                          /* 50 ms of CPU */
+
+        u64 cts[2];
+        if (oclock_gettime(CLOCK_PROCESS_CPUTIME_ID, cts) != 0) sysc(SYS_EXIT, 1880, 0, 0);
+        u64 v0 = cts[0] * 1000000ull + cts[1] / 1000ull;
+        if (osetitimer_us(ITIMER_VIRTUAL, want_cpu) != 0) sysc(SYS_EXIT, 1888, 0, 0);
+
+        /* (a) SLEEP MUST NOT CONSUME IT. Sleep twice the interval in wall time
+         * and require that it neither fired nor lost much of its remaining. */
+        u64 iv[4];
+        if (ogetitimer(ITIMER_VIRTUAL, iv) != 0) sysc(SYS_EXIT, 1888, 0, 0);
+        u64 rem_before = iv[2] * 1000000ull + iv[3];
+        onanosleep_us(100000ull);                         /* 2x the interval */
+        if (ogetitimer(ITIMER_VIRTUAL, iv) != 0) sysc(SYS_EXIT, 1888, 0, 0);
+        u64 rem_after = iv[2] * 1000000ull + iv[3];
+        print("  [r63] ITIMER_VIRTUAL across a 100000 us SLEEP: remaining ");
+        hex(rem_before); print(" -> "); hex(rem_after);
+        print("  fired "); hex(g_r63_vtalrm); print("\n");
+        if (g_r63_vtalrm) {
+            print("  [r63] ITIMER_VIRTUAL FIRED during a sleep\n");
+            sysc(SYS_EXIT, 1889, 0, 0);
+        }
+        /* Losing a quarter of the interval to a sleep would mean it is tracking
+         * wall time. The same bound as the CPU-clock check, for the same reason. */
+        if (rem_before > rem_after && (rem_before - rem_after) > want_cpu / 4ull) {
+            print("  [r63] ITIMER_VIRTUAL decremented through a sleep\n");
+            sysc(SYS_EXIT, 1889, 0, 0);
+        }
+
+        /* (b) COMPUTE MUST CONSUME IT. Burn CPU until it fires, bounded by a
+         * wall-clock deadline so a host that never schedules us reports a
+         * timeout rather than hanging the suite. */
+        /* No printing inside this loop. A print() writes to the serial console,
+         * which is real CPU time charged to this process — it would consume the
+         * very interval being measured. That mistake has now been made twice in
+         * this cycle; the loop stays silent and reports afterwards. */
+        u64 w0 = omono_us();
+        while (!g_r63_vtalrm && (omono_us() - w0) < 5000000ull) { }
+        if (!g_r63_vtalrm) {
+            print("  [r63] ITIMER_VIRTUAL never fired under load\n");
+            sysc(SYS_EXIT, 1890, 0, 0);
+        }
+        if (oclock_gettime(CLOCK_PROCESS_CPUTIME_ID, cts) != 0) sysc(SYS_EXIT, 1880, 0, 0);
+        u64 v1 = cts[0] * 1000000ull + cts[1] / 1000ull;
+        print("  [r63] ITIMER_VIRTUAL armed "); hex(want_cpu);
+        print(" us of CPU -> fired after "); hex(v1 - v0); print(" us of CPU\n");
+        /* Early is the failure. Late is a busy machine plus up to one excursion
+         * of lag, which the kernel comment on the arming path explains. */
+        if ((v1 - v0) + 1 < want_cpu) {
+            print("  [r63] ITIMER_VIRTUAL fired EARLY\n");
+            sysc(SYS_EXIT, 1891, 0, 0);
+        }
+        osetitimer_us(ITIMER_VIRTUAL, 0);                 /* disarm */
     }
 
     sysc(SYS_EXIT, 1870, 0, 0);
