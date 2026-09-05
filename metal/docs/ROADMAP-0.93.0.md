@@ -381,3 +381,71 @@ would compare against an empty string and pass silently.
 
 The check was confirmed to FAIL before it was trusted — restoring the old
 `0.30.0-metal` string makes it warn, and putting it back makes it pass.
+
+### Objective 3 — multi-core validation (second sample)
+
+The first matrix pass verified the SUITES. It did not verify the probe, because
+**the gate never runs it**: `gate-matrix.sh` launches qemu with `< /dev/null`
+and types nothing, and role 63 only runs when `timebench` is entered at the
+shell. Both tier logs from the first pass contain zero occurrences of it. So the
+probe was run separately under each tier's exact device configuration — the
+first time it has executed behind VT-d.
+
+Image `7ec553b76b7eb98e1eea7cc74d6d5014`, rebuilt from `d319e51`.
+
+| tier | suites | passed | failed | ranks | time |
+|---|---|---|---|---|---|
+| `smp4-bios` | 45 | 583 | 0 | 0 | 435 s |
+| `smp4-iommu` | 47 | 597 | 0 | 0 | 450 s |
+
+| probe check | `smp4-bios` | `smp4-iommu` |
+|---|---|---|
+| `ITIMER_REAL` armed 50,000 us | fired 50,107 us | fired 50,122 us |
+| `getitimer` remaining | 49,937 us | 49,941 us |
+| CPU time over 20,000 us compute | +20,044 us | +20,038 us |
+| CPU time over a ~50 ms SLEEP | **+73 us (0.13%)** | **+60 us (0.12%)** |
+| verdict | OK (1870) | OK (1870) |
+
+Note the ISO md5 differs from the first pass despite an identical tree —
+`grub-mkrescue` output is not byte-reproducible. The md5 identifies which binary
+a log came from; it is not a claim that the build is deterministic.
+
+### Per-core evidence, and one correction to how this was framed
+
+`cpu_run_t0` and `cpu_run_excl0` are fields of `struct kproc`
+(`kernel64.c:2028-2029`) — **per TASK, not per CPU**. They are not in
+`struct cpu_local` / `g_cpu[N]`. That distinction decides what can even be
+asserted about them:
+
+- There is no per-CPU replica to corrupt. Each is written only by the core
+  currently dispatching that task, and a task is dispatched by exactly one core.
+- **This path takes no locks**, so cross-core lock contention cannot arise in it
+  by construction. `ksleep_charge_to` uses `__sync_fetch_and_add`; the dispatch
+  stamps are plain volatile stores. `ranks=0` from the gate is real, but it is
+  not evidence about a lock that does not exist.
+
+What the logs DO show per core is the LAPIC timer, calibrated independently on
+each secondary core against the ACPI PM timer:
+
+| tier | cpu1 | cpu2 | cpu3 | spread |
+|---|---|---|---|---|
+| `smp4-bios` | 62,467,873 Hz | 62,411,999 Hz | 62,389,182 Hz | 0.13% |
+| `smp4-iommu` | 62,598,566 Hz | 62,507,126 Hz | 62,387,386 Hz | 0.34% |
+
+Each derives its own initial count (~625,000) for the 10 ms quantum.
+
+No backward time steps and no underflows in either tier. Every match for those
+terms is a counter REPORTING zero (`underflow 0 -> 0`) — live instrumentation
+reading zero, not a grep for a string nothing emits.
+
+`smp4-iommu` came up with DMA remapping enabled (`GSTS.TES`), root table
+programmed (`GSTS.RTPS`), 3-level second-level tables and interrupt remapping,
+all four cores online with timer vectors allocated. `capdma` passed 12/12,
+including the deliberately blocked cross-domain DMA that is its confinement
+proof.
+
+**Still not covered:** `ITIMER_VIRTUAL` is wired to `SIGVTALRM` but no ring-3
+test arms it. `uniprocessor`, `smp2-bios`, `smp8-bios` and both dirty-volume
+gates were not run for this objective. Role 63's sleeps carry no per-core
+attribution, so the drift figures above are per-process, not per-core; the LAPIC
+table is the per-core measurement.
