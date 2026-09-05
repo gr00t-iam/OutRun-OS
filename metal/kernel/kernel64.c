@@ -1823,6 +1823,10 @@ static uint64_t create_address_space(void) {
 #define SIGSEGV 11
 #define SIGALRM 14
 #define SIGCHLD 17
+/* v0.93: ITIMER_VIRTUAL's signal. 26 is the Linux/POSIX number, kept for the
+ * same reason every other value here is — a ring-3 program written against a
+ * real libc must not have to be recompiled to talk to this kernel. */
+#define SIGVTALRM 26
 #define NSIG    32
 
 /* v0.39: a COMPLETE ring-3 register context. The preempt IPI (vector 50)
@@ -1972,7 +1976,57 @@ struct kproc {
     volatile uint32_t sig_pending;
     volatile uint32_t sig_mask;
     uint64_t sigframe_sp;
-    volatile uint64_t alarm_deadline;      /* g_ticks value at which SIGALRM fires (0 = off) */
+    /* v0.93: THE REAL-TIME INTERVAL TIMER. This was `alarm_deadline`, a g_ticks
+     * value, and it is now an absolute ktime_get_ns() deadline (0 = disarmed).
+     *
+     * IT IS ONE TIMER, DELIBERATELY. POSIX says alarm() and setitimer(ITIMER_REAL)
+     * share state and interfere with each other, and giving each its own field
+     * would produce a kernel where arming an itimer fails to cancel a pending
+     * alarm — two deadlines racing to deliver SIGALRM to the same process, with
+     * whichever lost still armed afterwards. SYS_ALARM keeps its tick-granularity
+     * ABI and converts at the boundary.
+     *
+     * The move to nanoseconds is what makes setitimer meaningful at all: struct
+     * itimerval is microseconds, and a 10 ms tick cannot express it. */
+    volatile uint64_t it_real_ns;          /* absolute ktime ns; 0 = disarmed         */
+    volatile uint64_t it_real_iv_ns;       /* reload interval, 0 = one-shot           */
+    /* ITIMER_VIRTUAL, measured against consumed process CPU time rather than the
+     * wall clock. Absolute, in the same units as cpu_grp_ns below. */
+    volatile uint64_t it_virt_ns;          /* absolute process-CPU ns; 0 = disarmed   */
+    volatile uint64_t it_virt_iv_ns;       /* reload interval, 0 = one-shot           */
+    /* v0.93: CPU TIME ACCOUNTING. Accumulated in cpu_exec_proc around the ring-3
+     * excursion, so the window covers user time plus the kernel time spent
+     * servicing this task's syscalls — which is what CLOCK_PROCESS_CPUTIME_ID is
+     * defined to report (utime+stime), not user time alone.
+     *
+     * cpu_ns is this task's own; cpu_grp_ns is kept on the THREAD-GROUP LEADER and
+     * is the sum across the group, so a per-process read is O(1) instead of a scan
+     * that would have to be re-taken under a lock to be consistent.
+     *
+     * cpu_excl_ns is a raw, monotonically growing count of time spent deliberately
+     * ASLEEP inside a syscall. That time lands inside the excursion window but is
+     * emphatically not CPU time — without removing it a process blocked in
+     * nanosleep would accrue CPU time at wall-clock rate, and a CPU-time clock
+     * that advances while the process is asleep is just a second wall clock.
+     *
+     * It is never subtracted at READ time. cpu_exec_proc samples it at both ends
+     * of an excursion and removes only what was slept during that excursion, so
+     * cpu_ns and cpu_grp_ns are already net and can never be driven negative by a
+     * sleep that straddles the accounting boundary. */
+    volatile uint64_t cpu_ns;              /* this task's net CPU time                */
+    volatile uint64_t cpu_grp_ns;          /* group total; kept on the leader         */
+    volatile uint64_t cpu_excl_ns;         /* raw slept-in-syscall ns; a delta source */
+    /* THE IN-FLIGHT EXCURSION. The three counters above only advance when an
+     * excursion ENDS, and a task reading its own CPU clock is by definition in
+     * the middle of one — so without these it reads a value that excludes every
+     * microsecond it has burned since it was last dispatched. Measured exactly
+     * that way before these existed: 20 ms of ring-3 compute reported +0 ns.
+     *
+     * cpu_run_t0 is the ktime at dispatch, 0 when not running; cpu_run_excl0 is
+     * the sleep counter at that same instant, so the live delta can have its
+     * slept time removed the same way the accumulated total does. */
+    volatile uint64_t cpu_run_t0;          /* ktime ns at dispatch; 0 = not running   */
+    volatile uint64_t cpu_run_excl0;       /* cpu_excl_ns at dispatch                 */
     /* v0.75 DEFECT B, FIXED. ppid_slot is a SLOT INDEX, and slots are recycled.
      * Every reader used to validate it with `kprocs[par].used`, which stays true
      * for a slot whose occupant died and was replaced — so a process could be
@@ -2442,7 +2496,10 @@ static void kproc_reset(struct kproc *p) {
      * one thread in the group, per-thread stacks start below the main stack. */
     for (int sg = 0; sg < NSIG; sg++) p->sig_handler[sg] = 0;
     p->sig_pending = 0; p->sig_mask = 0; p->sigframe_sp = 0;
-    p->alarm_deadline = 0; p->ppid_slot = -1; p->ppid_gen = 0; p->pgid = 0;
+    p->it_real_ns = 0; p->it_real_iv_ns = 0; p->it_virt_ns = 0; p->it_virt_iv_ns = 0;
+    p->cpu_ns = 0; p->cpu_grp_ns = 0; p->cpu_excl_ns = 0;
+    p->cpu_run_t0 = 0; p->cpu_run_excl0 = 0;
+    p->ppid_slot = -1; p->ppid_gen = 0; p->pgid = 0;
     /* v0.75: a recycled slot must not inherit the dead task's held ranks — the
      * same lesson thread_create_ex learned for PCBs, one struct over. */
     p->rank_sp = 0;
@@ -4336,6 +4393,11 @@ static void ktime_reanchor(void) {
     g_anchor_pm   = pm;
     g_anchor_count++;
 }
+
+/* v0.93: the PIT runs at 100 Hz, so one g_ticks step is 10 ms. Named because
+ * SYS_ALARM's ABI is in ticks while the timer behind it is now in nanoseconds,
+ * and the conversion appears on both the arming and the reporting side. */
+#define NS_PER_TICK 10000000ull
 
 /* Lockless, IRQ-safe, SMP-safe. The anchor triple is published by the PIT ISR
  * on the BSP only; a reader that sees the anchor change mid-read simply
@@ -13748,25 +13810,86 @@ static int tty_intr(void) {
 /* Fire SIGALRM for any process whose deadline has passed. Called from the
  * scheduler boundary (never from the timer ISR itself, so no lock ordering
  * hazard against a process mid-teardown). */
-static volatile int g_alarms_armed = 0;      /* fast-path gate: SYS_ALARM users only */
+static volatile int g_alarms_armed = 0;      /* fast-path gate: armed timers, both kinds */
+
+/* CPU time consumed by the PROCESS that p belongs to. Kept on the thread-group
+ * leader by cpu_exec_proc, so this is O(1) rather than a scan of the group that
+ * would have to be re-taken under a lock to be self-consistent. */
+static inline uint64_t proc_cpu_ns(int p) { return kprocs[tg_of(p)].cpu_grp_ns; }
+
+/* CPU time burned in the excursion the task is inside RIGHT NOW, and not yet
+ * folded into the totals above. Zero when the task is not on a CPU.
+ *
+ * Without this a task reading its own CPU clock sees only excursions that have
+ * already closed — which is never the one it is calling from. It measured +0 ns
+ * across 20 ms of ring-3 compute, because both readings fell inside a single
+ * excursion that had not ended yet. */
+static inline uint64_t cpu_ns_inflight(int p) {
+    uint64_t t0 = kprocs[p].cpu_run_t0;
+    if (!t0) return 0;
+    uint64_t now = ktime_get_ns();
+    if ((int64_t)(now - t0) <= 0) return 0;        /* raced with dispatch      */
+    uint64_t el = now - t0;
+    uint64_t sl = kprocs[p].cpu_excl_ns - kprocs[p].cpu_run_excl0;
+    return el > sl ? el - sl : 0;
+}
+
+/* Advance an expired absolute deadline to the first repeat strictly after `now`.
+ * Returns 0 for a one-shot timer, which disarms it.
+ *
+ * The loop SKIPS whole missed periods rather than firing once per period. A
+ * timer with a 1 ms interval whose process was descheduled for a second would
+ * otherwise have a thousand signals owed to it, and delivering them would leave
+ * the process doing nothing but running its handler. POSIX permits coalescing;
+ * a process that cannot make progress is not a defensible alternative. */
+static inline uint64_t itimer_next(uint64_t dl, uint64_t iv, uint64_t now) {
+    if (!iv) return 0;
+    uint64_t n = dl;
+    do { n += iv; } while ((int64_t)(now - n) >= 0);
+    return n;
+}
+
+/* Fire SIGALRM / SIGVTALRM for any process whose timer has expired. Called from
+ * the scheduler boundary (never from the timer ISR itself, so no lock ordering
+ * hazard against a process mid-teardown). */
 static void sig_check_alarms(void) {
-    if (!g_alarms_armed) return;             /* hot path: no armed alarm anywhere */
+    if (!g_alarms_armed) return;             /* hot path: nothing armed anywhere */
+    uint64_t now_ns = ktime_get_ns();
     for (int i = 0; i < n_kproc; i++) {
-        uint64_t dl = kprocs[i].alarm_deadline;
-        if (!kprocs[i].used || !dl) continue;
-        /* Disarm an exited process's alarm too, so the gate counter above can
-         * never be left permanently non-zero by a task that died holding one. */
-        int expired = kprocs[i].exited || g_ticks >= dl;
-        if (!expired) continue;
-        /* CLAIM the deadline atomically. This runs on every core at every
-         * syscall boundary, so two cores can see the same alarm expired at
-         * once; letting both decrement the gate counter drives it to zero
-         * while another process still has an alarm armed, and that alarm then
-         * never fires at all. (Found live: SIGALRM intermittently missing in
-         * exactly one round of the POSIX suite under SMP.) */
-        if (!__sync_bool_compare_and_swap(&kprocs[i].alarm_deadline, dl, 0)) continue;
-        __sync_fetch_and_sub(&g_alarms_armed, 1);
-        if (!kprocs[i].exited) sig_raise(i, SIGALRM);
+        if (!kprocs[i].used) continue;
+        /* ITIMER_REAL — wall clock. Signed compare, not `>=`: these are absolute
+         * ns and a subtraction is the only form that stays correct if a deadline
+         * is ever set from a clock reading taken a moment later on another core. */
+        uint64_t dl = kprocs[i].it_real_ns;
+        if (dl && (kprocs[i].exited || (int64_t)(now_ns - dl) >= 0)) {
+            uint64_t nxt = kprocs[i].exited
+                         ? 0 : itimer_next(dl, kprocs[i].it_real_iv_ns, now_ns);
+            /* CLAIM the deadline atomically. This runs on every core at every
+             * syscall boundary, so two cores can see the same timer expired at
+             * once; letting both decrement the gate counter drives it to zero
+             * while another process still has one armed, and that timer then
+             * never fires at all. (Found live: SIGALRM intermittently missing in
+             * exactly one round of the POSIX suite under SMP.) */
+            if (__sync_bool_compare_and_swap(&kprocs[i].it_real_ns, dl, nxt)) {
+                if (!nxt) __sync_fetch_and_sub(&g_alarms_armed, 1);
+                if (!kprocs[i].exited) sig_raise(i, SIGALRM);
+            }
+        }
+        /* ITIMER_VIRTUAL — process CPU time. Checked ONLY on the thread-group
+         * leader: it is a per-process timer, and testing it on every member would
+         * deliver one signal per thread for a single expiry. */
+        uint64_t vd = kprocs[i].it_virt_ns;
+        if (vd && tg_of(i) == i) {
+            uint64_t used = proc_cpu_ns(i);
+            if (kprocs[i].exited || (int64_t)(used - vd) >= 0) {
+                uint64_t nxt = kprocs[i].exited
+                             ? 0 : itimer_next(vd, kprocs[i].it_virt_iv_ns, used);
+                if (__sync_bool_compare_and_swap(&kprocs[i].it_virt_ns, vd, nxt)) {
+                    if (!nxt) __sync_fetch_and_sub(&g_alarms_armed, 1);
+                    if (!kprocs[i].exited) sig_raise(i, SIGVTALRM);
+                }
+            }
+        }
     }
 }
 
@@ -14861,15 +14984,31 @@ static uint64_t g_rtc_boot_epoch = 0;          /* seconds at boot, 0 = unknown  
  * added, this is the one place that has to diverge. */
 #define CLK_REALTIME      0u
 #define CLK_MONOTONIC     1u
+/* v0.93: the two CPU-time clocks. POSIX numbers again, for the same reason. */
+#define CLK_PROCESS_CPUTIME 2u
+#define CLK_THREAD_CPUTIME  3u
 #define CLK_MONOTONIC_RAW 4u
 
 static inline int clockid_valid(uint64_t id) {
-    return id == CLK_REALTIME || id == CLK_MONOTONIC || id == CLK_MONOTONIC_RAW;
+    return id == CLK_REALTIME || id == CLK_MONOTONIC || id == CLK_MONOTONIC_RAW
+        || id == CLK_PROCESS_CPUTIME || id == CLK_THREAD_CPUTIME;
 }
 
 /* One reader for every clock-taking syscall, so gettime and an ABSTIME sleep
  * can never disagree about what "now" means on the same clock. */
 static uint64_t clock_read_ns(uint64_t id) {
+    /* v0.93: THE CPU CLOCKS ARE NOT THE WALL CLOCK and must return before it is
+     * consulted at all. They count time this task was actually on a CPU, so they
+     * advance strictly slower than MONOTONIC and stay flat while it sleeps. */
+    /* Both add the CALLER's in-flight excursion. For the process clock the
+     * in-flight time of OTHER threads in the group is not included: reading it
+     * would mean sampling counters other cores are actively writing, and the
+     * error is bounded by one scheduling quantum per sibling. Stated because a
+     * reader is entitled to know the bound rather than discover it. */
+    if (id == CLK_PROCESS_CPUTIME)
+        return proc_cpu_ns((int)current_proc_idx) + cpu_ns_inflight((int)current_proc_idx);
+    if (id == CLK_THREAD_CPUTIME)
+        return kprocs[current_proc_idx].cpu_ns + cpu_ns_inflight((int)current_proc_idx);
     uint64_t ns = ktime_get_ns();
     /* REALTIME falls back to monotonic when the RTC never anchored — the same
      * behaviour v0.92 had, and better than reporting 1970 as though it were
@@ -14907,9 +15046,35 @@ static void rtc_init(void) {
             (uint64_t)t.hour, (uint64_t)t.min, (uint64_t)t.sec, epoch);
 }
 
+/* v0.93: charge a completed sleep to the running task's excluded-time counter, so
+ * the CPU-time clocks do not advance across it. current_proc_idx is per-CPU, so
+ * this attributes to the task that actually slept even under SMP.
+ *
+ * A sleep taken in KERNEL context (the timebench command) also lands on whatever
+ * task that core last ran, and that is harmless by construction: cpu_exec_proc
+ * samples this counter at the START of an excursion, so anything added between
+ * excursions is already in the baseline and contributes a delta of zero. Only
+ * time added while an excursion is open can subtract from it, and during an
+ * excursion the running task IS current_proc_idx. */
+/* THE TASK IS PASSED IN, NOT RE-READ, and that is the whole correctness argument.
+ *
+ * krelax() calls sched_yield() on cpu 0, which runs OTHER processes and reassigns
+ * g_cpu[0].cur_proc as it does. A charge that reads current_proc_idx after the
+ * sleep has yielded therefore bills whichever task ran last, not the sleeper.
+ *
+ * Measured with the counter printed rather than assumed: a 52,522 us sleep had
+ * only ~30,000 us of it charged to the sleeping task, and the missing 22,400 us
+ * showed up as CPU time on a process that had been asleep for all of it. */
+static inline void ksleep_charge_to(int p, uint64_t ns) {
+    if (p >= 0 && p < n_kproc) __sync_fetch_and_add(&kprocs[p].cpu_excl_ns, ns);
+}
+
 static void ksleep_us(uint64_t us) {
     if (!us) return;
-    if (us < KSLEEP_POLL_THRESHOLD_US) { udelay(us); return; }
+    /* Captured ONCE, before any yield can move cur_proc off this task. */
+    int who = (int)current_proc_idx;
+    if (us < KSLEEP_POLL_THRESHOLD_US) { udelay(us); ksleep_charge_to(who, us * 1000ull); return; }
+    uint64_t charge_t0 = ktime_get_ns();
     /* THE DEADLINE COMES FROM THE PM TIMER, NOT FROM ktime_get_ns, and that is a
      * correction rather than a preference. The first version used ktime_get_ns
      * and a 10 ms sleep came back 720 us SHORT, which is the one outcome a sleep
@@ -14956,6 +15121,22 @@ static void ksleep_us(uint64_t us) {
     /* Top up against the caller-visible clock. Normally zero passes; it matters
      * only when ktime has been running slower than real time. */
     while ((int64_t)(ktime_get_ns() - kt_target) < 0) krelax();
+    /* ONE CHARGE, AT THE END, AND THAT WAS MEASURED RATHER THAN ASSUMED.
+     *
+     * An earlier version split this loop into 2 ms steps and charged after each,
+     * reasoning that a sleep longer than a scheduling quantum is preempted
+     * partway through and the excursion would close with elapsed time counted
+     * and no slept time yet subtracted. The control says otherwise: with the
+     * charge back at the end and a single 4,000,000 us chunk, a 50,053 us sleep
+     * advanced CLOCK_PROCESS_CPUTIME_ID by 83 us against 91 us for the split
+     * version — no difference. The extra machinery was reverted rather than
+     * kept on a plausible story, and the reason is recorded so the idea is not
+     * re-derived from scratch next time.
+     *
+     * Charge what ELAPSED, not what was requested: the two differ by the
+     * overshoot, and billing the request leaves the overshoot counted as CPU
+     * time the task never spent computing. */
+    ksleep_charge_to(who, ktime_get_ns() - charge_t0);
 }
 
 /* v0.92: LAPIC TIMER CALIBRATION, per core.
@@ -15363,9 +15544,32 @@ static void cpu_exec_proc(int c, int p) {
          * entries below save that point into %gs:24..72; the decrement runs on
          * the unwind, whichever way the excursion ends. */
         __sync_fetch_and_add(&me->excur_depth, 1);
+        /* v0.93: CPU TIME ACCOUNTING WINDOW. This is the only interval in which
+         * this task is the thing the CPU is running, so it is the only honest
+         * place to measure from. slept0 captures the sleep counter at entry;
+         * whatever the task adds to it before unwinding is time it spent parked
+         * inside a syscall and must come back out of the total. */
+        uint64_t cpu_t0 = ktime_get_ns();
+        uint64_t slept0 = kprocs[p].cpu_excl_ns;
+        /* Published so the task can account for THIS excursion while still
+         * inside it — see cpu_ns_live(). Ordered before entry, cleared after. */
+        kprocs[p].cpu_run_excl0 = slept0;
+        kprocs[p].cpu_run_t0    = cpu_t0;
         code = kprocs[p].pstate
              ? enter_user_resume(&kprocs[p].uctx)
              : enter_user_mode(kprocs[p].entry, USTK_INIT);
+        kprocs[p].cpu_run_t0 = 0;                  /* excursion closed */
+        uint64_t elapsed = ktime_get_ns() - cpu_t0;
+        uint64_t slept   = kprocs[p].cpu_excl_ns - slept0;
+        /* Clamped, not trusted to be ordered: `slept` is sampled across a window
+         * in which another core can be writing, and a measured sleep can round
+         * fractionally past the elapsed time it sits inside. A negative CPU-time
+         * delta would corrupt a monotonic clock permanently, so it floors at 0. */
+        uint64_t net = (elapsed > slept) ? (elapsed - slept) : 0;
+        if (net) {
+            __sync_fetch_and_add(&kprocs[p].cpu_ns, net);
+            __sync_fetch_and_add(&kprocs[L].cpu_grp_ns, net);
+        }
         __sync_fetch_and_sub(&me->excur_depth, 1);
     }
     write_cr3(kernel_cr3);
@@ -19718,13 +19922,32 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         resume_kernel(a0);
         return 0;                                      /* unreachable */
     case 54: {   /* SYS_ALARM(ticks) -> ticks remaining on the previous alarm (0 if none).
-                  * 0 cancels. Fires SIGALRM from the scheduler/syscall boundary. */
+                  * 0 cancels. Fires SIGALRM from the scheduler/syscall boundary.
+                  *
+                  * v0.93: THE SAME TIMER setitimer(ITIMER_REAL) USES. POSIX says
+                  * these two interfere, and they do here because there is exactly
+                  * one field. The ABI is unchanged — argument and return value are
+                  * still 10 ms ticks — but the state behind it is now absolute
+                  * nanoseconds, so an alarm() cancels a pending itimer and an
+                  * itimer cancels a pending alarm, which is what a caller of
+                  * either is entitled to assume.
+                  *
+                  * Arming through alarm() clears the reload interval: alarm() is
+                  * defined as one-shot, and inheriting a repeat from an earlier
+                  * setitimer would silently turn it into a periodic signal. */
         int p = (int)current_proc_idx;
-        uint64_t rem = 0;
-        if (kprocs[p].alarm_deadline) __sync_fetch_and_sub(&g_alarms_armed, 1);
-        if (kprocs[p].alarm_deadline > g_ticks) rem = kprocs[p].alarm_deadline - g_ticks;
-        kprocs[p].alarm_deadline = a0 ? g_ticks + a0 : 0;
-        if (kprocs[p].alarm_deadline) __sync_fetch_and_add(&g_alarms_armed, 1);
+        uint64_t now = ktime_get_ns(), rem = 0;
+        uint64_t old = kprocs[p].it_real_ns;
+        if (old) {
+            __sync_fetch_and_sub(&g_alarms_armed, 1);
+            /* Round UP to ticks: alarm(1) answered while 1 ns of a tick remains
+             * must not report 0, which the caller reads as "no alarm was set". */
+            if ((int64_t)(old - now) > 0)
+                rem = ((old - now) + (NS_PER_TICK - 1)) / NS_PER_TICK;
+        }
+        kprocs[p].it_real_iv_ns = 0;
+        kprocs[p].it_real_ns    = a0 ? now + a0 * NS_PER_TICK : 0;
+        if (kprocs[p].it_real_ns) __sync_fetch_and_add(&g_alarms_armed, 1);
         return rem;
     }
     case 58: {   /* SYS_BRK(new_end) -> the resulting program break, or the CURRENT
@@ -21144,6 +21367,77 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         ((uint64_t *)a1)[1] = res_ns;
         return 0;
     }
+    case 108:    /* SYS_SETITIMER(which, const struct itimerval *new, struct itimerval *old) */
+    case 109: {  /* SYS_GETITIMER(which, struct itimerval *cur) -> 0, or negative errno.
+                  *
+                  * struct itimerval is { it_interval, it_value }, IN THAT ORDER,
+                  * each a struct timeval of { tv_sec, tv_usec } — 32 bytes total.
+                  * The interval comes FIRST, which is the opposite of the order a
+                  * caller thinks in, and getting it backwards would silently swap
+                  * "fire once in 5 ms" with "fire every 5 ms".
+                  *
+                  * ITIMER_REAL (0) and ITIMER_VIRTUAL (1) only. ITIMER_PROF (2) is
+                  * rejected rather than aliased onto VIRTUAL: PROF is defined to
+                  * count user+system time and VIRTUAL user time alone, so treating
+                  * them as one would answer a question the caller did not ask. */
+        int p = (int)current_proc_idx;
+        if (a0 != 0 && a0 != 1) return (uint64_t)-22;          /* EINVAL */
+        uint64_t cr3 = kprocs[p].cr3;
+
+        /* Both timers are absolute deadlines; they differ only in which clock
+         * they are absolute IN. Resolving that once here keeps the arming and
+         * reporting arithmetic identical for the two. */
+        volatile uint64_t *dlp, *ivp;
+        uint64_t now;
+        if (a0 == 0) { dlp = &kprocs[p].it_real_ns; ivp = &kprocs[p].it_real_iv_ns;
+                       now = ktime_get_ns(); }
+        else         { dlp = &kprocs[p].it_virt_ns; ivp = &kprocs[p].it_virt_iv_ns;
+                       now = proc_cpu_ns(p); }
+
+        if (num == 109) {
+            if (!access_ok(cr3, a1, 32, 1)) return (uint64_t)-14;   /* EFAULT */
+            uint64_t dl = *dlp, iv = *ivp;
+            uint64_t rem = (dl && (int64_t)(dl - now) > 0) ? dl - now : 0;
+            uint64_t *o = (uint64_t *)a1;
+            o[0] = iv  / 1000000000ull; o[1] = (iv  % 1000000000ull) / 1000ull;
+            o[2] = rem / 1000000000ull; o[3] = (rem % 1000000000ull) / 1000ull;
+            return 0;
+        }
+
+        /* SETITIMER. `new` is required; `old` is optional and may legitimately
+         * alias `new`, which is why every field is read into locals before
+         * anything is written back. */
+        if (!a1) return (uint64_t)-22;
+        if (!access_ok(cr3, a1, 32, 0)) return (uint64_t)-14;
+        if (a2 && !access_ok(cr3, a2, 32, 1)) return (uint64_t)-14;
+        const uint64_t *nv = (const uint64_t *)a1;
+        uint64_t iv_s = nv[0], iv_u = nv[1], v_s = nv[2], v_u = nv[3];
+        /* A tv_usec at or past a full second is malformed. Rejecting it here
+         * means the arithmetic below cannot silently normalise a caller's bug
+         * into a timer that fires at a time they never asked for. */
+        if (iv_u >= 1000000ull || v_u >= 1000000ull) return (uint64_t)-22;
+        uint64_t iv_ns = iv_s * 1000000000ull + iv_u * 1000ull;
+        uint64_t v_ns  = v_s  * 1000000000ull + v_u  * 1000ull;
+
+        uint64_t old_dl = *dlp, old_iv = *ivp;
+        uint64_t old_rem = (old_dl && (int64_t)(old_dl - now) > 0) ? old_dl - now : 0;
+
+        /* Gate accounting mirrors SYS_ALARM: the counter tracks ARMED timers, so
+         * a re-arm over an existing one must not double-count and a disarm must
+         * not leave it high — either way the fast-path check stops matching
+         * reality and some other process's timer stops firing. */
+        if (old_dl) __sync_fetch_and_sub(&g_alarms_armed, 1);
+        *ivp = iv_ns;
+        *dlp = v_ns ? now + v_ns : 0;
+        if (*dlp) __sync_fetch_and_add(&g_alarms_armed, 1);
+
+        if (a2) {
+            uint64_t *o = (uint64_t *)a2;
+            o[0] = old_iv  / 1000000000ull; o[1] = (old_iv  % 1000000000ull) / 1000ull;
+            o[2] = old_rem / 1000000000ull; o[3] = (old_rem % 1000000000ull) / 1000ull;
+        }
+        return 0;
+    }
     case 107: {  /* SYS_CLOCK_NANOSLEEP(clockid, flags, req) -> 0, or negative
                   *
                   * THREE ARGUMENTS, NOT POSIX'S FOUR. This kernel's syscall ABI
@@ -21171,6 +21465,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * exists to prevent, so it is checked with a signed compare
                   * before any arithmetic. */
         if (!clockid_valid(a0)) return (uint64_t)-22;
+        /* v0.93: A CPU-TIME CLOCK CANNOT BE SLEPT ON HERE, and this rejection is
+         * load-bearing rather than pedantic. Those clocks advance only while the
+         * task is running; a task that goes to sleep waiting for one stops
+         * advancing the very quantity it is waiting for, so the deadline is
+         * unreachable and the sleep never ends. POSIX already returns EINVAL for
+         * CLOCK_THREAD_CPUTIME_ID; this kernel extends that to the process clock
+         * because it has no separate thread able to keep the process's clock
+         * moving while the caller waits. */
+        if (a0 == CLK_PROCESS_CPUTIME || a0 == CLK_THREAD_CPUTIME) return (uint64_t)-22;
         if (!access_ok(kprocs[current_proc_idx].cr3, a2, 16, 0)) return (uint64_t)-14;
         uint64_t sec = ((const uint64_t *)a2)[0], nsec = ((const uint64_t *)a2)[1];
         if (nsec >= 1000000000ull) return (uint64_t)-22;
@@ -23328,6 +23631,12 @@ static void cmd_timebench(void) {
                 if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);
                 int ok = role_drain(63, 6000, "clkprobe");
                 current_proc_idx = save;
+                /* v0.93 diagnostic: the raw accounting counters for the probe.
+                 * cpu_excl_ns reading ~0 while cpu_ns is large is the signature
+                 * of sleep time being billed as compute. */
+                kprintf("[timebench] r63 accounting: cpu_ns=%u grp=%u excl=%u (us)\n",
+                        kprocs[p].cpu_ns / 1000ull, kprocs[p].cpu_grp_ns / 1000ull,
+                        kprocs[p].cpu_excl_ns / 1000ull);
                 int c = kprocs[p].exit_code;
                 const char *why = c == 1870 ? "OK"
                                 : c == 1871 ? "CLOCK WENT BACKWARDS"
@@ -23339,6 +23648,14 @@ static void cmd_timebench(void) {
                                 : c == 1877 ? "clock_getres accepted an invalid clock id"
                                 : c == 1878 ? "TIMER_ABSTIME woke EARLY or left rem set"
                                 : c == 1879 ? "TIMER_ABSTIME slept on a past target"
+                                : c == 1880 ? "setitimer/getitimer refused a valid call"
+                                : c == 1881 ? "ITIMER_REAL NEVER FIRED"
+                                : c == 1882 ? "ITIMER_REAL FIRED EARLY"
+                                : c == 1883 ? "getitimer reported a bad remaining time"
+                                : c == 1884 ? "CPU time did not advance while computing"
+                                : c == 1885 ? "CPU TIME ADVANCED WHILE ASLEEP"
+                                : c == 1886 ? "CPU time ran ahead of the wall clock"
+                                : c == 1887 ? "clock_nanosleep accepted a CPU-time clock"
                                             : "undecoded exit code";
                 kprintf("[timebench] ring-3 clock probe: %s (exit %u)%s\n",
                         why, (uint64_t)c, ok ? "" : " — WATCHDOG, it never finished");
@@ -26698,6 +27015,9 @@ static const char SDK_SIGNAL_H[] =
 "#define SIGSEGV 11\n"
 "#define SIGALRM 14\n"
 "#define SIGTERM 15\n"
+"#define SIGVTALRM 26\n"
+"#define ITIMER_REAL 0\n"
+"#define ITIMER_VIRTUAL 1\n"
 "int kill(int pid, int sig);\n"
 "#endif\n";
 

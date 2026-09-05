@@ -415,6 +415,26 @@ release-version-check:
 	else \
 	  echo "  [release] kernel banner check OK: $$kv"; \
 	fi
+# v0.93: the GRUB menu entry is the THIRD place a version is written down, and
+# it is the one a user reads FIRST -- it is on screen before the kernel has
+# printed a single line. Nothing checked it, so it sat at "0.30.0-metal" for
+# roughly sixty releases and was noticed only when a boot log was read for an
+# unrelated reason. A literal nothing verifies is a literal that drifts.
+#
+# `want` is recomputed here rather than carried over: every recipe line runs in
+# its own shell, so the variable set by the check above does not survive to this
+# one. Reusing it would silently compare against an empty string and pass.
+	@want="$(VERSION)"; case "$(VERSION)" in *-dev) ;; *) want="$(VERSION)-metal" ;; esac; \
+	gv=$$(sed -n 's/^menuentry "Outrun OS (kernel \(.*\))".*/\1/p' iso/boot/grub/grub.cfg | tr -d '\r'); \
+	if [ -z "$$gv" ]; then \
+	  echo "  [release] *** WARNING: could not read a version out of grub.cfg --"; \
+	  echo "  [release] *** the menuentry line is not in the shape this expects."; \
+	elif [ "$$gv" != "$$want" ]; then \
+	  echo "  [release] *** WARNING: grub.cfg menu says \"$$gv\", expected \"$$want\""; \
+	  echo "  [release] *** that is the FIRST version string a user sees at boot."; \
+	else \
+	  echo "  [release] grub menu check OK: $$gv"; \
+	fi
 
 # A release image is built from a CLEAN tree. An incremental build can carry an
 # object from a source state that no longer exists anywhere, and that is not

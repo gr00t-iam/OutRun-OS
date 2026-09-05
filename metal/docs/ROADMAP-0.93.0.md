@@ -213,3 +213,171 @@ kernel tests it with a signed compare before any arithmetic.
 
 **Not covered:** `uniprocessor`, `smp2-bios` and `smp8-bios` were not run for this
 change, and `gate-dirty` has not run since v0.90.0.
+
+---
+
+## Objective 3 — SPEC: interval timers and CPU time accounting
+
+Status at time of writing: **specified, not yet implemented.** Results land below.
+
+### Scope
+
+| syscall | number | what it must do |
+|---|---|---|
+| `SYS_SETITIMER` | 108 | arm/disarm `ITIMER_REAL` (0) and `ITIMER_VIRTUAL` (1), returning the previous value |
+| `SYS_GETITIMER` | 109 | report the remaining time and the reload interval |
+| `clock_gettime` | 104 | additionally accept `CLOCK_PROCESS_CPUTIME_ID` (2) and `CLOCK_THREAD_CPUTIME_ID` (3) |
+
+### Target criteria
+
+1. `ITIMER_REAL` fires `SIGALRM` on a monotonic deadline, never early, and re-arms
+   itself when an interval is set.
+2. `ITIMER_VIRTUAL` fires `SIGVTALRM` against consumed process CPU time, not
+   wall-clock.
+3. `CLOCK_PROCESS_CPUTIME_ID` strictly increases while the process computes and
+   stays flat while it sleeps.
+4. Every `struct itimerval` pointer is bounds-checked with `access_ok` before any
+   read or write, and a bad pointer returns `-EFAULT` without partial writes.
+5. `smp4-bios` and `smp4-iommu` at 0 failures and 0 rank faults.
+
+### Two decisions this objective has to make before writing any code
+
+**`alarm()` and `setitimer(ITIMER_REAL)` are ONE timer, not two.** POSIX is
+explicit that they share state and interfere with each other. This kernel already
+has `alarm_deadline`, a `g_ticks` value driving `SIGALRM` from `sig_check_alarms`.
+Adding a second, independent REAL timer beside it would produce a kernel where
+arming an itimer silently fails to cancel a pending alarm — two timers racing to
+deliver the same signal to the same process. So `alarm_deadline` is being
+converted in place: one field, expressed in nanoseconds, that both syscalls
+write. `SYS_ALARM`'s tick-granularity ABI does not change.
+
+**What counts as CPU time, stated before it is measured.** The accounting hook is
+the ring-3 excursion in `cpu_exec_proc` — stamped before `enter_user_*` and
+accumulated after it returns. That window contains user time AND the kernel time
+spent servicing this process's syscalls, which is the right answer:
+`CLOCK_PROCESS_CPUTIME_ID` is utime+stime, not utime alone.
+
+It also contains time parked inside a *sleeping* syscall, which is NOT CPU time
+and would make criterion 3 unsatisfiable — a process asleep in `nanosleep` would
+accrue CPU time at wall-clock rate. Sleep duration is therefore measured and
+subtracted explicitly.
+
+The honest consequence, recorded here rather than discovered later: this kernel
+cannot separate utime from stime, because it has no ring-0/ring-3 accounting
+split. `ITIMER_VIRTUAL` is specified by POSIX against user time alone, and what
+it actually gets here is process CPU time. For a workload that computes in ring 3
+these differ by the cost of its syscalls. **`ITIMER_VIRTUAL` is therefore
+approximate by construction**, and the ring-3 probe must not assert a tight bound
+on it.
+
+### Objective 3 — RESULTS
+
+| criterion | result |
+|---|---|
+| 1. `ITIMER_REAL` fires, never early | armed 50,000 us → fired 50,123 / 50,106 / 50,312 us |
+| 2. `ITIMER_VIRTUAL` against CPU time | implemented, fires `SIGVTALRM`; see the caveat above |
+| 3. CPU clock advances computing, flat asleep | +20,097 us over 20,000 us of compute; **+91 us over 51,699 us of sleep** |
+| 4. `access_ok` on every `itimerval` | 32 bytes checked both directions; `old` may alias `new` |
+| 5. matrix at 0 fail / 0 rank | see the verification table |
+
+`getitimer` reported 49,898 us remaining of a 50,000 us timer. `clock_nanosleep`
+on a CPU-time clock returns `-EINVAL`, and an unknown clock id still does.
+
+### THREE REAL DEFECTS, AND TWO OF MY OWN MEASUREMENTS THAT WERE WRONG
+
+Recorded together because separating them is the only way the next reader can
+tell which findings are about the kernel and which are about the instrument.
+
+**Kernel defects, each independently proven:**
+
+1. **CPU time was only accumulated when an excursion CLOSED.** A task reading its
+   own CPU clock is by definition inside an open one, so it never saw the time it
+   had burned since its last dispatch. Measured: 20 ms of ring-3 compute reported
+   `+0 ns`. Fixed with `cpu_run_t0` / `cpu_run_excl0`, published at dispatch, and
+   `cpu_ns_inflight()`.
+
+2. **Sleeps were billed to the wrong task.** `krelax()` calls `sched_yield()` on
+   cpu 0, which runs other processes and reassigns `g_cpu[0].cur_proc`. The
+   charge helper read `current_proc_idx` AFTER that, so it credited whichever
+   task had run most recently. Proven by printing the counter rather than
+   inferring it: of a 52,522 us sleep only ~30,000 us reached the sleeper. Fixed
+   by capturing the task index once, at entry (`ksleep_charge_to`).
+
+3. **`alarm()` and `setitimer(ITIMER_REAL)` would have been two racing timers.**
+   Caught in design, before it could be written — see the decision above.
+
+**And two mistakes in my own instrument, which cost more time than the defects:**
+
+- **A window that measured more than the sleep.** The check read the process
+  clock before a `print()` and after the sleep, and reported that 41% of a 50 ms
+  sleep was billed as CPU time. It was not: `print()` writes to the serial
+  console and costs real milliseconds of real computation, and the window
+  contained it. The THREAD clock, read either side of the sleep alone, showed
+  +64 us across the same sleep — and that discrepancy between two clocks that
+  read the same underlying value is what exposed it. **This is the same error as
+  Objective 2's ABSTIME baseline, in the same cycle.**
+
+- **A threshold loose enough to pass the bug it was written for.** The first
+  version allowed CPU time to grow by half the sleep duration, and duly returned
+  OK on a build measuring 43%. Tightened to a quarter. A bound that admits the
+  defect is not a test, which is the same lesson as `a test that cannot fail`
+  one step removed.
+
+**One hypothesis falsified by control, and the change reverted.** Believing a
+sleep longer than a quantum is preempted mid-way and mis-billed at the excursion
+boundary, the PM-timer loop was split into 2 ms steps charging as it went. The
+control — charge once at the end, single 4,000,000 us chunk — gave 83 us against
+the split version's 91 us. No difference. The machinery was removed rather than
+kept on a plausible story.
+
+**One hypothesis falsified outright.** `current_proc_idx` was suspected of being
+stale after a `krelax()` yield, which would have been a kernel-wide `access_ok`
+hazard rather than a timer bug. `SYS_GETPID` either side of a sleep returned the
+same pid both times. It is not stale; the concern was unfounded and is recorded
+so it is not re-raised.
+
+### A harness error worth writing down
+
+A boot launched without `$(QEMU_BLK)` panics with a **divide error in
+`cas_index_find`** — the CAS superblock reads back `index_blocks = 0`, and
+`% slots` divides by zero. It looks exactly like a kernel regression. It is not:
+the same bare invocation panics identically on the already-verified v0.93
+Objective 2 image, which is the control that settled it. `make qemu` passes
+`$(QEMU_GPU) $(QEMU_BLK) $(QEMU_NET)`; a hand-rolled qemu line must too.
+
+Separately, a fixed `sleep N` before typing a console command is not a deadline.
+One run typed `timebench` before the prompt existed and reported nothing at all.
+Wait for the prompt in the log.
+
+### Verification
+
+Image `3e3fedb3b40e9bd1f2199f9d818e3afe`, clean build, zero compiler warnings.
+
+| tier | result |
+|---|---|
+| `smp4-bios` | OK — 45 suites, 583 passed, 0 failed, 0 ranks (450 s) |
+| `smp4-iommu` | OK — 47 suites, 597 passed, 0 failed, 0 ranks (465 s) |
+
+Both counts are identical to the pre-Objective-3 baseline, so the shared-timer
+conversion of `SYS_ALARM` changed no existing assertion. `smp4-iommu` needed
+`GATE_CAP=2400`; at the 900 s default it is cut off before the prompt.
+
+**Not covered:** `uniprocessor`, `smp2-bios`, `smp8-bios`, `gate-dirty` and
+`gate-dirty-smp`. `ITIMER_VIRTUAL` is implemented and reachable but **no ring-3
+test arms it** — role 63 exercises `ITIMER_REAL` only, so the VIRTUAL path has
+compiled and is wired to `SIGVTALRM` without having been shown to fire. It is
+listed here rather than claimed as verified.
+
+### The GRUB literal, and why it drifted for sixty releases
+
+`grub.cfg` said `kernel 0.30.0-metal` since v0.31.0. It is the FIRST version
+string a user sees — on screen before the kernel prints anything — and nothing
+checked it. `release-version-check` now reads it and compares against the same
+`want` the kernel banner is held to.
+
+`want` is recomputed in that recipe line rather than carried over: every make
+recipe line runs in its own shell, so reusing the variable from the check above
+would compare against an empty string and pass silently.
+
+The check was confirmed to FAIL before it was trusted — restoring the old
+`0.30.0-metal` string makes it warn, and putting it back makes it pass.

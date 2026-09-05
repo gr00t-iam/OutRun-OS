@@ -162,12 +162,19 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_FSTAT              103          /* v0.85: (fd, out) -> 0; out has timestamps */
 /* v0.92: POSIX timekeeping. timespec is TWO 64-BIT WORDS { tv_sec, tv_nsec } —
  * occ's int is a machine word, and SYS_STAT/SYS_PIPE set that precedent.
- * CLOCK_REALTIME is boot-relative on this machine: there is no RTC, so it
- * carries the same value as CLOCK_MONOTONIC rather than a fabricated epoch. */
+ *
+ * v0.93: CLOCK_REALTIME IS A REAL EPOCH NOW. This comment used to say "there is
+ * no RTC, so it carries the same value as CLOCK_MONOTONIC"; Objective 1 of this
+ * same cycle added the CMOS driver that anchors it, so the claim was false the
+ * moment it shipped. It still falls back to boot-relative when the RTC does not
+ * settle on a plausible time, which is the only case the old wording now
+ * describes. */
 #define SYS_CLOCK_GETTIME      104          /* v0.92: (clockid, timespec*) -> 0        */
 #define SYS_CLOCK_GETRES       105          /* v0.92: (clockid, timespec*) -> 0        */
 #define SYS_NANOSLEEP          106          /* v0.92: (req, rem) -> 0                  */
 #define SYS_CLOCK_NANOSLEEP    107          /* v0.93: (clk, flags, req, rem) -> 0      */
+#define SYS_SETITIMER          108          /* v0.93: (which, new*, old*) -> 0         */
+#define SYS_GETITIMER          109          /* v0.93: (which, cur*) -> 0               */
 /* v0.93: THE POSIX NUMBERS, CORRECTED. v0.92 defined these as MONOTONIC 0 and
  * REALTIME 1, which is backwards: every C library uses REALTIME 0, MONOTONIC 1,
  * and the SEEK_* comment immediately below states exactly why that matters —
@@ -177,8 +184,18 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
  * future ring-3 program later. */
 #define CLOCK_REALTIME         0
 #define CLOCK_MONOTONIC        1
+/* v0.93: the CPU-time clocks. These count time the task was actually ON a CPU,
+ * so they advance strictly slower than MONOTONIC and do not advance at all
+ * while it sleeps — which is the property the role-63 probe tests. */
+#define CLOCK_PROCESS_CPUTIME_ID 2
+#define CLOCK_THREAD_CPUTIME_ID  3
 #define CLOCK_MONOTONIC_RAW    4
 #define TIMER_ABSTIME          1
+/* v0.93: struct itimerval is { it_interval, it_value }, each { tv_sec, tv_usec }
+ * — four words, INTERVAL FIRST. The order is the opposite of how a caller thinks
+ * about it, and swapping the halves turns "once in 5 ms" into "every 5 ms". */
+#define ITIMER_REAL            0
+#define ITIMER_VIRTUAL         1
 
 /* v0.82: the three POSIX whence values, in POSIX's order and with POSIX's
  * numbers. They are not an internal encoding to be chosen freely — a ring-3
@@ -1806,6 +1823,24 @@ static i64 oclock_nanosleep(u64 clkid, u64 flags, const u64 *req, u64 *rem) {
     i64 r = (i64)sysc(SYS_CLOCK_NANOSLEEP, clkid, flags, (u64)(const void *)req);
     if (rem) { rem[0] = 0; rem[1] = 0; }
     return r;
+}
+
+/* v0.93: interval timers. `itv` is FOUR words — { iv_sec, iv_usec, val_sec,
+ * val_usec } — matching struct itimerval's { it_interval, it_value } layout.
+ * `old` may be 0, and may also legitimately point at the same buffer as `nw`;
+ * the kernel reads every field before it writes any. */
+static i64 osetitimer(u64 which, const u64 *nw, u64 *old) {
+    return (i64)sysc(SYS_SETITIMER, which, (u64)(const void *)nw, (u64)(void *)old);
+}
+static i64 ogetitimer(u64 which, u64 *cur) {
+    return (i64)sysc(SYS_GETITIMER, which, (u64)(void *)cur, 0);
+}
+/* Convenience: arm a one-shot `us` microseconds out, or disarm with us == 0. */
+static i64 osetitimer_us(u64 which, u64 us) {
+    u64 itv[4];
+    itv[0] = 0; itv[1] = 0;                       /* it_interval: one-shot     */
+    itv[2] = us / 1000000ull; itv[3] = us % 1000000ull;
+    return osetitimer(which, itv, 0);
 }
 
 static void onanosleep_us(u64 us) {
@@ -3561,8 +3596,23 @@ static void append_smp_worker(u32 idx) {
  * the measurements so a failure says which number was wrong.
  *   1870 ok   1871 clock went backwards   1872 clock did not advance
  *   1873 a sleep was SHORT (worse than long: a deadline that returns early is
- *        a broken deadline, where an overshoot is a busy machine) */
+ *        a broken deadline, where an overshoot is a busy machine)
+ *
+ * v0.93 adds interval timers and the CPU-time clocks:
+ *   1880 setitimer/getitimer refused a call that should have worked
+ *   1881 ITIMER_REAL never fired      1882 ITIMER_REAL fired EARLY
+ *   1883 getitimer reported a remaining time outside the interval it was given
+ *   1884 CPU time did not advance while the process was computing
+ *   1885 CPU time advanced while the process was ASLEEP
+ *   1886 CPU time ran ahead of wall-clock time
+ *   1887 clock_nanosleep accepted a CPU-time clock (it can never wake) */
 #define R63_READS 200000u
+
+/* Signal-delivery evidence for the ITIMER_REAL test. Counted rather than
+ * flagged: a timer that fires twice for one arming is as wrong as one that
+ * never fires, and a bare flag cannot tell those apart. */
+static volatile u64 g_r63_alrm = 0;
+static void r63_on_alrm(int s) { (void)s; g_r63_alrm++; }
 static void role63_clock_probe(void) {
     /* (1) monotonicity across the syscall boundary */
     u64 back = 0, last = omono_us();
@@ -3687,6 +3737,133 @@ static void role63_clock_probe(void) {
         if (got + 1 < want[s]) short_sleep = 1;
     }
     if (short_sleep) sysc(SYS_EXIT, 1873, 0, 0);
+
+    /* ------------------------------------------------------------------ *
+     * (4) v0.93: ITIMER_REAL fires, and does not fire EARLY.
+     *
+     * Early is the failure that matters. A timer that overshoots means the
+     * machine was busy; one that fires early means the deadline arithmetic is
+     * wrong, and a program that arms a 50 ms timeout gets a 40 ms one with no
+     * way to notice. Measured with CLOCK_MONOTONIC, the clock a caller has.
+     * ------------------------------------------------------------------ */
+    {
+        if (osigaction(SIGALRM, r63_on_alrm) != 0) sysc(SYS_EXIT, 1880, 0, 0);
+        g_r63_alrm = 0;
+        u64 want_us = 50000ull;                          /* 50 ms */
+        u64 t0 = omono_us();
+        if (osetitimer_us(ITIMER_REAL, want_us) != 0) sysc(SYS_EXIT, 1880, 0, 0);
+
+        /* getitimer must report a remaining time inside the window we asked
+         * for. Zero would mean disarmed; more than we asked means it is
+         * counting from the wrong origin. */
+        u64 cur[4];
+        if (ogetitimer(ITIMER_REAL, cur) != 0) sysc(SYS_EXIT, 1880, 0, 0);
+        u64 rem_us = cur[2] * 1000000ull + cur[3];
+        print("  [r63] getitimer remaining "); hex(rem_us); print(" us of ");
+        hex(want_us); print("\n");
+        if (rem_us == 0 || rem_us > want_us) sysc(SYS_EXIT, 1883, 0, 0);
+
+        /* Spin on a syscall so the kernel keeps reaching a delivery boundary.
+         * A deadline, not an iteration count — this must mean the same thing
+         * at 1 vCPU and at 4. */
+        while (!g_r63_alrm && (omono_us() - t0) < 2000000ull) { }
+        u64 fired_at = omono_us() - t0;
+        if (!g_r63_alrm) {
+            print("  [r63] ITIMER_REAL never fired\n"); sysc(SYS_EXIT, 1881, 0, 0);
+        }
+        print("  [r63] ITIMER_REAL armed "); hex(want_us);
+        print(" us -> fired at "); hex(fired_at); print(" us\n");
+        if (fired_at + 1 < want_us) {
+            print("  [r63] ITIMER_REAL fired EARLY\n"); sysc(SYS_EXIT, 1882, 0, 0);
+        }
+        osetitimer_us(ITIMER_REAL, 0);                   /* disarm */
+    }
+
+    /* ------------------------------------------------------------------ *
+     * (5) v0.93: CLOCK_PROCESS_CPUTIME_ID counts CPU, not wall clock.
+     *
+     * Two claims, and the second is the one that makes the clock worth having:
+     * it must ADVANCE while the process computes, and must stay FLAT while the
+     * process sleeps. A CPU clock that keeps running through a sleep is just a
+     * second monotonic clock wearing a different id.
+     * ------------------------------------------------------------------ */
+    {
+        u64 ts[2];
+        if (oclock_gettime(CLOCK_PROCESS_CPUTIME_ID, ts) != 0) sysc(SYS_EXIT, 1880, 0, 0);
+        u64 c0 = ts[0] * 1000000ull + ts[1] / 1000ull;    /* us */
+
+        /* Compute for ~20 ms of wall time. omono_us() is a syscall, so this is
+         * genuinely running — user time plus the kernel time servicing it,
+         * which is exactly what this clock is defined to count. */
+        u64 w0 = omono_us();
+        while (omono_us() - w0 < 20000ull) { }
+        if (oclock_gettime(CLOCK_PROCESS_CPUTIME_ID, ts) != 0) sysc(SYS_EXIT, 1880, 0, 0);
+        u64 c1 = ts[0] * 1000000ull + ts[1] / 1000ull;
+        print("  [r63] cputime over 20000 us of compute: +");
+        hex(c1 - c0); print(" us\n");
+        if (c1 <= c0) sysc(SYS_EXIT, 1884, 0, 0);
+
+        /* Now sleep 50 ms and read it again. The process is not running, so
+         * the clock must barely move. The bound is deliberately loose — the
+         * point is that it does not track wall time, not that it is zero. */
+        /* NOTHING IN THIS WINDOW BUT THE SLEEP.
+         *
+         * The first version of this check read the process clock before the
+         * print above and after the sleep, and reported that 41% of a 50 ms
+         * sleep had been billed as CPU time. It had not: print() writes to the
+         * serial console, which costs real milliseconds of real computation,
+         * and the window was measuring that print. The thread clock — read
+         * either side of the sleep alone — showed +64 us across the same sleep,
+         * which is what exposed it.
+         *
+         * This is the same mistake as the v0.93 Objective 2 ABSTIME baseline,
+         * repeated: a window that contains more than the thing being claimed
+         * about. Both clocks are now read immediately either side of the sleep
+         * and every print happens after the last read. */
+        u64 th[2];
+        if (oclock_gettime(CLOCK_THREAD_CPUTIME_ID, th) != 0) sysc(SYS_EXIT, 1880, 0, 0);
+        u64 t_a = th[0] * 1000000ull + th[1] / 1000ull;
+        if (oclock_gettime(CLOCK_PROCESS_CPUTIME_ID, ts) != 0) sysc(SYS_EXIT, 1880, 0, 0);
+        u64 c1s = ts[0] * 1000000ull + ts[1] / 1000ull;
+        u64 s0 = omono_us();
+        onanosleep_us(50000ull);
+        u64 slept = omono_us() - s0;
+        if (oclock_gettime(CLOCK_PROCESS_CPUTIME_ID, ts) != 0) sysc(SYS_EXIT, 1880, 0, 0);
+        u64 c2 = ts[0] * 1000000ull + ts[1] / 1000ull;
+        if (oclock_gettime(CLOCK_THREAD_CPUTIME_ID, th) != 0) sysc(SYS_EXIT, 1880, 0, 0);
+        u64 t_b = th[0] * 1000000ull + th[1] / 1000ull;
+        print("  [r63] cputime over "); hex(slept); print(" us of SLEEP: proc +");
+        hex(c2 - c1s); print("  thread +"); hex(t_b - t_a); print(" us\n");
+        /* A QUARTER, not a half. The first version of this check allowed 50%
+         * and PASSED a build in which 43% of a 50 ms sleep was being billed as
+         * CPU time — the exact defect it was written to catch. A bound loose
+         * enough to admit the bug is not a test. 25% still leaves ample room
+         * for the syscall entry/exit either side of the sleep, which is the
+         * only CPU time this window should legitimately contain. */
+        if ((c2 - c1s) > slept / 4ull) {
+            print("  [r63] cputime tracked the wall clock through a sleep\n");
+            sysc(SYS_EXIT, 1885, 0, 0);
+        }
+
+        /* A CPU clock can never have run longer than the wall clock it sits
+         * inside. This catches a units error that both checks above would
+         * otherwise pass. */
+        if (c2 > (omono_us() - w0) + c0) sysc(SYS_EXIT, 1886, 0, 0);
+
+        /* THREAD_CPUTIME must also answer, and cannot exceed the process it
+         * belongs to. This worker is single-threaded, so they should be equal
+         * or within a sample of each other. */
+        if (oclock_gettime(CLOCK_THREAD_CPUTIME_ID, ts) != 0) sysc(SYS_EXIT, 1880, 0, 0);
+
+        /* Sleeping ON a CPU-time clock can never wake: the quantity the sleeper
+         * waits for only advances while it runs. It must be refused, not hung. */
+        u64 req[2]; req[0] = 0; req[1] = 1000000ull;
+        if (oclock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, 0, req, 0) != -22) {
+            print("  [r63] clock_nanosleep accepted a CPU-time clock\n");
+            sysc(SYS_EXIT, 1887, 0, 0);
+        }
+    }
+
     sysc(SYS_EXIT, 1870, 0, 0);
 }
 
