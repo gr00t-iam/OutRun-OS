@@ -171,3 +171,49 @@ what evidence, and — deliberately — what is not.
   git add -A && git commit  (message drafted in the final report)
   git tag -a v1.0.0
   Then `make release-version-check` should print three OKs and no warning.
+
+
+7. TAGGED — 2026-09-06
+----------------------
+
+  All four release-protocol steps of §6 executed. Verbatim results:
+
+  a. Commit
+       c94305aa3f4de31992d6b3cdd2c1100b416a7d3b
+       "release(v1.0.0): OutRun OS 1.0.0 native desktop session, persistent
+        desktop, ring-3 app suite, and full release verification"
+       25 paths (Progress.txt, apps/, include/outrun_abi.h, kernel64.c,
+       Makefile, grub cfgs, docs/CHANGELOG-1.0.0.md, tools/).
+
+  b. Annotated tag
+       v1.0.0 -> c94305a
+       "OutRun OS v1.0.0 — Native Desktop Session Release"
+       `git describe --tags` now prints exactly `v1.0.0` (no -N-g suffix),
+       i.e. the tag is ON the release commit, not behind it.
+
+  c. `make release-version-check` — three OKs, no warning, as §6 required:
+
+       [release] version check OK: v1.0.0
+       [release] kernel banner check OK: 1.0.0-metal
+       [release] grub menu check OK: 1.0.0-metal
+
+     That is VERSION (metal/Makefile) == git describe == kernel banner ==
+     GRUB menu title. The v0.75.0 mismatch class this check exists for is
+     closed for this tag.
+
+  d. Note on identity, recorded because it changed repository state:
+     the WSL-side git had no user.name/user.email (the identity lives in the
+     Windows global gitconfig, which WSL's git does not read), so the first
+     commit attempt aborted with "empty ident name". Fixed by setting
+     user.name=bot-builder / user.email=technician.there@gmail.com as a
+     REPO-LOCAL config (.git/config, untracked) rather than a WSL global, so
+     nothing outside this repository was touched. The commit and tag carry
+     that identity.
+
+  The tag is NOT signed — `-a` (annotated) was used, per the release protocol
+  and the command run. No GPG key was configured or requested; do not describe
+  this tag as signed.
+
+  This section is an uncommitted edit to Progress.txt made AFTER the tag, and
+  is deliberately left uncommitted: committing it would move HEAD past v1.0.0
+  and the artefact checksums in §2 belong to c94305a.
