@@ -27,7 +27,7 @@
  * because release-version-check only ever compared the Makefile's VERSION against
  * the git tag. The string the KERNEL prints was never in the comparison. It is
  * now: see release-version-check in metal/Makefile, which greps this line. */
-#define KERNEL_VERSION "0.94.0-metal"
+#define KERNEL_VERSION "1.0.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -758,6 +758,36 @@ struct mb2_mmap_entry { uint64_t base, len; uint32_t type, rsv; };
 static uint64_t g_total_ram = 0;
 
 static uint64_t g_user_elf = 0, g_user_elf_end = 0;    /* boot module: the user ELF */
+/* v0.96: EVERY boot module, kept by name. Until now this scan overwrote
+ * g_user_elf on each tag, so a second module silently displaced the first and
+ * whichever GRUB listed last became "the user ELF". The desktop ships five
+ * modules, so the name is the only thing that can identify them. */
+#define MAX_BOOT_MODULES 8
+struct boot_module { char name[24]; uint64_t start, end; };
+static struct boot_module g_modules[MAX_BOOT_MODULES];
+static int g_nmodules = 0;
+static int g_boot_desktop = 0;         /* v0.96: set by the "desktop" boot flag */
+/* multiboot_scan runs before kstrcpy_n is declared, and moving that
+ * declaration would reorder a block every suite depends on. */
+static void kstrcpy_n_early(char *dst, const char *src, uint64_t n) {
+    uint64_t i = 0;
+    for (; src[i] && i < n - 1; i++) dst[i] = src[i];
+    dst[i] = 0;
+}
+/* Find a module by the basename GRUB was given, ignoring any path and any
+ * ".elf" suffix, so "/boot/apps/calc.elf" answers to "calc". */
+static struct boot_module *mod_find(const char *want) {
+    for (int i = 0; i < g_nmodules; i++) {
+        const char *n = g_modules[i].name;
+        for (const char *p = n; *p; p++) if (*p == '/') n = p + 1;
+        int k = 0;
+        while (want[k] && n[k] == want[k]) k++;
+        if (want[k]) continue;                        /* prefix mismatch      */
+        if (!n[k] || (n[k] == '.' && n[k+1] == 'e' && n[k+2] == 'l' && n[k+3] == 'f'))
+            return &g_modules[i];
+    }
+    return 0;
+}
 static uint64_t g_fb_addr = 0;                         /* framebuffer physical base */
 static uint32_t g_fb_pitch = 0, g_fb_width = 0, g_fb_height = 0;
 static uint8_t  g_fb_bpp = 0;
@@ -774,11 +804,30 @@ static void multiboot_scan(uint64_t info_addr, bool print) {
         if (tag->type == 0) break;
         if (tag->type == 2 && print)                  /* bootloader name        */
             kprintf("[kernel ] booted by: %s\n", (char *)(p + 8));
+        if (tag->type == 1) {                         /* boot command line      */
+            const char *cl = (const char *)(p + 8);
+            /* v0.96: the desktop is opt-in and selected HERE, by the GRUB entry,
+             * so `make gate` boots exactly the regression battery it always has
+             * and the desktop ISO boots a session. One kernel, two images. */
+            for (const char *q = cl; *q; q++)
+                if (q[0]=='d'&&q[1]=='e'&&q[2]=='s'&&q[3]=='k'&&q[4]=='t'&&
+                    q[5]=='o'&&q[6]=='p') { g_boot_desktop = 1; break; }
+            if (print) kprintf("[kernel ] command line: '%s'%s\n", cl,
+                               g_boot_desktop ? " -> desktop session" : "");
+        }
         if (tag->type == 3) {                         /* boot module (user ELF) */
-            g_user_elf     = *(uint32_t *)(p + 8);
-            g_user_elf_end = *(uint32_t *)(p + 12);
-            if (print) kprintf("[kernel ] boot module '%s' at phys %X..%X (user ELF)\n",
-                               (char *)(p + 16), g_user_elf, g_user_elf_end);
+            uint64_t ms = *(uint32_t *)(p + 8), me = *(uint32_t *)(p + 12);
+            const char *mname = (const char *)(p + 16);
+            /* The FIRST module remains "the user ELF" so every existing suite
+             * keeps loading exactly what it loaded before; the named table is
+             * additive. */
+            if (!g_user_elf) { g_user_elf = ms; g_user_elf_end = me; }
+            if (g_nmodules < MAX_BOOT_MODULES) {
+                struct boot_module *m = &g_modules[g_nmodules++];
+                kstrcpy_n_early(m->name, mname, sizeof m->name);
+                m->start = ms; m->end = me;
+            }
+            if (print) kprintf("[kernel ] boot module '%s' at phys %X..%X\n", mname, ms, me);
         }
         if (tag->type == 6) {                         /* memory map             */
             uint32_t esize = *(uint32_t *)(p + 8);
@@ -13664,6 +13713,10 @@ static void net_teardown_kproc(int proc_idx) {
  * The pages are therefore physically SCATTERED but virtually contiguous in the
  * owner, so the compositor walks this per-window page table to read them. */
 #define WIN_SURF_MAXPG WIN_SURF_MAXPG_
+/* v0.96: the paired back buffers, one stride each, starting above every
+ * primary surface. Kept as a macro next to the layout it depends on so a
+ * change to NWMWIN or WIN_SURF_MAXB moves both halves together. */
+#define WIN_BACK_V(id) (WIN_USER_V + (uint64_t)(NWMWIN + (id)) * (uint64_t)WIN_SURF_MAXB)
 
 struct wmwin {
     int      used, owner;
@@ -13678,6 +13731,18 @@ struct wmwin {
     uint64_t *ppage;                     /* -> g_wm_pagetab[id]: phys of each surface page */
     struct sevent q[8]; volatile uint32_t qw, qr;   /* routed input events for the owner */
     int      focus_wg;                   /* v0.71: focused widget index, or -1         */
+    /* v0.96: OPTIONAL PAIRED BUFFERS. A window created with a2=1 gets two page
+     * sets and publishes with SYS_WIN_DAMAGE, which returns the address of the
+     * set the application may now draw into. The compositor only ever reads
+     * `front`, so a half-drawn frame cannot reach the screen — the same
+     * guarantee SYS_SURFACE_FLIP gives canvas surfaces, which is why the
+     * single-buffered path below is left exactly as it was rather than being
+     * "improved" underneath the suites that depend on it.
+     *
+     * `paired` is 0 for every legacy window, and every consumer reads
+     * ppage[front] — which is ppage[0] when there is only one set. */
+    int      paired, front;
+    uint64_t *ppage_b;                   /* second page set, or 0 when unpaired        */
 };
 static struct wmwin g_wmwin[NWMWIN];
 
@@ -13759,12 +13824,34 @@ static int wg_focused(int wi) {
     return k;
 }
 static uint64_t g_wm_pagetab[NWMWIN][WIN_SURF_MAXPG];   /* phys of each window's surface pages */
+static uint64_t g_wm_pagetab_b[NWMWIN][WIN_SURF_MAXPG]; /* v0.96: the paired second set */
 static struct klock g_wm_lock = { 0, "wm", 10, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static int g_wm_focus = -1;              /* window index with keyboard focus, or -1     */
 static int g_wm_znext = 1;               /* monotonically increasing z stamp            */
 static int g_wm_drag = -1, g_wm_drag_dx = 0, g_wm_drag_dy = 0;   /* window being dragged */
 static volatile uint64_t g_wm_composes = 0, g_wm_damage = 0;     /* stats               */
 static volatile uint64_t g_wm_created = 0;   /* v0.54: monotonic count of windows ever created */
+/* v0.96: DESKTOP SETTINGS. Live state, read by the compositor and the input
+ * path and written only by SYS_DESKTOP_SETTINGS. Each one has a real consumer;
+ * a setting the system merely remembers would be a lie told in a nicer font.
+ *   scale   -> fb_flip presents the logical desktop at this magnification
+ *   accent  -> the desktop chrome the compositor paints
+ *   repeat  -> the key auto-repeat deadline and cadence, in 100 Hz ticks */
+static volatile uint32_t g_desk_scale  = 1;
+static volatile uint32_t g_desk_accent = 0x22E4FFu;
+static volatile uint32_t g_desk_rep_delay = 50, g_desk_rep_period = 5;
+/* Auto-repeat state for the key currently held down. Bounded on purpose: the
+ * scancode map discards releases, so nothing can positively observe a key
+ * coming up, and an unbounded repeat would be a stuck key rather than a
+ * feature. Roughly 20 s at the default period. */
+#define DESK_MAX_REPEATS 400
+static int g_desk_last_key = 0, g_desk_key_repeats = 0;
+static uint64_t g_desk_key_tick = 0;
+static int g_cur_x, g_cur_y;             /* pointer, in logical desktop space */
+/* The logical desktop: what the window manager, the pointer and the compositor
+ * all work in. Equal to the framebuffer at scale 1. */
+static inline int desk_w(void) { return (int)(g_fb_width  / (g_desk_scale ? g_desk_scale : 1)); }
+static inline int desk_h(void) { return (int)(g_fb_height / (g_desk_scale ? g_desk_scale : 1)); }
 
 static int wm_count_used(void) {
     int n = 0;
@@ -13816,6 +13903,7 @@ static void wm_destroy(int idx) {
     if (g_wm_drag == idx) g_wm_drag = -1;
     W->used = 0; W->owner = -1; W->surf_vaddr = 0; W->ppage = 0;
     W->cw = W->ch = 0; W->cpages = 0;
+    W->paired = 0; W->front = 0; W->ppage_b = 0;
     W->focused = 0; W->minimized = 0; W->qw = W->qr = 0;
     W->focus_wg = -1;                    /* v0.71 */
 }
@@ -20237,9 +20325,28 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             pt[pg] = f;
             map_page(p->cr3, va + pg * 0x1000, f, PTE_USER | PTE_WRITE | PTE_NX);
         }
+        /* v0.96: the second set of a paired window. It CANNOT sit one stride
+         * above the first: WIN_USER_V + id*WIN_SURF_MAXB is already window
+         * id+1's base, so that layout would have window 0's back buffer
+         * occupying window 1's front buffer's addresses. The pairs therefore
+         * live in their own region above all NWMWIN primary surfaces, which
+         * also leaves the legacy single-buffer layout (the one user/init.c
+         * computes for itself at WIN_SURF_BASE + id*WIN_SURF_STRIDE) untouched. */
+        int paired = (a2 & 1u) ? 1 : 0;
+        uint64_t *ptb = 0;
+        if (paired) {
+            ptb = g_wm_pagetab_b[id];
+            for (uint64_t pg = 0; pg < cpages; pg++) {
+                uint64_t f = alloc_frame();
+                ptb[pg] = f;
+                map_page(p->cr3, WIN_BACK_V(id) + pg * 0x1000, f,
+                         PTE_USER | PTE_WRITE | PTE_NX);
+            }
+        }
 
         klock_acquire(&g_wm_lock);
         W->cw = cw; W->ch = chh; W->cpages = cpages; W->surf_vaddr = va;
+        W->paired = paired; W->front = 0; W->ppage_b = ptb;
         barrier();
         W->ppage = pt;                                        /* publish content LAST */
         g_wm_created++;
@@ -20349,15 +20456,46 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         cmemcpy((void *)uout, capbuf, n);
         return (uint64_t)n;
     }
-    case 41: {   /* SYS_WIN_DAMAGE(id) -> 0 ok, negative. Requests recomposition. */
+    case 41: {   /* SYS_WIN_DAMAGE(id, title) -> 0 ok (legacy), or for a PAIRED
+                  * window the address of the buffer the caller may now draw
+                  * into. Negative on error.
+                  *
+                  * v0.96: a1, when non-zero, is a ring-3 string that becomes the
+                  * window's title — so a program can name itself instead of
+                  * living under the "WIN 0" the window manager assigns. a1 == 0
+                  * is exactly the old call and behaves exactly as it did. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
         int id = (int)(int64_t)a0;
         if (id < 0 || id >= NWMWIN) return (uint64_t)-1;
+        char title[16];
+        int have_title = 0;
+        if (a1) {
+            /* Copied BEFORE the lock: copy_user_str can fault on a bad pointer,
+             * and faulting while holding a rank-10 klock would take the machine
+             * down over an application's bad argument. */
+            if (copy_user_str(kprocs[current_proc_idx].cr3, a1, title, sizeof title) < 0)
+                return (uint64_t)-14;
+            have_title = 1;
+        }
         klock_acquire(&g_wm_lock);
         int ok = (g_wmwin[id].used && g_wmwin[id].owner == (int)current_proc_idx);
-        if (ok) g_wm_damage++;
+        uint64_t ret = 0;
+        if (ok) {
+            struct wmwin *W = &g_wmwin[id];
+            if (have_title) kstrcpy_n(W->title, title, sizeof W->title);
+            if (W->paired) {
+                /* PUBLISH: the set just drawn becomes the one the compositor
+                 * reads, and the caller is handed the other one. A compositor
+                 * pass either sees the old front or the new one; there is no
+                 * state in which it reads a buffer being written. */
+                barrier();
+                W->front ^= 1;
+                ret = W->front ? W->surf_vaddr : WIN_BACK_V(id);
+            }
+            g_wm_damage++;
+        }
         klock_release(&g_wm_lock);
-        return ok ? (uint64_t)0 : (uint64_t)-1;
+        return ok ? ret : (uint64_t)-1;
     }
     case 42: {   /* SYS_WIN_POLL(id, *out_event) -> 1 if an event was popped, 0 none, neg on error */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
@@ -20377,6 +20515,109 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         }
         klock_release(&g_wm_lock);
         return (uint64_t)got;
+    }
+    /* --- v0.96: the desktop's own two calls (require PCAP_WIMP) --- */
+    case 117: {  /* SYS_DESKTOP_INFO(out, size) -> processes reported, or -errno.
+                  * Fills struct outrun_desktop_info (include/outrun_abi.h is the
+                  * master copy; this layout must move with it).
+                  *
+                  * The CPU figures are the scheduler's REAL per-process
+                  * accounting, in-flight excursion included — not a tick-phase
+                  * animation. SYS_SYSINFO (case 44) had no time field at all,
+                  * which is why the old sysmon drew a bar it labelled "activity"
+                  * rather than load. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        uint64_t ubuf = a0;
+        struct udesk_process { uint64_t pid, cpu_ns; uint32_t flags, reserved; char name[24]; };
+        struct udesk_info {
+            uint32_t version, size, ncpu, nproc;
+            uint32_t width, height, scale, accent;
+            uint32_t repeat_delay, repeat_period;
+            uint64_t wall_ns, frames_used, frames_total;
+            struct udesk_process proc[12];
+        };
+        /* The size is checked, not assumed: a program built against a different
+         * revision of the header is refused rather than partly filled. */
+        if (a1 != sizeof(struct udesk_info)) return (uint64_t)-22;         /* EINVAL */
+        if (!access_ok(kprocs[current_proc_idx].cr3, ubuf, sizeof(struct udesk_info), 1))
+            return (uint64_t)-14;                                          /* EFAULT */
+        static struct udesk_info k;                     /* 640 B: too big for a stack frame */
+        cmemset(&k, 0, sizeof k);
+        k.version = 1; k.size = (uint32_t)sizeof k;
+        k.ncpu = (uint32_t)g_ncpu_online;
+        k.width = (uint32_t)desk_w(); k.height = (uint32_t)desk_h();
+        k.scale = g_desk_scale; k.accent = g_desk_accent;
+        k.repeat_delay = g_desk_rep_delay; k.repeat_period = g_desk_rep_period;
+        k.wall_ns = ktime_get_ns();
+        k.frames_used  = (g_next_frame - FRAME_POOL_BASE) / 0x1000 - g_frame_free_depth;
+        k.frames_total = (g_total_ram > FRAME_POOL_BASE)
+                       ? (g_total_ram - FRAME_POOL_BASE) / 0x1000 : 0;
+        int nfill = 0;
+        for (int i = 0; i < n_kproc && nfill < 12; i++) {
+            if (!kprocs[i].pid) continue;
+            if (tg_of(i) != i) continue;                /* threads report under their leader */
+            k.proc[nfill].pid = kprocs[i].pid;
+            k.proc[nfill].cpu_ns = proc_cpu_live(i);
+            k.proc[nfill].flags = kprocs[i].exited ? 1u : 0u;
+            for (int c = 0; c < 24; c++) k.proc[nfill].name[c] = kprocs[i].name[c];
+            k.proc[nfill].name[23] = 0;
+            nfill++;
+        }
+        k.nproc = (uint32_t)nfill;
+        cmemcpy((void *)ubuf, &k, sizeof k);
+        return (uint64_t)nfill;
+    }
+    case 118: {  /* SYS_DESKTOP_SETTINGS(in, size) -> 0, or -errno.
+                  * Every field is validated and every accepted field has a live
+                  * consumer; an out-of-range value is REFUSED rather than
+                  * clamped, so a settings app can tell the difference between
+                  * "applied" and "not supported". */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        /* Changing the whole desktop's presentation is an administrative act:
+         * one unprivileged application must not be able to resize every other
+         * application's world. */
+        if (kprocs[current_proc_idx].euid != 0) return (uint64_t)-1;        /* EPERM */
+        struct udesk_settings { uint32_t scale, accent, repeat_delay, repeat_period; };
+        if (a1 != sizeof(struct udesk_settings)) return (uint64_t)-22;
+        if (!access_ok(kprocs[current_proc_idx].cr3, a0, sizeof(struct udesk_settings), 0))
+            return (uint64_t)-14;
+        struct udesk_settings s = *(struct udesk_settings *)a0;
+        if (s.scale != 1 && s.scale != 2) return (uint64_t)-22;
+        if (!s.accent || (s.accent & 0xFF000000u)) return (uint64_t)-22;
+        if (s.repeat_delay < 25 || s.repeat_delay > 100) return (uint64_t)-22;
+        if (s.repeat_period < 2 || s.repeat_period > 50) return (uint64_t)-22;
+        /* A scale that leaves no usable desktop is refused, not applied: at
+         * 640x480 doubling still leaves 320x240, but a smaller mode would leave
+         * less than one minimum-sized window. */
+        if ((int)(g_fb_width / s.scale) < WIN_MIN_W + 40 ||
+            (int)(g_fb_height / s.scale) < WIN_MIN_H + WIN_TASKBAR_H + 40) return (uint64_t)-22;
+        g_desk_scale = s.scale; g_desk_accent = s.accent;
+        g_desk_rep_delay = s.repeat_delay; g_desk_rep_period = s.repeat_period;
+        /* Windows and the pointer that were placed in the OLD logical desktop
+         * can now be entirely off-screen, which would strand them where no
+         * click can reach. */
+        klock_acquire(&g_wm_lock);
+        for (int i = 0; i < NWMWIN; i++) {
+            if (!g_wmwin[i].used) continue;
+            if (g_wmwin[i].x > desk_w() - 40) g_wmwin[i].x = desk_w() - 40;
+            if (g_wmwin[i].y > desk_h() - WIN_TITLE_H) g_wmwin[i].y = desk_h() - WIN_TITLE_H;
+            if (g_wmwin[i].x < 0) g_wmwin[i].x = 0;
+            if (g_wmwin[i].y < 0) g_wmwin[i].y = 0;
+        }
+        klock_release(&g_wm_lock);
+        if (g_cur_x >= desk_w()) g_cur_x = desk_w() - 1;
+        if (g_cur_y >= desk_h()) g_cur_y = desk_h() - 1;
+        g_wm_damage++;
+        /* Printed because a setting that changes nothing observable is
+         * indistinguishable from one that was never applied. This line is what
+         * lets the UI test assert that the call did something, rather than
+         * that it returned 0. */
+        kprintf("[desktop] settings applied by pid %u: scale %u (%dx%d), accent %x, "
+                "repeat %u/%u ticks\n",
+                kprocs[current_proc_idx].pid, (uint64_t)g_desk_scale,
+                (uint64_t)desk_w(), (uint64_t)desk_h(), (uint64_t)g_desk_accent,
+                (uint64_t)g_desk_rep_delay, (uint64_t)g_desk_rep_period);
+        return 0;
     }
 
     /* =======================================================================
@@ -28063,6 +28304,18 @@ static uint64_t elf_load(int proc_idx, uint64_t img, uint64_t img_size) {
             return 0;
         }
         if (ph->type != 1) continue;                       /* PT_LOAD           */
+        /* v0.96: AN EMPTY PT_LOAD MAPS NOTHING, so it is skipped rather than
+         * judged. ld emits exactly this — type PT_LOAD, filesz 0, memsz 0,
+         * vaddr 0 — for a `data` segment in a program that turned out to have
+         * no writable data at all, which is true of any application that keeps
+         * its state on the stack. calc.elf is one, and it was refused at the
+         * vaddr check below with "segment vaddr 0 outside user range": a
+         * correct binary rejected for a segment that asks for no memory.
+         *
+         * The bounds checks that follow are unweakened, and the validation
+         * matrix's fixture has memsz 0x1000, so every rejection it pins still
+         * fires. */
+        if (ph->memsz == 0 && ph->filesz == 0) continue;
         /* strict per-segment bounds checks (defend against hostile ELFs) */
         if (ph->offset > img_size || ph->filesz > img_size ||
             ph->offset + ph->filesz > img_size || ph->offset + ph->filesz < ph->offset) {
@@ -28921,6 +29174,27 @@ static void draw_str(int x, int y, const char *s, uint32_t c) {
 struct win { int64_t x, y, vx, vy, tx, ty; int w, h; uint32_t edge; };
 
 static void fb_flip(void) {
+    /* v0.96: DESKTOP SCALING IS DONE HERE, AT PRESENT TIME.
+     *
+     * At scale 1 this is the identical copy it has always been. At scale 2 the
+     * compositor has drawn into the top-left quarter of the backbuffer, in
+     * logical coordinates, and every pixel of it is doubled on the way to the
+     * hardware — so the whole desktop, chrome and application content alike,
+     * genuinely gets bigger. Doing it at the flip rather than in each draw
+     * primitive is what keeps hit-testing honest: the window manager and the
+     * pointer both work in logical coordinates and need no scale term at all. */
+    uint32_t s = g_desk_scale ? g_desk_scale : 1;
+    if (s > 1) {
+        uint32_t lw = g_fb_width / s, lh = g_fb_height / s;
+        for (uint32_t y = 0; y < lh; y++)
+            for (uint32_t x = 0; x < lw; x++) {
+                uint32_t c = g_bb[y * g_stride + x];
+                for (uint32_t dy = 0; dy < s; dy++)
+                    for (uint32_t dx = 0; dx < s; dx++)
+                        g_fb[(y * s + dy) * g_stride + x * s + dx] = c;
+            }
+        return;
+    }
     for (uint32_t y = 0; y < g_fb_height; y++)
         for (uint32_t x = 0; x < g_fb_width; x++)
             g_fb[y * g_stride + x] = g_bb[y * g_stride + x];
@@ -29032,7 +29306,9 @@ static void compositor_frame(int frame) {
     for (int y = 0; y < H; y += 2) for (int x = 0; x < W; x++) blend(x, y, 0x000000, 26);
 }
 
-static int g_cur_x = 512, g_cur_y = 384;      /* pointer position in screen space */
+/* g_cur_x/g_cur_y are declared with the desktop state above, because
+ * SYS_DESKTOP_SETTINGS has to bring the pointer back inside a desktop that
+ * just got smaller. */
 
 /* ===========================================================================
  * v0.53: THE CYBER-COMPOSITOR — WIMP desktop composition + pointer + input
@@ -29045,13 +29321,71 @@ static int g_cur_x = 512, g_cur_y = 384;      /* pointer position in screen spac
 #define WIMP_CLOSE_W 14
 #define WIMP_MIN_W   14
 
+/* ===========================================================================
+ * v0.96: THE DESKTOP SHELL — launcher, taskbar, and the programs behind them
+ * ===========================================================================
+ * Every tile in the left rail names a REAL ring-3 program shipped as its own
+ * boot module. The label, the tint, the module name and the hit box all come
+ * from this one table, because the failure this project already documents for
+ * ring-3 role numbers — two halves matched by nothing but an integer — is
+ * exactly what a separately-maintained "draw" list and "click" list would
+ * reproduce.
+ *
+ * The names are this system's own. */
+#define DESK_RAIL_W   112
+#define DESK_RAIL_Y   32
+#define DESK_TILE_H   44
+#define DESK_NLAUNCH  4
+struct launch_tile { const char *label, *module; uint32_t tint; };
+static const struct launch_tile g_launch[DESK_NLAUNCH] = {
+    { "VAULT PAD", "vault_pad", C_MAGE  },
+    { "NUMWORKS",  "calc",      C_MINT  },
+    { "SYS-DIAG",  "task_mgr",  C_CYAN  },
+    { "CTRL DECK", "settings",  C_AMBER },
+};
+/* Which launcher tile contains a logical-desktop point, or -1. */
+static int desk_launch_at(int sx, int sy) {
+    if (sx < 6 || sx >= DESK_RAIL_W - 6) return -1;
+    if (sy < DESK_RAIL_Y) return -1;
+    int i = (sy - DESK_RAIL_Y) / DESK_TILE_H;
+    if (i < 0 || i >= DESK_NLAUNCH) return -1;
+    if ((sy - DESK_RAIL_Y) % DESK_TILE_H >= DESK_TILE_H - 8) return -1;   /* the gap */
+    return i;
+}
+/* Where window `id`'s taskbar chip sits, given the window table `snap`.
+ * Returns 0 if it has no chip (which happens once the bar is full). One
+ * function serves the compositor and the pointer so the two cannot disagree. */
+#define DESK_CHIP_W 96
+static int desk_launch(int t);           /* defined with the scheduler helpers below */
+static int desk_chip_slot(const struct wmwin *snap, int id, int *out_x, int *out_w) {
+    int slot = 0;
+    for (int i = 0; i < id; i++) if (snap[i].used) slot++;
+    int x = 8 + slot * (DESK_CHIP_W + 6);
+    if (x + DESK_CHIP_W > desk_w() - 8) return 0;
+    *out_x = x; *out_w = DESK_CHIP_W;
+    return 1;
+}
+/* The window whose chip contains a logical-desktop point, or -1.
+ * Caller holds g_wm_lock. */
+static int desk_chip_at(int sx, int sy) {
+    if (sy < desk_h() - WIN_TASKBAR_H) return -1;
+    for (int i = 0; i < NWMWIN; i++) {
+        int cx, cw2;
+        if (!g_wmwin[i].used || !desk_chip_slot(g_wmwin, i, &cx, &cw2)) continue;
+        if (sx >= cx && sx < cx + cw2) return i;
+    }
+    return -1;
+}
+
 /* v0.54: blit a window's full-resolution ARGB content surface 1:1 into its
  * on-screen content rectangle (no scaling — the surface is allocated to exactly
  * this size at SYS_WIN_CREATE), clipped to whichever is smaller. A window with
  * no surface (seeded by the stress suite's WM-logic tests) paints flat. */
 static void wimp_draw_content(struct wmwin *W, int cx, int cy, int cw, int ch) {
     if (cw <= 0 || ch <= 0) return;
-    uint64_t *pt = W->ppage;
+    /* v0.96: a paired window is read from whichever set it last PUBLISHED, so
+     * a frame the application is still drawing is never composited. */
+    uint64_t *pt = (W->paired && W->front) ? W->ppage_b : W->ppage;
     int sw = W->cw, sh = W->ch;
     uint64_t npg = W->cpages;
     for (int j = 0; j < ch; j++) {
@@ -29168,16 +29502,28 @@ static void wimp_draw_widgets(const struct wmwin *W, int wi) {
 }
 
 static void wimp_compose(void) {
-    int W = g_fb_width, H = g_fb_height;
+    int W = desk_w(), H = desk_h();
     if (!g_bb) return;
-    fill(C_OBS0);
+    /* v0.96: only the LOGICAL desktop is cleared. At scale 2 the rest of the
+     * backbuffer is never presented (fb_flip magnifies this region), and
+     * clearing all of it would be three quarters of the work for nothing. */
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) g_bb[y * (int)g_stride + x] = C_OBS0;
     for (int gx = 0; gx < W; gx += 48) vline(gx, 0, H - WIN_TASKBAR_H, C_GRID);
     for (int gy = 0; gy < H - WIN_TASKBAR_H; gy += 48) hline(0, gy, W, C_GRID);
-    draw_str(40, 8, "OUTRUN // WIMP DESKTOP", C_CYAN);
+    draw_str(DESK_RAIL_W + 12, 8, "OUTRUN NODE // GRID ONLINE", g_desk_accent);
 
-    /* launcher icons down the left rail */
-    uint32_t iconc[4] = { C_CYAN, C_MINT, C_AMBER, C_MAGE };
-    for (int i = 0; i < 4; i++) { rect(8, 40 + i * 44, 18, 18, iconc[i]); rect(10, 42 + i * 44, 14, 14, C_OBS0); }
+    /* v0.96: THE LAUNCHER IS A CONTROL NOW, not decoration. Every tile here is
+     * hit-tested by wimp_pointer against this exact geometry — the two are
+     * driven from one table (g_launch) so a tile cannot be drawn somewhere the
+     * pointer does not look for it. */
+    rect(0, 0, DESK_RAIL_W, H - WIN_TASKBAR_H, C_OBS1);
+    vline(DESK_RAIL_W - 1, 0, H - WIN_TASKBAR_H, C_HAIR);
+    for (int i = 0; i < DESK_NLAUNCH; i++) {
+        int y = DESK_RAIL_Y + i * DESK_TILE_H;
+        rect(6, y, DESK_RAIL_W - 12, DESK_TILE_H - 8, C_OBS2);
+        hline(6, y, DESK_RAIL_W - 12, g_launch[i].tint);
+        draw_str(12, y + 10, g_launch[i].label, g_launch[i].tint);
+    }
 
     /* Snapshot the window table under the lock, then draw without holding it
      * (draw primitives can be slow and must never run under a klock). */
@@ -29204,12 +29550,18 @@ static void wimp_compose(void) {
     /* taskbar across the bottom: one chip per used window */
     rect(0, H - WIN_TASKBAR_H, W, WIN_TASKBAR_H, C_OBS1);
     hline(0, H - WIN_TASKBAR_H, W, C_HAIR);
-    int tbx = 8;
+    /* v0.96: NAMED, CLICKABLE CHIPS. A minimized window had no way back before
+     * this — the chips were painted but nothing hit-tested them, so minimizing
+     * a window was one-way. desk_chip_at() decides both where a chip is drawn
+     * and which chip a click landed on. */
     for (int i = 0; i < NWMWIN; i++) {
-        if (!snap[i].used) continue;
+        int cx, cw2;
+        if (!snap[i].used || !desk_chip_slot(snap, i, &cx, &cw2)) continue;
         uint32_t chip = snap[i].focused ? snap[i].accent : (snap[i].minimized ? C_MUTE : C_HAIR);
-        rect(tbx, H - WIN_TASKBAR_H + 4, 46, WIN_TASKBAR_H - 8, chip);
-        tbx += 52;
+        rect(cx, H - WIN_TASKBAR_H + 4, cw2, WIN_TASKBAR_H - 8, C_OBS2);
+        hline(cx, H - WIN_TASKBAR_H + 4, cw2, chip);
+        draw_str(cx + 4, H - WIN_TASKBAR_H + 9, snap[i].title,
+                 snap[i].minimized ? C_MUTE : C_TEXT);
     }
 
     wimp_draw_cursor();
@@ -29225,6 +29577,27 @@ static int wimp_pointer(int sx, int sy, int down) {
     int hit = -1;
     klock_acquire(&g_wm_lock);
     if (down) {
+        /* v0.96: the shell gets first refusal, and only where no window is.
+         * A window dragged over the rail must still be clickable — the desktop
+         * furniture is BEHIND the windows, so it is consulted only when the
+         * hit-test finds nothing there. */
+        if (wm_topmost_at(sx, sy) < 0) {
+            int chip = desk_chip_at(sx, sy);
+            if (chip >= 0) {
+                /* One chip, two jobs: restore a minimized window, or raise and
+                 * focus a visible one. */
+                g_wmwin[chip].minimized = 0;
+                wm_raise(chip); wm_focus(chip);
+                klock_release(&g_wm_lock);
+                return chip;
+            }
+            int tile = desk_launch_at(sx, sy);
+            if (tile >= 0) {
+                klock_release(&g_wm_lock);
+                desk_launch(tile);          /* spawns; never runs the app inline */
+                return -1;
+            }
+        }
         hit = wm_topmost_at(sx, sy);
         if (hit >= 0) {
             struct wmwin *W = &g_wmwin[hit];
@@ -29338,6 +29711,49 @@ static int wimp_key(int ch) {
     return consumed;
 }
 
+/* v0.96: start the program behind launcher tile `t`.
+ *
+ * The app is QUEUED, never entered here. wimp_pointer runs inside the desktop
+ * loop's input step, and calling cpu_exec_proc from there would run a ring-3
+ * program nested inside the pass that is meant to be compositing for it — the
+ * app's first SYS_WIN_DAMAGE would then be waiting on a compositor that is
+ * suspended in this call. Queueing keeps the loop flat: dispatch, compose,
+ * input, repeat.
+ *
+ * Declared before wimp_pointer (which calls it) and defined here, next to the
+ * scheduler helpers it uses. */
+static volatile uint64_t g_desk_launched = 0, g_desk_launch_fail = 0;
+static int desk_launch(int t) {
+    if (t < 0 || t >= DESK_NLAUNCH) return -1;
+    struct boot_module *m = mod_find(g_launch[t].module);
+    if (!m) {
+        /* Named out loud rather than silently doing nothing: a tile whose
+         * module is missing from the ISO is a build mistake, and a launcher
+         * that quietly ignores clicks is how it would go unnoticed. */
+        kprintf("[desktop] '%s': no boot module '%s' on this image\n",
+                g_launch[t].label, g_launch[t].module);
+        g_desk_launch_fail++;
+        return -1;
+    }
+    uint64_t save = current_proc_idx;
+    int p = kproc_spawn(g_launch[t].label, PCAP_WIMP | PCAP_FILESYSTEM);
+    if (p < 0) { current_proc_idx = save; g_desk_launch_fail++; return -1; }
+    uint64_t entry = elf_load(p, m->start, m->end - m->start);
+    current_proc_idx = save;
+    if (!entry) { g_desk_launch_fail++; return -1; }
+    kprocs[p].entry = entry;
+    /* Pinned to the boot processor, which is also where the desktop loop runs.
+     * The compositor reads window surfaces without the WM lock (it must — see
+     * wimp_draw_widgets), and that is sound precisely because a paired window's
+     * owner cannot be drawing on another core while this core composites. */
+    kprocs[p].affinity = 1u;
+    rq_push_any(0, p);
+    g_desk_launched++;
+    kprintf("[desktop] launched '%s' (pid %u) from module '%s'\n",
+            g_launch[t].label, kprocs[p].pid, g_launch[t].module);
+    return p;
+}
+
 /* Process real pointer + keyboard hardware for the interactive desktop. */
 /* v0.77: driven from the shell command path in earlier milestones; retained so
  * the input step stays visible next to the compositor it belongs to. */
@@ -29346,11 +29762,21 @@ static void wimp_input_step(void) {
     static uint8_t prevbtn = 0;
     int dx = g_mouse_dx, dy = g_mouse_dy;
     g_mouse_dx = 0; g_mouse_dy = 0;
-    g_cur_x += dx; g_cur_y -= dy;                         /* mouse Y is inverted */
+    /* v0.96: PLUS dy, not minus. mouse_irq ALREADY inverts the PS/2 packet's
+     * up-positive Y into screen space ("g_mouse_dy -= dy" there), so
+     * subtracting here inverted it a second time and the desktop pointer moved
+     * up when the mouse moved down. canvas_input_step, the other consumer of
+     * these deltas, has always added them — the two paths disagreed, and only
+     * the canvas one had ever been driven by a human.
+     *
+     * Found by the QMP UI test: with the pointer parked at the top of the
+     * screen, every attempt to drive it down to a launcher tile moved it
+     * further up into the clamp. */
+    g_cur_x += dx; g_cur_y += dy;
     if (g_cur_x < 0) g_cur_x = 0;
-    if (g_cur_x >= (int)g_fb_width)  g_cur_x = g_fb_width - 1;
+    if (g_cur_x >= desk_w())  g_cur_x = desk_w() - 1;
     if (g_cur_y < 0) g_cur_y = 0;
-    if (g_cur_y >= (int)g_fb_height) g_cur_y = g_fb_height - 1;
+    if (g_cur_y >= desk_h()) g_cur_y = desk_h() - 1;
 
     uint8_t btn = g_mouse_btn & 1;
     if (btn && !prevbtn) wimp_pointer(g_cur_x, g_cur_y, 1);
@@ -29361,8 +29787,8 @@ static void wimp_input_step(void) {
             int nx = g_cur_x - g_wm_drag_dx, ny = g_cur_y - g_wm_drag_dy;
             if (nx < 0) nx = 0;
             if (ny < 0) ny = 0;
-            if (nx > (int)g_fb_width - 40)  nx = g_fb_width - 40;
-            if (ny > (int)g_fb_height - WIN_TITLE_H) ny = g_fb_height - WIN_TITLE_H;
+            if (nx > desk_w() - 40)  nx = desk_w() - 40;
+            if (ny > desk_h() - WIN_TITLE_H) ny = desk_h() - WIN_TITLE_H;
             g_wmwin[g_wm_drag].x = nx; g_wmwin[g_wm_drag].y = ny;
         }
         klock_release(&g_wm_lock);
@@ -29374,10 +29800,102 @@ static void wimp_input_step(void) {
         /* v0.71: the focused WIDGET gets first refusal. Only a key no widget
          * wanted is delivered to the application. */
         if (wimp_key(ch)) continue;
+        g_desk_last_key = ch; g_desk_key_tick = g_ticks; g_desk_key_repeats = 0;
         klock_acquire(&g_wm_lock);
         if (g_wm_focus >= 0 && g_wmwin[g_wm_focus].used)
             wm_queue_event(g_wm_focus, 2 /*key*/, 0, 0, ch);
         klock_release(&g_wm_lock);
+    }
+    /* v0.96: KEY AUTO-REPEAT, and the reason the settings app's two repeat
+     * fields are real. The PS/2 controller's own typematic rate is not used:
+     * it repeats scancodes into the ring whether or not anything is reading
+     * them, and it cannot be changed per-desktop. Repeating here means the
+     * delay and period are the ones SYS_DESKTOP_SETTINGS was given.
+     *
+     * A key stops repeating when it is released — which this map cannot see,
+     * since keyboard_irq discards releases — so repetition is bounded and
+     * cancelled by the next real keystroke. It is deliberately conservative:
+     * a stuck repeat is worse than one that stops early. */
+    if (g_desk_last_key && g_desk_key_repeats < DESK_MAX_REPEATS) {
+        uint64_t due = g_desk_key_tick + (g_desk_key_repeats ? g_desk_rep_period
+                                                            : g_desk_rep_delay);
+        if (g_ticks >= due) {
+            g_desk_key_tick = g_ticks; g_desk_key_repeats++;
+            if (!wimp_key(g_desk_last_key)) {
+                klock_acquire(&g_wm_lock);
+                if (g_wm_focus >= 0 && g_wmwin[g_wm_focus].used)
+                    wm_queue_event(g_wm_focus, 2, 0, 0, g_desk_last_key);
+                klock_release(&g_wm_lock);
+            }
+        }
+    }
+}
+
+/* ===========================================================================
+ * v0.96: THE DESKTOP LOOP — what makes this a desktop rather than a demo
+ * ===========================================================================
+ * Every earlier release composed WIMP frames only from inside a stress suite,
+ * so windows existed for as long as a test drove them and the machine then went
+ * back to a serial prompt. This is the loop that does not end: it dispatches
+ * ring-3 applications, composites what they published, and feeds them real
+ * mouse and keyboard input, forever.
+ *
+ * THE ORDER OF THE THREE STEPS IS THE DESIGN.
+ *
+ *   1. DISPATCH — run whatever is on this core's queue, one task per pass.
+ *   2. COMPOSE  — paint the desktop from the window table.
+ *   3. INPUT    — move the pointer, hit-test, route keys.
+ *
+ * Composition happens BETWEEN ring-3 excursions, never during one, and that is
+ * what makes the compositor's lock-free read of window surfaces sound: an
+ * application pinned to this core cannot be drawing while this core is
+ * compositing. It is the same reasoning wimp_draw_widgets already relies on,
+ * made structural rather than incidental.
+ *
+ * A task that is preempted is requeued by cpu_exec_proc and picked up on a
+ * later pass, so a busy application cannot starve the compositor: it gets one
+ * quantum per frame, exactly like every other task on the queue.
+ *
+ * The loop never returns. There is no "desktop exited" state to design, because
+ * there is nothing to return to — shell_run() is the other terminal state of
+ * this kernel and the ISO chooses between them. */
+static void desktop_run(void) {
+    kputs("\n[desktop] OUTRUN NODE — persistent desktop session\n");
+    fb_init();
+    mouse_init();
+    g_cur_x = desk_w() / 2; g_cur_y = desk_h() / 2;
+    kprintf("[desktop] logical desktop %dx%d (scale %u), %d launcher tiles, %d modules\n",
+            (uint64_t)desk_w(), (uint64_t)desk_h(), (uint64_t)g_desk_scale,
+            (uint64_t)DESK_NLAUNCH, (uint64_t)g_nmodules);
+
+    /* The editor opens on boot so the desktop is populated the moment it is
+     * visible; the other three are one click away in the rail. */
+    desk_launch(0);
+
+    uint64_t frames = 0, last_report = 0;
+    for (;;) {
+        int p = rq_pop(0);
+        if (p >= 0 && !kprocs[p].torn_down) cpu_exec_proc(0, p);
+        current_proc_idx = (uint64_t)-1;
+
+        wimp_compose();
+        wimp_input_step();
+        frames++;
+
+        /* A heartbeat on the serial console, because a graphical session that
+         * says nothing is indistinguishable from a hung one in a log — and the
+         * gate reads logs, not screens. */
+        if (g_ticks - last_report >= 500) {
+            last_report = g_ticks;
+            /* frames_used is the SAME expression SYS_DESKTOP_INFO reports, so
+             * a soak reading it out of the log sees the allocator the apps
+             * see. It is here so that a window-churn soak has a number that
+             * must come back to where it started; without it, "no leak" would
+             * be a claim about a counter nothing printed. */
+            kprintf("[desktop] %u frames, %d window(s), %u launched, %u launch failure(s), frames_used=%u\n",
+                    frames, (uint64_t)wm_count_used(), g_desk_launched, g_desk_launch_fail,
+                    (uint64_t)((g_next_frame - FRAME_POOL_BASE) / 0x1000 - g_frame_free_depth));
+        }
     }
 }
 
@@ -36331,6 +36849,14 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_invariants();
     usermode_init();        /* user GDT segments + TSS + SYSCALL MSRs (needed for ring 3) */
     smp_init();             /* v0.35: boot every core (needs the kernel GDT above) */
+    /* v0.96: THE DESKTOP FORK IN THE BOOT.
+     *
+     * Placed here on purpose: ring 3, the scheduler, SMP, CAS and the VFS are
+     * all up, and the ~45 regression suites below are not. A desktop session
+     * must not sit behind twenty minutes of stress tests, and the tests must
+     * not run underneath a session that owns the framebuffer — so this is an
+     * either/or, chosen by the image, and neither path changes the other. */
+    if (g_boot_desktop) desktop_run();   /* never returns */
 #ifdef POSIX_ITER
     /* Fast-iteration build (make EXTRA=-DPOSIX_ITER): run ONLY the milestone's
      * own suite. Everything it needs — CAS/VFS, ring 3, SMP — is already up.

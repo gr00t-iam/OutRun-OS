@@ -12,3 +12,4 @@ metal/.logs/
 # untracked for several releases because nothing ignored it and nothing
 # pruned it; `git worktree prune` removes the REGISTRATION, never the files.
 .claude/
+metal/tools/__pycache__/

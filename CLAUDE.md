@@ -310,3 +310,91 @@ A worker reports by **exit code**, decoded at its call site: pick one success
 sentinel and give every failure point a distinct code, so a suite can name which
 rule broke instead of reporting that the worker failed. Keep deadline expiry on
 its own code — a slow host must never be decoded as a defect.
+
+---
+
+## The desktop session (v0.96)
+
+There are now **two images from one kernel**, and the difference is a single
+word on the GRUB command line:
+
+| image | built by | GRUB entry passes | kmain runs |
+|---|---|---|---|
+| `outrun-os-<V>.iso` | `make` | nothing | the ~45 regression suites, then `shell_run` |
+| `outrun-desktop-<V>.iso` | `make desktop` | `desktop` | `desktop_run()`, forever |
+
+**This separation is not tidiness, it is the gate's correctness.** Every timing
+budget in this tree was calibrated against the suite boot; a desktop loop
+running underneath the suites would change what they measure. `make gate` boots
+the regression ISO and is untouched by anything in this section.
+
+`make qemu-vga` now boots the DESKTOP image — that is what a windowed target is
+for. The old behaviour (regression suites in a VGA window) is `make
+qemu-vga-suites`.
+
+### What the desktop actually consists of
+
+- **Applications are ordinary boot modules**, one ELF each, in `apps/`. They are
+  found by NAME (`mod_find`), not by module order. `multiboot_scan` used to
+  overwrite `g_user_elf` on every module tag, so before v0.96 a second module
+  silently displaced the first; the first module is still "the user ELF" so
+  every existing suite loads exactly what it loaded before.
+- **The launcher rail and taskbar chips are controls**, hit-tested against the
+  same table and the same geometry function the compositor draws from
+  (`g_launch`, `desk_chip_slot`). Before this they were painted and nothing
+  tested them, so a minimized window could not be restored — the chips existed
+  only as decoration. Never add a second copy of a hit box; that is the launcher
+  version of the role-number trap above.
+- **`desk_launch` queues, it never enters.** It is called from inside the
+  desktop loop's input step, and running a ring-3 program there would suspend
+  the compositor the program is about to wait on.
+- **Windows may be PAIRED** (`SYS_WIN_CREATE` a2=1): two page sets, published by
+  `SYS_WIN_DAMAGE`, which returns the buffer the app may now draw into. The
+  compositor only ever reads the published set. `a2=0` is the legacy
+  single-buffer window and behaves exactly as it always has. The back buffers
+  live at `WIN_BACK_V(id)`, ABOVE all `NWMWIN` primary surfaces — one stride
+  above the front buffer is window id+1's front buffer, which is a live trap.
+- **`SYS_WIN_DAMAGE`'s a1 is an optional title.** a1 == 0 is the old call.
+- **Apps are pinned to CPU 0**, which is also where the desktop loop runs. That
+  is what makes the compositor's lock-free surface read sound: an app cannot be
+  drawing on another core while this core composites.
+
+### Desktop settings must stay honest
+
+`SYS_DESKTOP_INFO` (117) and `SYS_DESKTOP_SETTINGS` (118) are declared in
+`include/outrun_abi.h`, which is the master copy of those structs — the kernel's
+local declaration must move with it, and the call REFUSES a size that disagrees
+rather than partly filling the buffer.
+
+Every accepted setting has a live consumer, and an out-of-range value is
+**refused, not clamped**, so a settings app can distinguish "applied" from "not
+supported":
+
+- `scale` is applied in `fb_flip`, which magnifies the logical desktop on the
+  way to the hardware. The window manager and pointer work in LOGICAL
+  coordinates (`desk_w()`/`desk_h()`) and need no scale term.
+- `accent` is painted by the compositor.
+- `repeat_delay`/`repeat_period` drive auto-repeat in `wimp_input_step`. The
+  PS/2 controller's own typematic rate is deliberately not used: it cannot be
+  changed per-desktop, so a settings app pointed at it would be adjusting a
+  number nothing honoured.
+
+CPU figures in `SYS_DESKTOP_INFO` are the scheduler's real per-process
+accounting (`proc_cpu_live`), in-flight excursion included. The old
+`SYS_SYSINFO` had no time field at all, which is why the previous monitor drew a
+tick-phase bar it had to label "activity" rather than load.
+
+### Testing the desktop
+
+- `make apps-test` runs the applications' host-side unit tests (`apps/tests/`)
+  in about a second. Application logic — the calculator's overflow guard, the
+  editor's cursor arithmetic, the monitor's CPU deltas — is tested here, not in
+  a 300 s emulated boot.
+- `tools/desktop-ui-test.py` drives the REAL input path over QMP and reads its
+  verdicts out of the serial log.
+  **Send `rel` events, never `abs`.** The machine has a PS/2 mouse and no
+  tablet, so absolute events are delivered nowhere: the first version of that
+  test clicked at absolute coordinates and watched the desktop sit on one window
+  for 31,000 frames while it waited for launches that could not happen. It is
+  the same class of mistake as a counter nothing increments — a test that
+  cannot press the button has not tested the button.

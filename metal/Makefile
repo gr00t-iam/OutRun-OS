@@ -20,11 +20,12 @@ LDFLAGS := -n -T linker.ld -z max-page-size=0x1000
 
 OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(BUILD)/kernel64.o \
         $(BUILD)/cap_engine.o $(BUILD)/ipc_ring.o $(BUILD)/scrypt.o
-# v0.81 DEV CYCLE. The suffix is deliberate and it propagates: the ISO is named
-# outrun-os-0.81.0-dev.iso, so a development image cannot be mistaken for a
-# release artefact by its filename alone. At release time this becomes plain
-# 0.81.0 and KERNEL_VERSION becomes 0.81.0-metal.
-VERSION := 0.94.0
+# v1.0.0. The suffix convention still holds: a dev cycle is `X.Y.Z-dev` and the
+# ISO is named after it, so a development image cannot be mistaken for a release
+# artefact by its filename alone. At release time it becomes plain X.Y.Z and
+# KERNEL_VERSION becomes X.Y.Z-metal. release-version-check cross-checks all
+# three strings (this one, KERNEL_VERSION, and the grub menuentry).
+VERSION := 1.0.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean
@@ -121,6 +122,76 @@ $(BUILD)/user_init.elf: $(BUILD)/user_init.o user/user.ld
 	$(LD) -n -T user/user.ld $< -o $@
 	@echo "  user ELF linked: $@"
 
+# ---- the desktop applications: standalone ring-3 ELFs, one per program ------
+# Each is an ordinary boot module the kernel loads by NAME (see mod_find in
+# kernel64.c), so adding a program here is the whole of adding a program. They
+# share apps/gui.c and are held to the same -Wall -Wextra the kernel is: ring 3
+# being the quieter half is exactly how v0.77 hid three real defects.
+APPS      := vault_pad calc task_mgr settings
+APP_ELFS  := $(APPS:%=$(BUILD)/apps/%.elf)
+APP_SRC   := ../apps
+APP_DEPS  := $(APP_SRC)/gui.h $(APP_SRC)/font.h ../include/outrun_abi.h
+
+$(BUILD)/apps:
+	mkdir -p $@
+
+$(BUILD)/apps/gui.o: $(APP_SRC)/gui.c $(APP_DEPS) | $(BUILD)/apps
+	$(CC) $(UCFLAGS) $(UEXTRA) -c $< -o $@
+
+$(BUILD)/apps/%.o: $(APP_SRC)/%.c $(APP_DEPS) | $(BUILD)/apps
+	$(CC) $(UCFLAGS) $(UEXTRA) -c $< -o $@
+
+$(BUILD)/apps/%.elf: $(BUILD)/apps/%.o $(BUILD)/apps/gui.o user/user.ld
+	$(LD) -n -T user/user.ld $< $(BUILD)/apps/gui.o -o $@
+	@echo "  app linked: $@"
+
+apps: $(APP_ELFS)
+
+# The applications' own host-side unit tests. They run in under a second on the
+# build host and need no image, so there is no excuse for them not to run before
+# a boot: a defect in the calculator's overflow guard is far cheaper to see here
+# than in a serial log 300 s into an emulated boot.
+.PHONY: apps apps-test
+apps-test:
+	bash ../apps/tests/run.sh
+
+# The desktop's own acceptance test: boots the desktop image, drives the REAL
+# input path over QMP, and fails unless every launcher tile starts its program
+# and the compositor is still running at the end. Roughly 3 minutes.
+.PHONY: desktop-test
+desktop-test: $(DESKTOP_ISO)
+	python3 tools/desktop-ui-test.py $(DESKTOP_ISO) $(GATE_LOGS)/desktop-ui-$$$$.log
+
+# The desktop at -smp 4. The compositor and its applications are pinned to the
+# BSP, so the other cores are live, idle and STEALING — which is the shape that
+# would expose a compositor racing an application's surface publication. A
+# desktop verified only at one vCPU has not been verified.
+.PHONY: desktop-test-smp
+desktop-test-smp: $(DESKTOP_ISO)
+	DESKTOP_QEMU="-smp 4" python3 tools/desktop-ui-test.py $(DESKTOP_ISO) \
+	  $(GATE_LOGS)/desktop-ui-smp-$$$$.log
+
+# Long-run desktop soak: holds the session open past SOAK_FRAMES composited
+# frames while opening and closing applications continuously, and fails if
+# the compositor stalls, a window fails to close, or the allocator's resting
+# level drifts. desktop-test cannot see a leak that costs a few frames an
+# hour; this is the target that can. About 45 min at 50,000 frames under TCG.
+#   make desktop-soak                       50,000 frames, uniprocessor
+#   make desktop-soak SOAK_QEMU="-smp 4"    the -smp 4 desktop
+SOAK_FRAMES ?= 50000
+.PHONY: desktop-soak
+desktop-soak: $(DESKTOP_ISO)
+	python3 tools/desktop-soak.py $(DESKTOP_ISO) $(GATE_LOGS)/desktop-soak-$$$$.log $(SOAK_FRAMES)
+
+# Everything the desktop image is checked by, in cost order. `make gate` boots
+# the REGRESSION image and is deliberately untouched by this: every timing
+# budget in the tree was calibrated against the suite boot, and a desktop loop
+# underneath the suites would change what they measure. The two images share a
+# kernel, so a kernel regression shows in `gate`; what only THIS can show is a
+# regression in the session the kernel runs when told to.
+.PHONY: gate-desktop
+gate-desktop: apps-test desktop-test desktop-test-smp
+
 $(BUILD)/outrun-kernel.elf: $(OBJS) linker.ld
 	$(LD) $(LDFLAGS) $(OBJS) -o $@
 	@echo "  kernel linked: $@"
@@ -162,8 +233,43 @@ QEMU_GPU := -vga none -device virtio-vga
 qemu: $(ISO) $(VBLK_IMG)
 	qemu-system-x86_64 -cdrom $(ISO) -m 512M -nographic -no-reboot $(QEMU_GPU) $(QEMU_BLK) $(QEMU_NET)
 
-qemu-vga: $(ISO) $(VBLK_IMG)
-	qemu-system-x86_64 -cdrom $(ISO) -m 512M -serial stdio -no-reboot $(QEMU_GPU) $(QEMU_BLK) $(QEMU_NET)
+# ---- the desktop image -----------------------------------------------------
+# A SECOND ISO, not a second kernel. It carries the same kernel.elf and the same
+# user_init.elf plus the four application modules, and its GRUB entry passes
+# `desktop` on the command line — which is the only thing that makes kmain run
+# a session instead of the regression battery.
+#
+# Two images rather than a runtime choice because `make gate` must keep booting
+# EXACTLY what it has always booted. A desktop that could start underneath the
+# suites would change what every timing budget in this tree was calibrated
+# against, which CLAUDE.md rules out in as many words.
+DESKTOP_ISO := $(BUILD)/outrun-desktop-$(VERSION).iso
+
+$(DESKTOP_ISO): $(BUILD)/outrun-kernel.elf $(BUILD)/user_init.elf $(APP_ELFS) \
+                iso/boot/grub/grub-desktop.cfg
+	rm -rf $(BUILD)/desktop-iso
+	mkdir -p $(BUILD)/desktop-iso/boot/grub $(BUILD)/desktop-iso/boot/apps
+	cp $(BUILD)/outrun-kernel.elf $(BUILD)/desktop-iso/boot/outrun-kernel.elf
+	cp $(BUILD)/user_init.elf     $(BUILD)/desktop-iso/boot/user_init.elf
+	cp $(APP_ELFS)                $(BUILD)/desktop-iso/boot/apps/
+	cp iso/boot/grub/grub-desktop.cfg $(BUILD)/desktop-iso/boot/grub/grub.cfg
+	grub-mkrescue -o $@ $(BUILD)/desktop-iso 2>/dev/null
+	@echo "  Desktop image ready: $@ ($(words $(APPS)) applications)"
+
+.PHONY: desktop
+desktop: $(DESKTOP_ISO)
+
+# QEMU_EXTRA exists so a harness can add -display/-qmp without editing this
+# file; -accel tcg is explicit because every budget in this tree assumes it.
+QEMU_EXTRA ?=
+qemu-vga: $(DESKTOP_ISO) $(VBLK_IMG)
+	qemu-system-x86_64 -accel tcg -cdrom $(DESKTOP_ISO) -m 512M -serial stdio -no-reboot \
+	  $(QEMU_GPU) $(QEMU_BLK) $(QEMU_NET) $(QEMU_EXTRA)
+
+# The regression image with a VGA window, which is what qemu-vga used to be.
+qemu-vga-suites: $(ISO) $(VBLK_IMG)
+	qemu-system-x86_64 -accel tcg -cdrom $(ISO) -m 512M -serial stdio -no-reboot \
+	  $(QEMU_GPU) $(QEMU_BLK) $(QEMU_NET) $(QEMU_EXTRA)
 
 # v0.51: virtio-sound-pci is verified in its OWN dedicated target, NOT the
 # main virtio-vga regression targets above. Reason (root-caused live, see
@@ -465,15 +571,21 @@ release-version-check:
 release-iso: release-version-check
 	$(MAKE) clean
 	$(MAKE) all
+	$(MAKE) desktop
 	@mkdir -p $(RELEASE_DIR)
-	cp $(ISO) $(RELEASE_DIR)/
+	cp $(ISO) $(DESKTOP_ISO) $(RELEASE_DIR)/
 	cd $(RELEASE_DIR) && md5sum outrun-os-$(VERSION).iso    > outrun-os-$(VERSION).iso.md5
 	cd $(RELEASE_DIR) && sha256sum outrun-os-$(VERSION).iso > outrun-os-$(VERSION).iso.sha256
+	cd $(RELEASE_DIR) && md5sum outrun-desktop-$(VERSION).iso    > outrun-desktop-$(VERSION).iso.md5
+	cd $(RELEASE_DIR) && sha256sum outrun-desktop-$(VERSION).iso > outrun-desktop-$(VERSION).iso.sha256
 	@echo "-------------------------------------------------------------"
-	@echo " RELEASE ARTEFACT"
+	@echo " RELEASE ARTEFACTS"
 	@echo "   $(RELEASE_DIR)/outrun-os-$(VERSION).iso"
 	@cat $(RELEASE_DIR)/outrun-os-$(VERSION).iso.md5
 	@cat $(RELEASE_DIR)/outrun-os-$(VERSION).iso.sha256
+	@echo "   $(RELEASE_DIR)/outrun-desktop-$(VERSION).iso"
+	@cat $(RELEASE_DIR)/outrun-desktop-$(VERSION).iso.md5
+	@cat $(RELEASE_DIR)/outrun-desktop-$(VERSION).iso.sha256
 	@echo "-------------------------------------------------------------"
 	@echo " NOT YET VERIFIED — run 'make release-verify'"
 
@@ -482,8 +594,15 @@ release-iso: release-version-check
 # this one behind -- which promptly cost the v0.80.0 release-verify log, and
 # then the release ARTEFACT itself, to a routine clean build. The
 # published-artefact check is the last log that should be disposable.
+#
+# v1.0: the desktop artefact is verified too, by the same acceptance test that
+# gates it in development, run against the COPY in release/ rather than the
+# one in build/. Both files must boot; one file having booted says nothing
+# about the other.
 release-verify:
 	tools/release-verify.sh "$(RELEASE_DIR)/outrun-os-$(VERSION).iso" "" "$(GATE_LOGS)/release-verify"
+	python3 tools/desktop-ui-test.py "$(RELEASE_DIR)/outrun-desktop-$(VERSION).iso" \
+	  "$(GATE_LOGS)/release-verify/desktop-$(VERSION).log"
 
 release: release-iso release-verify
 	@echo "  [release] ISO built, checksummed and booted clean."

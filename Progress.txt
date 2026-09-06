@@ -1,0 +1,173 @@
+OUTRUN OS — PROGRESS
+====================
+Milestone: v1.0.0 — the desktop session
+Recorded:  2026-09-06
+Tree:      main, ahead of origin/main by 7; the 1.0.0 work is UNCOMMITTED and
+           UNTAGGED. A staged commit is the last step of this file.
+
+Read CLAUDE.md for the standing conventions and metal/docs/CHANGELOG-1.0.0.md
+for the release record. This file is the working status: what is verified, by
+what evidence, and — deliberately — what is not.
+
+
+1. RELEASE ARTEFACTS (built by `make release-iso` from a clean tree, -Werror)
+------------------------------------------------------------------------------
+
+  build/release/outrun-os-1.0.0.iso
+    md5     6eeda6f3bcb27217e443c2b31c0d9a70
+    sha256  43eb43dbc9f1c627d0701f0fb4f9705b90eb18bb34f14af6533a8e9637eee2c2
+
+  build/release/outrun-desktop-1.0.0.iso
+    md5     cb4d7a2388bec4d84e1b98154fd28f54
+    sha256  efc7930de00c2fa099779ee1f2fee7893e8583a3e8560d4416c2b627697d261a
+
+  VERSION (Makefile), KERNEL_VERSION (kernel64.c) and both GRUB menuentries
+  read 1.0.0 / 1.0.0-metal; release-version-check confirmed the kernel banner
+  and grub menu. Its remaining warning — "git tag v0.94.0 != VERSION 1.0.0" —
+  is expected and correct: the tag does not exist yet. Zero compiler warnings.
+
+
+2. VERIFICATION MATRIX
+----------------------
+
+  Every row names the image it booted. A row with no md5 is not evidence.
+
+  REGRESSION, fresh image per boot (make gate, GATE_CAP=2400)
+  on outrun-os-1.0.0.iso 6eeda6f3…, run dir metal/.logs/gate/matrix-1592
+    uniprocessor          PASS  45 suites  566 passed  0 failed  0 ranks  465 s
+    smp2-bios             PASS  45 suites  580 passed  0 failed  0 ranks  410 s
+    smp4-bios             PASS  45 suites  586 passed  0 failed  0 ranks  440 s
+    smp4-iommu (VT-d)     PASS  47 suites  601 passed  0 failed  0 ranks  445 s
+
+  The same matrix was run before any 1.0 change on outrun-os-0.94.0.iso
+  7e83f341… (matrix-1465): 566 / 580 / 586 / 601, 0 failed. The counts are
+  identical. That is the negative control for "the desktop work did not
+  disturb the regression battery".
+
+  REGRESSION, one reused volume (GATE_DIRTY_CAP=900)
+    gate-dirty      3 boots, uniprocessor   PASS  .logs/gate/dirty-2914: consecutive-boot
+                                                  diffs empty (1->2, 2->3); udbreboot,
+                                                  vfs-reboot-test, cas pending->recovered
+                                                  all survived every boot
+    gate-dirty-smp  3 boots, -smp 4         PASS  .logs/gate/dirty-4056: same
+
+  PUBLISHED ARTEFACTS (make release-verify)
+    outrun-os-1.0.0.iso       PASS  474 passed / 0 failed / prompt; rank violations=0
+                                    underflow=0 mismatch=0; .logs/gate/release-verify/
+                                    boot.log is stamped md5=6eeda6f3bcb27217e443c2b31c0d9a70
+    outrun-desktop-1.0.0.iso  PASS  20/20 checks, 5,538 frames, against the copy in
+                                    build/release/ (.logs/gate/release-verify/desktop-1.0.0.log)
+
+  DESKTOP
+    make apps-test        5/5   host unit tests, gcc -O1 -fsanitize=address,undefined -Werror
+                                gui, calc, vault_pad, task_mgr, settings — about 1 s
+    make desktop-test     20/20 on outrun-desktop-0.94.0.iso 3fde3452… (the 1.0.0 desktop
+                                image differs only by version string), 1 vCPU, 5,695 frames:
+                                session loop reached; all four tiles launch real windows;
+                                4 windows at once; SYS_DESKTOP_INFO readers stay alive 12 s;
+                                no-tearing sample [112 x6]; SYS_DESKTOP_SETTINGS scale 2
+                                applied AND framebuffer genuinely magnified (80000/80000
+                                2x2 blocks uniform); survives keyboard; compositor still
+                                advancing at the end
+    make desktop-test-smp 20/20 at -smp 4, 3,875 frames (.logs/gate/desktop-ui-smp-5521.log):
+                                the compositor and its pinned apps on the BSP with three
+                                other cores live and stealing
+    make desktop-soak     PASS  on 3fde3452…, 50,000 frames in 504 s, 17 churn cycles
+                                (each 3 launches + 3 closes via the real close boxes),
+                                every cycle returned the window count to 1, frames_used
+                                = 1451 at all 17 resting points (drift 0), 0 launch
+                                failures, no panic / rank violation / underflow
+
+
+3. WHAT CHANGED IN 1.0 (since the v0.96-dev desktop milestone)
+--------------------------------------------------------------
+
+  apps/calc.c        Operator precedence: * and / bind tighter than + and -,
+                     equal precedence left-to-right. Two-level pending stack
+                     (lhs/op + low_lhs/low_op) — with two levels there is never
+                     a third, so it is a complete stack. Deferred operations are
+                     overflow/zero-divide checked when finally applied. The
+                     "Pending:" line shows both operators ("+ *").
+  apps/vault_pad.c   g/G document jumps. One-line clipboard: y yank, D cut,
+                     p paste-below (1 KiB cap; an over-long line is REFUSED, not
+                     truncated). Overwrite confirmation: save onto a file that
+                     exists and is not this buffer's origin asks once; the next
+                     save confirms; any other key withdraws. The existence probe
+                     opens with flags 0 so it cannot create.
+  apps/task_mgr.c    Click PID / CPU column headers to sort. Stable insertion
+                     sort producing an index table over the kernel's list — the
+                     list itself is never permuted, so monitor_sample's cross-
+                     sample pid matching is untouched (asserted). Per-row CPU
+                     share column. NO memory sort: outrun_process has no memory
+                     field and a fabricated column is not a feature. Graphs
+                     auto-scale to the observed peak with a floor of 20.
+  apps/settings.c    Instant apply: a row click pushes to the kernel in the
+                     same step; on refusal the local copy rolls back so the
+                     screen never shows a value the desktop is not honouring.
+                     APPLY button removed; RELOAD kept.
+  kernel64.c         Desktop heartbeat prints frames_used= by the same
+                     expression SYS_DESKTOP_INFO reports (needed so the soak
+                     reads a counter something actually prints).
+                     KERNEL_VERSION 1.0.0-metal.
+  Makefile           VERSION 1.0.0. New: desktop-soak, gate-desktop.
+                     release-iso builds + checksums BOTH images; release-verify
+                     boots both.
+  tools/             desktop-soak.py (new). desktop-ui-test.py: no-tearing
+                     sample moved to the RELOAD button / REPEAT DELAY row since
+                     a scale click now magnifies the pixels being sampled.
+  docs/              CHANGELOG-1.0.0.md.
+
+  Every app change was made test-first: the failing test was written and run
+  (watched fail for the right reason — undeclared symbol or wrong value), then
+  the implementation, then green on the target test, the whole apps suite, and
+  the freestanding build.
+
+
+4. THINGS THAT WENT WRONG, AND WHAT THEY CHANGED
+------------------------------------------------
+
+  a. Two delegated subagents (calc, task_mgr) hit their iteration cap after
+     rate-limit errors and left test_calc.c overwritten with a fragment. The
+     original was recovered byte-exact from the session database (read_file
+     result, 113 lines) and confirmed by the suite passing. All four apps were
+     then finished directly, test-first.
+
+  b. The soak's first run reported an allocator "leak" — frames_used 1451 →
+     4656 — that was twelve windows that never closed: the close-box table had
+     window ids 2 and 3 assigned to the wrong apps, so the "close" clicks landed
+     in content and RAISED windows instead. The harness now fails fast if the
+     first three cycles never report one window, and only samples frames_used
+     at heartbeats that report exactly one window. The corrected run is the one
+     in §2. A test that cannot fail has not passed; this one demonstrably can.
+
+  c. CLAUDE.md says "Highest assigned: 54" for ring-3 roles. It is 66 —
+     roles 60–66 exist (65/66 are set via R[k].role, not a `.role =` literal,
+     so the grep CLAUDE.md prescribes misses them). This is the exact stale-
+     number trap that section documents. The file is protected from agent
+     edits; a human should update it. Suggested text is in CHANGELOG-1.0.0.md
+     "WHAT THIS RELEASE DOES NOT CLAIM".
+
+
+5. NOT COVERED (so "verified" stays "measured")
+-----------------------------------------------
+
+  - Settings do not persist across boots (by design; the app says so).
+  - The soak is one image, one vCPU, 17 cycles, and drives only launch/close.
+    It does not minimize, drag, resize, or type. No -smp 4 soak was run
+    (desktop-test-smp covers -smp 4 for ~4k frames, not 50k).
+  - The no-tearing check samples six frames. It can catch tearing, not prove
+    its absence; the claim rests on paired buffers + CPU-0 pinning.
+  - One boot per fresh tier, three per dirty tier: cannot see an intermittent
+    below ~1 in 10 boots.
+  - Nothing on bare metal or Proxmox.
+  - desktop-test and the soak ran on the 0.94.0-stringed development desktop
+    image (3fde3452…); the 1.0.0 artefact itself passed the same 20 checks
+    under release-verify (§2). The two differ only in version strings.
+
+
+6. TO TAG
+---------
+
+  git add -A && git commit  (message drafted in the final report)
+  git tag -a v1.0.0
+  Then `make release-version-check` should print three OKs and no warning.
