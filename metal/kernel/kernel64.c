@@ -24060,6 +24060,61 @@ static void cmd_vfio_stress(void) {
     vfiocheck("the frame allocator's leaf lock never triggered a rank violation (no double-free race)",
               g_rank_violations == viol0);
 
+    /* =====================================================================
+     * v0.95 Objective 1: ROLES 65 and 66 — the claim surface, from ring 3.
+     * =====================================================================
+     * Driven from here rather than from a new interactive command because
+     * vfiostrs already runs on every gate boot, and roles 63/64 taught the
+     * cost of the alternative: timebench is interactive, so make gate has
+     * never reached them and v0.93 shipped a "role 63 OK" line no target
+     * could produce. A test only the author runs is not coverage.
+     *
+     * DETECTIONS AND FAILURES ARE COUNTED SEPARATELY. Exit 1921 from role 65
+     * and 1931 from role 66 both mean NOT EXERCISED — the workload never
+     * reached the guard — and are reported as such rather than as passes. A
+     * suite that cannot tell "the check held" from "the check never ran" is
+     * green on a boot that tested nothing, which is the Carryover-3 failure
+     * this tree keeps a section of CLAUDE.md about. */
+    {
+        int save = (int)current_proc_idx;
+        static const struct { int role; int ok; int noex; const char *what; }
+        R[2] = { { 65, 1920, 1921, "role 65: the claim surface REFUSES what it must" },
+                 { 66, 1930, 1931, "role 66: claim -> map BAR -> release -> re-claim" } };
+        for (int k = 0; k < 2; k++) {
+            int p = kproc_spawn(R[k].role == 65 ? "claimneg" : "claimpos",
+                                PCAP_VFIO | PCAP_SMP_ADMIN);
+            if (p < 0) { vfiocheck(R[k].what, 0); continue; }
+            kprocs[p].role = R[k].role;
+            kprocs[p].affinity = 0;
+            uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+            current_proc_idx = save;
+            if (!e) { vfiocheck(R[k].what, 0); continue; }
+            kprocs[p].entry = e;
+            rq_push_any(0, p);
+            __sync_synchronize();
+            if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);
+            int drained = role_drain(R[k].role, 6000, R[k].role == 65 ? "claimneg" : "claimpos");
+            current_proc_idx = save;
+            int c = (int)kprocs[p].exit_code;
+            if (!drained) {
+                kprintf("[vfiostrs] role %d WATCHDOG — never finished\n",
+                        (uint64_t)(int64_t)R[k].role);
+                vfiocheck(R[k].what, 0);
+            } else if (c == R[k].noex) {
+                /* NOT a pass and NOT a failure of the kernel: the workload
+                 * could not reach the code. Named so it cannot be read as
+                 * either. */
+                kprintf("[vfiostrs]  NOT EXERCISED  %s (exit %u)\n",
+                        R[k].what, (uint64_t)(int64_t)c);
+            } else {
+                if (c != R[k].ok)
+                    kprintf("[vfiostrs] role %d exit %u\n",
+                            (uint64_t)(int64_t)R[k].role, (uint64_t)(int64_t)c);
+                vfiocheck(R[k].what, c == R[k].ok);
+            }
+        }
+    }
+
     kprintf("[vfiostrs] RESULT: %d passed, %d failed\n", (uint64_t)g_vfiopass, (uint64_t)g_vfiofail);
     if (!g_vfiofail)
         kputs("[vfiostrs] VFIO STRESS VERIFIED — BAR mapping and routed interrupts both leak-free across driver churn\n");

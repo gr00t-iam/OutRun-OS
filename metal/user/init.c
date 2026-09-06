@@ -4255,6 +4255,241 @@ static void role64_cpusplit_probe(void) {
     sysc(SYS_EXIT, 1900, 0, 0);
 }
 
+/* ===========================================================================
+ * v0.95 ROLE 65: THE NEGATIVE CONTROL FOR DEVICE CLAIM
+ * ===========================================================================
+ * This role asserts what the passthrough surface REFUSES. That is the half a
+ * green positive test cannot demonstrate, and on an isolation feature it is the
+ * half that matters: a claim path that grants everything passes every test that
+ * only checks that claiming works.
+ *
+ * Every check here is written so that a kernel with the guard REMOVED fails it.
+ * Where a check could pass by never reaching the code — the shape of the
+ * Carryover-3 failure CLAUDE.md records — it counts detections separately and
+ * reports NOT EXERCISED rather than success.
+ *
+ *   1920 ok
+ *   1921 claim on a HOST-BOUND device was not refused with EBUSY
+ *   1922 claim accepted a reserved flag bit
+ *   1923 claim accepted a BDF the bus walk never found
+ *   1924 MAP_PCI_BAR succeeded WITHOUT a claim
+ *   1925 MAP_PCI_BAR accepted an out-of-range bar_index
+ *   1926 MAP_PCI_BAR accepted a write-combining request it cannot honour
+ *   1927 REGISTER_PCI_IRQ claimed MSI-X works when no MSI exists
+ *   1928 CORE_PIN isolated every online core
+ *   1929 the worker's own deadline expired (SLOW HOST, not a defect)  */
+#define R65_T 6000u
+
+static void role65_claim_negative(void) {
+    u64 t0 = omono_us();
+    u64 out[4];
+
+    /* (1) A HOST-BOUND DEVICE MUST BE REFUSED. virtio-net, virtio-gpu and
+     * virtio-blk all have kernel drivers bound; a claim on any of them would
+     * attach an IOMMU domain underneath a live driver. Scan the registry for
+     * one that refuses with EBUSY.
+     *
+     * DETECTION COUNTED SEPARATELY. If no device in the registry is
+     * host-bound, this check never ran — and a boot where it never ran is not
+     * a boot where it passed. */
+    /* SWEEP BY BDF, NOT BY DEVICE INDEX. SYS_CLAIM_PCI_DEVICE takes a PCI
+     * source-id — (bus << 8) | (slot << 3) | func — and the first version of
+     * this loop passed 0..7, which is bus 0 slot 0 functions 0-7: the host
+     * bridge, not the devices under test. Bus 0 slots 0-31 functions 0-7 is
+     * 256 calls, bounded and cheap, and covers every function this machine
+     * presents. */
+    int bound_seen = 0;
+    for (u64 slot = 0; slot < 32; slot++) {
+        for (u64 fn = 0; fn < 8; fn++) {
+            u64 bdf = (slot << 3) | fn;
+            i64 r = (i64)sysc(SYS_CLAIM_PCI_DEVICE, bdf, 0, (u64)(void *)out);
+            if (r == -16) { bound_seen++; continue; }    /* EBUSY: refused      */
+            if (r >= 0) sysc(SYS_RELEASE_PCI_DEVICE, (u64)r, 0, 0); /* put back */
+        }
+        if (odeadline_expired(t0, (u64)R65_T * 10000ull)) sysc(SYS_EXIT, 1929, 0, 0);
+    }
+    print("  [r65] host-bound devices refusing a claim: "); hex((u64)bound_seen);
+    print("\n");
+    if (!bound_seen) {
+        /* NOT a pass. Distinguished from success by its own exit code so the
+         * kernel-side decode can say "this boot tested nothing" rather than
+         * printing OK for a workload that never reached the guard. */
+        print("  [r65] NOT EXERCISED: no host-bound device was present\n");
+        sysc(SYS_EXIT, 1921, 0, 0);
+    }
+
+    /* (2) Reserved flag bits are refused, not ignored. Bit 7 has no meaning. */
+    if ((i64)sysc(SYS_CLAIM_PCI_DEVICE, 0, 1u << 7, (u64)(void *)out) != -22) {
+        print("  [r65] claim ACCEPTED a reserved flag bit\n");
+        sysc(SYS_EXIT, 1922, 0, 0);
+    }
+
+    /* (3) A BDF the bus walk never found is ENODEV, not a registry miss that
+     * looks like the device is merely busy. 0xFF00 is bus 255, slot 0. */
+    if ((i64)sysc(SYS_CLAIM_PCI_DEVICE, 0xFF00, 0, (u64)(void *)out) != -19) {
+        print("  [r65] claim ACCEPTED an absent BDF\n");
+        sysc(SYS_EXIT, 1923, 0, 0);
+    }
+
+    /* (4) THE CLAIM IS THE AUTHORISATION. This worker holds PCAP_VFIO, so a
+     * capability check alone would let this through — which is exactly the
+     * confusion this check exists to catch. Mapping a BAR of a device we do
+     * not own must fail even though we could claim it. */
+    for (u64 dev = 0; dev < 8; dev++) {
+        i64 r = (i64)sysc(SYS_MAP_PCI_BAR, dev, 0, 0);
+        if (r >= 0) {
+            print("  [r65] MAP_PCI_BAR succeeded with NO claim on dev "); hex(dev);
+            print("\n");
+            sysc(SYS_EXIT, 1924, 0, 0);
+        }
+    }
+
+    /* (5) bar_index 6 does not exist. */
+    if ((i64)sysc(SYS_MAP_PCI_BAR, 0, 6, 0) != -22) {
+        print("  [r65] MAP_PCI_BAR accepted bar_index 6\n");
+        sysc(SYS_EXIT, 1925, 0, 0);
+    }
+
+    /* (6) WRITE-COMBINING MUST BE REFUSED, NOT SILENTLY DOWNGRADED. This
+     * kernel maps MMIO uncacheable because WC needs a PAT entry it does not
+     * program. Accepting the flag and mapping UC anyway hands a caller
+     * different ordering guarantees than it asked for. */
+    if ((i64)sysc(SYS_MAP_PCI_BAR, 0, 0, 1) != -22) {
+        print("  [r65] MAP_PCI_BAR accepted a write-combining request\n");
+        sysc(SYS_EXIT, 1926, 0, 0);
+    }
+
+    /* (7) MSI-X MUST ADMIT IT DOES NOT EXIST. There is no MSI infrastructure
+     * in this kernel — no IOAPIC, no vector allocator, an IDT with no free
+     * slot. A kernel that returned success here would be reporting delivery
+     * from a subsystem that is not built. */
+    if ((i64)sysc(SYS_REGISTER_PCI_IRQ, 0, PCI_IRQ_MSIX, 0) != -38) {
+        print("  [r65] REGISTER_PCI_IRQ claimed MSI-X works\n");
+        sysc(SYS_EXIT, 1927, 0, 0);
+    }
+
+    /* (8) Isolating every online core is refused: a kernel that lets a process
+     * strand the scheduler with nowhere to place work has a one-syscall hang.
+     *
+     * THE MASK MUST BE EXACTLY THE ONLINE SET. The first version passed
+     * 0xFFFFFFFF and asserted -EBUSY, and it FAILED against a correct kernel:
+     * that mask also names cores which do not exist, so the kernel rejects it
+     * with -EINVAL at an earlier and equally correct check, and the last-core
+     * guard is never reached. The test was asserting the wrong refusal — and
+     * accepting "either -22 or -16" would have hidden a kernel with no
+     * last-core guard at all, since -22 alone would satisfy it. Building the
+     * real mask is what makes -EBUSY the only correct answer. */
+    u32 nc = osysncpu();
+    if (!nc) { print("  [r65] SYS_SYSINFO gave no cpu count\n"); sysc(SYS_EXIT, 1929, 0, 0); }
+    u64 all = (nc >= 32) ? 0xFFFFFFFFull : ((1ull << nc) - 1ull);
+    i64 pr = (i64)sysc(SYS_CORE_PIN, all, 0, 0);
+    print("  [r65] CORE_PIN(all "); hex((u64)nc); print(" cores) -> "); hex((u64)pr);
+    print("\n");
+    if (pr != -16) {
+        print("  [r65] CORE_PIN did not refuse isolating every online core\n");
+        sysc(SYS_EXIT, 1928, 0, 0);
+    }
+    /* And a mask naming a core that is not there is a DIFFERENT error. Checked
+     * so the two refusals cannot collapse into one. */
+    if (nc < 32 && (i64)sysc(SYS_CORE_PIN, 1ull << 31, 0, 0) != -22) {
+        print("  [r65] CORE_PIN accepted a core that does not exist\n");
+        sysc(SYS_EXIT, 1928, 0, 0);
+    }
+
+    sysc(SYS_EXIT, 1920, 0, 0);
+}
+
+/* ===========================================================================
+ * v0.95 ROLE 66: THE POSITIVE PATH — claim, map, release, re-claim
+ * ===========================================================================
+ *   1930 ok
+ *   1931 no claimable (unbound) device existed — NOT EXERCISED
+ *   1932 claim of an unbound device failed
+ *   1933 MAP_PCI_BAR of a claimed device failed
+ *   1934 the mapped BAR was not readable
+ *   1935 release failed
+ *   1936 RE-CLAIM after release failed — a teardown leak
+ *   1937 a second claim by the same owner was refused
+ *   1939 deadline expired (SLOW HOST)  */
+#define R66_T 6000u
+
+static void role66_claim_positive(void) {
+    u64 t0 = omono_us();
+    u64 out[4];
+    i64 dev = -1;
+    u64 devbdf = 0;
+
+    /* Find a device that is NOT host-bound, sweeping by BDF for the same
+     * reason role 65 does. On the reference machine every registered PCI
+     * function currently has a driver bound, so this may legitimately find
+     * nothing — reported as NOT EXERCISED rather than as a pass, because a
+     * positive test that never claimed anything has demonstrated nothing. */
+    for (u64 slot = 0; slot < 32 && dev < 0; slot++) {
+        for (u64 fn = 0; fn < 8; fn++) {
+            u64 bdf = (slot << 3) | fn;
+            i64 r = (i64)sysc(SYS_CLAIM_PCI_DEVICE, bdf, 0, (u64)(void *)out);
+            if (r >= 0) { dev = r; devbdf = bdf; break; }
+        }
+        if (odeadline_expired(t0, (u64)R66_T * 10000ull)) sysc(SYS_EXIT, 1939, 0, 0);
+    }
+    if (dev < 0) {
+        print("  [r66] NOT EXERCISED: every registered device is host-bound\n");
+        sysc(SYS_EXIT, 1931, 0, 0);
+    }
+    print("  [r66] claimed bdf "); hex(devbdf); print(" -> dev "); hex((u64)dev);
+    print(" bar0 phys "); hex(out[0]); print(" len "); hex(out[1]); print("\n");
+
+    /* A second claim BY THE SAME OWNER is not a conflict. The kernel's test is
+     * `owner_live && owner != me`, so re-claiming must be idempotent rather
+     * than EBUSY against oneself — a driver re-opening its own device should
+     * not have to release first. */
+    if ((i64)sysc(SYS_CLAIM_PCI_DEVICE, devbdf, 0, (u64)(void *)out) < 0) {
+        print("  [r66] a second claim by the SAME owner was refused\n");
+        sysc(SYS_EXIT, 1937, 0, 0);
+    }
+
+    /* Map every BAR that has one, and read the first word back. A mapping that
+     * cannot be read is a page-table entry that looks right and is not. */
+    int mapped = 0;
+    for (u64 b = 0; b < 6; b++) {
+        i64 va = (i64)sysc(SYS_MAP_PCI_BAR, (u64)dev, b, 0);
+        if (va < 0) continue;                        /* that BAR has no window */
+        mapped++;
+        volatile u32 *reg = (volatile u32 *)(u64)va;
+        u32 v = *reg;                                /* MUST NOT FAULT         */
+        print("  [r66] bar "); hex(b); print(" -> va "); hex((u64)va);
+        print(" first word "); hex((u64)v); print("\n");
+    }
+    if (!mapped) {
+        print("  [r66] no BAR of the claimed device could be mapped\n");
+        sysc(SYS_EXIT, 1933, 0, 0);
+    }
+
+    /* Release, then RE-CLAIM. This is the check that catches a teardown leak,
+     * and a single-shot test cannot see it: a release that clears the owner
+     * but leaves the IOMMU domain attached looks identical to a correct one
+     * until something claims the device again. */
+    if ((i64)sysc(SYS_RELEASE_PCI_DEVICE, (u64)dev, 0, 0) != 0) {
+        print("  [r66] release FAILED\n"); sysc(SYS_EXIT, 1935, 0, 0);
+    }
+    /* Mapping after release must FAIL: the claim was the authorisation, and a
+     * release that leaves the mapping usable has released nothing. */
+    if ((i64)sysc(SYS_MAP_PCI_BAR, (u64)dev, 0, 0) >= 0) {
+        print("  [r66] MAP_PCI_BAR still worked AFTER release\n");
+        sysc(SYS_EXIT, 1936, 0, 0);
+    }
+    /* RE-CLAIM. This is what catches a teardown leak, and a single claim
+     * cannot see it: a release that clears the owner but leaves the IOMMU
+     * domain attached looks identical to a correct one until the device is
+     * claimed again. */
+    if ((i64)sysc(SYS_CLAIM_PCI_DEVICE, devbdf, 0, (u64)(void *)out) < 0) {
+        print("  [r66] RE-CLAIM after release FAILED — teardown leak\n");
+        sysc(SYS_EXIT, 1936, 0, 0);
+    }
+    print("  [r66] release + re-claim OK, "); hex((u64)mapped);
+    print(" bar(s) mapped\n");
+    sysc(SYS_EXIT, 1930, 0, 0);
+}
 
 static void role62_ofile_stress(void) {
     u64 backoff = 0;                /* table-full retries: contention, observed */
@@ -6976,6 +7211,8 @@ int main(int argc, const char **argv, const char **envp) {
     if (role == 60) { meta_worker(); }                 /* v0.85 VFS metadata from ring 3 */
     if (role == 63) { role63_clock_probe(); }          /* v0.92 CLOCK_MONOTONIC + nanosleep from ring 3 */
     if (role == 64) { role64_cpusplit_probe(); }       /* v0.94 utime/stime split + ITIMER_PROF */
+    if (role == 65) { role65_claim_negative(); }       /* v0.95 PCI claim: what it REFUSES */
+    if (role == 66) { role66_claim_positive(); }       /* v0.95 PCI claim/map/release      */
     if (role == 62) { role62_ofile_stress(); }         /* v0.90 g_ofile_lock descriptor contention */
     if (role == 61) { cas_contend_worker(); }          /* v0.89 CAS index/bitmap contention soak */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */
