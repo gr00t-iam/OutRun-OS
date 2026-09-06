@@ -2820,7 +2820,15 @@ struct kdev {
     uint32_t owner_gen;                    /* kprocs[owner].gen when claimed   */
     uint32_t claim_flags;                  /* CLAIM_* the owner asked for      */
 };
-#define MAX_KDEV 8
+/* v0.95: 8 -> 32. The first boot of the generalised bus walk inventoried SEVEN
+ * PCI functions on a plain SeaBIOS machine while the registry held eight slots
+ * — so registering what enumeration finds would have overflowed on the
+ * reference configuration, before anyone attached a GPU. q35 with root ports
+ * carries more. 32 is chosen to leave headroom for the synthetic devices
+ * (sensor0, vfio-dev0) alongside a real machine's functions rather than to be
+ * exactly sufficient for this one; kdev_register still refuses past the end and
+ * pci_register_claimable now SAYS SO rather than dropping silently. */
+#define MAX_KDEV 32
 static struct kdev kdevs[MAX_KDEV];
 static int n_kdev = 0;
 
@@ -2855,6 +2863,18 @@ static int g_kdev_irq_line[MAX_KDEV] = { [0 ... MAX_KDEV - 1] = -1 };
  * device. That is a different statement from "nobody filled this in", and the
  * difference is the whole point of making it an argument. */
 #define KDEV_SYNTHETIC 0xFFFF
+/* v0.95: SYS_CLAIM_PCI_DEVICE flags. Bits outside these are RESERVED and are
+ * refused with -EINVAL rather than ignored — see case 111 for why. */
+#define CLAIM_EXCLUSIVE (1u << 0)
+#define CLAIM_DMA       (1u << 1)
+#define PIN_NO_SLICE    (1u << 0)   /* SYS_CORE_PIN: also gate off the slice tick */
+/* Cores withheld from the general scheduler by SYS_CORE_PIN, and the subset
+ * that additionally has its LAPIC slice tick suppressed. Read on the hot
+ * enqueue path, so plain uint32_t reads: a stale value costs one misplacement,
+ * which the next enqueue corrects, and an atomic here would tax every wakeup
+ * in the system to fix nothing. */
+static volatile uint32_t g_cpu_isolated = 0;
+static volatile uint32_t g_cpu_noslice  = 0;
 static void kdev_register(const char *name, uint64_t base, uint64_t len,
                           uint64_t req, uint16_t bdf) {
     if (n_kdev >= MAX_KDEV) return;
@@ -2902,7 +2922,32 @@ static int g_vfio_irq_owner[MAX_VFIO_LINES] = { [0 ... MAX_VFIO_LINES - 1] = -1 
  * so that machinery (including v0.45's device-MMIO double-free guard) is
  * reused, not reimplemented. The one thing v0.44/v0.45 know nothing about
  * is IRQ-line ownership, so that is all this function releases. */
+/* fwd: defined with the IOMMU, below. Needed here because the claim teardown
+ * runs on every exit path and must return a dead owner's device to the kernel
+ * identity domain. */
+static void iommu_detach_to_kernel(uint16_t bdf);
+
 static void vfio_teardown_kproc(int proc_idx) {
+    /* v0.95: RELEASE ANY DEVICE THIS PROCESS CLAIMED.
+     *
+     * Every exit path reaches here — SYS_EXIT, a CPL3 fault, a fatal signal —
+     * which is why the release lives here rather than only in case 112. A
+     * crashed driver that kept its claim would leave a device attached to a
+     * dead process's page tables, and a device does not stop issuing DMA
+     * because its driver died.
+     *
+     * ORDER: detach the IOMMU FIRST, then clear the owner. Clearing first
+     * opens a window in which another process can claim a device whose domain
+     * still points at the corpse's tables. */
+    for (int i = 0; i < n_kdev; i++) {
+        if (kdevs[i].owner != proc_idx) continue;
+        uint16_t bdf = kdevs[i].bdf;
+        if (kdevs[i].claim_flags & CLAIM_DMA) iommu_detach_to_kernel(bdf);
+        kdevs[i].owner = -1; kdevs[i].owner_gen = 0; kdevs[i].claim_flags = 0;
+        if (g_debug_vfio)
+            kprintf("[dbgvfio] pid %u slot %d: released claim on dev %d (bdf %x)\n",
+                    kprocs[proc_idx].pid, proc_idx, (uint64_t)(int64_t)i, (uint64_t)bdf);
+    }
     for (int i = 0; i < MAX_VFIO_LINES; i++) {
         if (g_vfio_irq_owner[i] != proc_idx) continue;
         if (g_debug_vfio)
@@ -14782,6 +14827,8 @@ struct pcifn {
     uint16_t vendor, device;
     uint8_t  class, subclass, progif;
     uint8_t  header;                 /* header type, bit 7 masked off        */
+    uint64_t bar0_phys, bar0_len;    /* first MEMORY bar found, 0 = none     */
+    int8_t   bar_index;              /* which BAR that was, -1 = none        */
 };
 static struct pcifn g_pcifn[MAX_PCIFN];
 static int n_pcifn = 0;
@@ -14801,6 +14848,34 @@ static int pcifn_find(uint16_t bdf) {
     return -1;
 }
 
+/* Size BAR `idx` by the standard write-all-ones / read-back / restore dance.
+ *
+ * SIZING MUST HAPPEN BEFORE A DRIVER BINDS. Writing 0xFFFFFFFF to a BAR makes
+ * the device decode a different window for the duration, and doing that to a
+ * NIC with live rings is a way to lose traffic for no reason. pci_probe_fn
+ * calls this before it hands the function to any driver probe, which is the
+ * only point in the boot where every device is quiescent.
+ *
+ * Returns 0 for an I/O BAR or an unimplemented one; *out_phys is the base. */
+static uint64_t pci_bar_size(uint8_t bus, uint8_t dev, uint8_t fn, int idx,
+                             uint64_t *out_phys) {
+    uint8_t bo = (uint8_t)(0x10 + 4 * idx);
+    uint32_t lo = pci_cfg_read32(bus, dev, fn, bo);
+    if (lo == 0xFFFFFFFF || lo == 0) { *out_phys = 0; return 0; }
+    if (lo & 1) { *out_phys = 0; return 0; }               /* I/O BAR, not MMIO */
+    int is64 = (((lo >> 1) & 3) == 2);
+    uint64_t base = (uint64_t)(lo & ~0xFu);
+    if (is64) base |= (uint64_t)pci_cfg_read32(bus, dev, fn, (uint8_t)(bo + 4)) << 32;
+
+    pci_cfg_write32(bus, dev, fn, bo, 0xFFFFFFFF);
+    uint32_t szlo = pci_cfg_read32(bus, dev, fn, bo);
+    pci_cfg_write32(bus, dev, fn, bo, lo);                 /* RESTORE, always   */
+    if (!szlo || szlo == 0xFFFFFFFF) { *out_phys = base; return 0; }
+    uint64_t size = (uint64_t)(~(szlo & ~0xFu) + 1) & 0xFFFFFFFFull;
+    *out_phys = base;
+    return size;
+}
+
 /* Record one present function, and bind a driver to it if we have one. */
 static void pci_probe_fn(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t id) {
     uint32_t cls  = pci_cfg_read32(bus, dev, fn, 0x08);
@@ -14809,10 +14884,36 @@ static void pci_probe_fn(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t id) {
     uint8_t  class = (uint8_t)(cls >> 24), subclass = (uint8_t)(cls >> 16);
     uint8_t  progif = (uint8_t)(cls >> 8);
 
+    /* Size BARs here, while nothing is driving this function yet.
+     *
+     * SCAN 0-5, DO NOT ASSUME BAR 0. The first version of this looked at BAR 0
+     * alone and registered ONE claimable device on the reference machine where
+     * there should have been two: a virtio-modern device with disable-legacy=on
+     * puts its registers in BAR 4, and BAR 0 reads back unimplemented. virtio-blk
+     * was therefore skipped as "no memory BAR" — an implementation shortcut
+     * reported as a property of the device, which is the worst kind of wrong
+     * answer because it looks like a considered exclusion in the log.
+     *
+     * A 64-bit BAR consumes TWO consecutive slots, so the loop steps by two
+     * over one — reading the high half as if it were its own BAR yields a
+     * garbage base that happens to look present. */
+    uint64_t b0p = 0, b0l = 0;
+    int b0i = -1;
+    if (((hdr >> 16) & 0x7F) == 0) {                       /* type 0 header only */
+        for (int bi = 0; bi < 6; ) {
+            uint32_t raw = pci_cfg_read32(bus, dev, fn, (uint8_t)(0x10 + 4 * bi));
+            int is64 = (!(raw & 1)) && (((raw >> 1) & 3) == 2);
+            uint64_t phys = 0, len = pci_bar_size(bus, dev, fn, bi, &phys);
+            if (len && phys) { b0p = phys; b0l = len; b0i = bi; break; }
+            bi += is64 ? 2 : 1;
+        }
+    }
+
     if (n_pcifn < MAX_PCIFN) {
         g_pcifn[n_pcifn++] = (struct pcifn){
             pci_bdf(bus, dev, fn), vendor, (uint16_t)(id >> 16),
-            class, subclass, progif, (uint8_t)((hdr >> 16) & 0x7F)
+            class, subclass, progif, (uint8_t)((hdr >> 16) & 0x7F), b0p, b0l,
+            (int8_t)b0i
         };
     } else g_pcifn_overflow++;
 
@@ -14828,6 +14929,66 @@ static void pci_probe_fn(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t id) {
     } else if (class == 0x0C) {                         /* serial bus controller */
         if (subclass == 0x03 && progif == 0x30) xhci_probe(bus, dev, fn); /* xHCI */
     }
+}
+
+/* Is a kdev already registered for this source-id? Drivers that register their
+ * own device (virtio-net) must not be entered a second time by the sweep below,
+ * or one physical device appears twice under two device_ids with two
+ * independent owner fields — and two processes could each "own" it. */
+static int kdev_find_bdf(uint16_t bdf) {
+    if (bdf == KDEV_SYNTHETIC) return -1;
+    for (int i = 0; i < n_kdev; i++)
+        if (kdevs[i].used && kdevs[i].bdf == bdf) return i;
+    return -1;
+}
+
+/* v0.95: enter every claimable PCI function into the device registry.
+ *
+ * WHAT "CLAIMABLE" EXCLUDES, and why each exclusion is a decision rather than a
+ * filter that happened to be convenient:
+ *
+ *   BRIDGES (class 0x06). A host bridge, an ISA bridge or a root port is not a
+ *   device a driver drives; handing one to ring 3 detaches the path to
+ *   everything behind it. On the reference machine that is 0:0.0 and 0:1.0.
+ *
+ *   FUNCTIONS WITH NO MEMORY BAR. SYS_VFIO_MAP_BAR has nothing to map, so a
+ *   claim would succeed and then be useless. 0:1.3 (the PIIX3 ACPI function)
+ *   is exactly this case.
+ *
+ *   FUNCTIONS A DRIVER ALREADY REGISTERED. See kdev_find_bdf.
+ *
+ * Everything else is registered with PCAP_VFIO as its required capability — the
+ * same gate SYS_VFIO_MAP_BAR already applies — and with its REAL bdf, which is
+ * what makes iommu_attach_proc_domain able to confine it at all. */
+static void pci_register_claimable(void) {
+    int added = 0, dropped = 0;
+    for (int i = 0; i < n_pcifn; i++) {
+        struct pcifn *f = &g_pcifn[i];
+        if (f->class == 0x06) continue;                 /* bridge              */
+        if (!f->bar0_len) continue;                     /* nothing to map      */
+        if (kdev_find_bdf(f->bdf) >= 0) continue;       /* a driver has it     */
+        if (n_kdev >= MAX_KDEV) { dropped++; continue; }
+        kdev_register("pci-dev", f->bar0_phys, f->bar0_len, PCAP_VFIO, f->bdf);
+        added++;
+        /* NAMED, NOT JUST COUNTED. "1 function registered" was true and
+         * useless: it did not say WHICH, so a device missing for the wrong
+         * reason looked identical to a device correctly excluded. */
+        kprintf("[pci    ]   claimable: %d:%d.%d  vendor %x device %x  BAR%d "
+                "phys %X len %X\n",
+                (uint64_t)(f->bdf >> 8), (uint64_t)((f->bdf >> 3) & 0x1F),
+                (uint64_t)(f->bdf & 7), (uint64_t)f->vendor, (uint64_t)f->device,
+                (uint64_t)(int64_t)f->bar_index, f->bar0_phys, f->bar0_len);
+    }
+    if (added)
+        kprintf("[pci    ] %d function(s) registered as claimable devices\n",
+                (uint64_t)(int64_t)added);
+    /* SAID, NOT SWALLOWED. A device that is present, claimable in principle and
+     * absent from the registry because the table filled is a claim that fails
+     * for a reason no log names — which is the failure mode MAX_KDEV=8 would
+     * have produced silently on this very machine. */
+    if (dropped)
+        kprintf("[pci    ] *** %d claimable function(s) did NOT fit MAX_KDEV=%d "
+                "and cannot be claimed\n", (uint64_t)(int64_t)dropped, (uint64_t)MAX_KDEV);
 }
 
 static void pci_init(void) {
@@ -14852,6 +15013,7 @@ static void pci_init(void) {
             }
         }
     }
+    pci_register_claimable();
     kprintf("[pci    ] %d function(s) inventoried%s\n", (uint64_t)(int64_t)n_pcifn,
             g_pcifn_overflow ? " — TABLE FULL, some were dropped" : "");
     if (g_pcifn_overflow)
@@ -15796,11 +15958,26 @@ static int rq_push(int cpu, int proc) {                /* producer: tail       *
  * -1 that history shows nobody checks. Returns the cpu it landed on, or -1. */
 static int rq_push(int cpu, int proc);
 static int rq_push_any(int cpu, int proc) {
-    if (rq_push(cpu, proc) == 0) return cpu;
+    /* v0.95: AN ISOLATED CORE TAKES ONLY WORK THAT BELONGS TO IT.
+     *
+     * `confined` is the test: a task whose affinity names ONLY isolated cores
+     * is the pinning workload itself and must still be placeable, while
+     * everything else is kept off. Expressed as a subset check rather than
+     * "is this the pinning process" because affinity is what the scheduler
+     * already understands, and a second notion of ownership here would be a
+     * second thing to keep in step with the first.
+     *
+     * Note the preferred-core push below WAS unconditional — it did not even
+     * consult affinity — so without this an isolated core would still receive
+     * whatever happened to wake on it. */
     uint32_t aff = kprocs[proc].affinity;
+    uint32_t iso = g_cpu_isolated;
+    int confined = (iso && aff && (aff & ~iso) == 0);
+    if ((!iso || confined || !(iso & (1u << cpu))) && rq_push(cpu, proc) == 0) return cpu;
     for (int c = 0; c < MAX_CPUS; c++) {
         if (c == cpu || !g_cpu[c].online) continue;
         if (aff && !(aff & (1u << c))) continue;
+        if (iso && !confined && (iso & (1u << c))) continue;   /* isolated: skip */
         if (rq_push(c, proc) == 0) return c;
     }
     kprintf("[sched  ] RUN QUEUE FULL: pid %u could not be enqueued on cpu %d "
@@ -15827,9 +16004,19 @@ static int rq_pop(int cpu) {                           /* consumer: head       *
     return p;
 }
 static int rq_steal(int thief) {                       /* balance: rob siblings */
+    /* v0.95: isolation cuts BOTH ways, and both directions are needed.
+     *
+     * An isolated core must not steal, or it pulls general work onto itself
+     * and stops being isolated. And a general core must not steal FROM an
+     * isolated one, or the pinned workload is migrated off the very core it
+     * was pinned to. Either omission silently defeats SYS_CORE_PIN while the
+     * syscall still reports success. */
+    uint32_t iso = g_cpu_isolated;
+    if (iso & (1u << thief)) return -1;
     for (int off = 1; off < MAX_CPUS; off++) {
         int v = (thief + off) % MAX_CPUS;
         if (v == thief || !g_cpu[v].online) continue;
+        if (iso & (1u << v)) continue;                 /* isolated: not a victim */
         struct cpu_local *victim = &g_cpu[v];
         /* v0.49: NON-BLOCKING steal — trylock only. A busy victim is skipped
          * immediately (never spun on); requirement (2)'s work-stealing
@@ -16150,7 +16337,13 @@ static volatile int g_slice_on = 0;
 
 static void smp_preempt_ipi(struct isr_frame *f) {
     struct cpu_local *me = &g_cpu[cpu_idx()];
-    if (f->vector == 51 && !g_slice_on) {    /* slicing gated off: ignore tick   */
+    /* v0.95: PIN_NO_SLICE. A core isolated with that flag stops taking its own
+     * round-robin tick, so the pinned workload runs to completion instead of
+     * being sliced against nothing — there is no other runnable work on this
+     * core, so a preemption here costs a context switch and buys nothing. The
+     * EOI still happens: an un-acknowledged LAPIC timer stops the core taking
+     * any further interrupt at all, which is a hang rather than an isolation. */
+    if (f->vector == 51 && (!g_slice_on || (g_cpu_noslice & (1u << cpu_idx())))) {
         lapic_eoi();
         return;
     }
@@ -21943,31 +22136,134 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         o[2] = sys / 1000000000ull; o[3] = (sys % 1000000000ull) / 1000ull;
         return 0;
     }
-    /* =====================================================================
-     * v0.95 Objective 1 — PCI PASSTHROUGH. STUBS, DELIBERATELY.
-     * =====================================================================
-     * These three are wired into the dispatcher and return -ENOSYS. That is
-     * the point of landing them now: the ABI numbers are claimed so nothing
-     * else takes them, ring 3 can compile against the constants, and the
-     * dispatcher shape is fixed — while the kernel says plainly that the
-     * behaviour is not there yet.
-     *
-     * -38 (ENOSYS) AND NOT -22 (EINVAL). An unimplemented call and a rejected
-     * argument are different facts, and a caller that cannot tell them apart
-     * will debug the wrong one. An unrecognised syscall number falls through
-     * to this switch's default, so returning EINVAL here would make "not built
-     * yet" indistinguishable from "no such call".
-     *
-     * Argument validation is deliberately NOT performed yet either. A stub
-     * that validated and then refused would let a test pass on the validation
-     * while proving nothing about the operation — the shape of false-positive
-     * this cycle's role 65 exists to rule out. Nothing here can be mistaken
-     * for working. */
-    case 111:    /* SYS_CLAIM_PCI_DEVICE(bdf, flags, out) -> device_id, or -errno */
-    case 112:    /* SYS_RELEASE_PCI_DEVICE(device_id) -> 0, or -errno            */
-    case 113:    /* SYS_CORE_PIN(cpu_mask, flags) -> 0, or -errno                */
-        (void)a0; (void)a1; (void)a2;
-        return (uint64_t)-38;                            /* ENOSYS */
+    case 111: {  /* v0.95: SYS_CLAIM_PCI_DEVICE(bdf, flags, out) -> device_id, or -errno
+                  *
+                  * bdf packs (bus << 8) | (slot << 3) | func — the same source-id
+                  * the IOMMU uses, so no translation layer exists to disagree
+                  * with itself. There is NO domain argument: this kernel's DMAR
+                  * handling addresses one segment, and an argument it cannot
+                  * honour would be an ABI that lies. */
+        int p = (int)current_proc_idx;
+        if (!rust_cap_check(kprocs[p].caps, PCAP_VFIO)) return (uint64_t)-13;
+        /* RESERVED BITS ARE REFUSED, NOT IGNORED. A kernel that ignores a flag
+         * it does not know cannot ever be given a new one: the caller has no
+         * way to discover whether the meaning took effect, so an old kernel
+         * silently does the wrong thing forever. */
+        if (a1 & ~(uint64_t)(CLAIM_EXCLUSIVE | CLAIM_DMA)) return (uint64_t)-22;
+        if (a0 > 0xFFFFull || (uint16_t)a0 == KDEV_SYNTHETIC) return (uint64_t)-22;
+        uint16_t bdf = (uint16_t)a0;
+        /* The bus walk is the authority on what exists. Resolving here means a
+         * BDF nobody enumerated is ENODEV rather than a registry miss that
+         * looks like the device is merely busy. */
+        if (pcifn_find(bdf) < 0) return (uint64_t)-19;             /* ENODEV */
+        /* USER MEMORY IS VALIDATED BEFORE THE LOCK IS TAKEN. A fault under a
+         * klock is a deadlock this tree can detect but has no reason to invite;
+         * see g_dev_lock's declaration. */
+        if (a2 && !access_ok(kprocs[p].cr3, a2, 32, 1)) return (uint64_t)-14;
+
+        klock_acquire(&g_dev_lock);
+        int idx = kdev_find_bdf(bdf);
+        if (idx < 0) { klock_release(&g_dev_lock); return (uint64_t)-19; }
+        struct kdev *d = &kdevs[idx];
+        /* The device's OWN capability still applies. Claiming is not a way
+         * around the gate SYS_VFIO_MAP_BAR would have applied to it. */
+        if (!rust_cap_check(kprocs[p].caps, d->req)) {
+            klock_release(&g_dev_lock); return (uint64_t)-13;
+        }
+        /* kdev_owner_live is what makes a claim survive slot recycling — a
+         * dead owner's slot may already hold a different process. */
+        if (kdev_owner_live(d) && d->owner != p) {
+            klock_release(&g_dev_lock); return (uint64_t)-16;       /* EBUSY */
+        }
+        d->owner = p; d->owner_gen = kprocs[p].gen; d->claim_flags = (uint32_t)a1;
+        uint64_t b0 = d->base, l0 = d->len;
+        uint64_t b1 = g_kdev_bar1_phys[idx], l1 = g_kdev_bar1_len[idx];
+        klock_release(&g_dev_lock);
+
+        /* IOMMU ATTACH OUTSIDE THE LOCK. iommu_attach_proc_domain builds page
+         * tables and ends in iommu_invalidate_all(), which drives hardware
+         * registers and can be slow; holding a rank-11 lock across it would
+         * stall every other claim on every core for no benefit. */
+        if (a1 & CLAIM_DMA) {
+            if (iommu_attach_proc_domain(bdf, p) < 0) {
+                /* ROLL THE CLAIM BACK. Returning an error while leaving the
+                 * device owned would make it permanently unclaimable by anyone
+                 * — including the caller, who has just been told it failed. */
+                klock_acquire(&g_dev_lock);
+                if (d->owner == p && d->owner_gen == kprocs[p].gen) {
+                    d->owner = -1; d->owner_gen = 0; d->claim_flags = 0;
+                }
+                klock_release(&g_dev_lock);
+                return (uint64_t)-5;                                /* EIO */
+            }
+        }
+        if (a2) {
+            uint64_t *o = (uint64_t *)a2;
+            o[0] = b0; o[1] = l0; o[2] = b1; o[3] = l1;
+        }
+        if (g_debug_vfio)
+            kprintf("[dbgvfio] pid %u CLAIM bdf %x -> dev %d flags %x\n",
+                    kprocs[p].pid, (uint64_t)bdf, (uint64_t)(int64_t)idx, a1);
+        return (uint64_t)(int64_t)idx;
+    }
+    case 112: {  /* v0.95: SYS_RELEASE_PCI_DEVICE(device_id) -> 0, or -errno */
+        int p = (int)current_proc_idx;
+        if (!rust_cap_check(kprocs[p].caps, PCAP_VFIO)) return (uint64_t)-13;
+        if (a0 >= (uint64_t)n_kdev) return (uint64_t)-22;
+        int idx = (int)a0;
+        klock_acquire(&g_dev_lock);
+        struct kdev *d = &kdevs[idx];
+        if (!d->used || d->owner != p || !kdev_owner_live(d)) {
+            klock_release(&g_dev_lock); return (uint64_t)-13;       /* not yours */
+        }
+        uint16_t bdf = d->bdf;
+        d->owner = -1; d->owner_gen = 0; d->claim_flags = 0;
+        klock_release(&g_dev_lock);
+        /* DETACH AFTER the owner is cleared but BEFORE anything else can claim
+         * it: the ordering that matters is detach-before-reuse, and a device
+         * does not stop issuing DMA because its driver said it was done. */
+        iommu_detach_to_kernel(bdf);
+        if (g_debug_vfio)
+            kprintf("[dbgvfio] pid %u RELEASE dev %d (bdf %x)\n",
+                    kprocs[p].pid, (uint64_t)(int64_t)idx, (uint64_t)bdf);
+        return 0;
+    }
+    case 113: {  /* v0.95: SYS_CORE_PIN(cpu_mask, flags) -> 0, or -errno
+                  *
+                  * DISTINCT FROM SYS_SETAFFINITY, which this kernel already has
+                  * and which this does NOT duplicate. Affinity says where THIS
+                  * task may run. Pinning says what may run on THOSE CORES: it
+                  * asks the scheduler to stop placing other work there, which
+                  * is a property of a core and cannot be expressed as a
+                  * property of a task.
+                  *
+                  * Both halves are done here on purpose. Recording the mask
+                  * without enforcing it would return success while isolating
+                  * nothing — a syscall that reports a guarantee it does not
+                  * provide is worse than one that refuses. rq_push_any and
+                  * rq_steal are where the enforcement lives. */
+        int p = (int)current_proc_idx;
+        if (!rust_cap_check(kprocs[p].caps, PCAP_SMP_ADMIN)) return (uint64_t)-13;
+        if (a1 & ~(uint64_t)PIN_NO_SLICE) return (uint64_t)-22;
+        uint32_t mask = (uint32_t)a0;
+        uint32_t online = 0;
+        for (int c = 0; c < MAX_CPUS; c++) if (g_cpu[c].online) online |= (1u << c);
+        if (mask & ~online) return (uint64_t)-22;      /* a core that is not there */
+        /* REFUSING TO ISOLATE THE LAST CORE IS LOAD-BEARING. A kernel that
+         * lets a process strand the scheduler with nowhere to place work is a
+         * kernel with a one-syscall hang, and the check has to be here because
+         * the caller cannot see the online set. */
+        if (mask && (mask & online) == online) return (uint64_t)-16;   /* EBUSY */
+        g_cpu_isolated = mask;
+        g_cpu_noslice  = (a1 & PIN_NO_SLICE) ? mask : 0;
+        /* The caller is confined TO the isolated set, which is the half that
+         * makes the isolation useful rather than merely exclusive. */
+        if (mask) kprocs[tg_of(p)].affinity = mask;
+        kprintf("[sched  ] core-pin: cpus %x isolated%s by pid %u\n",
+                (uint64_t)mask, (a1 & PIN_NO_SLICE) ? " (slice tick off)" : "",
+                kprocs[p].pid);
+        return 0;
+    }
     case 107: {  /* SYS_CLOCK_NANOSLEEP(clockid, flags, req) -> 0, or negative
                   *
                   * THREE ARGUMENTS, NOT POSIX'S FOUR. This kernel's syscall ABI

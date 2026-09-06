@@ -389,10 +389,27 @@ what exposed v0.94's split as real; the same discipline applies here.
    walker?** `sys_claim_pci_device` takes a BDF, and today only virtio devices
    have one; every other `kdev` carries `bdf = 0xFFFF`. Nothing can be claimed
    by BDF until that is fixed, and it is the first thing to build.
-2. **Does `MAX_KDEV 8` hold?** A generic enumerator will find more than eight
-   functions on a q35 machine. Either the table grows or enumeration filters,
-   and filtering silently is how a device becomes unclaimable for reasons
-   nobody wrote down.
+2. **ANSWERED, NO — `MAX_KDEV 8` did not hold.** The first boot of the
+   generalised walk inventoried seven PCI functions on a plain SeaBIOS machine
+   against an eight-slot registry, before anyone attached a GPU. Raised to 32,
+   and `pci_register_claimable` now reports an overflow rather than dropping
+   silently.
+
+6. **NEW — should a device the KERNEL is actively driving be claimable?**
+   Auto-registration currently enters virtio-gpu `0:2.0` into the registry
+   while this kernel's own virtio-gpu driver is bound to it and the compositor
+   is running on it. A `CLAIM_DMA` on that BDF would attach a per-process IOMMU
+   domain underneath a live driver, and the kernel's own DMA to the device
+   would begin faulting.
+   It needs `PCAP_VFIO`, so this is not reachable by an unprivileged process —
+   but "privileged callers can break the running system by using the API as
+   documented" is a design gap, not an acceptable boundary. Blueprints wants
+   exactly this eventually ("detaches a high-performance GPU ... from the host
+   kernel"), which means a claim on a bound device has to quiesce the driver
+   first. Until that exists, the honest options are to refuse a claim on a
+   driver-bound BDF, or to mark such devices in the registry so the refusal is
+   explicit. This must be settled before claim/release is exercised by a probe
+   role against a real device.
 3. **Is `MAX_DMA_GRANTS 8` enough for a real passthrough workload?** See §4b.
 4. **Should `SYS_VFIO_WAIT_IRQ` park instead of spin?** See §1c. The spin is now
    visible as system time, `block_ring3_restart` already exists for this shape
