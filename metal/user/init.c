@@ -183,6 +183,10 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_CLAIM_PCI_DEVICE   111          /* v0.95: (bdf, flags, out*) -> dev_id      */
 #define SYS_RELEASE_PCI_DEVICE 112          /* v0.95: (dev_id) -> 0                     */
 #define SYS_CORE_PIN           113          /* v0.95: (cpu_mask, flags) -> 0            */
+#define SYS_MAP_PCI_BAR        114          /* v0.95: (dev_id, bar, flags) -> vaddr     */
+#define SYS_REGISTER_PCI_IRQ   115          /* v0.95: (dev_id, mode, timeout_ms) -> 0/1 */
+#define PCI_IRQ_LEGACY         0
+#define PCI_IRQ_MSIX           1            /* -ENOSYS: no MSI infrastructure yet       */
 
 /* claim flags. Bits 2-15 are RESERVED and must be zero: a non-zero reserved
  * bit is refused with -EINVAL rather than ignored, so a future meaning cannot
@@ -4250,6 +4254,7 @@ static void role64_cpusplit_probe(void) {
 
     sysc(SYS_EXIT, 1900, 0, 0);
 }
+
 
 static void role62_ofile_stress(void) {
     u64 backoff = 0;                /* table-full retries: contention, observed */

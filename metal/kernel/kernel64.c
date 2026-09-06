@@ -2819,7 +2819,23 @@ struct kdev {
     int      owner;                        /* kproc slot, or -1 = unclaimed    */
     uint32_t owner_gen;                    /* kprocs[owner].gen when claimed   */
     uint32_t claim_flags;                  /* CLAIM_* the owner asked for      */
+    uint32_t state;                        /* KDEV_* below                     */
 };
+/* v0.95 design question 6: A DEVICE THIS KERNEL IS DRIVING IS NOT CLAIMABLE.
+ *
+ * Auto-registration enters virtio-gpu into the registry while this kernel's own
+ * driver is bound to it and the compositor is running on it. A CLAIM_DMA on
+ * that BDF would attach a per-process IOMMU domain underneath a live driver and
+ * the kernel's own DMA would begin faulting — a privileged caller breaking the
+ * running system by using the API exactly as documented.
+ *
+ * Refusing is the honest resolution while no driver can quiesce. Blueprints
+ * wants the opposite eventually ("detaches a high-performance GPU ... from the
+ * host kernel"), which is what kdev_unbind_host() is for: an EXPLICIT release
+ * by the driver that owns the device, not an implicit override by the claimer.
+ * The distinction matters — a claim that could silently evict a driver is the
+ * same defect wearing a permission check. */
+#define KDEV_BOUND_HOST (1u << 0)   /* a kernel driver is bound to this device */
 /* v0.95: 8 -> 32. The first boot of the generalised bus walk inventoried SEVEN
  * PCI functions on a plain SeaBIOS machine while the registry held eight slots
  * — so registering what enumeration finds would have overflowed on the
@@ -2842,6 +2858,16 @@ static int n_kdev = 0;
  * bar_index 1 is valid only where g_kdev_bar1_len[idx] != 0. */
 static uint64_t g_kdev_bar1_phys[MAX_KDEV];
 static uint64_t g_kdev_bar1_len[MAX_KDEV];
+/* v0.95: ALL SIX BARs, for SYS_MAP_PCI_BAR. The bar1 pair above predates this
+ * and stays because SYS_VFIO_MAP_BAR's ABI is built on it and the synthetic
+ * test device populates it directly; these are the real windows discovered by
+ * the bus walk, indexed by PCI BAR number so bar_index means the same thing to
+ * ring 3 as it does to lspci. A zero length means that BAR is unimplemented,
+ * is an I/O BAR, or is the high half of a 64-bit BAR — all three are equally
+ * "nothing to map here", and all three must be refused rather than mapped as
+ * though phys 0 were a device. */
+static uint64_t g_kdev_bar_phys[MAX_KDEV][6];
+static uint64_t g_kdev_bar_len[MAX_KDEV][6];
 /* -1 = no interrupt associated with this device (true of every device before */
 /* v0.47); see the MAX_VFIO_LINES section below for what a real value means.  */
 static int g_kdev_irq_line[MAX_KDEV] = { [0 ... MAX_KDEV - 1] = -1 };
@@ -2878,7 +2904,7 @@ static volatile uint32_t g_cpu_noslice  = 0;
 static void kdev_register(const char *name, uint64_t base, uint64_t len,
                           uint64_t req, uint16_t bdf) {
     if (n_kdev >= MAX_KDEV) return;
-    kdevs[n_kdev++] = (struct kdev){ name, base, len, req, true, bdf, -1, 0, 0 };
+    kdevs[n_kdev++] = (struct kdev){ name, base, len, req, true, bdf, -1, 0, 0, 0 };
 }
 
 /* Is this device's recorded owner still the process that claimed it?
@@ -14827,7 +14853,9 @@ struct pcifn {
     uint16_t vendor, device;
     uint8_t  class, subclass, progif;
     uint8_t  header;                 /* header type, bit 7 masked off        */
+    uint8_t  bound;                  /* a kernel driver probe took this fn   */
     uint64_t bar0_phys, bar0_len;    /* first MEMORY bar found, 0 = none     */
+    uint64_t bar_phys[6], bar_len[6];/* every BAR, indexed by PCI BAR number */
     int8_t   bar_index;              /* which BAR that was, -1 = none        */
 };
 static struct pcifn g_pcifn[MAX_PCIFN];
@@ -14897,14 +14925,20 @@ static void pci_probe_fn(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t id) {
      * A 64-bit BAR consumes TWO consecutive slots, so the loop steps by two
      * over one — reading the high half as if it were its own BAR yields a
      * garbage base that happens to look present. */
-    uint64_t b0p = 0, b0l = 0;
+    uint64_t b0p = 0, b0l = 0, bp[6] = {0}, bl[6] = {0};
     int b0i = -1;
     if (((hdr >> 16) & 0x7F) == 0) {                       /* type 0 header only */
         for (int bi = 0; bi < 6; ) {
             uint32_t raw = pci_cfg_read32(bus, dev, fn, (uint8_t)(0x10 + 4 * bi));
             int is64 = (!(raw & 1)) && (((raw >> 1) & 3) == 2);
             uint64_t phys = 0, len = pci_bar_size(bus, dev, fn, bi, &phys);
-            if (len && phys) { b0p = phys; b0l = len; b0i = bi; break; }
+            if (len && phys) {
+                bp[bi] = phys; bl[bi] = len;               /* record EVERY BAR   */
+                if (b0i < 0) { b0p = phys; b0l = len; b0i = bi; }  /* and the first */
+            }
+            /* Step over a 64-bit BAR's high half. Its slot stays zero-length,
+             * which is what makes a map request for it fail rather than map a
+             * garbage base that happens to look present. */
             bi += is64 ? 2 : 1;
         }
     }
@@ -14912,7 +14946,9 @@ static void pci_probe_fn(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t id) {
     if (n_pcifn < MAX_PCIFN) {
         g_pcifn[n_pcifn++] = (struct pcifn){
             pci_bdf(bus, dev, fn), vendor, (uint16_t)(id >> 16),
-            class, subclass, progif, (uint8_t)((hdr >> 16) & 0x7F), b0p, b0l,
+            class, subclass, progif, (uint8_t)((hdr >> 16) & 0x7F), 0, b0p, b0l,
+            { bp[0], bp[1], bp[2], bp[3], bp[4], bp[5] },
+            { bl[0], bl[1], bl[2], bl[3], bl[4], bl[5] },
             (int8_t)b0i
         };
     } else g_pcifn_overflow++;
@@ -14921,13 +14957,27 @@ static void pci_probe_fn(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t id) {
             (uint64_t)bus, (uint64_t)dev, (uint64_t)fn, (uint64_t)vendor,
             (uint64_t)(id >> 16), (uint64_t)class, (uint64_t)subclass);
 
+    /* v0.95: RECORD THAT A KERNEL DRIVER TOOK THIS FUNCTION.
+     *
+     * Marked at the one place every driver bind goes through, rather than
+     * asking each probe to remember to say so — five probes each responsible
+     * for setting a flag is five chances to forget, and the failure mode of
+     * forgetting is a claimable device the kernel is actively driving. The
+     * probes return int but several ignore their own result, so binding is
+     * taken to mean "we dispatched a driver at it", which errs toward refusing
+     * a claim rather than allowing one. */
+    int bound = 0;
     if (vendor == 0x1AF4) {                             /* Red Hat / virtio  */
-        if (class == 0x01)       virtio_blk_probe(bus, dev, fn);   /* mass storage */
-        else if (class == 0x02)  virtionet_probe(bus, dev, fn);    /* network      */
-        else if (class == 0x03)  virtio_gpu_probe(bus, dev, fn);   /* display      */
-        else if (class == 0x04)  virtio_sound_probe(bus, dev, fn); /* multimedia   */
+        if (class == 0x01)      { virtio_blk_probe(bus, dev, fn);   bound = 1; }
+        else if (class == 0x02) { virtionet_probe(bus, dev, fn);    bound = 1; }
+        else if (class == 0x03) { virtio_gpu_probe(bus, dev, fn);   bound = 1; }
+        else if (class == 0x04) { virtio_sound_probe(bus, dev, fn); bound = 1; }
     } else if (class == 0x0C) {                         /* serial bus controller */
-        if (subclass == 0x03 && progif == 0x30) xhci_probe(bus, dev, fn); /* xHCI */
+        if (subclass == 0x03 && progif == 0x30) { xhci_probe(bus, dev, fn); bound = 1; }
+    }
+    if (bound) {
+        int pi = pcifn_find(pci_bdf(bus, dev, fn));
+        if (pi >= 0) g_pcifn[pi].bound = 1;
     }
 }
 
@@ -14961,14 +15011,38 @@ static int kdev_find_bdf(uint16_t bdf) {
  * same gate SYS_VFIO_MAP_BAR already applies — and with its REAL bdf, which is
  * what makes iommu_attach_proc_domain able to confine it at all. */
 static void pci_register_claimable(void) {
-    int added = 0, dropped = 0;
+    int added = 0, dropped = 0, bound = 0;
     for (int i = 0; i < n_pcifn; i++) {
         struct pcifn *f = &g_pcifn[i];
         if (f->class == 0x06) continue;                 /* bridge              */
         if (!f->bar0_len) continue;                     /* nothing to map      */
-        if (kdev_find_bdf(f->bdf) >= 0) continue;       /* a driver has it     */
+        int ex = kdev_find_bdf(f->bdf);
+        if (ex >= 0) {
+            /* A driver registered this itself (virtio-net). It is still
+             * host-bound, and saying so here is what stops a claim on it —
+             * the flag has to follow the device, not the registration path. */
+            if (f->bound) { kdevs[ex].state |= KDEV_BOUND_HOST; bound++; }
+            /* The BAR table follows the DEVICE, not the registration path: a
+             * driver-registered device that is later unbound must be mappable
+             * on the same terms as an auto-registered one. */
+            for (int b = 0; b < 6; b++) {
+                g_kdev_bar_phys[ex][b] = f->bar_phys[b];
+                g_kdev_bar_len[ex][b]  = f->bar_len[b];
+            }
+            continue;
+        }
         if (n_kdev >= MAX_KDEV) { dropped++; continue; }
         kdev_register("pci-dev", f->bar0_phys, f->bar0_len, PCAP_VFIO, f->bdf);
+        for (int b = 0; b < 6; b++) {
+            g_kdev_bar_phys[n_kdev - 1][b] = f->bar_phys[b];
+            g_kdev_bar_len[n_kdev - 1][b]  = f->bar_len[b];
+        }
+        /* REGISTERED, THEN MARKED — not omitted. A host-bound device stays
+         * visible in the registry on purpose: a claim on it must be refused
+         * with EBUSY, which tells the caller the device exists and is spoken
+         * for, where an absent device would be indistinguishable from one
+         * that is not on this machine at all. */
+        if (f->bound) { kdevs[n_kdev - 1].state |= KDEV_BOUND_HOST; bound++; }
         added++;
         /* NAMED, NOT JUST COUNTED. "1 function registered" was true and
          * useless: it did not say WHICH, so a device missing for the wrong
@@ -14980,8 +15054,9 @@ static void pci_register_claimable(void) {
                 (uint64_t)(int64_t)f->bar_index, f->bar0_phys, f->bar0_len);
     }
     if (added)
-        kprintf("[pci    ] %d function(s) registered as claimable devices\n",
-                (uint64_t)(int64_t)added);
+        kprintf("[pci    ] %d function(s) registered, %d bound to a host driver "
+                "(claims refused with EBUSY)\n",
+                (uint64_t)(int64_t)added, (uint64_t)(int64_t)bound);
     /* SAID, NOT SWALLOWED. A device that is present, claimable in principle and
      * absent from the registry because the table filled is a claim that fails
      * for a reason no log names — which is the failure mode MAX_KDEV=8 would
@@ -14989,6 +15064,36 @@ static void pci_register_claimable(void) {
     if (dropped)
         kprintf("[pci    ] *** %d claimable function(s) did NOT fit MAX_KDEV=%d "
                 "and cannot be claimed\n", (uint64_t)(int64_t)dropped, (uint64_t)MAX_KDEV);
+}
+
+/* v0.95: THE EXPLICIT RELEASE. A kernel driver that has quiesced its device —
+ * stopped its rings, masked its interrupt, and stopped issuing DMA — calls this
+ * to make the device claimable by ring 3.
+ *
+ * IT IS A KERNEL-SIDE CALL AND HAS NO SYSCALL, DELIBERATELY. Exposing "unbind"
+ * to ring 3 would let a claimer evict a driver that has not quiesced, which is
+ * the exact hazard KDEV_BOUND_HOST exists to prevent — the same defect wearing
+ * a permission check. Only the driver knows when its device is safe to hand
+ * over, so only the driver may say so.
+ *
+ * No caller yet: no driver in this tree can quiesce. That is stated rather than
+ * hidden, because a helper nothing calls is not a working feature — it is the
+ * shape the feature will take, and the boot below reports the flag so the
+ * refusal it produces is visible rather than inferred. */
+__attribute__((unused))
+static int kdev_unbind_host(uint16_t bdf) {
+    int r = -1;
+    klock_acquire(&g_dev_lock);
+    int idx = kdev_find_bdf(bdf);
+    if (idx >= 0 && (kdevs[idx].state & KDEV_BOUND_HOST)) {
+        kdevs[idx].state &= ~KDEV_BOUND_HOST;
+        r = idx;
+    }
+    klock_release(&g_dev_lock);
+    if (r >= 0)
+        kprintf("[dev    ] bdf %x unbound from its host driver — now claimable\n",
+                (uint64_t)bdf);
+    return r;
 }
 
 static void pci_init(void) {
@@ -22170,6 +22275,19 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (!rust_cap_check(kprocs[p].caps, d->req)) {
             klock_release(&g_dev_lock); return (uint64_t)-13;
         }
+        /* DESIGN QUESTION 6: a device this kernel is driving is not claimable.
+         *
+         * Checked BEFORE the ownership test and, critically, before any IOMMU
+         * work: iommu_attach_proc_domain would rewrite the context entry for a
+         * BDF whose driver is mid-DMA, and the rollback path cannot undo
+         * transactions the device has already had rejected. Refusing early is
+         * the only point at which nothing has happened yet.
+         *
+         * EBUSY, not EPERM. The device exists and the caller may well hold
+         * every capability for it; what it lacks is a device that is free. */
+        if (d->state & KDEV_BOUND_HOST) {
+            klock_release(&g_dev_lock); return (uint64_t)-16;       /* EBUSY */
+        }
         /* kdev_owner_live is what makes a claim survive slot recycling — a
          * dead owner's slot may already hold a different process. */
         if (kdev_owner_live(d) && d->owner != p) {
@@ -22227,6 +22345,109 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             kprintf("[dbgvfio] pid %u RELEASE dev %d (bdf %x)\n",
                     kprocs[p].pid, (uint64_t)(int64_t)idx, (uint64_t)bdf);
         return 0;
+    }
+    case 114: {  /* v0.95: SYS_MAP_PCI_BAR(device_id, bar_index, flags) -> vaddr, or -errno
+                  *
+                  * DISTINCT FROM SYS_VFIO_MAP_BAR (20), which stays. That call
+                  * predates claims, accepts only bar_index 0/1, and gates on
+                  * capability alone — the synthetic test device depends on it.
+                  * This one requires an ACTIVE CLAIM, covers BARs 0-5, and maps
+                  * the windows the bus walk actually discovered.
+                  *
+                  * flags bit 0 requests write-combining and is REFUSED, not
+                  * ignored. WC needs an IA32_PAT entry this kernel's default
+                  * (unreprogrammed) PAT does not have, and reprogramming PAT is
+                  * a global change to the cache behaviour of every existing
+                  * mapping in the system. Accepting the flag and mapping UC
+                  * anyway is what case 20 does, and it means a caller asking
+                  * for WC is silently given something with different ordering
+                  * guarantees than it asked for. -EINVAL says so. */
+        int p = (int)current_proc_idx;
+        if (!rust_cap_check(kprocs[p].caps, PCAP_VFIO)) return (uint64_t)-13;
+        if (a2) return (uint64_t)-22;                  /* WC unimplemented; see above */
+        if (a0 >= (uint64_t)n_kdev || a1 >= 6) return (uint64_t)-22;
+        int idx = (int)a0;
+        uint64_t phys, len;
+        klock_acquire(&g_dev_lock);
+        struct kdev *d = &kdevs[idx];
+        /* THE CLAIM IS THE AUTHORISATION. Capability alone is not enough here:
+         * two processes can both hold PCAP_VFIO, and only one of them owns the
+         * device. Checked under the lock together with the BAR lookup so a
+         * release racing on another core cannot land between them. */
+        if (!d->used || d->owner != p || !kdev_owner_live(d)) {
+            klock_release(&g_dev_lock); return (uint64_t)-13;
+        }
+        phys = g_kdev_bar_phys[idx][a1];
+        len  = g_kdev_bar_len[idx][a1];
+        klock_release(&g_dev_lock);
+        /* A zero-length BAR is unimplemented, an I/O BAR, or the high half of a
+         * 64-bit BAR. All three are "nothing to map", and mapping phys 0 as
+         * though it were a device would hand ring 3 the first page of RAM. */
+        if (!len || !phys) return (uint64_t)-22;
+
+        uint64_t vbase = VFIO_BAR_V + (uint64_t)p * 0x100000ull + a1 * 0x10000ull;
+        uint64_t pages = (len + 0xFFF) / 0x1000;
+        /* REFUSE RATHER THAN TRUNCATE. The per-BAR window above is 64 KiB and
+         * the per-process region 1 MiB; virtio-gpu's BAR 0 on this machine is
+         * 8 MiB. Mapping the first 64 KiB of an 8 MiB register file and
+         * returning a pointer that looks complete is how a driver reads
+         * garbage from an address it was told was valid. */
+        if (len > 0x10000ull) return (uint64_t)-27;                /* EFBIG */
+        /* UNCACHEABLE, and this is correctness rather than tuning. MMIO reads
+         * must reach the device and writes must not sit in a write-back line:
+         * a cached register file gives a driver a stale status word and an
+         * ordering the device never saw. PTE_PCD is what this kernel has. */
+        uint64_t pteflags = PTE_WRITE | PTE_USER | PTE_NX | PTE_PCD;
+        for (uint64_t k = 0; k < pages; k++)
+            map_page(kprocs[p].cr3, vbase + k * 0x1000, phys + k * 0x1000, pteflags);
+        if (dma_grant_create(&kprocs[p], phys, pages * 0x1000ull,
+                             DMA_GRANT_MMIO, d->bdf) < 0)
+            return (uint64_t)-12;
+        if (g_debug_vfio)
+            kprintf("[dbgvfio] pid %u MAP_PCI_BAR dev %d bar %u -> %X (%u pages, UC)\n",
+                    kprocs[p].pid, (uint64_t)(int64_t)idx, a1, vbase, pages);
+        return vbase;
+    }
+    case 115: {  /* v0.95: SYS_REGISTER_PCI_IRQ(device_id, mode, timeout_ms)
+                  *   mode 0 = legacy INTx line  -> 1 fired, 0 timed out
+                  *   mode 1 = MSI / MSI-X       -> -ENOSYS
+                  *
+                  * MSI-X IS NOT IMPLEMENTED AND THIS SAYS SO RATHER THAN
+                  * PRETENDING. There is no MSI infrastructure in this kernel at
+                  * all: interrupts are 8259 PIC remapped to vectors 32-47, the
+                  * IDT is exactly 52 entries with no free slot, and there is no
+                  * vector allocator, no IOAPIC driver and no MSI capability
+                  * parser. Delivering "MSI-X notification" on top of the legacy
+                  * line and calling it MSI-X would be a test that passes
+                  * against a subsystem that does not exist — see DESIGN-0.95
+                  * section 1b and open question 5.
+                  *
+                  * -ENOSYS for mode 1 is what lets role 66 assert the ABSENCE
+                  * honestly today and flip to asserting delivery when the
+                  * vector allocator lands, without the test changing shape. */
+        int p = (int)current_proc_idx;
+        if (!rust_cap_check(kprocs[p].caps, PCAP_VFIO)) return (uint64_t)-13;
+        if (a1 > 1) return (uint64_t)-22;
+        if (a1 == 1) return (uint64_t)-38;             /* ENOSYS: no MSI/MSI-X yet */
+        if (a0 >= (uint64_t)n_kdev) return (uint64_t)-22;
+        int idx = (int)a0;
+        klock_acquire(&g_dev_lock);
+        struct kdev *d = &kdevs[idx];
+        if (!d->used || d->owner != p || !kdev_owner_live(d)) {
+            klock_release(&g_dev_lock); return (uint64_t)-13;
+        }
+        int line = g_kdev_irq_line[idx];
+        klock_release(&g_dev_lock);
+        if (line < 0 || line >= MAX_VFIO_LINES) return (uint64_t)-19;   /* ENODEV */
+        /* Claim the line for this process, then wait on it exactly as case 21
+         * does. The ownership recorded here is what case 21's own check tests,
+         * so the two calls agree about who may wait. */
+        g_vfio_irq_owner[line] = p;
+        uint64_t timeout_ticks = a2 / 10; if (a2 && !timeout_ticks) timeout_ticks = 1;
+        uint32_t seen = g_vfio_irq_seq[line];
+        uint64_t t0 = g_ticks;
+        while (g_vfio_irq_seq[line] == seen && g_ticks - t0 < timeout_ticks) krelax();
+        return (g_vfio_irq_seq[line] != seen) ? 1 : 0;
     }
     case 113: {  /* v0.95: SYS_CORE_PIN(cpu_mask, flags) -> 0, or -errno
                   *
@@ -23731,6 +23952,10 @@ static void cmd_ipc_stress(void) {
  * ROUNDS repetitions of spawn -> map BAR0 -> map BAR1 -> wait on the
  * simulated IRQ -> exit, reusing v0.45's kproc recycling. */
 #define VFIOSTRESS_ROUNDS 15
+/* fwd: defined with the suite drivers below. vfiostrs drives ring-3 roles 65
+ * and 66 and so needs the same drain-with-watchdog every other suite uses. */
+static int role_drain(uint64_t role, uint64_t watchdog, const char *label);
+
 static int g_vfiopass, g_vfiofail;
 static void vfiocheck(const char *n, int c) {
     if (c) { g_vfiopass++; kprintf("[vfiostrs]  PASS  %s\n", n); }
