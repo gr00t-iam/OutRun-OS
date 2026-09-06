@@ -548,9 +548,8 @@ it does not prove none exists at a rate below one boot in one.
 
 ### What this does NOT cover, stated so the gaps are visible
 
-- **`smp2-bios`, `smp8-bios`, `gate-dirty` and `gate-dirty-smp` were not run.**
-  The dirty tiers were last run at v0.90.0 and persisted-state reuse across
-  boots is therefore unverified for four cycles now.
+- **`smp2-bios` and `smp8-bios` were not run.** The dirty tiers WERE run this
+  cycle — see the release section below, which closes the four-release gap.
 - **One boot per configuration**, so nothing below roughly 1 in 10 boots is
   visible.
 - **`make gate` still does not reach role 64.** `gate-matrix.sh` boots QEMU with
@@ -558,9 +557,8 @@ it does not prove none exists at a rate below one boot in one.
   being typed. `make probe-timebench` (added this cycle) is the target that
   drives it over a FIFO, and it is a separate command: role 63 and role 64 are
   covered only when someone runs it.
-- **No release ISO was built or `release-verify`'d.** `VERSION`,
-  `KERNEL_VERSION` and the GRUB menuentry now read `0.94.0`, but no tag exists
-  and the four-step release protocol has not been performed.
+- **One boot per fresh configuration, three per dirty configuration.** This
+  cannot see an intermittent below roughly 1 in 10 boots.
 - Interrupt and fault time is billed as utime, by design — see 3d.
 
 ### A note on ISO checksums
@@ -572,3 +570,61 @@ across both (`98edd859…`, `211c0f6e…`). So an ISO md5 identifies a *build*, 
 source state, and a rebuild of the tested tree will not reproduce `84e371fd…`.
 Where a claim needs to be tied to a source state rather than to an artefact, the
 ELF checksums are the ones that carry it.
+
+---
+
+## RELEASE — v0.94.0
+
+    build/release/outrun-os-0.94.0.iso
+    md5     5d24d12d10622a5304fb27a82ca03766
+    sha256  83196d735aecf7ce39d66821e8823a36e82bd86cd622c29271140543e802cf5e
+
+Built by `make release` from a clean tree, which runs `make clean` first so no
+object can survive from a source state that no longer exists. Zero compiler
+warnings or errors.
+
+### Gate table
+
+| target | result |
+|---|---|
+| `make release-verify` (the published artefact) | **PASS** — 45 suites, 0 failing assertions, RESULT tally 0, 0 rank faults, 465 s |
+| `uniprocessor` (fresh image) | PASS — 45 suites, 563 passed, 0 failed, 0 ranks |
+| `smp4-bios` (fresh image) | PASS — 45 suites, 583 passed, 0 failed, 0 ranks |
+| `smp4-iommu` (q35 + VT-d, `intremap=on`) | PASS — 47 suites, 597 passed, 0 failed, 0 ranks |
+| `gate-dirty` (3 boots, one reused image, uniprocessor) | PASS — `GATE_DIRTY_CAP=900` |
+| `gate-dirty-smp` (3 boots, one reused image, `-smp 4`) | PASS |
+| `probe-timebench` | role 63 OK (1870), role 64 OK (1900) |
+| `probe-timebench PROBE_QEMU="-smp 4"` | role 63 OK (1870), role 64 OK (1900) |
+
+### The dirty tiers, and why they mattered this cycle
+
+Both were last run at **v0.90.0**, so persisted-state reuse across boots had
+been unverified for four releases. It mattered more than usual here: the dirty
+gates are the only configuration where a second boot sees state the first boot
+left behind, which is what actually exercises `kproc_reset` zeroing the five new
+accounting fields. `sys_enter_ns` above all — a stale non-zero there would make
+`sys_ns_inflight` measure from an instant belonging to a dead process. A
+fresh-image boot cannot tell a correct reset from a lucky one.
+
+All six boots: 45 suites, 0 failing assertions, empty consecutive-boot
+assertion diffs (`new=0 disappeared=0`), and every durable cross-boot artefact
+survived — `udbreboot`, `vfs-reboot-test`, and the CAS pending -> recovered
+transaction.
+
+### One invalid run, recorded rather than buried
+
+`gate-dirty` **failed on its first attempt** at the default
+`GATE_DIRTY_CAP=480`. All three boots reported `NO-PROMPT` at exactly 480 s,
+having emitted 45 suites with 0 failing assertions but never reached a prompt
+for the harness to type at — so every downstream complaint ("console input did
+not land", artefacts absent) was a consequence of that and not a finding.
+
+Uniprocessor needs **485-495 s** to reach the prompt on this host, and
+`release-verify` had already measured 465 s on the same image, leaving a 15 s
+margin against the cap. The cap was the cause, not the build; re-run at 900 it
+passes.
+
+This is written down because reading a `NO-PROMPT` as a `FAIL` is the exact
+misreading v0.81's run classifier was built to prevent, and the temptation to
+report those three boots as a persisted-state defect was real. A run that did
+not complete is not a verdict.
