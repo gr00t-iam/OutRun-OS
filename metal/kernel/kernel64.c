@@ -15066,34 +15066,102 @@ static void pci_register_claimable(void) {
                 "and cannot be claimed\n", (uint64_t)(int64_t)dropped, (uint64_t)MAX_KDEV);
 }
 
-/* v0.95: THE EXPLICIT RELEASE. A kernel driver that has quiesced its device —
- * stopped its rings, masked its interrupt, and stopped issuing DMA — calls this
- * to make the device claimable by ring 3.
+/* v0.95: GENERIC PCI QUIESCE — the part that is true of every device.
  *
- * IT IS A KERNEL-SIDE CALL AND HAS NO SYSCALL, DELIBERATELY. Exposing "unbind"
- * to ring 3 would let a claimer evict a driver that has not quiesced, which is
- * the exact hazard KDEV_BOUND_HOST exists to prevent — the same defect wearing
- * a permission check. Only the driver knows when its device is safe to hand
- * over, so only the driver may say so.
+ * Clears BUS MASTER (command bit 2), which is the one that matters: it is the
+ * device's licence to initiate DMA, and while it is set the device can write to
+ * memory whether or not any driver is still talking to it. Sets INTERRUPT
+ * DISABLE (bit 10) so a line the kernel has stopped servicing cannot be left
+ * asserted, and clears MEMORY SPACE (bit 1) so the old window stops decoding.
  *
- * No caller yet: no driver in this tree can quiesce. That is stated rather than
- * hidden, because a helper nothing calls is not a working feature — it is the
- * shape the feature will take, and the boot below reports the flag so the
- * refusal it produces is visible rather than inferred. */
-__attribute__((unused))
+ * ORDER: bus master first. Dropping memory decode while DMA is still enabled
+ * leaves a device that can write to RAM but whose registers the driver can no
+ * longer reach to stop it.
+ *
+ * This is necessary and NOT sufficient. It stops the device at the PCI level;
+ * it does not tell a driver that its rings are gone, does not wait for
+ * in-flight transactions to retire, and does not reset the device's internal
+ * state. That is what the per-driver hook below is for. */
+static void pci_quiesce_generic(uint16_t bdf) {
+    uint8_t bus = (uint8_t)(bdf >> 8), dev = (uint8_t)((bdf >> 3) & 0x1F),
+            fn  = (uint8_t)(bdf & 7);
+    uint32_t cmd = pci_cfg_read32(bus, dev, fn, 0x04);
+    cmd &= ~(1u << 2);                       /* BUS MASTER off: no more DMA    */
+    pci_cfg_write32(bus, dev, fn, 0x04, cmd);
+    cmd |=  (1u << 10);                      /* INTx disable                   */
+    cmd &= ~(1u << 1);                       /* memory decode off              */
+    pci_cfg_write32(bus, dev, fn, 0x04, cmd);
+}
+
+/* Per-device quiesce. NULL means THIS DRIVER CANNOT HAND ITS DEVICE OVER, and
+ * that is the honest default rather than an oversight — see kdev_unbind_host. */
+typedef int (*kdev_quiesce_fn)(uint16_t bdf);
+static kdev_quiesce_fn g_kdev_quiesce[MAX_KDEV];
+
+/* v0.95: THE EXPLICIT RELEASE. A kernel driver that can stop its device —
+ * stop its rings, mask its interrupt, and stop issuing DMA — becomes claimable
+ * by ring 3 through this.
+ *
+ * IT IS A KERNEL-SIDE CALL AND HAS NO SYSCALL, DELIBERATELY, AND CLAIM DOES NOT
+ * CALL IT. Letting SYS_CLAIM_PCI_DEVICE unbind on demand would mean a ring-3
+ * process could take the boot disk's controller away from the kernel by asking
+ * for it — the filesystem every later suite depends on would be gone, and the
+ * caller needs no more privilege than it already has to map a BAR. That is the
+ * exact hazard KDEV_BOUND_HOST exists to prevent, wearing a permission check.
+ * A claim on a bound device stays EBUSY; only deliberate kernel-side policy
+ * moves a device across this line.
+ *
+ * REFUSES WITHOUT A DRIVER HOOK. The generic PCI quiesce below stops the device
+ * from mastering the bus, but a virtio driver whose rings are still armed and
+ * whose completion path still expects to run has not been told anything. Three
+ * of the four bound drivers in this tree hold live system state — the root
+ * filesystem, the network, the console compositor — and none can currently be
+ * told to stand down. Returning -1 for them is the correct answer, not a
+ * placeholder: an unbind that left virtio-blk's driver believing it still owned
+ * a device it no longer decodes would corrupt the filesystem on the next
+ * write. */
 static int kdev_unbind_host(uint16_t bdf) {
-    int r = -1;
+    int idx, has_hook;
+    kdev_quiesce_fn q;
     klock_acquire(&g_dev_lock);
-    int idx = kdev_find_bdf(bdf);
-    if (idx >= 0 && (kdevs[idx].state & KDEV_BOUND_HOST)) {
-        kdevs[idx].state &= ~KDEV_BOUND_HOST;
-        r = idx;
+    idx = kdev_find_bdf(bdf);
+    if (idx < 0 || !(kdevs[idx].state & KDEV_BOUND_HOST)) {
+        klock_release(&g_dev_lock);
+        return -1;                            /* not bound, or not a device   */
     }
+    /* A CLAIMED DEVICE IS NOT UNBINDABLE. If ring 3 already owns it, the
+     * host-bound flag is stale and clearing it now would race the owner. */
+    if (kdev_owner_live(&kdevs[idx])) { klock_release(&g_dev_lock); return -1; }
+    q = g_kdev_quiesce[idx];
+    has_hook = (q != 0);
     klock_release(&g_dev_lock);
-    if (r >= 0)
-        kprintf("[dev    ] bdf %x unbound from its host driver — now claimable\n",
+
+    if (!has_hook) {
+        kprintf("[dev    ] bdf %x: its driver cannot quiesce — NOT unbound\n",
                 (uint64_t)bdf);
-    return r;
+        return -1;
+    }
+    /* QUIESCE OUTSIDE THE LOCK. A driver hook stops rings and may wait for
+     * in-flight work; holding rank 11 across that would stall every claim on
+     * every core, and the hook may itself need a driver lock of LOWER rank,
+     * which under g_dev_lock would be an inversion. */
+    if (q(bdf) < 0) {
+        kprintf("[dev    ] bdf %x: quiesce FAILED — NOT unbound\n", (uint64_t)bdf);
+        return -1;
+    }
+    pci_quiesce_generic(bdf);
+
+    klock_acquire(&g_dev_lock);
+    /* Re-check under the lock: the quiesce ran unlocked, so confirm nothing
+     * claimed or re-bound the device while it was in progress. */
+    if (!(kdevs[idx].state & KDEV_BOUND_HOST) || kdev_owner_live(&kdevs[idx])) {
+        klock_release(&g_dev_lock); return -1;
+    }
+    kdevs[idx].state &= ~KDEV_BOUND_HOST;
+    klock_release(&g_dev_lock);
+    kprintf("[dev    ] bdf %x quiesced and unbound from its host driver — "
+            "now claimable\n", (uint64_t)bdf);
+    return idx;
 }
 
 static void pci_init(void) {
@@ -22408,6 +22476,45 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                     kprocs[p].pid, (uint64_t)(int64_t)idx, a1, vbase, pages);
         return vbase;
     }
+    case 116: {  /* v0.95: SYS_PCI_CFG_READ(device_id, offset) -> dword, or -errno
+                  *
+                  * READ-ONLY, AND CLAIMED DEVICES ONLY. Real VFIO exposes a
+                  * device's configuration space to its userspace driver, and a
+                  * driver genuinely needs it: the virtio register layout is
+                  * discoverable only by walking the capability list at 0x34,
+                  * so without this a ring-3 driver cannot find the registers
+                  * inside a BAR it has already mapped.
+                  *
+                  * NO WRITE COUNTERPART, deliberately. Config space contains
+                  * the BARs themselves, the command register and the interrupt
+                  * line: a ring-3 write could move a device's window on top of
+                  * kernel memory and then have the device DMA into it, which
+                  * defeats the IOMMU confinement by moving the target rather
+                  * than by escaping the domain. Reads leak a device's identity
+                  * to a process that already owns the device; writes hand it
+                  * the machine.
+                  *
+                  * Bounded to the 256-byte legacy config header and dword
+                  * aligned. The extended (PCIe, 4 KiB) region needs MMCONFIG,
+                  * which this kernel does not map. */
+        int p = (int)current_proc_idx;
+        if (!rust_cap_check(kprocs[p].caps, PCAP_VFIO)) return (uint64_t)-13;
+        if (a0 >= (uint64_t)n_kdev) return (uint64_t)-22;
+        if (a1 > 0xFC || (a1 & 3)) return (uint64_t)-22;   /* aligned, in header */
+        int idx = (int)a0;
+        uint16_t bdf;
+        klock_acquire(&g_dev_lock);
+        struct kdev *d = &kdevs[idx];
+        if (!d->used || d->owner != p || !kdev_owner_live(d)) {
+            klock_release(&g_dev_lock); return (uint64_t)-13;
+        }
+        bdf = d->bdf;
+        klock_release(&g_dev_lock);
+        if (bdf == KDEV_SYNTHETIC) return (uint64_t)-19;   /* no config space  */
+        return (uint64_t)pci_cfg_read32((uint8_t)(bdf >> 8),
+                                        (uint8_t)((bdf >> 3) & 0x1F),
+                                        (uint8_t)(bdf & 7), (uint8_t)a1);
+    }
     case 115: {  /* v0.95: SYS_REGISTER_PCI_IRQ(device_id, mode, timeout_ms)
                   *   mode 0 = legacy INTx line  -> 1 fired, 0 timed out
                   *   mode 1 = MSI / MSI-X       -> -ENOSYS
@@ -24075,6 +24182,40 @@ static void cmd_vfio_stress(void) {
      * suite that cannot tell "the check held" from "the check never ran" is
      * green on a boot that tested nothing, which is the Carryover-3 failure
      * this tree keeps a section of CLAUDE.md about. */
+    /* v0.95: THE UNBIND REFUSAL, tested on a REAL bound device.
+     *
+     * kdev_unbind_host's success path cannot be exercised here and that is a
+     * property of the machine, not an omission: every host-bound function on
+     * the gate's topology is load-bearing — virtio-blk holds the filesystem
+     * every later suite reads, virtio-net the socket layer, virtio-gpu the
+     * compositor — and none has a quiesce hook, because none of those drivers
+     * can currently be told to stand down. Unbinding one to make a test green
+     * would break the boot it is running in.
+     *
+     * So what IS tested is the refusal, which is the safety-critical half: a
+     * bound device with no quiesce hook must stay bound and must say so. A
+     * kernel that unbound it anyway would hand ring 3 a device whose driver
+     * still believes it owns it, and virtio-blk in that state corrupts the
+     * filesystem on its next write. The device is re-checked afterwards to
+     * prove the refusal changed nothing. */
+    {
+        int bound_idx = -1;
+        for (int i = 0; i < n_kdev; i++)
+            if (kdevs[i].used && (kdevs[i].state & KDEV_BOUND_HOST)) { bound_idx = i; break; }
+        if (bound_idx < 0) {
+            kprintf("[vfiostrs]  NOT EXERCISED  unbind refusal: no host-bound device\n");
+        } else {
+            uint16_t bb = kdevs[bound_idx].bdf;
+            int r = kdev_unbind_host(bb);
+            vfiocheck("kdev_unbind_host REFUSES a driver that cannot quiesce", r < 0);
+            vfiocheck("the refused device is still marked host-bound",
+                      (kdevs[bound_idx].state & KDEV_BOUND_HOST) != 0);
+            kprintf("[vfiostrs] unbind(bdf %x) -> %d, still bound=%d\n",
+                    (uint64_t)bb, (uint64_t)(int64_t)r,
+                    (uint64_t)(int64_t)((kdevs[bound_idx].state & KDEV_BOUND_HOST) != 0));
+        }
+    }
+
     {
         int save = (int)current_proc_idx;
         static const struct { int role; int ok; int noex; const char *what; }

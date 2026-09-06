@@ -185,6 +185,7 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_CORE_PIN           113          /* v0.95: (cpu_mask, flags) -> 0            */
 #define SYS_MAP_PCI_BAR        114          /* v0.95: (dev_id, bar, flags) -> vaddr     */
 #define SYS_REGISTER_PCI_IRQ   115          /* v0.95: (dev_id, mode, timeout_ms) -> 0/1 */
+#define SYS_PCI_CFG_READ       116          /* v0.95: (dev_id, offset) -> dword         */
 #define PCI_IRQ_LEGACY         0
 #define PCI_IRQ_MSIX           1            /* -ENOSYS: no MSI infrastructure yet       */
 
@@ -4465,21 +4466,86 @@ static void role66_claim_positive(void) {
         sysc(SYS_EXIT, 1937, 0, 0);
     }
 
-    /* Map every BAR that has one, and read the first word back. A mapping that
-     * cannot be read is a page-table entry that looks right and is not. */
+    /* Map every BAR that has one. A mapping that cannot be read is a page-table
+     * entry that looks right and is not. */
+    u64 bar_va[6];
     int mapped = 0;
     for (u64 b = 0; b < 6; b++) {
+        bar_va[b] = 0;
         i64 va = (i64)sysc(SYS_MAP_PCI_BAR, (u64)dev, b, 0);
         if (va < 0) continue;                        /* that BAR has no window */
+        bar_va[b] = (u64)va;
         mapped++;
-        volatile u32 *reg = (volatile u32 *)(u64)va;
-        u32 v = *reg;                                /* MUST NOT FAULT         */
-        print("  [r66] bar "); hex(b); print(" -> va "); hex((u64)va);
-        print(" first word "); hex((u64)v); print("\n");
+        print("  [r66] bar "); hex(b); print(" -> va "); hex((u64)va); print("\n");
     }
     if (!mapped) {
         print("  [r66] no BAR of the claimed device could be mapped\n");
         sysc(SYS_EXIT, 1933, 0, 0);
+    }
+
+    /* ------------------------------------------------------------------ *
+     * DOES THE MAPPING POINT AT THE DEVICE, OR AT A ZERO PAGE?
+     *
+     * The previous version read offset 0 of each BAR and printed it. Both read
+     * zero — which is exactly what a zero page reads, so the check proved the
+     * mapping was PRESENT and proved nothing about what it pointed at. A PTE
+     * aimed at the wrong frame would have passed it.
+     *
+     * Settling it needs a register whose value is known and non-zero, and for
+     * a virtio device that means finding the register layout: it is not at a
+     * fixed offset, it is described by vendor capabilities (ID 0x09) in PCI
+     * CONFIG space, each naming a BAR and an offset within it. So walk the
+     * capability list from 0x34, find the COMMON_CFG structure (cfg_type 1),
+     * and read through the BAR this process already mapped.
+     *
+     * virtio_pci_common_cfg begins:
+     *   0x00 device_feature_select (RW)   0x04 device_feature (RO)
+     *   0x12 num_queues (RO)
+     * Selecting feature word 1 must return a non-zero value, because
+     * VIRTIO_F_VERSION_1 is bit 32 and every modern virtio device sets it —
+     * this device is one, since the gate line forces disable-legacy=on.
+     * ------------------------------------------------------------------ */
+    {
+        i64 sc = (i64)sysc(SYS_PCI_CFG_READ, (u64)dev, 0x34, 0);
+        if (sc < 0) { print("  [r66] PCI_CFG_READ refused\n"); sysc(SYS_EXIT, 1934, 0, 0); }
+        u64 cap = (u64)(sc & 0xFC);
+        i64 cfg_bar = -1; u64 cfg_off = 0;
+        int hops = 0;
+        while (cap && hops++ < 48) {          /* bounded: a cyclic list must not hang */
+            i64 c0 = (i64)sysc(SYS_PCI_CFG_READ, (u64)dev, cap, 0);
+            if (c0 < 0) break;
+            u8 id = (u8)(u64)c0;
+            u8 cfg_type = (u8)(((u64)c0) >> 24);
+            if (id == 0x09 && cfg_type == 1) {        /* VIRTIO_PCI_CAP_COMMON_CFG */
+                i64 b = (i64)sysc(SYS_PCI_CFG_READ, (u64)dev, cap + 4, 0);
+                i64 o = (i64)sysc(SYS_PCI_CFG_READ, (u64)dev, cap + 8, 0);
+                if (b >= 0 && o >= 0) { cfg_bar = (i64)((u64)b & 0xFF); cfg_off = (u64)o; }
+                break;
+            }
+            cap = (((u64)c0) >> 8) & 0xFC;
+        }
+        if (cfg_bar < 0 || cfg_bar >= 6 || !bar_va[cfg_bar]) {
+            print("  [r66] no virtio COMMON_CFG capability in a mapped BAR\n");
+            sysc(SYS_EXIT, 1934, 0, 0);
+        }
+        print("  [r66] COMMON_CFG in bar "); hex((u64)cfg_bar);
+        print(" at offset "); hex(cfg_off); print("\n");
+
+        volatile u32 *cc = (volatile u32 *)(bar_va[cfg_bar] + cfg_off);
+        cc[0] = 1;                                   /* device_feature_select = 1 */
+        u32 feat_hi = cc[1];                         /* device_feature            */
+        volatile u16 *nq = (volatile u16 *)((u64)cc + 0x12);
+        u16 queues = *nq;
+        print("  [r66] device_feature[1] "); hex((u64)feat_hi);
+        print("  num_queues "); hex((u64)queues); print("\n");
+        /* THE ASSERTION THAT ZERO CANNOT SATISFY. A zero page returns 0 for
+         * both of these; a real modern virtio device returns VIRTIO_F_VERSION_1
+         * in feature word 1 and at least one queue. Either alone would do; both
+         * together make an accidental pass implausible. */
+        if (!feat_hi && !queues) {
+            print("  [r66] BOTH registers read ZERO — the BAR maps no device\n");
+            sysc(SYS_EXIT, 1934, 0, 0);
+        }
     }
 
     /* Release, then RE-CLAIM. This is the check that catches a teardown leak,
