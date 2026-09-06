@@ -4424,11 +4424,28 @@ static void role66_claim_positive(void) {
      * function currently has a driver bound, so this may legitimately find
      * nothing — reported as NOT EXERCISED rather than as a pass, because a
      * positive test that never claimed anything has demonstrated nothing. */
+    /* CLAIM_DMA, NOT A BARE CLAIM. A claim with no flags never calls
+     * iommu_attach_proc_domain, so a test that used one would exercise the
+     * bookkeeping and none of the confinement — and confinement is the point
+     * of the feature. The DMA path is what this asks for.
+     *
+     * dma_ok records whether it was granted. On a machine with no IOMMU the
+     * attach fails with -EIO and the claim is rolled back; that is correct
+     * behaviour there, not a defect, so the fallback below re-claims WITHOUT
+     * the flag and the result is reported through a DIFFERENT exit code. The
+     * kernel side, which knows whether g_iommu_on, is what decides whether
+     * "claimed without confinement" is acceptable on this boot — ring 3
+     * cannot see that and must not guess. */
+    int dma_ok = 0;
     for (u64 slot = 0; slot < 32 && dev < 0; slot++) {
         for (u64 fn = 0; fn < 8; fn++) {
             u64 bdf = (slot << 3) | fn;
-            i64 r = (i64)sysc(SYS_CLAIM_PCI_DEVICE, bdf, 0, (u64)(void *)out);
-            if (r >= 0) { dev = r; devbdf = bdf; break; }
+            i64 r = (i64)sysc(SYS_CLAIM_PCI_DEVICE, bdf, CLAIM_DMA, (u64)(void *)out);
+            if (r >= 0) { dev = r; devbdf = bdf; dma_ok = 1; break; }
+            if (r == -5) {                       /* EIO: no IOMMU to attach to */
+                r = (i64)sysc(SYS_CLAIM_PCI_DEVICE, bdf, 0, (u64)(void *)out);
+                if (r >= 0) { dev = r; devbdf = bdf; dma_ok = 0; break; }
+            }
         }
         if (odeadline_expired(t0, (u64)R66_T * 10000ull)) sysc(SYS_EXIT, 1939, 0, 0);
     }
@@ -4487,8 +4504,12 @@ static void role66_claim_positive(void) {
         sysc(SYS_EXIT, 1936, 0, 0);
     }
     print("  [r66] release + re-claim OK, "); hex((u64)mapped);
-    print(" bar(s) mapped\n");
-    sysc(SYS_EXIT, 1930, 0, 0);
+    print(" bar(s) mapped, dma_confined "); hex((u64)dma_ok); print("\n");
+    /* TWO SUCCESS CODES, because "it worked" and "it worked but nothing was
+     * confined" are different facts and only the kernel can judge the second.
+     * Collapsing them into one would let a boot on an IOMMU machine report a
+     * clean pass while CLAIM_DMA silently did nothing. */
+    sysc(SYS_EXIT, dma_ok ? 1930 : 1938, 0, 0);
 }
 
 static void role62_ofile_stress(void) {

@@ -139,6 +139,9 @@ for CFG in $CONFIGS; do
     printf 'OUTRUN-DISK-SIGNATURE-OK' | dd of="$IMG" bs=1 seek=1024 conv=notrunc 2>/dev/null
 
     BLK="-drive file=$IMG,if=none,format=raw,id=vd0 -device virtio-blk-pci,drive=vd0,disable-legacy=on,disable-modern=off"
+    # v0.95: THE UNBOUND DEVICE, for ring-3 passthrough (role 66). Empty for
+    # every configuration that does not set it below.
+    UNBOUND=""
     NET="-netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,mac=52:54:00:ab:cd:ef"
     case "$CFG" in
       uniprocessor) SMP="" ;;
@@ -170,7 +173,35 @@ for CFG in $CONFIGS; do
         # q35 with an unused unit bolted on. iommu_platform=on is what puts them
         # there; without it this target silently tests nothing extra.
         BLK="$BLK,iommu_platform=on"
-        NET="$NET,iommu_platform=on" ;;
+        NET="$NET,iommu_platform=on"
+        # v0.95: AN UNBOUND PCI DEVICE, so role 66 has something to claim.
+        #
+        # Every other function on this machine has a kernel driver bound to it,
+        # so the claim path was only ever exercised NEGATIVELY -- role 66
+        # reported NOT EXERCISED on every boot. This device closes that.
+        #
+        # virtio-rng-pci SPECIFICALLY, and the choice is not arbitrary. It is
+        # vendor 1af4 but PCI class 0x00 (unclassified), and pci_probe_fn binds
+        # drivers to 1af4 classes 01/02/03/04 only -- so nothing in this kernel
+        # claims it and it stays free for ring 3. A second virtio-net would NOT
+        # work: virtionet_probe binds any 1af4 class 0x02 function, so the
+        # duplicate would be host-bound too and refused exactly like the first.
+        # e1000 would not work either -- its BAR0 is 128 KiB and SYS_MAP_PCI_BAR
+        # refuses a BAR larger than its 64 KiB window rather than truncating it.
+        #
+        # iommu_platform=on puts it BEHIND the IOMMU, which is the whole point:
+        # without it a CLAIM_DMA would attach a domain to a device that is not
+        # translated, and the confinement would be decorative.
+        #
+        # disable-legacy=on,disable-modern=off IS REQUIRED, not decoration.
+        # virtio-rng-pci defaults to a TRANSITIONAL device and
+        # iommu_platform=on is a modern-only feature, so without these qemu
+        # refuses the command line outright:
+        #   "VIRTIO_F_IOMMU_PLATFORM was supported by neither legacy nor
+        #    transitional device"
+        # and the guest never starts at all. Same flags BLK and NET already
+        # carry, for the same reason.
+        UNBOUND="-device virtio-rng-pci,disable-legacy=on,disable-modern=off,iommu_platform=on" ;;
       *) echo "gate-matrix: unknown configuration '$CFG'"; rc=1; continue ;;
     esac
 
@@ -180,7 +211,7 @@ for CFG in $CONFIGS; do
     echo "# config=$CFG iso=$ISO md5=$MD5 qemu='${SMP:-uniprocessor}'" > "$LOG"
 
     # shellcheck disable=SC2086
-    qemu-system-x86_64 $SMP -cdrom "$ISO" -m 512M -nographic -no-reboot $GPU $BLK $NET \
+    qemu-system-x86_64 $SMP -cdrom "$ISO" -m 512M -nographic -no-reboot $GPU $BLK $NET $UNBOUND \
       < /dev/null >> "$LOG" 2>&1 &
     q=$!; e=0
     while [ "$e" -lt "$CAP" ]; do

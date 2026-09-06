@@ -24106,6 +24106,20 @@ static void cmd_vfio_stress(void) {
                  * either. */
                 kprintf("[vfiostrs]  NOT EXERCISED  %s (exit %u)\n",
                         R[k].what, (uint64_t)(int64_t)c);
+            } else if (R[k].role == 66 && c == 1938) {
+                /* Role 66 succeeded but got no DMA confinement. Whether that
+                 * is acceptable is a question ring 3 cannot answer: it depends
+                 * on whether this machine HAS an IOMMU, which only the kernel
+                 * knows. On a q35 + VT-d boot, a claim that skipped
+                 * confinement is exactly the "silently unconfined" defect the
+                 * bdf work fixed earlier this cycle, and it fails here. */
+                kprintf("[vfiostrs] role 66 claimed WITHOUT dma confinement "
+                        "(g_iommu_on=%d)\n", (uint64_t)(int64_t)g_iommu_on);
+                if (g_iommu_on)
+                    vfiocheck("role 66: CLAIM_DMA confined the device on an IOMMU machine", 0);
+                else
+                    vfiocheck("role 66: claim -> map BAR -> release -> re-claim "
+                              "(no IOMMU on this machine; confinement not applicable)", 1);
             } else {
                 if (c != R[k].ok)
                     kprintf("[vfiostrs] role %d exit %u\n",

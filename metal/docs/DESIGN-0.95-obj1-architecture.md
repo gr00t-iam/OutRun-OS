@@ -372,14 +372,35 @@ what exposed v0.94's split as real; the same discipline applies here.
   `8>`) should be carried across rather than rediscovered.
 - **New `make probe-passthrough`**, with `PROBE_QEMU` for the `-smp 4` form,
   mirroring `probe-timebench`.
-- **`gate-matrix.sh` needs a new device.** The claim path cannot be exercised
-  against a device QEMU does not expose. The `smp4-iommu` tier already runs
-  q35 + `intel-iommu,intremap=on,caching-mode=on` with virtio behind the
-  IOMMU; role 65/66 need a second, claimable device on that machine — the
-  existing `cmd_vfio_stress` test device (`23256`) is the model, and whether it
-  can be driven from a real PCI BDF rather than a synthesised `kdev` is an open
-  question this objective must answer early, because the whole probe strategy
-  rests on it.
+- **DONE — `gate-matrix.sh` has an unbound device.** The claim path cannot be
+  exercised against a device QEMU does not expose, and every function on the
+  reference machine had a kernel driver bound, so role 66 reported NOT
+  EXERCISED on every boot. The `smp4-iommu` tier now carries
+  `-device virtio-rng-pci,disable-legacy=on,disable-modern=off,iommu_platform=on`.
+
+  The device choice is constrained from three directions, and only one option
+  satisfies all of them:
+  - **Not a second virtio-net.** `virtionet_probe` binds any vendor 1af4 class
+    0x02 function, so a duplicate NIC would be host-bound and refused exactly
+    like the first. virtio-rng is vendor 1af4 but PCI **class 0x00**, and this
+    kernel binds drivers to classes 01/02/03/04 only.
+  - **Not `e1000`.** Its BAR 0 is 128 KiB and `SYS_MAP_PCI_BAR` refuses a BAR
+    larger than its 64 KiB window rather than truncating it.
+  - **`disable-legacy=on,disable-modern=off` is required, not decoration.**
+    virtio-rng-pci defaults to a *transitional* device and `iommu_platform=on`
+    is modern-only, so without them QEMU refuses the command line and the
+    guest never starts — measured, as a `NO-PROMPT` run with a two-line log.
+
+  The synthetic `cmd_vfio_stress` device was considered and rejected as the
+  vehicle: it has no BDF and no IOMMU domain, so claiming it would exercise
+  neither claim resolution nor confinement while turning the suite green.
+
+  **Note for a later reader:** on q35, `0:31.2` (the ICH9 SATA controller) is
+  also registered claimable, because this kernel has no AHCI driver to bind to
+  it. Role 66 picks `0:4.0` only because the sweep reaches slot 4 first. The
+  explicit rng is still correct — deliberate beats incidental — but a claimable
+  storage controller is worth a look on real hardware, where `KDEV_BOUND_HOST`
+  protects it only if something is actually bound.
 
 ---
 
