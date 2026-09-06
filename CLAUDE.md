@@ -201,13 +201,48 @@ this repository.
 ## Lock ranks
 
 `klock` enforces an acquisition order. Acquiring a lower rank while holding a
-higher one is an inversion and will be reported. Current ranks: `ofile` 1,
-`vfs` 2, `cas` 3, `vblk` 4, `surf` 5, `net` 9, `udb` 13.
+higher one is an inversion and will be reported.
+
+**The complete set, and it must stay complete.** This list previously named only
+`ofile` 1, `vfs` 2, `cas` 3, `vblk` 4, `surf` 5, `net` 9, `udb` 13 — six ranks
+short. v0.95 proposed a new lock at rank 7 on the strength of it, and 7 has been
+`g_gpu_lock` since v0.51. A partial rank table does not merely fail to help; it
+actively invites a collision, which is the same trap this file already documents
+for ring-3 role numbers. Grep `struct klock g_` before adding one.
+
+| rank | lock | protects |
+|---|---|---|
+| 0 | `g_redir_lock` | fd redirection table |
+| 1 | `g_ofile_lock` | open-descriptor array (fd alloc/free/deref) |
+| 2 | `g_vfs_lock` | VFS directory: dirent claim/scan/rewrite/flush |
+| 3 | `g_cas_lock` | CAS superblock counters, bitmap, index, staging sectors |
+| 4 | `g_vblk_lock` | virtio-blk request slots + avail-ring publish |
+| 5 | `g_surf_lock` | surface slot table + pixel-buffer free list |
+| 6 | `g_ipc_lock` | IPC mailbox rings |
+| 7 | `g_gpu_lock` | virtio-gpu resource / scanout state |
+| 8 | `g_audio_lock` | virtio-sound stream state |
+| 9 | `g_net_lock` | virtio-net rings and socket table |
+| 10 | `g_wm_lock` | window-manager stacking order |
+| **11** | **`g_dev_lock`** | **v0.95: device registry — claim/release, ownership** |
+| 12 | `g_vm_lock` | vmfile mappings |
+| 13 | `g_udb_lock` | user database (a leaf: never held while acquiring another) |
+
+Two raw spinlocks are deliberately **UNRANKED** and are not `klock`s at all:
+`g_frame_lock` (frame free-list — it must work before the scheduler exists and
+on APs, where there is no per-CPU rank tracking, so it is never nested under a
+klock and never held across an allocation or a yield) and `g_conlock` (console,
+an IRQ-safe leaf inside `kprintf`). They are absent from the table because they
+have no rank, not because anyone forgot them.
 
 The common trap: helpers that take `g_ofile_lock` (rank 1) look harmless but
 cannot be called while holding `g_net_lock` (rank 9). Validate against state the
 lock you already hold protects, rather than re-deriving it through a lower-ranked
 one.
+
+`g_dev_lock` sits at 11 — above `net`, `gpu` and `audio` — precisely so a driver
+holding its own lock can claim or release its device, since acquisition is
+upward. The discipline that follows is: driver lock first, then `g_dev_lock`,
+never the reverse.
 
 ---
 

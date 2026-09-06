@@ -236,24 +236,41 @@ memory" is not.
 
 ### 5a. A new lock, and its rank
 
-`kdevs[]` becomes runtime-mutable, so it needs `g_dev_lock`. Existing ranks:
+`kdevs[]` becomes runtime-mutable, so it needs `g_dev_lock`.
 
-    1 ofile   2 vfs   3 cas   4 vblk   5 surf   6 frame   9 net   13 udb
+**CORRECTED — this section originally proposed rank 7, which is taken.** The
+first draft read CLAUDE.md's rank list as the complete set and proposed slotting
+in at 7 "between frame (6) and net (9)". Enumerating the actual declarations
+shows that wrong twice over, and it is recorded rather than silently fixed
+because it is the same class of mistake CLAUDE.md documents for role numbers:
+*check for a free number before adding one, and grep both halves.*
 
-Proposed: **`g_dev_lock` rank 7**, between `frame` (6) and `net` (9).
+The live set, from `grep 'struct klock g_'`:
 
-The reasoning is the ordering it must survive, not the gap in the numbering.
-Building an IOMMU domain allocates frames, so the device lock must be
-acquirable *above* `g_frame_lock` (6) — i.e. claim takes rank 7 then rank 6,
-never the reverse. It must sit below `net` (9) because a future NIC passthrough
-path would claim a device while holding the net lock, and CLAUDE.md's standing
-trap is precisely this: "helpers that take `g_ofile_lock` (rank 1) look harmless
-but cannot be called while holding `g_net_lock` (rank 9)."
+    0 redir   1 ofile   2 vfs    3 cas     4 vblk   5 surf   6 ipc
+    7 gpu     8 audio   9 net   10 wm     12 vmfile        13 udb
 
-**CLAUDE.md's rank list is already stale** and should be corrected in the same
-commit: it names ofile 1, vfs 2, cas 3, vblk 4, surf 5, net 9, udb 13 and omits
-`g_frame_lock` rank 6, which is live at `kernel64.c:1006`. A rank table that
-does not list every rank is how an inversion gets designed in.
+plus two deliberately **UNRANKED** raw spinlocks that are not klocks at all —
+`g_frame_lock` (the frame free-list, which must work before the scheduler
+exists and on APs with no rank tracking) and `g_conlock` (console, IRQ-safe
+leaf inside `kprintf`). The parenthesised "(6)" and "(7)" beside them in the
+`kernel64.c:3349` comment are descriptive labels, not ranks.
+
+So the second error: **CLAUDE.md is not stale about `g_frame_lock`** — it
+correctly omits it, because an unranked leaf has no rank to list. What CLAUDE.md
+actually lacks is `ipc` 6, `gpu` 7, `audio` 8, `wm` 10, `vmfile` 12 and
+`redir` 0, and that omission is what made rank 7 look free.
+
+Adopted: **`g_dev_lock` rank 11**, the only free rank in the range.
+
+The reasoning is the ordering it must survive. The original draft also had the
+direction backwards: acquiring UPWARD is legal, so a NIC passthrough path
+holding `net` (9) and then claiming a device needs the device lock **above** 9,
+not below it. Rank 11 satisfies that, and equally lets a driver holding
+`gpu` (7) or `audio` (8) claim its own device — which is the whole point for a
+GPU passthrough path. The discipline that follows: take the driver's lock
+first, then `g_dev_lock`, never the reverse. Frame allocation is unranked, so
+it constrains nothing here.
 
 ### 5b. What the lock protects, and what it must not span
 

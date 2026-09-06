@@ -2801,7 +2801,25 @@ static int kproc_spawn_thread(const char *name, int leader, int tid) {
 }
 
 /* ---- Device registry ------------------------------------------------------- */
-struct kdev { const char *name; uint64_t base, len, req; bool used; uint16_t bdf; };
+/* v0.95 Objective 1: OWNERSHIP, AND WHY IT IS A (slot, gen) PAIR.
+ *
+ * owner is a kproc SLOT INDEX, and slots are recycled. Storing the slot alone
+ * is the exact defect v0.75 found in ppid_slot: every reader validated it with
+ * `kprocs[owner].used`, which stays true for a slot whose occupant died and was
+ * replaced — so a claim could be inherited by whichever process next landed in
+ * that slot, and inheriting a claim means inheriting a mapped BAR and a DMA
+ * domain. owner_gen pins the claim to THAT occupant; kdev_owner_live() below is
+ * the only sanctioned way to ask "is the owner still the process that claimed
+ * this", and nothing should open-code the comparison.
+ *
+ * owner == -1 means unclaimed. A device with bdf == 0xFFFF is SYNTHETIC (see
+ * kdev_register) and cannot be claimed by BDF at all. */
+struct kdev {
+    const char *name; uint64_t base, len, req; bool used; uint16_t bdf;
+    int      owner;                        /* kproc slot, or -1 = unclaimed    */
+    uint32_t owner_gen;                    /* kprocs[owner].gen when claimed   */
+    uint32_t claim_flags;                  /* CLAIM_* the owner asked for      */
+};
 #define MAX_KDEV 8
 static struct kdev kdevs[MAX_KDEV];
 static int n_kdev = 0;
@@ -2820,9 +2838,37 @@ static uint64_t g_kdev_bar1_len[MAX_KDEV];
 /* v0.47); see the MAX_VFIO_LINES section below for what a real value means.  */
 static int g_kdev_irq_line[MAX_KDEV] = { [0 ... MAX_KDEV - 1] = -1 };
 
-static void kdev_register(const char *name, uint64_t base, uint64_t len, uint64_t req) {
+/* v0.95: BDF IS NOW A PARAMETER, not something a caller remembers to patch in
+ * afterwards.
+ *
+ * Before this, kdev_register hardcoded 0xFFFF and exactly one of five call
+ * sites (virtio-net) wrote the real source-id back into kdevs[n_kdev-1].bdf on
+ * the following line. That is a two-statement invariant with no compiler
+ * checking it, and four of the five call sites did not hold it — so four
+ * devices were invisible to iommu_attach_proc_domain, which returns -1 on
+ * 0xFFFF, and to dma_grant_create's confinement, which is guarded by
+ * `if (d->bdf != 0xFFFF)`. They were not refused; they were silently
+ * unconfined.
+ *
+ * KDEV_SYNTHETIC is passed EXPLICITLY by devices that genuinely have no PCI
+ * identity — the scratch-page 'sensor0' and the fabricated 'vfio-dev0' test
+ * device. That is a different statement from "nobody filled this in", and the
+ * difference is the whole point of making it an argument. */
+#define KDEV_SYNTHETIC 0xFFFF
+static void kdev_register(const char *name, uint64_t base, uint64_t len,
+                          uint64_t req, uint16_t bdf) {
     if (n_kdev >= MAX_KDEV) return;
-    kdevs[n_kdev++] = (struct kdev){ name, base, len, req, true, 0xFFFF };
+    kdevs[n_kdev++] = (struct kdev){ name, base, len, req, true, bdf, -1, 0, 0 };
+}
+
+/* Is this device's recorded owner still the process that claimed it?
+ *
+ * The (slot, gen) pair is checked TOGETHER and nowhere else — see the struct
+ * comment for why the slot alone is not an identity. */
+static inline int kdev_owner_live(const struct kdev *d) {
+    if (d->owner < 0 || d->owner >= n_kproc) return 0;
+    if (!kprocs[d->owner].used || kprocs[d->owner].exited) return 0;
+    return kprocs[d->owner].gen == d->owner_gen;
 }
 static struct kdev *kdev_find(uint64_t io_addr) {
     for (int i = 0; i < n_kdev; i++) {
@@ -2971,7 +3017,7 @@ static void cmd_passthrough(void) {
     /* back THROUGH its own virtual mapping only if it holds the capability.    */
     uint64_t dev_phys = alloc_frame();
     *(volatile uint32_t *)dev_phys = 0xCAFEBABE;
-    kdev_register("sensor0", dev_phys, 0x1000, PCAP_CAMERA);
+    kdev_register("sensor0", dev_phys, 0x1000, PCAP_CAMERA, KDEV_SYNTHETIC);
     kprintf("[hw     ] device 'sensor0' registers at phys %X, sentinel 0x%X, requires CAMERA\n",
             dev_phys, (uint64_t)0xCAFEBABE);
 
@@ -3085,8 +3131,8 @@ static void pci_probe_virtio(uint8_t bus, uint8_t dev, uint8_t fn) {
     uint32_t cmd = pci_cfg_read32(bus, dev, fn, 0x04);
     pci_cfg_write32(bus, dev, fn, 0x04, cmd | 0x2);
 
-    kdev_register("virtio-net", base, size, PCAP_NETWORK);
-    kdevs[n_kdev - 1].bdf = (uint16_t)((bus << 8) | (dev << 3) | fn);   /* IOMMU source-id */
+    kdev_register("virtio-net", base, size, PCAP_NETWORK,
+                  (uint16_t)((bus << 8) | (dev << 3) | fn));   /* IOMMU source-id */
     g_virtio_kdev = n_kdev - 1;
     kprintf("[pci    ] virtio device %x: MMIO BAR%d phys %X (+%X), common@+%X devcfg@+%X\n",
             (uint64_t)device_id, bar_idx, base, size, g_virtio_common, g_virtio_devcfg);
@@ -3352,6 +3398,16 @@ static void idle_fn(void *a) {
  *                          shared staging sectors (g_blk / g_idxbuf)
  *   rank 4  g_vblk_lock    virtio-blk request slots + avail-ring publish
  *   rank 5  g_surf_lock    surface slot table + pixel-buffer free list
+ *   rank 6  g_ipc_lock     IPC mailbox rings
+ *   rank 7  g_gpu_lock     virtio-gpu resource/scanout state
+ *   rank 8  g_audio_lock   virtio-sound stream state
+ *   rank 9  g_net_lock     virtio-net rings and socket table
+ *   rank 10 g_wm_lock      window-manager stacking order
+ *   rank 11 g_dev_lock     v0.95: device registry — claim/release, ownership.
+ *                          ABOVE net/gpu/audio so a driver holding its own lock
+ *                          can claim its device; acquisition is upward.
+ *   rank 12 g_vm_lock      vmfile mappings
+ *   rank 13 g_udb_lock     user database (a leaf; see its declaration)
  *   (6)     g_frame_lock   v0.42: frame free-list — a raw leaf spinlock, NOT
  *                          a klock and deliberately UNRANKED: it must work
  *                          before the scheduler exists (early boot) and on
@@ -3476,6 +3532,31 @@ static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0, 0, 0, 0 KLOCK_RW_INIT 
  * both happen with this released — collect under the lock, do the I/O outside
  * it, re-check on the way back in. Holding it across g_vfs_lock (rank 2) would
  * be a real inversion, not a bookkeeping nicety. */
+/* v0.95 Objective 1: THE DEVICE REGISTRY LOCK.
+ *
+ * kdevs[] was written once at boot and read-only thereafter, which is why it
+ * has never needed a lock. SYS_CLAIM_PCI_DEVICE makes it mutable from any core,
+ * so the claim/release transition, the owner fields and the used flag all move
+ * under this.
+ *
+ * RANK 11, AND THE FIRST DRAFT PICKED 7, WHICH IS TAKEN BY g_gpu_lock. The
+ * error came from reading CLAUDE.md's rank list as complete when it omits ipc
+ * (6), gpu (7), audio (8), wm (10) and vmfile (12); 11 is the only free rank in
+ * the range. Recorded because it is the lock-rank form of the trap CLAUDE.md
+ * already documents for role numbers — check for a free number before adding
+ * one, and grep the declarations rather than the documentation.
+ *
+ * ABOVE net (9), gpu (7) and audio (8) deliberately. Acquisition is upward, so
+ * this ordering is what lets a driver holding its OWN lock claim or release its
+ * device — a NIC passthrough path under g_net_lock, a GPU path under
+ * g_gpu_lock, which is Blueprints' motivating case. The discipline that follows
+ * is: driver lock first, then g_dev_lock, never the reverse. Frame allocation
+ * is an unranked leaf and constrains nothing here.
+ *
+ * NOT held across iommu_invalidate_all() (hardware registers, slow) or across
+ * any access to user memory — a fault taken under a lock is a deadlock this
+ * tree can detect but has no reason to invite. */
+static struct klock g_dev_lock   = { 0, "dev",   11, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static volatile uint32_t g_rank_violations = 0;
 #ifdef KERNEL_DEBUG
@@ -5619,8 +5700,8 @@ static int virtionet_probe(uint8_t bus, uint8_t dev, uint8_t fn) {
     g_vnet_devcfg = (volatile uint8_t *)(v + devcfg_off);
 
     /* also expose this device to ring-3 passthrough (real MAC read demo)      */
-    kdev_register("virtio-net", cbase, 0x4000, PCAP_NETWORK);
-    kdevs[n_kdev - 1].bdf = (uint16_t)((bus << 8) | (dev << 3) | fn);   /* IOMMU source-id */
+    kdev_register("virtio-net", cbase, 0x4000, PCAP_NETWORK,
+                  (uint16_t)((bus << 8) | (dev << 3) | fn));   /* IOMMU source-id */
     g_virtio_kdev = n_kdev - 1;
     g_virtio_common = common_off; g_virtio_devcfg = devcfg_off;
 
@@ -14672,26 +14753,110 @@ static int posix_try_fault_signal(struct isr_frame *f) {
     return 1;
 }
 
+/* ===========================================================================
+ * v0.95 Objective 1: THE PCI FUNCTION INVENTORY
+ * ===========================================================================
+ * Until now enumeration was a single loop over bus 0, device 0-31, FUNCTION 0
+ * ONLY, which found devices well enough to bind the four virtio drivers and
+ * recorded nothing else. Three things were missing, and all three block a
+ * claim-by-BDF syscall:
+ *
+ *   - MULTI-FUNCTION DEVICES WERE INVISIBLE. Function 0 was probed and 1-7
+ *     never were. Blueprints' own example — "a GPU and its audio controller" —
+ *     is exactly a multi-function device: the audio function is .1 of the same
+ *     slot. The feature could not have addressed its own motivating case.
+ *   - BUSES ABOVE 0 WERE INVISIBLE. q35 puts devices behind root ports.
+ *   - NOTHING WAS REMEMBERED. The loop probed and moved on, so there was no
+ *     table to resolve a (bus, slot, func) against.
+ *
+ * BRUTE FORCE, NOT BRIDGE RECURSION. All 256 buses are walked directly rather
+ * than discovered by following bridge secondary-bus registers. It is 256*32*8
+ * = 65,536 config reads, each two port accesses, once at boot; recursion would
+ * be fewer reads and one more thing to get wrong, and a bus that is not behind
+ * a configured bridge simply reads 0xFFFF. Correctness over cleverness at a
+ * cost paid once.
+ * =========================================================================== */
+#define MAX_PCIFN 64
+struct pcifn {
+    uint16_t bdf;                    /* (bus << 8) | (slot << 3) | func      */
+    uint16_t vendor, device;
+    uint8_t  class, subclass, progif;
+    uint8_t  header;                 /* header type, bit 7 masked off        */
+};
+static struct pcifn g_pcifn[MAX_PCIFN];
+static int n_pcifn = 0;
+/* Functions found after the table filled. Printed, not silently dropped: a
+ * device that cannot be claimed because the inventory overflowed is a very
+ * confusing failure if the overflow itself is invisible. */
+static int g_pcifn_overflow = 0;
+
+static inline uint16_t pci_bdf(uint8_t bus, uint8_t dev, uint8_t fn) {
+    return (uint16_t)(((uint16_t)bus << 8) | ((uint16_t)dev << 3) | (fn & 7));
+}
+
+/* Resolve a BDF to its inventory entry, or -1. This is what a claim syscall
+ * validates against before it touches the device registry. */
+static int pcifn_find(uint16_t bdf) {
+    for (int i = 0; i < n_pcifn; i++) if (g_pcifn[i].bdf == bdf) return i;
+    return -1;
+}
+
+/* Record one present function, and bind a driver to it if we have one. */
+static void pci_probe_fn(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t id) {
+    uint32_t cls  = pci_cfg_read32(bus, dev, fn, 0x08);
+    uint32_t hdr  = pci_cfg_read32(bus, dev, fn, 0x0C);
+    uint16_t vendor = (uint16_t)id;
+    uint8_t  class = (uint8_t)(cls >> 24), subclass = (uint8_t)(cls >> 16);
+    uint8_t  progif = (uint8_t)(cls >> 8);
+
+    if (n_pcifn < MAX_PCIFN) {
+        g_pcifn[n_pcifn++] = (struct pcifn){
+            pci_bdf(bus, dev, fn), vendor, (uint16_t)(id >> 16),
+            class, subclass, progif, (uint8_t)((hdr >> 16) & 0x7F)
+        };
+    } else g_pcifn_overflow++;
+
+    kprintf("[pci    ]   %d:%d.%d  vendor %x device %x class %x.%x\n",
+            (uint64_t)bus, (uint64_t)dev, (uint64_t)fn, (uint64_t)vendor,
+            (uint64_t)(id >> 16), (uint64_t)class, (uint64_t)subclass);
+
+    if (vendor == 0x1AF4) {                             /* Red Hat / virtio  */
+        if (class == 0x01)       virtio_blk_probe(bus, dev, fn);   /* mass storage */
+        else if (class == 0x02)  virtionet_probe(bus, dev, fn);    /* network      */
+        else if (class == 0x03)  virtio_gpu_probe(bus, dev, fn);   /* display      */
+        else if (class == 0x04)  virtio_sound_probe(bus, dev, fn); /* multimedia   */
+    } else if (class == 0x0C) {                         /* serial bus controller */
+        if (subclass == 0x03 && progif == 0x30) xhci_probe(bus, dev, fn); /* xHCI */
+    }
+}
+
 static void pci_init(void) {
-    kprintf("[pci    ] enumerating bus 0 (config mechanism #1, ports 0xCF8/0xCFC):\n");
-    for (uint8_t dev = 0; dev < 32; dev++) {
-        uint32_t id = pci_cfg_read32(0, dev, 0, 0x00);
-        uint16_t vendor = (uint16_t)id;
-        if (vendor == 0xFFFF) continue;
-        uint32_t cls = pci_cfg_read32(0, dev, 0, 0x08);
-        uint8_t  class = (uint8_t)(cls >> 24);
-        kprintf("[pci    ]   %d:00.0  vendor %x device %x class %x\n",
-                (uint64_t)dev, (uint64_t)vendor, (uint64_t)(id >> 16), (uint64_t)(cls >> 16));
-        if (vendor == 0x1AF4) {                             /* Red Hat / virtio  */
-            if (class == 0x01)       virtio_blk_probe(0, dev, 0);   /* mass storage */
-            else if (class == 0x02)  virtionet_probe(0, dev, 0);    /* network      */
-            else if (class == 0x03)  virtio_gpu_probe(0, dev, 0);   /* display      */
-            else if (class == 0x04)  virtio_sound_probe(0, dev, 0); /* multimedia   */
-        } else if (class == 0x0C) {                         /* serial bus controller */
-            uint8_t subclass = (uint8_t)(cls >> 16), progif = (uint8_t)(cls >> 8);
-            if (subclass == 0x03 && progif == 0x30) xhci_probe(0, dev, 0);   /* xHCI (USB3) */
+    kprintf("[pci    ] enumerating all buses (config mechanism #1, ports 0xCF8/0xCFC):\n");
+    for (int bus = 0; bus < 256; bus++) {
+        for (uint8_t dev = 0; dev < 32; dev++) {
+            uint32_t id0 = pci_cfg_read32((uint8_t)bus, dev, 0, 0x00);
+            if ((uint16_t)id0 == 0xFFFF) continue;       /* no function 0 = no device */
+            pci_probe_fn((uint8_t)bus, dev, 0, id0);
+            /* Header-type bit 7 is the ONLY thing that says functions 1-7 may
+             * exist. Probing them unconditionally is not merely wasteful: on a
+             * single-function device the spec leaves the response to a non-zero
+             * function undefined, and some hardware aliases function 0 across
+             * all eight — which would enter the same device into the inventory
+             * eight times under eight different BDFs, each looking claimable. */
+            uint32_t hdr0 = pci_cfg_read32((uint8_t)bus, dev, 0, 0x0C);
+            if (!((hdr0 >> 16) & 0x80)) continue;        /* single-function */
+            for (uint8_t fn = 1; fn < 8; fn++) {
+                uint32_t id = pci_cfg_read32((uint8_t)bus, dev, fn, 0x00);
+                if ((uint16_t)id == 0xFFFF) continue;
+                pci_probe_fn((uint8_t)bus, dev, fn, id);
+            }
         }
     }
+    kprintf("[pci    ] %d function(s) inventoried%s\n", (uint64_t)(int64_t)n_pcifn,
+            g_pcifn_overflow ? " — TABLE FULL, some were dropped" : "");
+    if (g_pcifn_overflow)
+        kprintf("[pci    ] *** %d function(s) did NOT fit MAX_PCIFN=%d and cannot be "
+                "claimed by BDF\n", (uint64_t)(int64_t)g_pcifn_overflow, (uint64_t)MAX_PCIFN);
     if (g_virtio_kdev < 0)
         kprintf("[pci    ] no virtio-net device found (passthrough demo will use scratch)\n");
 }
@@ -21778,6 +21943,31 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         o[2] = sys / 1000000000ull; o[3] = (sys % 1000000000ull) / 1000ull;
         return 0;
     }
+    /* =====================================================================
+     * v0.95 Objective 1 — PCI PASSTHROUGH. STUBS, DELIBERATELY.
+     * =====================================================================
+     * These three are wired into the dispatcher and return -ENOSYS. That is
+     * the point of landing them now: the ABI numbers are claimed so nothing
+     * else takes them, ring 3 can compile against the constants, and the
+     * dispatcher shape is fixed — while the kernel says plainly that the
+     * behaviour is not there yet.
+     *
+     * -38 (ENOSYS) AND NOT -22 (EINVAL). An unimplemented call and a rejected
+     * argument are different facts, and a caller that cannot tell them apart
+     * will debug the wrong one. An unrecognised syscall number falls through
+     * to this switch's default, so returning EINVAL here would make "not built
+     * yet" indistinguishable from "no such call".
+     *
+     * Argument validation is deliberately NOT performed yet either. A stub
+     * that validated and then refused would let a test pass on the validation
+     * while proving nothing about the operation — the shape of false-positive
+     * this cycle's role 65 exists to rule out. Nothing here can be mistaken
+     * for working. */
+    case 111:    /* SYS_CLAIM_PCI_DEVICE(bdf, flags, out) -> device_id, or -errno */
+    case 112:    /* SYS_RELEASE_PCI_DEVICE(device_id) -> 0, or -errno            */
+    case 113:    /* SYS_CORE_PIN(cpu_mask, flags) -> 0, or -errno                */
+        (void)a0; (void)a1; (void)a2;
+        return (uint64_t)-38;                            /* ENOSYS */
     case 107: {  /* SYS_CLOCK_NANOSLEEP(clockid, flags, req) -> 0, or negative
                   *
                   * THREE ARGUMENTS, NOT POSIX'S FOUR. This kernel's syscall ABI
@@ -23264,7 +23454,11 @@ static void cmd_vfio_stress(void) {
         *(volatile uint32_t *)bar0 = 0xCAFEBABEu;
         uint64_t bar1 = alloc_frame();
         g_vfio_test_dev = n_kdev;
-        kdev_register("vfio-dev0", bar0, 0x1000, PCAP_VFIO);
+        /* SYNTHETIC BY CONSTRUCTION: bar0 is an allocated frame standing in
+         * for a register file, not a window discovered on the bus, so there is
+         * no source-id the IOMMU could confine. Roles 65/66 need a device with
+         * a REAL bdf; see DESIGN-0.95 section 6d and open question 1. */
+        kdev_register("vfio-dev0", bar0, 0x1000, PCAP_VFIO, KDEV_SYNTHETIC);
         g_kdev_bar1_phys[g_vfio_test_dev] = bar1;
         g_kdev_bar1_len[g_vfio_test_dev] = 0x1000;
         g_kdev_irq_line[g_vfio_test_dev] = 16;
@@ -27815,7 +28009,7 @@ static void cmd_usermode(void) {
         *(volatile uint32_t *)dev_phys = 0xCAFEBABE;
         g_demo_dev_index = n_kdev;
         dev_cap = PCAP_CAMERA;
-        kdev_register("sensor0", dev_phys, 0x1000, PCAP_CAMERA);
+        kdev_register("sensor0", dev_phys, 0x1000, PCAP_CAMERA, KDEV_SYNTHETIC);
         kprintf("[kernel ] demo device: scratch 'sensor0' (no virtio present)\n");
     }
 
@@ -35325,7 +35519,44 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     /* window as a capability-gated device), then enable ring 3 and run the    */
     /* passthrough as a real SYSCALL trap from an unprivileged ELF process.    */
     kputs("\n");
+    /* v0.95: the device registry starts with every slot unclaimed, BEFORE
+     * pci_init runs and registers anything into it. kdev_register writes
+     * owner = -1 itself, so this is belt-and-braces over the static
+     * zero-initialisation — which would otherwise leave owner = 0, a VALID
+     * slot index naming whatever process lands in slot 0. A registry that
+     * comes up believing pid 0 owns every device is one claim away from
+     * refusing every claim with -EBUSY, and the cause would not be obvious. */
+    for (int i = 0; i < MAX_KDEV; i++) {
+        kdevs[i].owner = -1; kdevs[i].owner_gen = 0; kdevs[i].claim_flags = 0;
+    }
     pci_init();
+    /* Printed, not assumed. "How many registered devices can actually be
+     * claimed by BDF" is the number this objective turns on, and a counter
+     * nothing prints is not instrumentation — a synthetic device is invisible
+     * to iommu_attach_proc_domain, so a registry that is all synthetic would
+     * make every claim fail for a reason no log names. */
+    int real_bdf = 0, orphan_bdf = 0;
+    for (int i = 0; i < n_kdev; i++) {
+        if (!kdevs[i].used || kdevs[i].bdf == KDEV_SYNTHETIC) continue;
+        real_bdf++;
+        /* CROSS-CHECK THE TWO TABLES AGAINST EACH OTHER. A registered device
+         * carrying a BDF the bus walk never saw means the two disagree about
+         * what is on this machine, and the claim path resolves through the
+         * inventory — so such a device would be registered, look claimable,
+         * and be unreachable. Counting it here is what makes that visible on
+         * the boot it happens rather than from a failing syscall later. */
+        if (pcifn_find(kdevs[i].bdf) < 0) {
+            orphan_bdf++;
+            kprintf("[dev    ] *** '%s' has bdf %x, which the PCI walk did not "
+                    "find — it cannot be claimed\n", kdevs[i].name,
+                    (uint64_t)kdevs[i].bdf);
+        }
+    }
+    kprintf("[dev    ] registry: %d device(s), %d with a real BDF, %d synthetic, "
+            "%d orphan; g_dev_lock rank %d\n",
+            (uint64_t)(int64_t)n_kdev, (uint64_t)(int64_t)real_bdf,
+            (uint64_t)(int64_t)(n_kdev - real_bdf), (uint64_t)(int64_t)orphan_bdf,
+            (uint64_t)g_dev_lock.rank);
     sched_init();
     cpp_ring_selftest();
     cmd_cas();

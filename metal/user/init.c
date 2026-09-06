@@ -176,6 +176,20 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_SETITIMER          108          /* v0.93: (which, new*, old*) -> 0         */
 #define SYS_GETITIMER          109          /* v0.93: (which, cur*) -> 0               */
 #define SYS_GETRUSAGE          110          /* v0.94: (who, orusage*) -> 0             */
+/* v0.95 Objective 1: PCI passthrough. STUBS in the kernel — every one of these
+ * returns -ENOSYS (-38) today. The numbers are claimed now so nothing else
+ * takes them and ring 3 can compile against them; -38 is distinguishable from
+ * both -EINVAL (a rejected argument) and the dispatcher's default. */
+#define SYS_CLAIM_PCI_DEVICE   111          /* v0.95: (bdf, flags, out*) -> dev_id      */
+#define SYS_RELEASE_PCI_DEVICE 112          /* v0.95: (dev_id) -> 0                     */
+#define SYS_CORE_PIN           113          /* v0.95: (cpu_mask, flags) -> 0            */
+
+/* claim flags. Bits 2-15 are RESERVED and must be zero: a non-zero reserved
+ * bit is refused with -EINVAL rather than ignored, so a future meaning cannot
+ * be silently swallowed by an older kernel. */
+#define CLAIM_EXCLUSIVE        (1u << 0)
+#define CLAIM_DMA              (1u << 1)
+#define PIN_NO_SLICE           (1u << 0)    /* SYS_CORE_PIN: also gate off the slice tick */
 /* v0.93: THE POSIX NUMBERS, CORRECTED. v0.92 defined these as MONOTONIC 0 and
  * REALTIME 1, which is backwards: every C library uses REALTIME 0, MONOTONIC 1,
  * and the SEEK_* comment immediately below states exactly why that matters —
