@@ -175,6 +175,7 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
 #define SYS_CLOCK_NANOSLEEP    107          /* v0.93: (clk, flags, req, rem) -> 0      */
 #define SYS_SETITIMER          108          /* v0.93: (which, new*, old*) -> 0         */
 #define SYS_GETITIMER          109          /* v0.93: (which, cur*) -> 0               */
+#define SYS_GETRUSAGE          110          /* v0.94: (who, orusage*) -> 0             */
 /* v0.93: THE POSIX NUMBERS, CORRECTED. v0.92 defined these as MONOTONIC 0 and
  * REALTIME 1, which is backwards: every C library uses REALTIME 0, MONOTONIC 1,
  * and the SEEK_* comment immediately below states exactly why that matters —
@@ -196,6 +197,17 @@ static inline u64 sysc(u64 num, u64 a0, u64 a1, u64 a2) {
  * about it, and swapping the halves turns "once in 5 ms" into "every 5 ms". */
 #define ITIMER_REAL            0
 #define ITIMER_VIRTUAL         1
+/* v0.94: ITIMER_PROF counts user+system CPU time; ITIMER_VIRTUAL counts user
+ * time alone. Before v0.94 this kernel had no ring 0/3 split and refused PROF
+ * outright rather than aliasing it onto VIRTUAL — an honest -EINVAL being
+ * better than two names for one number. Role 64 tests that they now differ. */
+#define ITIMER_PROF            2
+
+/* v0.94: getrusage's `who`. RUSAGE_CHILDREN is deliberately absent — this
+ * kernel does not accumulate a reaped child's CPU time into its parent, and
+ * the syscall returns -EINVAL rather than a zero nobody measured. */
+#define RUSAGE_SELF            0
+#define RUSAGE_THREAD          1
 
 /* v0.82: the three POSIX whence values, in POSIX's order and with POSIX's
  * numbers. They are not an internal encoding to be chosen freely — a ring-3
@@ -321,6 +333,8 @@ static i64 oeventfd_read(int fd, u64 *out) {
 #define SIGCHLD 17
 /* v0.93: ITIMER_VIRTUAL's signal, at POSIX's number. */
 #define SIGVTALRM 26
+/* v0.94: ITIMER_PROF's signal, likewise. */
+#define SIGPROF 27
 #define NSIG    32
 
 #define PCAP_SMP_ADMIN (1ull << 9)
@@ -1837,6 +1851,20 @@ static i64 osetitimer(u64 which, const u64 *nw, u64 *old) {
 static i64 ogetitimer(u64 which, u64 *cur) {
     return (i64)sysc(SYS_GETITIMER, which, (u64)(void *)cur, 0);
 }
+/* v0.94: getrusage. `ru` is FOUR words — { utime_sec, utime_usec, stime_sec,
+ * stime_usec }, 32 bytes.
+ *
+ * NOT POSIX's struct rusage, and named so nobody casts one to the other.
+ * POSIX's has sixteen members; this kernel can honestly fill two. The other
+ * fourteen would be zeroes that were never counted, and a caller cannot tell
+ * an unmeasured zero from a measured one. */
+static i64 ogetrusage(u64 who, u64 *ru) {
+    return (i64)sysc(SYS_GETRUSAGE, who, (u64)(void *)ru, 0);
+}
+/* The two halves in microseconds, which is the unit every check below works in. */
+static u64 oru_utime_us(const u64 *ru) { return ru[0] * 1000000ull + ru[1]; }
+static u64 oru_stime_us(const u64 *ru) { return ru[2] * 1000000ull + ru[3]; }
+
 /* Convenience: arm a one-shot `us` microseconds out, or disarm with us == 0. */
 static i64 osetitimer_us(u64 which, u64 us) {
     u64 itv[4];
@@ -3940,6 +3968,273 @@ static void role63_clock_probe(void) {
     }
 
     sysc(SYS_EXIT, 1870, 0, 0);
+}
+
+/* ===========================================================================
+ * v0.94 ROLE 64: THE RING 0/3 SPLIT, FROM RING 3
+ * ===========================================================================
+ * Objective 4 gave the kernel separate user and system CPU accounting and gave
+ * ITIMER_PROF a quantity of its own. This is what checks that the split is real
+ * rather than two names for one number.
+ *
+ * THE DISCRIMINATING ASSERTION IS THE POINT OF THIS ROLE. Everything else here
+ * — utime advances, stime advances, the timers fire — passes just as happily on
+ * a kernel where PROF and VIRTUAL are wired to the same counter. Only test 2's
+ * side-by-side arming can tell those apart, and that is why it exists: arm both
+ * for the same amount during a syscall storm, and require PROF to expire more
+ * often than VIRTUAL. If that check is ever weakened, this role stops testing
+ * the objective and starts testing that two constants were added to a header.
+ *
+ * A BOUND, NOT AN EQUALITY, on both ratios. Test 1's compute loop has to read a
+ * clock to have a deadline at all, so its stime can never be zero; an assertion
+ * of `stime == 0` would be measuring the sampling rate rather than the split,
+ * and would fail on a correct kernel. The fractions below are chosen so that
+ * only a working split can satisfy them, which is the actual requirement.
+ *
+ *   1900 ok
+ *   1901 getrusage refused a call that should have worked
+ *   1902 getrusage accepted RUSAGE_CHILDREN, which this kernel cannot answer
+ *   1903 utime + stime disagreed with CLOCK_PROCESS_CPUTIME_ID
+ *   1904 utime did not advance across a ring-3 compute loop
+ *   1905 stime DOMINATED a ring-3 compute loop (the split is not happening)
+ *   1906 setitimer/getitimer refused ITIMER_PROF
+ *   1907 ITIMER_PROF never fired under sustained compute
+ *   1908 ITIMER_PROF fired EARLY
+ *   1909 ITIMER_VIRTUAL never fired under sustained compute
+ *   1910 stime did NOT advance across a syscall storm (nothing is measured)
+ *   1911 stime was a negligible fraction of a syscall storm
+ *   1912 ITIMER_PROF did not expire during a syscall storm
+ *   1913 PROF and VIRTUAL behaved identically — they are the same counter
+ *   1914 a CPU total went BACKWARDS
+ *   1915 the worker's own deadline expired (a SLOW HOST, not a defect)
+ *
+ * 1915 is on its own code deliberately: a budget that expires on a loaded host
+ * must never be decoded as a kernel defect, which is the standing rule for
+ * every deadline in this tree. */
+#define R64_T        6000u          /* ticks; 100 Hz, so 60 s */
+#define R64_SPIN     100000u        /* iterations between clock reads in test 1 */
+
+static volatile u64 g_r64_prof = 0;
+static void r64_on_prof(int s) { (void)s; g_r64_prof++; }
+static volatile u64 g_r64_vtalrm = 0;
+static void r64_on_vtalrm(int s) { (void)s; g_r64_vtalrm++; }
+
+/* Read the split and the total ADJACENTLY, and in this order. getrusage
+ * derives utime from ONE reading of the total, so utime + stime is exact
+ * within that call; the clock is read immediately after so the two windows
+ * overlap as tightly as two syscalls allow. */
+static void r64_sample(u64 *usr, u64 *sys, u64 *tot) {
+    u64 ru[4];
+    if (ogetrusage(RUSAGE_SELF, ru) != 0) sysc(SYS_EXIT, 1901, 0, 0);
+    *usr = oru_utime_us(ru);
+    *sys = oru_stime_us(ru);
+    *tot = oclock_ns(CLOCK_PROCESS_CPUTIME_ID) / 1000ull;
+}
+
+static void role64_cpusplit_probe(void) {
+    u64 t0 = omono_us();                        /* the worker's own deadline base */
+    u64 u0, s0, c0, u1, s1, c1;
+
+    /* ------------------------------------------------------------------ *
+     * (0) The interface answers, and refuses what it cannot answer.
+     * ------------------------------------------------------------------ */
+    {
+        u64 ru[4];
+        if (ogetrusage(RUSAGE_SELF, ru) != 0) sysc(SYS_EXIT, 1901, 0, 0);
+        if (ogetrusage(RUSAGE_THREAD, ru) != 0) sysc(SYS_EXIT, 1901, 0, 0);
+        /* RUSAGE_CHILDREN is -1. This kernel does not accumulate a reaped
+         * child's CPU time into its parent, so answering it with zeroes would
+         * be a measurement nobody made. It must be REFUSED, not answered. */
+        if (ogetrusage((u64)-1, ru) != -22) {
+            print("  [r64] getrusage answered RUSAGE_CHILDREN it cannot measure\n");
+            sysc(SYS_EXIT, 1902, 0, 0);
+        }
+    }
+
+    /* ------------------------------------------------------------------ *
+     * (1) RING-3 COMPUTE. A register-only spin that reads the clock once every
+     * R64_SPIN iterations, so the syscall cost is a small fraction of the
+     * window rather than the window itself. utime must dominate.
+     * ------------------------------------------------------------------ */
+    r64_sample(&u0, &s0, &c0);
+    {
+        u64 w0 = omono_us();
+        u64 acc = 1;
+        while (omono_us() - w0 < 60000ull) {              /* ~60 ms of wall time */
+            /* Genuine ring-3 work between clock reads. `acc` is carried out of
+             * the loop and printed on one branch below, so the compiler cannot
+             * fold it away and leave the loop measuring nothing. */
+            for (u32 i = 0; i < R64_SPIN; i++) acc = acc * 1103515245ull + 12345ull;
+            if (odeadline_expired(t0, (u64)R64_T * 10000ull)) sysc(SYS_EXIT, 1915, 0, 0);
+        }
+        if (!acc) print("");                              /* keeps acc live */
+    }
+    r64_sample(&u1, &s1, &c1);
+    if (c1 < c0 || u1 < u0 || s1 < s0) {
+        print("  [r64] a CPU total went BACKWARDS\n"); sysc(SYS_EXIT, 1914, 0, 0);
+    }
+    {
+        u64 du = u1 - u0, ds = s1 - s0, dc = c1 - c0;
+        print("  [r64] compute 60000 us: utime +"); hex(du);
+        print(" stime +"); hex(ds); print(" total +"); hex(dc); print(" us\n");
+        if (!du) { print("  [r64] utime did not advance while computing\n");
+                   sysc(SYS_EXIT, 1904, 0, 0); }
+        /* A FIFTH, not zero. See the header: the loop must read a clock to have
+         * a deadline, and those reads are real system time. What must not
+         * happen is stime DOMINATING a window that was almost entirely ring 3. */
+        if (dc && ds > dc / 5ull) {
+            print("  [r64] stime dominated a ring-3 compute loop\n");
+            sysc(SYS_EXIT, 1905, 0, 0);
+        }
+        /* THE INVARIANT. utime + stime must equal the process CPU clock, which
+         * holds by construction because utime is derived by subtraction from
+         * the very quantity that clock returns. The slack is one sampling
+         * window — the clock is read one syscall after the split. */
+        u64 sum = u1 + s1;
+        u64 gap = sum > c1 ? sum - c1 : c1 - sum;
+        print("  [r64] utime+stime "); hex(sum); print(" vs cputime clock ");
+        hex(c1); print(" us\n");
+        if (gap > 20000ull) {
+            print("  [r64] utime+stime disagrees with CLOCK_PROCESS_CPUTIME_ID\n");
+            sysc(SYS_EXIT, 1903, 0, 0);
+        }
+    }
+
+    /* Both timers must fire on a compute workload: user time is advancing, and
+     * user+system necessarily is too. This is the check that PROF works at all,
+     * before test 2 asks whether it works DIFFERENTLY. */
+    {
+        if (osigaction(SIGPROF, r64_on_prof) != 0) sysc(SYS_EXIT, 1906, 0, 0);
+        if (osigaction(SIGVTALRM, r64_on_vtalrm) != 0) sysc(SYS_EXIT, 1906, 0, 0);
+        g_r64_prof = 0; g_r64_vtalrm = 0;
+        u64 want_cpu = 30000ull;                          /* 30 ms of CPU */
+
+        u64 ru[4];
+        if (ogetrusage(RUSAGE_SELF, ru) != 0) sysc(SYS_EXIT, 1901, 0, 0);
+        u64 p_base = oru_utime_us(ru) + oru_stime_us(ru);
+        if (osetitimer_us(ITIMER_PROF, want_cpu) != 0) sysc(SYS_EXIT, 1906, 0, 0);
+        if (osetitimer_us(ITIMER_VIRTUAL, want_cpu) != 0) sysc(SYS_EXIT, 1906, 0, 0);
+
+        /* getitimer must report ITIMER_PROF armed, and inside the interval it
+         * was given. Zero would mean the arm silently did nothing. */
+        u64 iv[4];
+        if (ogetitimer(ITIMER_PROF, iv) != 0) sysc(SYS_EXIT, 1906, 0, 0);
+        u64 rem = iv[2] * 1000000ull + iv[3];
+        if (rem == 0 || rem > want_cpu) {
+            print("  [r64] getitimer(ITIMER_PROF) reported "); hex(rem);
+            print(" us of "); hex(want_cpu); print("\n");
+            sysc(SYS_EXIT, 1906, 0, 0);
+        }
+
+        /* Burn CPU until both have fired, bounded by a WALL-CLOCK deadline so a
+         * host that never schedules us reports a slow host and not a defect. */
+        u64 w0 = omono_us();
+        while ((!g_r64_prof || !g_r64_vtalrm) && (omono_us() - w0) < 5000000ull) { }
+        if (ogetrusage(RUSAGE_SELF, ru) != 0) sysc(SYS_EXIT, 1901, 0, 0);
+        u64 p_fire = oru_utime_us(ru) + oru_stime_us(ru);
+        print("  [r64] compute: PROF fired "); hex(g_r64_prof);
+        print(" VIRTUAL fired "); hex(g_r64_vtalrm);
+        print(" after "); hex(p_fire - p_base); print(" us of CPU\n");
+        if (!g_r64_prof) {
+            print("  [r64] ITIMER_PROF never fired under compute\n");
+            sysc(SYS_EXIT, 1907, 0, 0);
+        }
+        if (!g_r64_vtalrm) {
+            print("  [r64] ITIMER_VIRTUAL never fired under compute\n");
+            sysc(SYS_EXIT, 1909, 0, 0);
+        }
+        /* Early is the failure that matters, exactly as for every other timer
+         * in this tree: late means the machine was busy, early means the
+         * arithmetic is wrong. PROF counts the same quantity p_fire measures. */
+        if ((p_fire - p_base) + 1 < want_cpu) {
+            print("  [r64] ITIMER_PROF fired EARLY\n");
+            sysc(SYS_EXIT, 1908, 0, 0);
+        }
+        osetitimer_us(ITIMER_PROF, 0);
+        osetitimer_us(ITIMER_VIRTUAL, 0);
+    }
+
+    if (odeadline_expired(t0, (u64)R64_T * 10000ull)) sysc(SYS_EXIT, 1915, 0, 0);
+
+    /* ------------------------------------------------------------------ *
+     * (2) SYSCALL STORM, and THE DISCRIMINATING CHECK.
+     *
+     * A tight getpid loop: the cheapest syscall in the tree, so the ratio
+     * reflects entry/exit cost rather than one expensive handler. System time
+     * must now be a large fraction of the window — and, critically, PROF must
+     * expire more often than VIRTUAL, because PROF is being fed the syscall
+     * time that VIRTUAL is not.
+     * ------------------------------------------------------------------ */
+    {
+        g_r64_prof = 0; g_r64_vtalrm = 0;
+        u64 want_cpu = 30000ull;                          /* 30 ms */
+        r64_sample(&u0, &s0, &c0);
+        /* An INTERVAL, not a one-shot: the discriminating check counts how many
+         * times each timer reached its deadline, and a one-shot can reach it
+         * only once however lopsided the split is. */
+        u64 itv[4];
+        itv[0] = 0; itv[1] = want_cpu; itv[2] = 0; itv[3] = want_cpu;
+        if (osetitimer(ITIMER_PROF, itv, 0) != 0) sysc(SYS_EXIT, 1906, 0, 0);
+        if (osetitimer(ITIMER_VIRTUAL, itv, 0) != 0) sysc(SYS_EXIT, 1906, 0, 0);
+
+        /* Run for a fixed amount of CPU TOTAL, not a fixed iteration count: at
+         * 1 vCPU and at 4 an iteration budget means completely different
+         * durations, which is the mistake owaitpid_ticks exists to prevent. */
+        u64 storm = 0;
+        for (;;) {
+            c1 = oclock_ns(CLOCK_PROCESS_CPUTIME_ID) / 1000ull;
+            if (c1 - c0 >= 240000ull) break;              /* 8x the armed interval */
+            for (u32 i = 0; i < 64u; i++) { sysc(SYS_GETPID, 0, 0, 0); }
+            storm++;
+            if (odeadline_expired(t0, (u64)R64_T * 10000ull)) sysc(SYS_EXIT, 1915, 0, 0);
+        }
+        r64_sample(&u1, &s1, &c1);
+        if (c1 < c0 || u1 < u0 || s1 < s0) {
+            print("  [r64] a CPU total went BACKWARDS\n"); sysc(SYS_EXIT, 1914, 0, 0);
+        }
+        u64 du = u1 - u0, ds = s1 - s0, dc = c1 - c0;
+        print("  [r64] storm "); hex(storm); print(" rounds: utime +"); hex(du);
+        print(" stime +"); hex(ds); print(" total +"); hex(dc); print(" us\n");
+        print("  [r64] storm timers: PROF fired "); hex(g_r64_prof);
+        print(" VIRTUAL fired "); hex(g_r64_vtalrm); print("\n");
+
+        if (!ds) {
+            print("  [r64] stime did not advance across a syscall storm\n");
+            sysc(SYS_EXIT, 1910, 0, 0);
+        }
+        /* THREE TENTHS. On a build with no split this is 0 and the check fails,
+         * which is the whole point — see the falsifiability note in the design
+         * doc: this assertion must be confirmed to FAIL against a kernel with
+         * sys_charge_close stubbed out before it is believed here. */
+        if (dc && ds < dc * 3ull / 10ull) {
+            print("  [r64] stime was a negligible fraction of a syscall storm\n");
+            sysc(SYS_EXIT, 1911, 0, 0);
+        }
+        if (!g_r64_prof) {
+            print("  [r64] ITIMER_PROF did not expire during a syscall storm\n");
+            sysc(SYS_EXIT, 1912, 0, 0);
+        }
+        /* ---- THE DISCRIMINATING ASSERTION ----------------------------- *
+         * Both were armed with the same 30 ms interval, at the same instant,
+         * and the window ran for 240 ms of CPU total of which a large fraction
+         * was system time. PROF counts that fraction; VIRTUAL does not. So PROF
+         * must reach its deadline strictly more often.
+         *
+         * This is the WEAKEST claim that still discriminates, and that is
+         * deliberate. Asserting `g_r64_vtalrm == 0` would be stronger and
+         * WRONG — the storm accumulates genuine user time too, so a correct
+         * kernel will fire VIRTUAL as well, just fewer times. On a kernel where
+         * both read the same counter they fire in lockstep and this is false,
+         * which is exactly the build this check exists to reject. */
+        if (g_r64_prof <= g_r64_vtalrm) {
+            print("  [r64] PROF and VIRTUAL fired alike — they are one counter\n");
+            sysc(SYS_EXIT, 1913, 0, 0);
+        }
+        osetitimer_us(ITIMER_PROF, 0);
+        osetitimer_us(ITIMER_VIRTUAL, 0);
+    }
+
+    sysc(SYS_EXIT, 1900, 0, 0);
 }
 
 static void role62_ofile_stress(void) {
@@ -6661,6 +6956,7 @@ int main(int argc, const char **argv, const char **envp) {
     if (role >= 56 && role <= 59) { append_smp_worker((u32)(role - 56)); }
     if (role == 60) { meta_worker(); }                 /* v0.85 VFS metadata from ring 3 */
     if (role == 63) { role63_clock_probe(); }          /* v0.92 CLOCK_MONOTONIC + nanosleep from ring 3 */
+    if (role == 64) { role64_cpusplit_probe(); }       /* v0.94 utime/stime split + ITIMER_PROF */
     if (role == 62) { role62_ofile_stress(); }         /* v0.90 g_ofile_lock descriptor contention */
     if (role == 61) { cas_contend_worker(); }          /* v0.89 CAS index/bitmap contention soak */
     if (role == 46) { mmap_stress_worker(); }          /* v0.63 demand paging, mprotect, munmap             */

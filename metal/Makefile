@@ -24,7 +24,7 @@ OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(B
 # outrun-os-0.81.0-dev.iso, so a development image cannot be mistaken for a
 # release artefact by its filename alone. At release time this becomes plain
 # 0.81.0 and KERNEL_VERSION becomes 0.81.0-metal.
-VERSION := 0.93.0
+VERSION := 0.94.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean
@@ -242,6 +242,29 @@ gate-dirty: $(ISO)
 
 gate-dirty-smp: $(ISO)
 	$(MAKE) gate-dirty GATE_DIRTY_QEMU="-smp 4"
+
+# ===========================================================================
+# v0.94: THE PROBE THE GATE CANNOT RUN
+# ===========================================================================
+# gate-matrix.sh boots qemu with `< /dev/null`, deliberately: a gate must not
+# depend on anything being typed. The consequence went unnoticed for two
+# releases — `timebench` is an interactive command, so ring-3 roles 63 and 64
+# are unreachable from `make gate`, and v0.93's release notes carried a
+# "role 63 probe: OK (1870)" line that no target in this tree could produce.
+#
+# That is the same failure CLAUDE.md records for the -smp 4 configurations
+# before v0.78: a result reproducible by exactly one person is a habit, not a
+# gate. This drives the command over a FIFO instead of a terminal, so it needs
+# no tty and no human, and it FAILS unless role 63 exits 1870 and role 64
+# exits 1900. It is not part of `make gate` because it is a different kind of
+# run — one command, typed at the prompt, after the suites are already done.
+#
+#   make probe-timebench                    uniprocessor
+#   make probe-timebench PROBE_QEMU="-smp 4"
+PROBE_QEMU ?=
+.PHONY: probe-timebench
+probe-timebench: $(ISO)
+	tools/probe-timebench.sh "$(ISO)" "$(GATE_LOGS)/probe-timebench-$$$$/timebench.log" $(PROBE_QEMU)
 
 # v0.78: THE FRESH-IMAGE MATRIX, as a target anyone can run.
 #

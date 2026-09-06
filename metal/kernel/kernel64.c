@@ -27,7 +27,7 @@
  * because release-version-check only ever compared the Makefile's VERSION against
  * the git tag. The string the KERNEL prints was never in the comparison. It is
  * now: see release-version-check in metal/Makefile, which greps this line. */
-#define KERNEL_VERSION "0.93.0-metal"
+#define KERNEL_VERSION "0.94.0-metal"
 
 /* ---- Port I/O ------------------------------------------------------------- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -1827,6 +1827,9 @@ static uint64_t create_address_space(void) {
  * same reason every other value here is — a ring-3 program written against a
  * real libc must not have to be recompiled to talk to this kernel. */
 #define SIGVTALRM 26
+/* v0.94: ITIMER_PROF's signal, at POSIX's number. It fits with room to spare —
+ * sig_pending is a uint32_t bitmask over signals 1..31, so 28-31 remain free. */
+#define SIGPROF  27
 #define NSIG    32
 
 /* v0.39: a COMPLETE ring-3 register context. The preempt IPI (vector 50)
@@ -1990,10 +1993,23 @@ struct kproc {
      * itimerval is microseconds, and a 10 ms tick cannot express it. */
     volatile uint64_t it_real_ns;          /* absolute ktime ns; 0 = disarmed         */
     volatile uint64_t it_real_iv_ns;       /* reload interval, 0 = one-shot           */
-    /* ITIMER_VIRTUAL, measured against consumed process CPU time rather than the
-     * wall clock. Absolute, in the same units as cpu_grp_ns below. */
-    volatile uint64_t it_virt_ns;          /* absolute process-CPU ns; 0 = disarmed   */
+    /* ITIMER_VIRTUAL, measured against consumed USER time — ring-3 execution
+     * alone, with the kernel time spent servicing this process's syscalls taken
+     * back out. Absolute, in the same units as proc_utime_ns() below.
+     *
+     * v0.94 CHANGED THE BASIS. Until then it was measured against the process
+     * CPU total, because that was the only quantity this kernel had; POSIX
+     * defines VIRTUAL as user time and PROF as user+system, and answering both
+     * with the same number would have made one of the two a lie. The split
+     * arrived first (cpu_stime_ns below), and this field moved onto it. */
+    volatile uint64_t it_virt_ns;          /* absolute process-USER ns; 0 = disarmed  */
     volatile uint64_t it_virt_iv_ns;       /* reload interval, 0 = one-shot           */
+    /* v0.94: ITIMER_PROF — user + system, i.e. the whole CPU total. This is
+     * exactly the quantity ITIMER_VIRTUAL was measured against before v0.94,
+     * which is the honest way to say that PROF is less new behaviour than the
+     * correct home for behaviour VIRTUAL should never have had. */
+    volatile uint64_t it_prof_ns;          /* absolute process-CPU ns; 0 = disarmed   */
+    volatile uint64_t it_prof_iv_ns;       /* reload interval, 0 = one-shot           */
     /* v0.93: CPU TIME ACCOUNTING. Accumulated in cpu_exec_proc around the ring-3
      * excursion, so the window covers user time plus the kernel time spent
      * servicing this task's syscalls — which is what CLOCK_PROCESS_CPUTIME_ID is
@@ -2027,6 +2043,38 @@ struct kproc {
      * slept time removed the same way the accumulated total does. */
     volatile uint64_t cpu_run_t0;          /* ktime ns at dispatch; 0 = not running   */
     volatile uint64_t cpu_run_excl0;       /* cpu_excl_ns at dispatch                 */
+    /* v0.94: THE RING 0/3 SPLIT. cpu_ns above stays exactly what it is — the
+     * total, utime+stime — because CLOCK_PROCESS_CPUTIME_ID is defined to be
+     * that and nothing here may change it. SYSTEM time is what gets measured,
+     * and USER time is DERIVED as (total - system) by proc_utime_ns().
+     *
+     * Deriving one of the two rather than accumulating both independently is
+     * the whole correctness argument. Two counters filled from two different
+     * brackets drift, and the first symptom is utime+stime disagreeing with
+     * cpu_ns — at which point ITIMER_PROF and CLOCK_PROCESS_CPUTIME_ID answer
+     * different questions about the same process and neither can be trusted.
+     * A derived utime cannot drift from the total it is subtracted from.
+     *
+     * The measurement bracket is syscall_trap, which is the single C funnel
+     * every syscall passes through (boot/usermode.asm has exactly one `call`
+     * into C and it is that one). A syscall does NOT close the ring-3
+     * excursion — syscall_entry sysrets straight back to ring 3 — so this
+     * bracket sits strictly INSIDE the cpu_run_t0 window and its total can
+     * never exceed it. cpu_exec_proc clamps anyway; see there for why. */
+    volatile uint64_t cpu_stime_ns;        /* this task's net kernel time, folded     */
+    volatile uint64_t cpu_grp_stime_ns;    /* group kernel total; kept on the leader  */
+    volatile uint64_t cpu_stime_run;       /* this excursion's kernel ns, not yet folded */
+    /* THE OPEN SYSCALL, published for the same reason cpu_run_t0 is: an
+     * observer on another core (sig_check_alarms) must be able to account for a
+     * syscall that has not returned yet, or a syscall-heavy process would show
+     * all of its time as USER right up until the call happened to return.
+     *
+     * Same subtractive shape as the excursion — elapsed since entry, minus
+     * whatever the task slept inside the call. Without that subtraction a 50 ms
+     * nanosleep would be reported as 50 ms of system time, and stime would grow
+     * at wall-clock rate for a process that was doing nothing at all. */
+    volatile uint64_t sys_enter_ns;        /* ktime at syscall_trap entry; 0 = none   */
+    volatile uint64_t sys_enter_excl0;     /* cpu_excl_ns at that same instant        */
     /* v0.75 DEFECT B, FIXED. ppid_slot is a SLOT INDEX, and slots are recycled.
      * Every reader used to validate it with `kprocs[par].used`, which stays true
      * for a slot whose occupant died and was replaced — so a process could be
@@ -2497,8 +2545,14 @@ static void kproc_reset(struct kproc *p) {
     for (int sg = 0; sg < NSIG; sg++) p->sig_handler[sg] = 0;
     p->sig_pending = 0; p->sig_mask = 0; p->sigframe_sp = 0;
     p->it_real_ns = 0; p->it_real_iv_ns = 0; p->it_virt_ns = 0; p->it_virt_iv_ns = 0;
+    p->it_prof_ns = 0; p->it_prof_iv_ns = 0;                       /* v0.94 */
     p->cpu_ns = 0; p->cpu_grp_ns = 0; p->cpu_excl_ns = 0;
     p->cpu_run_t0 = 0; p->cpu_run_excl0 = 0;
+    /* v0.94: a recycled slot must not inherit the dead task's ring 0/3 split,
+     * and sys_enter_ns above all — a stale non-zero would make sys_ns_inflight
+     * measure from an instant belonging to another process. */
+    p->cpu_stime_ns = 0; p->cpu_grp_stime_ns = 0; p->cpu_stime_run = 0;
+    p->sys_enter_ns = 0; p->sys_enter_excl0 = 0;
     p->ppid_slot = -1; p->ppid_gen = 0; p->pgid = 0;
     /* v0.75: a recycled slot must not inherit the dead task's held ranks — the
      * same lesson thread_create_ex learned for PCBs, one struct over. */
@@ -13834,6 +13888,135 @@ static inline uint64_t cpu_ns_inflight(int p) {
     return el > sl ? el - sl : 0;
 }
 
+/* v0.94: THE LIVE CPU TOTAL — folded, plus the excursion in flight.
+ *
+ * Three sites open-coded this expression before it had a name (the ITIMER scan,
+ * clock_read_ns and setitimer's arming path), and two of them drifted apart:
+ * d319e51 moved the clock onto the live total and left the timer scan on the
+ * accumulated one, so a CPU-bound process — exactly the workload a virtual
+ * timer exists to measure — could run its whole life inside one open excursion
+ * with the timer never reaching its deadline. c536dc0 fixed it. Naming the
+ * expression is what stops the third repetition.
+ *
+ * THE BOUNDS CHECK IS NOT DECORATION. tg_of returns its argument unchanged for
+ * an out-of-range slot, so proc_cpu_ns(-1) indexes kprocs[-1] — and -1 is a
+ * real value here, because current_proc_idx is that when no task is current.
+ * The old open-coded sites had the same hole and got away with it; -Warray-bounds
+ * found it the moment the expression was named and inlined one level deeper.
+ * Every accessor below carries the same guard for the same reason. */
+static inline uint64_t proc_cpu_live(int p) {
+    if ((unsigned)p >= (unsigned)MAX_KPROC) return 0;
+    return proc_cpu_ns(p) + cpu_ns_inflight(p);
+}
+
+/* v0.94: kernel time burned in the syscall the task is inside RIGHT NOW, and
+ * not yet folded. Zero when it is not in one.
+ *
+ * Mirrors cpu_ns_inflight exactly, sleep subtraction included — a syscall that
+ * sleeps is not a syscall that computes, and without the subtraction stime
+ * would advance at wall-clock rate across a nanosleep. */
+static inline uint64_t sys_ns_inflight(int p) {
+    if ((unsigned)p >= (unsigned)MAX_KPROC) return 0;
+    uint64_t t0 = kprocs[p].sys_enter_ns;
+    if (!t0) return 0;
+    uint64_t now = ktime_get_ns();
+    if ((int64_t)(now - t0) <= 0) return 0;        /* raced with entry         */
+    uint64_t el = now - t0;
+    uint64_t sl = kprocs[p].cpu_excl_ns - kprocs[p].sys_enter_excl0;
+    return el > sl ? el - sl : 0;
+}
+
+/* SYSTEM time for the PROCESS p belongs to: the folded group total, plus this
+ * task's unfolded excursion accumulation, plus the syscall open right now.
+ *
+ * As with proc_cpu_ns, the in-flight time of OTHER threads in the group is not
+ * included — reading it would mean sampling counters other cores are actively
+ * writing, and the error is bounded by one scheduling quantum per sibling. */
+static inline uint64_t proc_stime_ns(int p) {
+    if ((unsigned)p >= (unsigned)MAX_KPROC) return 0;
+    return kprocs[tg_of(p)].cpu_grp_stime_ns
+         + kprocs[p].cpu_stime_run + sys_ns_inflight(p);
+}
+
+/* USER time is the REMAINDER, and THE ORDER OF THE TWO READS IS LOAD-BEARING.
+ *
+ * These are two live reads of quantities another core can be advancing, taken
+ * microseconds apart, so their difference is not monotonic by construction.
+ * Reading the TOTAL first and the system time second means the system time can
+ * only have grown relative to the total in between — so this can only
+ * UNDER-state user time, never over-state it.
+ *
+ * An ITIMER_VIRTUAL deadline compared against an under-stated user time fires
+ * LATE. It can never fire EARLY, which is the failure that matters here and the
+ * same discipline this tree already applies to sleeps: an overshoot means the
+ * machine was busy, an early return means the arithmetic was wrong. */
+static inline uint64_t proc_utime_ns(int p) {
+    uint64_t tot = proc_cpu_live(p);
+    uint64_t sys = proc_stime_ns(p);
+    return tot > sys ? tot - sys : 0;
+}
+
+/* The per-THREAD pair, for getrusage(RUSAGE_THREAD). Same shape against this
+ * task's own folded counters rather than the group leader's. */
+static inline uint64_t thread_stime_ns(int p) {
+    if ((unsigned)p >= (unsigned)MAX_KPROC) return 0;
+    return kprocs[p].cpu_stime_ns + kprocs[p].cpu_stime_run + sys_ns_inflight(p);
+}
+static inline uint64_t thread_utime_ns(int p) {
+    if ((unsigned)p >= (unsigned)MAX_KPROC) return 0;
+    uint64_t tot = kprocs[p].cpu_ns + cpu_ns_inflight(p);
+    uint64_t sys = thread_stime_ns(p);
+    return tot > sys ? tot - sys : 0;
+}
+
+/* v0.94: OPEN the system-time bracket. Two plain 64-bit stores.
+ *
+ * No atomic and no barrier, and that is a claim about ownership rather than an
+ * optimisation: these fields are written only by the core currently running
+ * this task, which is what "inside an excursion" means. A concurrent reader
+ * (sig_check_alarms on another core) sees either the old or the new value of
+ * sys_enter_ns and is correct either way — the worst case is that it misses
+ * the first few microseconds of a syscall that had only just begun.
+ *
+ * excl0 is stored BEFORE the timestamp so that a reader which sees the new
+ * sys_enter_ns can never pair it with a baseline belonging to the previous
+ * call; the subtraction in sys_ns_inflight would otherwise go negative and
+ * floor to zero, silently losing the charge. */
+static inline void sys_charge_entry(int p) {
+    if (p < 0 || p >= n_kproc) return;
+    kprocs[p].sys_enter_excl0 = kprocs[p].cpu_excl_ns;
+    kprocs[p].sys_enter_ns    = ktime_get_ns();
+}
+
+/* CLOSE it, and fold what it measured into this excursion's running total.
+ *
+ * IDEMPOTENT BY DESIGN, because the call sites are not one place. syscall_trap
+ * has a normal epilogue, but SYS_EXIT, sigreturn, the three parking calls and a
+ * CPL3 fault all leave without reaching it — so this is also called before each
+ * enter_user_ctx (which abandons the syscall frame but stays in the excursion)
+ * and unconditionally at the excursion boundary in cpu_exec_proc, which every
+ * resume_kernel unwind passes through.
+ *
+ * That last one is the safety net, and it is what makes this design robust
+ * rather than a list of sites somebody must remember to extend: a syscall left
+ * open by a path nobody enumerated is still charged, at the excursion
+ * boundary, to the right task. Missing a site costs a few microseconds of
+ * attribution accuracy. It cannot lose a charge and it cannot corrupt a total.
+ *
+ * sys_enter_ns is cleared FIRST so a concurrent sys_ns_inflight cannot see the
+ * same interval both in flight and folded. */
+static inline void sys_charge_close(int p) {
+    if (p < 0 || p >= n_kproc) return;
+    uint64_t t0 = kprocs[p].sys_enter_ns;
+    if (!t0) return;
+    kprocs[p].sys_enter_ns = 0;
+    uint64_t now = ktime_get_ns();
+    if ((int64_t)(now - t0) <= 0) return;
+    uint64_t el = now - t0;
+    uint64_t sl = kprocs[p].cpu_excl_ns - kprocs[p].sys_enter_excl0;
+    if (el > sl) kprocs[p].cpu_stime_run += el - sl;
+}
+
 /* Advance an expired absolute deadline to the first repeat strictly after `now`.
  * Returns 0 for a one-shot timer, which disarms it.
  *
@@ -13849,7 +14032,8 @@ static inline uint64_t itimer_next(uint64_t dl, uint64_t iv, uint64_t now) {
     return n;
 }
 
-/* Fire SIGALRM / SIGVTALRM for any process whose timer has expired. Called from
+/* Fire SIGALRM / SIGVTALRM / SIGPROF for any process whose timer has expired.
+ * Called from
  * the scheduler boundary (never from the timer ISR itself, so no lock ordering
  * hazard against a process mid-teardown). */
 static void sig_check_alarms(void) {
@@ -13889,15 +14073,43 @@ static void sig_check_alarms(void) {
              *
              * This is the same defect fixed for clock_gettime in d319e51; the
              * timer scan was left on the old basis. Arming (case 108) also uses
-             * the live total, so the two now agree and the timer expires exactly
-             * at the requested amount of CPU rather than never. */
-            uint64_t used = proc_cpu_ns(i) + cpu_ns_inflight(i);
+             * the live figure, so the two agree and the timer expires exactly at
+             * the requested amount rather than never.
+             *
+             * v0.94: USER TIME, NOT THE CPU TOTAL. POSIX defines VIRTUAL as user
+             * time and PROF as user+system; before the ring 0/3 split existed
+             * this kernel had only the total, so VIRTUAL was measured against it
+             * and PROF was refused outright rather than aliased onto a quantity
+             * it does not name. Both now answer their own question. */
+            uint64_t used = proc_utime_ns(i);
             if (kprocs[i].exited || (int64_t)(used - vd) >= 0) {
                 uint64_t nxt = kprocs[i].exited
                              ? 0 : itimer_next(vd, kprocs[i].it_virt_iv_ns, used);
                 if (__sync_bool_compare_and_swap(&kprocs[i].it_virt_ns, vd, nxt)) {
                     if (!nxt) __sync_fetch_and_sub(&g_alarms_armed, 1);
                     if (!kprocs[i].exited) sig_raise(i, SIGVTALRM);
+                }
+            }
+        }
+        /* v0.94: ITIMER_PROF — user + system, i.e. the whole CPU total. Same
+         * shape as VIRTUAL above and leader-only for the same reason: it is a
+         * per-process timer, and testing it on every member of a thread group
+         * would deliver one signal per thread for a single expiry.
+         *
+         * The two differ in exactly one expression — the quantity compared —
+         * and that is the entire point of the objective. A build in which both
+         * read the same thing would pass every test that does not compare the
+         * two against each other, which is why role 64's discriminating check
+         * arms both at once and requires only one of them to fire. */
+        uint64_t pd = kprocs[i].it_prof_ns;
+        if (pd && tg_of(i) == i) {
+            uint64_t used = proc_cpu_live(i);
+            if (kprocs[i].exited || (int64_t)(used - pd) >= 0) {
+                uint64_t nxt = kprocs[i].exited
+                             ? 0 : itimer_next(pd, kprocs[i].it_prof_iv_ns, used);
+                if (__sync_bool_compare_and_swap(&kprocs[i].it_prof_ns, pd, nxt)) {
+                    if (!nxt) __sync_fetch_and_sub(&g_alarms_armed, 1);
+                    if (!kprocs[i].exited) sig_raise(i, SIGPROF);
                 }
             }
         }
@@ -15016,8 +15228,12 @@ static uint64_t clock_read_ns(uint64_t id) {
      * would mean sampling counters other cores are actively writing, and the
      * error is bounded by one scheduling quantum per sibling. Stated because a
      * reader is entitled to know the bound rather than discover it. */
+    /* v0.94: STILL THE TOTAL, deliberately. CLOCK_PROCESS_CPUTIME_ID is defined
+     * as utime+stime and returns a single scalar; the ring 0/3 split has no
+     * place to go in its ABI, and a caller who wants the breakdown asks
+     * getrusage. proc_cpu_live is the same expression this line always was. */
     if (id == CLK_PROCESS_CPUTIME)
-        return proc_cpu_ns((int)current_proc_idx) + cpu_ns_inflight((int)current_proc_idx);
+        return proc_cpu_live((int)current_proc_idx);
     if (id == CLK_THREAD_CPUTIME)
         return kprocs[current_proc_idx].cpu_ns + cpu_ns_inflight((int)current_proc_idx);
     uint64_t ns = ktime_get_ns();
@@ -15575,10 +15791,23 @@ static void cpu_exec_proc(int c, int p) {
          * inside it — see cpu_ns_live(). Ordered before entry, cleared after. */
         kprocs[p].cpu_run_excl0 = slept0;
         kprocs[p].cpu_run_t0    = cpu_t0;
+        /* v0.94: this excursion's system-time accumulator starts empty. A task
+         * cannot carry a residue in from the last excursion — the fold below
+         * always clears it, but a slot recycled mid-flight by any path that did
+         * not is one atomic away from billing a stranger's kernel time. */
+        kprocs[p].cpu_stime_run = 0;
         code = kprocs[p].pstate
              ? enter_user_resume(&kprocs[p].uctx)
              : enter_user_mode(kprocs[p].entry, USTK_INIT);
         kprocs[p].cpu_run_t0 = 0;                  /* excursion closed */
+        /* v0.94: THE CATCH-ALL. Every way out of ring 3 that is not a plain
+         * syscall return — SYS_EXIT, preemption, a futex/join/epoll park, a
+         * CPL3 fault — unwinds through resume_kernel and arrives here with the
+         * syscall bracket still open. Closing it unconditionally is what makes
+         * the accounting robust against a path nobody enumerated, and it is
+         * idempotent, so the common case (already closed in syscall_trap's
+         * epilogue) costs one load and a branch. */
+        sys_charge_close(p);
         uint64_t elapsed = ktime_get_ns() - cpu_t0;
         uint64_t slept   = kprocs[p].cpu_excl_ns - slept0;
         /* Clamped, not trusted to be ordered: `slept` is sampled across a window
@@ -15586,9 +15815,25 @@ static void cpu_exec_proc(int c, int p) {
          * fractionally past the elapsed time it sits inside. A negative CPU-time
          * delta would corrupt a monotonic clock permanently, so it floors at 0. */
         uint64_t net = (elapsed > slept) ? (elapsed - slept) : 0;
+        /* v0.94: the system-time half of the same fold. sn is (elapsed - slept)
+         * over syscall windows nested inside this excursion, so sn <= net holds
+         * by construction — but both are sampled across a window another core
+         * writes into, and a derived utime that could go negative would corrupt
+         * a monotonic quantity permanently. Clamped for the same reason `net`
+         * itself is floored rather than trusted to be ordered. */
+        uint64_t sn = kprocs[p].cpu_stime_run;
+        if (sn > net) sn = net;
+        kprocs[p].cpu_stime_run = 0;
         if (net) {
             __sync_fetch_and_add(&kprocs[p].cpu_ns, net);
             __sync_fetch_and_add(&kprocs[L].cpu_grp_ns, net);
+        }
+        /* One atomic pair per EXCURSION, not per syscall: the hot syscall path
+         * only ever touches the task-local cpu_stime_run, which is exactly the
+         * batching cpu_ns has always used. */
+        if (sn) {
+            __sync_fetch_and_add(&kprocs[p].cpu_stime_ns, sn);
+            __sync_fetch_and_add(&kprocs[L].cpu_grp_stime_ns, sn);
         }
         __sync_fetch_and_sub(&me->excur_depth, 1);
     }
@@ -17838,6 +18083,11 @@ static void sys_sigreturn(struct sysframe *sf) {
         return;
     }
     (void)sf;
+    /* v0.94: this abandons the syscall frame and goes straight back to ring 3
+     * WITHOUT closing the excursion, so syscall_trap's epilogue is unreachable
+     * from here. Close the system-time bracket now; everything after this line
+     * is ring 3 again. */
+    sys_charge_close(slot);
     enter_user_ctx(&u);                                 /* never returns */
 }
 
@@ -17876,6 +18126,11 @@ static void posix_sigcheck_on_return(struct sysframe *sf, uint64_t rv) {
         return;
     }
     if (r != 1) return;                                  /* ignored: fall through to sysret */
+    /* v0.94: same reason as sys_sigreturn — the handler runs in ring 3 and the
+     * syscall epilogue never runs, so the bracket closes here. Note this is the
+     * only path on which a signal HANDLER's own execution is billed: it starts
+     * after this point, so it accrues as USER time, which is what it is. */
+    sys_charge_close(slot);
     enter_user_ctx(&u);                                  /* into the handler; never returns */
 }
 
@@ -21396,12 +21651,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * caller thinks in, and getting it backwards would silently swap
                   * "fire once in 5 ms" with "fire every 5 ms".
                   *
-                  * ITIMER_REAL (0) and ITIMER_VIRTUAL (1) only. ITIMER_PROF (2) is
-                  * rejected rather than aliased onto VIRTUAL: PROF is defined to
-                  * count user+system time and VIRTUAL user time alone, so treating
-                  * them as one would answer a question the caller did not ask. */
+                  * v0.94: ALL THREE are supported. ITIMER_PROF (2) used to be
+                  * rejected rather than aliased onto VIRTUAL, because PROF counts
+                  * user+system and VIRTUAL user alone, and this kernel had no
+                  * ring 0/3 split with which to tell them apart — so answering
+                  * both with the process CPU total would have made one of them a
+                  * lie. Objective 4 built the split; the refusal is now obsolete
+                  * and PROF answers its own question. */
         int p = (int)current_proc_idx;
-        if (a0 != 0 && a0 != 1) return (uint64_t)-22;          /* EINVAL */
+        if (a0 > 2) return (uint64_t)-22;                      /* EINVAL */
         uint64_t cr3 = kprocs[p].cr3;
 
         /* Both timers are absolute deadlines; they differ only in which clock
@@ -21411,17 +21669,27 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         uint64_t now;
         if (a0 == 0) { dlp = &kprocs[p].it_real_ns; ivp = &kprocs[p].it_real_iv_ns;
                        now = ktime_get_ns(); }
-        /* VIRTUAL arms against the LIVE cpu total — accumulated plus the
-         * excursion in flight — while sig_check_alarms compares the accumulated
-         * total alone. That asymmetry is deliberate and it errs in the safe
-         * direction: the target is set from the larger number, so the timer can
-         * only fire LATE (by at most one excursion), never early. Arming from
-         * the accumulated total would let the in-flight time land the instant
-         * the excursion closes and consume part of the interval the caller had
-         * just asked for. Early is the failure that matters here, exactly as it
-         * is for a sleep. */
-        else         { dlp = &kprocs[p].it_virt_ns; ivp = &kprocs[p].it_virt_iv_ns;
-                       now = proc_cpu_ns(p) + cpu_ns_inflight(p); }
+        /* VIRTUAL arms against LIVE USER TIME, and sig_check_alarms compares
+         * against the same expression — proc_utime_ns — so the two cannot drift
+         * apart. THAT SYMMETRY IS THE CORRECTION, and it is recent: the comment
+         * here used to claim the scan compared "the accumulated total alone",
+         * which stopped being true in c536dc0 when the scan moved onto the live
+         * figure. A timer armed from one basis and tested against another either
+         * consumes part of the interval the caller asked for, or never expires
+         * at all; both were observed before the two were made to agree.
+         *
+         * Early remains the failure that matters, exactly as for a sleep, and
+         * proc_utime_ns is built to fail in the safe direction — see the
+         * read-ordering argument there.
+         *
+         * v0.94: this arms against USER time where it used to arm against the
+         * CPU total. ITIMER_PROF, below, inherits the old basis, which is the
+         * quantity it is actually defined to count. */
+        else if (a0 == 1) { dlp = &kprocs[p].it_virt_ns; ivp = &kprocs[p].it_virt_iv_ns;
+                            now = proc_utime_ns(p); }
+        /* PROF: user + system, i.e. the whole CPU total. */
+        else              { dlp = &kprocs[p].it_prof_ns; ivp = &kprocs[p].it_prof_iv_ns;
+                            now = proc_cpu_live(p); }
 
         if (num == 109) {
             if (!access_ok(cr3, a1, 32, 1)) return (uint64_t)-14;   /* EFAULT */
@@ -21465,6 +21733,49 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             o[0] = old_iv  / 1000000000ull; o[1] = (old_iv  % 1000000000ull) / 1000ull;
             o[2] = old_rem / 1000000000ull; o[3] = (old_rem % 1000000000ull) / 1000ull;
         }
+        return 0;
+    }
+    case 110: {  /* v0.94: SYS_GETRUSAGE(who, struct orusage *out) -> 0, or -errno.
+                  *
+                  * NOT POSIX'S struct rusage, AND NOT NAMED LIKE IT. POSIX's has
+                  * sixteen members; this kernel can honestly fill two of them.
+                  * Emitting the full layout with fourteen zeroes would hand a
+                  * caller ru_maxrss = 0 and ru_nvcsw = 0 as though they had been
+                  * counted, and a zero that was never measured is the exact
+                  * failure mode this tree keeps a whole section of CLAUDE.md
+                  * about. A smaller struct that is entirely real is worth more
+                  * than a familiar one that is mostly fiction, and the different
+                  * name is what stops someone casting one to the other.
+                  *
+                  *   struct orusage { u64 utime_sec, utime_usec,
+                  *                    u64 stime_sec, stime_usec; };   32 bytes
+                  *
+                  * who: 0 = RUSAGE_SELF (the whole thread group),
+                  *      1 = RUSAGE_THREAD (this task alone). */
+        int p = (int)current_proc_idx;
+        /* RUSAGE_CHILDREN (-1) IS REFUSED, not answered with zeroes. This kernel
+         * does not accumulate a reaped child's CPU time into its parent, so a
+         * well-formed zero would be a measurement nobody made — and a caller
+         * cannot tell that apart from a parent whose children really used no
+         * CPU. EINVAL says "this kernel does not know", which is true. */
+        if (a0 != 0 && a0 != 1) return (uint64_t)-22;          /* EINVAL */
+        if (!access_ok(kprocs[p].cr3, a1, 32, 1)) return (uint64_t)-14;  /* EFAULT */
+        /* ONE READ OF THE TOTAL, then the system half subtracted from THAT.
+         *
+         * proc_utime_ns would re-read the total independently, and the two
+         * readings are of a live quantity taken microseconds apart — so
+         * utime + stime would land near, but not exactly on, what
+         * CLOCK_PROCESS_CPUTIME_ID returns. The invariant is worth more than
+         * the shared helper: role 64 checks it, and a caller comparing the two
+         * interfaces is entitled to find them consistent. */
+        uint64_t tot = (a0 == 0) ? proc_cpu_live(p)
+                                 : kprocs[p].cpu_ns + cpu_ns_inflight(p);
+        uint64_t sys = (a0 == 0) ? proc_stime_ns(p) : thread_stime_ns(p);
+        if (sys > tot) sys = tot;                  /* see cpu_exec_proc's clamp */
+        uint64_t usr = tot - sys;
+        uint64_t *o = (uint64_t *)a1;
+        o[0] = usr / 1000000000ull; o[1] = (usr % 1000000000ull) / 1000ull;
+        o[2] = sys / 1000000000ull; o[3] = (sys % 1000000000ull) / 1000ull;
         return 0;
     }
     case 107: {  /* SYS_CLOCK_NANOSLEEP(clockid, flags, req) -> 0, or negative
@@ -21595,6 +21906,13 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
 uint64_t syscall_trap(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
                       struct sysframe *sf) {
     uint64_t r;
+    /* v0.94: OPEN THE SYSTEM-TIME BRACKET. This function is the single C funnel
+     * every syscall passes through — boot/usermode.asm has exactly one `call`
+     * into C and it is this one — which makes it the only place where "the
+     * kernel, running on this task's behalf, at this task's request" is
+     * unambiguous. Two plain stores; see sys_charge_entry for why no atomic. */
+    int sp_ = (int)current_proc_idx;
+    sys_charge_entry(sp_);
     if (num == 47) r = sys_fork(sf, a0);
     else if (num == 51) { sys_sigreturn(sf); r = 0; }   /* never returns */
     /* v0.61: the blocking pair. They live here rather than in syscall_dispatch
@@ -21618,6 +21936,12 @@ uint64_t syscall_trap(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
     }
     else r = syscall_dispatch(num, a0, a1, a2);
     posix_sigcheck_on_return(sf, r);                     /* may never return */
+    /* CLOSE IT. Re-read current_proc_idx rather than reusing sp_: SYS_FORK and
+     * SYS_EXECVE both reassign it while they run, and billing a fork's kernel
+     * time to whichever task the index happened to name on entry is exactly the
+     * mistake ksleep_charge_to was corrected for in v0.93. Whichever task is
+     * about to sysret is the one that has been running. */
+    sys_charge_close((int)current_proc_idx);
     return r;
 }
 
@@ -23696,6 +24020,71 @@ static void cmd_timebench(void) {
                                 : c == 1891 ? "ITIMER_VIRTUAL FIRED EARLY"
                                             : "undecoded exit code";
                 kprintf("[timebench] ring-3 clock probe: %s (exit %u)%s\n",
+                        why, (uint64_t)c, ok ? "" : " — WATCHDOG, it never finished");
+            }
+        }
+    }
+    /* (8) v0.94 Objective 4: the RING 0/3 SPLIT, as ring 3 sees it. Role 63
+     * above proved the CPU clocks count CPU rather than wall time; this proves
+     * that the CPU total is separable into the part burned in ring 3 and the
+     * part burned in the kernel on this process's behalf, and that ITIMER_PROF
+     * and ITIMER_VIRTUAL really are measured against different quantities.
+     * See role64_cpusplit_probe. */
+    {
+        int save = (int)current_proc_idx;
+        int p = kproc_spawn("cpusplit", PCAP_FILESYSTEM);
+        if (p < 0) { kputs("[timebench] could not spawn the ring-3 cpu-split probe\n"); }
+        else {
+            kprocs[p].role = 64;
+            kprocs[p].affinity = 0;
+            uint64_t e = elf_load(p, g_user_elf, g_user_elf_end - g_user_elf);
+            current_proc_idx = save;
+            if (!e) kputs("[timebench] ring-3 cpu-split probe: ELF load failed\n");
+            else {
+                kprocs[p].entry = e;
+                rq_push_any(0, p);
+                __sync_synchronize();
+                if (g_ncpu_online > 1) lapic_ipi(0, IPI_PING, 1);
+                int ok = role_drain(64, 9000, "cpusplit");
+                current_proc_idx = save;
+                /* THE COUNTERS THE CLAIM RESTS ON, PRINTED. A stime of ~0 beside
+                 * a large cpu_ns is the signature of the bracket never closing;
+                 * a stime equal to cpu_ns is the signature of it never opening.
+                 * Neither is visible from the exit code alone, and a counter
+                 * nothing prints is not instrumentation. */
+                uint64_t tot = kprocs[p].cpu_grp_ns, sys = kprocs[p].cpu_grp_stime_ns;
+                kprintf("[timebench] r64 accounting: cpu_ns=%u grp=%u stime=%u "
+                        "utime=%u excl=%u (us)\n",
+                        kprocs[p].cpu_ns / 1000ull, tot / 1000ull, sys / 1000ull,
+                        (tot > sys ? tot - sys : 0) / 1000ull,
+                        kprocs[p].cpu_excl_ns / 1000ull);
+                /* DETECTIONS, separately from failures. A suite that asserts
+                 * only "no failure" is green on a workload that never armed a
+                 * timer at all; a non-zero armed gate here is what shows the
+                 * boot reached the code. */
+                kprintf("[timebench] r64 timers: it_prof=%u it_virt=%u  "
+                        "armed_gate=%d  pending=%x\n",
+                        kprocs[p].it_prof_ns / 1000ull, kprocs[p].it_virt_ns / 1000ull,
+                        (uint64_t)(int64_t)g_alarms_armed, (uint64_t)kprocs[p].sig_pending);
+                int c = kprocs[p].exit_code;
+                const char *why = c == 1900 ? "OK"
+                                : c == 1901 ? "getrusage refused a valid call"
+                                : c == 1902 ? "getrusage ANSWERED RUSAGE_CHILDREN it cannot measure"
+                                : c == 1903 ? "utime+stime DISAGREES with CLOCK_PROCESS_CPUTIME_ID"
+                                : c == 1904 ? "utime did not advance while computing"
+                                : c == 1905 ? "stime DOMINATED a ring-3 compute loop"
+                                : c == 1906 ? "setitimer/getitimer refused ITIMER_PROF"
+                                : c == 1907 ? "ITIMER_PROF NEVER FIRED under compute"
+                                : c == 1908 ? "ITIMER_PROF FIRED EARLY"
+                                : c == 1909 ? "ITIMER_VIRTUAL never fired under compute"
+                                : c == 1910 ? "stime DID NOT ADVANCE across a syscall storm"
+                                : c == 1911 ? "stime was a negligible fraction of a syscall storm"
+                                : c == 1912 ? "ITIMER_PROF did not expire during a syscall storm"
+                                : c == 1913 ? "PROF AND VIRTUAL ARE THE SAME COUNTER"
+                                : c == 1914 ? "a CPU total went BACKWARDS"
+                                : c == 1915 ? "the probe's own deadline expired — SLOW HOST, not a defect"
+                                            : "undecoded exit code";
+                kprintf("[timebench] ring-3 cpu-split probe: %s (exit %u)%s\n",
                         why, (uint64_t)c, ok ? "" : " — WATCHDOG, it never finished");
             }
         }
@@ -27054,8 +27443,15 @@ static const char SDK_SIGNAL_H[] =
 "#define SIGALRM 14\n"
 "#define SIGTERM 15\n"
 "#define SIGVTALRM 26\n"
+"#define SIGPROF 27\n"
 "#define ITIMER_REAL 0\n"
 "#define ITIMER_VIRTUAL 1\n"
+"/* v0.94: ITIMER_PROF counts user+system time; ITIMER_VIRTUAL counts user\n"
+" * time alone. They are different numbers on a syscall-heavy program, and the\n"
+" * kernel really does measure them apart — syscall 110 returns the two halves\n"
+" * as { utime_sec, utime_usec, stime_sec, stime_usec }. There is no header for\n"
+" * it here because occ cannot yet declare a struct this SDK does not define. */\n"
+"#define ITIMER_PROF 2\n"
 "int kill(int pid, int sig);\n"
 "#endif\n";
 
