@@ -93,16 +93,38 @@ boot_error:                          ; print "ERR: <code>" via VGA and halt
     hlt
     jmp $
 
-; ---- Paging: identity-map first 1 GiB with 2 MiB pages -------------------------
+; ---- Paging: identity-map first 4 GiB with 2 MiB pages -------------------------
+; v1.1: 1 GiB -> 4 GiB. Found by the first `-m 4G` boot this tree ever
+; attempted: QEMU places the ACPI tables (RSDT, FADT, DMAR, MADT) just below
+; the 3 GiB PCI hole, at 0xBFFE0000 on a 4 GiB guest, and acpi_find_table
+; dereferences them BEFORE the kernel's physmap exists. With a 1 GiB identity
+; map that is a not-present #PF in kernel_main, on an unmodified v1.0 kernel
+; -- the negative control panicked identically. Four PDs, one per GiB, cover
+; every place firmware can put a table on a machine with <= 4 GiB, and the
+; physmap (kernel/mm.c) takes over for everything above. The kernel's
+; IDENT_MAP_LIMIT still says 1 GiB and still bounds the frame POOL; only the
+; range that is addressable changed, not the range that is allocatable.
 setup_page_tables:
     mov eax, pdpt
     or  eax, 0b11                    ; present | writable
     mov [pml4], eax
 
-    mov eax, pd
+    ; pdpt[0..3] -> pd0..pd3 (the four PDs are contiguous in .bss)
+    xor ecx, ecx
+.map_pdpt:
+    mov eax, 4096
+    mul ecx
+    add eax, pd
     or  eax, 0b11
-    mov [pdpt], eax
+    mov [pdpt + ecx * 8], eax
+    inc ecx
+    cmp ecx, 4
+    jne .map_pdpt
 
+    ; 4 * 512 = 2048 entries of 2 MiB = 4 GiB. Entry i maps phys i * 2 MiB;
+    ; the high dword of a 2 MiB leaf is nonzero from 4 GiB up, which we never
+    ; reach, so the 32-bit write to the low dword is exact here and the .bss
+    ; zero above it is the correct high dword.
     xor ecx, ecx
 .map_pd:
     mov eax, 0x200000                ; 2 MiB
@@ -110,7 +132,7 @@ setup_page_tables:
     or  eax, 0b10000011              ; present | writable | huge
     mov [pd + ecx * 8], eax
     inc ecx
-    cmp ecx, 512
+    cmp ecx, 2048
     jne .map_pd
     ret
 
@@ -157,7 +179,7 @@ section .bss
 align 4096
 pml4:   resb 4096
 pdpt:   resb 4096
-pd:     resb 4096
+pd:     resb 4096 * 4                ; v1.1: four PDs -> 4 GiB identity map
 stack_bottom:
         resb 64 * 1024               ; 64 KiB kernel stack
 stack_top:

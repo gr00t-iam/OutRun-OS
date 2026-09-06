@@ -261,6 +261,21 @@ struct tss64;                                /* fwd: per-CPU task state seg   */
  * sizing bug, and silently discarding a runnable task is the more serious one —
  * see rq_push_any below, which is now what every enqueue path uses. */
 #define RQ_LEN   32                          /* v0.39: per-CPU run queue slots */
+/* v1.1: LOCK-RANK STACK DEPTH, named rather than spelled `8` in five places.
+ *
+ * Raised 8 -> 16 by the rank shift. Phase 2's block layer can legitimately hold
+ * files(3) -> vfs(4) -> cas(5) -> vblk(6) -> blk(16) while a completion runs
+ * above it, and a rank stack that overflows stops RECORDING slots — klock's
+ * push declines to record past the ceiling (rank_spp = 0) and release pops
+ * nothing. The depth then under-reports, and later violations are hidden
+ * rather than reported. An overflowed rank stack is a silent loss of the very
+ * checking it exists to provide, so the ceiling has to lead the ranks that
+ * will use it, not trail them.
+ *
+ * Every site that walks or bounds a rank stack uses this. Before v1.1 the
+ * literal 8 appeared in five places across three structs; a raise that missed
+ * one would have been a buffer overrun in the two that index it. */
+#define KLOCK_RANK_DEPTH 16
 struct cpu_local {
     uint32_t idx;                            /* %gs:0   MUST stay offset 0    */
     uint32_t apic_id;                        /* %gs:4                         */
@@ -306,7 +321,7 @@ struct cpu_local {
     volatile uint32_t slice_count;           /* v0.40: contexts sliced out by MY timer */
     /* v0.41: cross-core reentrancy witnesses + lock-rank discipline.          */
     volatile uint32_t fs_ops;                /* file syscalls dispatched ON this CPU */
-    uint8_t  rank_stack[8];                  /* klock ranks held by the context      */
+    uint8_t  rank_stack[KLOCK_RANK_DEPTH];                  /* klock ranks held by the context      */
     uint8_t  rank_sp;                        /* running on this CPU (APs only; the   */
     volatile int dbg_was_idle;               /* v0.43: DEBUG_SMP_SCHED idle-edge latch */
     /* v0.79: WHERE IS THIS CORE? A one-word breadcrumb, updated at the handful
@@ -344,6 +359,22 @@ _Static_assert(__builtin_offsetof(struct cpu_local, krsp) == CPUL_KRSP,
                "asm contract: resume context at %gs:24..72");
 _Static_assert(__builtin_offsetof(struct cpu_local, canary) == CPUL_CANARY,
                "compiler contract: stack guard at %gs:80");
+/* v1.1: WHY RAISING rank_stack[] DID NOT MOVE THE CANARY, asserted rather than
+ * argued. The v1.1 plan predicted that growing the rank stack would shift every
+ * trailing field and force CPUL_CANARY off %gs:80. It does not, and the reason
+ * is a layout decision made earlier: `canary` sits at offset 80, near the TOP
+ * of this struct, while rank_stack[] sits ~40 fields BELOW it. Growing a field
+ * that follows the last pinned offset moves nothing that any contract names.
+ *
+ * That is a property of the current field ORDER, not a law, and the four
+ * asserts above only fire if a pinned offset moves. So this one states the
+ * ordering invariant itself: any future edit that moves rank_stack[] above the
+ * canary breaks the compiler's -mstack-protector-guard-offset contract, and the
+ * failure mode is a stack-guard read of an unrelated field — silent, and
+ * catastrophic on every core at once. Fail the build instead. */
+_Static_assert(__builtin_offsetof(struct cpu_local, rank_stack) > CPUL_CANARY,
+               "layout: rank_stack must stay BELOW the %gs:80 canary, or growing "
+               "it shifts the compiler's stack-guard offset");
 static struct cpu_local g_cpu[MAX_CPUS];
 static volatile int g_gs_ready;              /* set once per-CPU GS bases are armed */
 /* v0.75: BSP thread switches taken while this core was inside a ring-3
@@ -794,6 +825,7 @@ static uint8_t  g_fb_bpp = 0;
 
 static uint64_t g_rsdp = 0;          /* ACPI Root System Description Pointer   */
 static int      g_rsdp_rev = 0;      /* 1 = ACPI 1.0 (RSDT), 2 = ACPI 2.0+     */
+static void mm_note_usable(uint64_t base, uint64_t len);   /* fwd: kernel/mm.c */
 static void multiboot_scan(uint64_t info_addr, bool print) {
     uint8_t *p   = (uint8_t *)info_addr;
     uint32_t total = *(uint32_t *)p;
@@ -839,7 +871,7 @@ static void multiboot_scan(uint64_t info_addr, bool print) {
                 if (print)
                     kprintf("           %X + %X  %s\n", m->base, m->len,
                             m->type == 1 ? "USABLE RAM" : "reserved");
-                if (m->type == 1) g_total_ram += m->len;
+                if (m->type == 1) { g_total_ram += m->len; mm_note_usable(m->base, m->len); }
                 e += esize;
             }
             if (print) kprintf("           total usable: %M MiB\n", g_total_ram);
@@ -1085,7 +1117,17 @@ static inline int frame_in_pool(uint64_t pa) {
  * demo-device double-free documented on page_free_tree below. Sized for a
  * 256 MiB pool — comfortably more than this kernel's observed pool usage. */
 #define FRAME_DBG_MAX ((256ull * 1024 * 1024) / 0x1000)
-static uint8_t g_frame_dbg_isfree[FRAME_DBG_MAX];
+/* v1.1: the shadow bit and the refcount both now live in struct page (see
+ * kernel/mm.c), which is defined after this point in the TU. These four
+ * accessors are the whole seam: everything below keeps calling them with the
+ * same arguments and the same meaning, and the storage moved out from under
+ * them. Before mm_init has built g_mem_map they degrade to the legacy arrays'
+ * exact behaviour on a zero-initialised map — no double-free is detectable and
+ * every frame reads sole-owner — which is what the old arrays did too. */
+static inline int      frame_shadow_get(uint64_t idx);
+static inline void     frame_shadow_set(uint64_t idx, int v);
+static inline uint16_t frame_refc_get(uint64_t idx);
+static inline void     frame_refc_add(uint64_t idx, int delta);
 
 /* ===========================================================================
  * v0.63: PHYSICAL FRAME REFERENCE COUNTS
@@ -1110,7 +1152,7 @@ static uint8_t g_frame_dbg_isfree[FRAME_DBG_MAX];
  * loudly rather than silently: a refcount bug that frees a still-shared frame
  * halts the machine at the second free with the offending address, instead of
  * handing live memory to a second owner. */
-static uint16_t g_frame_ref[FRAME_DBG_MAX];
+/* v1.1: g_frame_ref[] is gone; frame_refc_* resolve to struct page::refcount. */
 static volatile uint64_t g_frames_shared = 0;    /* share operations, lifetime */
 static volatile uint64_t g_frames_cow_copied = 0;/* COW faults that duplicated */
 
@@ -1130,7 +1172,7 @@ static int frame_share(uint64_t pa) {
     int64_t i = frame_ref_idx(pa);
     if (i < 0 || !frame_in_pool(pa)) return 0;
     frame_lock();
-    g_frame_ref[i]++;
+    frame_refc_add((uint64_t)i, +1);
     frame_unlock();
     __sync_fetch_and_add(&g_frames_shared, 1);
     return 1;
@@ -1142,7 +1184,7 @@ static int frame_share(uint64_t pa) {
 static uint16_t frame_refs(uint64_t pa) {
     int64_t i = frame_ref_idx(pa);
     if (i < 0) return 0;
-    return g_frame_ref[i];
+    return frame_refc_get((uint64_t)i);
 }
 
 /* Return one 4 KiB frame to the pool. Returns 1 if it was actually reclaimed,
@@ -1158,7 +1200,7 @@ static int free_frame(uint64_t pa) {
         int64_t ri = frame_ref_idx(pa);
         if (ri >= 0) {
             frame_lock();
-            if (g_frame_ref[ri]) { g_frame_ref[ri]--; frame_unlock(); return 0; }
+            if (frame_refc_get((uint64_t)ri)) { frame_refc_add((uint64_t)ri, -1); frame_unlock(); return 0; }
             frame_unlock();
         }
     }
@@ -1176,13 +1218,13 @@ static int free_frame(uint64_t pa) {
     }
     uint64_t dbgidx = (pa - FRAME_POOL_BASE) / 0x1000;
     if (dbgidx < FRAME_DBG_MAX) {
-        if (g_frame_dbg_isfree[dbgidx]) {
+        if (frame_shadow_get(dbgidx)) {
             frame_unlock();
             kprintf("\n[frame  ] TRUE DOUBLE-FREE (shadow bit): pa=%X was ALREADY marked free"
                     " -- halting\n", pa);
             for (;;) __asm__ volatile("cli; hlt");
         }
-        g_frame_dbg_isfree[dbgidx] = 1;
+        frame_shadow_set(dbgidx, 1);
     }
     *(volatile uint64_t *)pa = g_frame_freelist;   /* thread the next-ptr through the frame */
     g_frame_freelist = pa;
@@ -1213,7 +1255,7 @@ static uint64_t alloc_frame(void) {
         g_frame_free_depth--;
         g_frames_reused++;
         { uint64_t dbgidx = (pa - FRAME_POOL_BASE) / 0x1000;   /* TEMPORARY DIAGNOSTIC */
-          if (dbgidx < FRAME_DBG_MAX) g_frame_dbg_isfree[dbgidx] = 0; }
+          if (dbgidx < FRAME_DBG_MAX) frame_shadow_set(dbgidx, 0); }
         frame_unlock();
         uint64_t *p = (uint64_t *)pa;                  /* zero on the way out, like the bump path */
         for (int i = 0; i < 512; i++) p[i] = 0;
@@ -1230,6 +1272,10 @@ static uint64_t alloc_frame_limited(void) {
     if (g_alloc_limit && g_next_frame >= g_alloc_limit) return 0;
     return alloc_frame();
 }
+
+/* v1.1: struct page, zones, buddy allocator, physmap. A fragment of this TU,
+ * not a separate object — the kernel is one translation unit by convention. */
+#include "mm.c"
 
 /* ---- 4-level map: install one 4 KiB PTE, creating tables as needed --------- */
 static int map_page(uint64_t pml4_phys, uint64_t vaddr, uint64_t paddr, uint64_t flags) {
@@ -1714,6 +1760,19 @@ static void harden_kernel_wx(void) {
             pd[hp] |= PTE_NX;                               /* data huge page RW+NX */
         }
     }
+    /* v1.1: boot.asm now identity-maps 4 GiB (four PDs under PDPT[0..3]), not
+     * one. The loop above hardens GiB 0, where the kernel lives; GiBs 1..3 hold
+     * no code and get NX on every present huge leaf. Caught by the parallel
+     * page-table audit on the first `-m 4G` boot — 1536 W+X violations, three
+     * GiB of exactly 512 — which is the audit doing precisely what it was built
+     * to do. A harden pass that only knew about one GiB was correct for as
+     * long as boot.asm mapped one GiB, and not one commit longer. */
+    for (int g = 1; g < 512; g++) {
+        if (!(pdpt[g] & PTE_PRESENT) || (pdpt[g] & PTE_HUGE)) continue;
+        uint64_t *pdg = (uint64_t *)(pdpt[g] & ADDR_MASK);
+        for (int hp = 0; hp < 512; hp++)
+            if ((pdg[hp] & PTE_PRESENT) && (pdg[hp] & PTE_HUGE)) pdg[hp] |= PTE_NX;
+    }
     write_cr3(kernel_cr3);                                  /* flush the whole TLB  */
     __asm__ volatile("sti");
 }
@@ -1841,6 +1900,16 @@ static uint64_t create_address_space(void) {
     uint64_t *kp = (uint64_t *)(kernel_cr3 & ADDR_MASK);
     np[0]    = kp[0];      /* low 1 GiB identity: kernel code/stack/data/IDT     */
     np[0xC0] = kp[0xC0];   /* kernel-global device MMIO window (0x600000000000)  */
+    /* v1.1: the physmap (kernel/mm.c) is kernel-global state exactly as the
+     * MMIO window is, and for the same reason: the kernel runs in every
+     * process's address space, and g_mem_map lives behind PHYSMAP_BASE. Found
+     * on the first `-m 4G` boot — alloc_frame(), called from a syscall with a
+     * process CR3 loaded, touched struct page through the physmap and took a
+     * not-present #PF at ffff888001xxxxxx. This entry is supervisor-only and
+     * NX at every level below, so aliasing it grants ring 3 nothing. It is
+     * copied by INDEX, like the two above, so it cannot drift if the constant
+     * moves. */
+    np[PHYSMAP_PML4_IDX] = kp[PHYSMAP_PML4_IDX];
     return p;
 }
 
@@ -2260,7 +2329,7 @@ struct kproc {
      *
      * Resolved through tg_of() so a thread answers with its process's stack, the
      * same rule every other identity in this kernel follows since defect C. */
-    uint8_t  rank_stack[8];
+    uint8_t  rank_stack[KLOCK_RANK_DEPTH];
     uint8_t  rank_sp;
 };
 #define MAX_KPROC 64                  /* v0.41: +6 cio workers; v0.43: +10 smp_stress workers */
@@ -2606,7 +2675,7 @@ static void kproc_reset(struct kproc *p) {
     /* v0.75: a recycled slot must not inherit the dead task's held ranks — the
      * same lesson thread_create_ex learned for PCBs, one struct over. */
     p->rank_sp = 0;
-    for (int rr = 0; rr < 8; rr++) p->rank_stack[rr] = 0;
+    for (int rr = 0; rr < KLOCK_RANK_DEPTH; rr++) p->rank_stack[rr] = 0;
     /* v0.75 defect B: this slot is about to hold a DIFFERENT process, so anyone
      * still pointing at it as a parent must stop resolving. Incremented, never
      * blanked — the counter's value is the whole point, and a memset here would
@@ -3300,7 +3369,7 @@ struct pcb {
     /* v0.41: klock ranks THIS THREAD holds. Per-thread on the BSP because a
      * lock holder can park (vblk wait) and another BSP thread runs meanwhile
      * — a per-CPU stack would see the parked holder's ranks as its own.      */
-    uint8_t  rank_stack[8];
+    uint8_t  rank_stack[KLOCK_RANK_DEPTH];
     uint8_t  rank_sp;
     /* v0.75: THIS THREAD's ring-3 kernel resume point. See sched_switch_to for
      * why it cannot stay per-CPU: the identical argument as rank_stack above,
@@ -3460,7 +3529,7 @@ static int thread_create_ex(const char *name, void (*entry)(void *), void *arg,
          * would be enough for correctness, but a stale rank sitting above sp is
          * exactly what makes a future off-by-one unreadable in a log. */
         t->rank_sp = 0;
-        for (int r = 0; r < 8; r++) t->rank_stack[r] = 0;
+        for (int r = 0; r < KLOCK_RANK_DEPTH; r++) t->rank_stack[r] = 0;
         uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
         t->canary = ((((uint64_t)hi << 32) | lo) * 0x9E3779B97F4A7C15ull)
                     ^ (0xC0FFEE0000ull + (uint64_t)i * 0x100000001B3ull);   /* per-thread entropy */
@@ -3642,11 +3711,11 @@ struct klock {
  * silent fill, and so the next appended field has an obvious place to go.
  * ORDER MATTERS: it must come before KLOCK_DBG_INIT, matching field order. */
 #define KLOCK_RW_INIT , 0, 0
-static struct klock g_ofile_lock = { 0, "ofile", 1, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
-static struct klock g_vfs_lock   = { 0, "vfs",   2, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
-static struct klock g_cas_lock   = { 0, "cas",   3, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
-static struct klock g_vblk_lock  = { 0, "vblk",  4, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
-static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_ofile_lock = { 0, "ofile", 3, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_vfs_lock   = { 0, "vfs",   4, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_cas_lock   = { 0, "cas",   5, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_vblk_lock  = { 0, "vblk",  6, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_surf_lock  = { 0, "surf",  7, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 /* v0.66. Rank 12: ABOVE every lock this ever needs, because it is never held
  * across one. Filling a page reads the VFS and flushing one writes it, and
  * both happen with this released — collect under the lock, do the I/O outside
@@ -3676,8 +3745,61 @@ static struct klock g_surf_lock  = { 0, "surf",  5, 0, 0, 0, 0, 0 KLOCK_RW_INIT 
  * NOT held across iommu_invalidate_all() (hardware registers, slow) or across
  * any access to user memory — a fault taken under a lock is a deadlock this
  * tree can detect but has no reason to invite. */
-static struct klock g_dev_lock   = { 0, "dev",   11, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
-static struct klock g_vm_lock    = { 0, "vmfile", 12, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_dev_lock   = { 0, "dev",   13, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_vm_lock    = { 0, "vmfile", 14, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+/* ===========================================================================
+ * v1.1: THE RANK TABLE SHIFTED UP BY +2. Ranks 0 and 1 are now RESERVED.
+ * ===========================================================================
+ * Every rank in this tree moved up by two, in ONE commit, so that rank 0 and
+ * rank 1 could be vacated for the Phase 1/3 memory locks:
+ *
+ *     0  g_zone_lock[]  (v1.2) per-zone buddy free lists + LRU lists
+ *     1  g_swap_lock    (v1.7) swap slot bitmap
+ *     2  g_redir_lock         (was 0)      9  g_gpu_lock     (was 7)
+ *     3  g_ofile_lock         (was 1)     10  g_audio_lock   (was 8)
+ *     4  g_vfs_lock           (was 2)     11  g_net_lock     (was 9)
+ *     5  g_cas_lock           (was 3)     12  g_wm_lock      (was 10)
+ *     6  g_vblk_lock          (was 4)     13  g_dev_lock     (was 11)
+ *     7  g_surf_lock          (was 5)     14  g_vm_lock      (was 12)
+ *     8  g_ipc_lock           (was 6)     15  g_udb_lock     (was 13)
+ *    16  g_blk_lock     (v1.4, RESERVED — block-layer queue map)
+ *    17  g_acpi_lock    (v2.0, RESERVED — ACPICA OSL global lock)
+ *
+ * WHY UP AND NOT DOWN. The obvious expression of "the allocator sits beneath
+ * everything" is a negative rank, and `rank` plus every rank stack in this
+ * kernel is uint8_t: -1 becomes 255, which reads as the HIGHEST rank there is
+ * and inverts the exact check it was meant to express. Shifting the table is
+ * the only encoding that says what was meant.
+ *
+ * WHY ONE COMMIT. A partially-applied shift reports inversions that are
+ * artefacts of the shift, and the natural response to a spurious inversion is
+ * to "fix" an acquisition order that was already correct. This tree has the
+ * precedent: v0.95 proposed a new lock at rank 7 against a table that was six
+ * entries short, and 7 had been g_gpu_lock since v0.51.
+ *
+ * WHY 16 AND 17 ARE RESERVED NOW. So that Phase 2 and Phase 4 do not each
+ * re-shift the table. A second shift is a second opportunity to half-apply one.
+ *
+ * ---------------------------------------------------------------------------
+ * THE ALLOCATION INVARIANT (v1.1, and it is a constraint on all future code)
+ * ---------------------------------------------------------------------------
+ * Once g_zone_lock is rank 0, acquiring it while holding ANY ranked lock is a
+ * DOWNWARD acquisition — an inversion by definition. Since allocation is
+ * reachable from beneath almost every subsystem, the rule that follows is:
+ *
+ *     NO CODE MAY ALLOCATE A FRAME WHILE HOLDING A RANKED LOCK.
+ *
+ * Pre-allocate before acquiring, or draw from a per-CPU reserve. This is not a
+ * new restriction being imposed on working code so much as an existing one
+ * being made visible: the current tree only gets away with allocating under
+ * g_vfs_lock and g_cas_lock because g_frame_lock is deliberately UNRANKED (it
+ * must work before the scheduler exists and on APs, where there is no per-CPU
+ * rank tracking). Ranking the allocator is what turns that silent exemption
+ * into a checked rule.
+ *
+ * g_frame_lock and g_conlock remain UNRANKED and are not klocks. They are
+ * absent from the table because they have no rank, not because they were
+ * forgotten. */
 static volatile uint32_t g_rank_violations = 0;
 #ifdef KERNEL_DEBUG
 /* v0.81: counted so a boot can report ZERO rather than merely not printing.
@@ -4094,10 +4216,10 @@ static void klock_acquire(struct klock *l) {
     /* v0.75: bind the slot to the LOCK. Everything below runs with the lock
      * held, so these three fields have exactly one writer. `st`/`sp` are the
      * ones resolved on THIS side; release will not resolve them again. A depth
-     * already at the 8-entry ceiling records no slot (rank_spp = 0) and release
-     * correspondingly pops nothing — the old code pushed nothing but popped
-     * anyway, which drifted the depth down and hid later violations. */
-    if (*sp < 8) {
+     * already at the KLOCK_RANK_DEPTH ceiling records no slot (rank_spp = 0) and
+     * release correspondingly pops nothing — the old code pushed nothing but
+     * popped anyway, which drifted the depth down and hid later violations. */
+    if (*sp < KLOCK_RANK_DEPTH) {
         l->rank_st  = st;
         l->rank_spp = sp;
         l->rank_idx = *sp;
@@ -4275,7 +4397,7 @@ static struct klock_rtok klock_read_acquire(struct klock *l) {
     __sync_fetch_and_add(&l->acq, 1);
 
     rf = klock_irq_save();
-    if (*sp < 8) { t.st = st; t.spp = sp; t.idx = *sp; t.pushed = 1; st[(*sp)++] = l->rank; }
+    if (*sp < KLOCK_RANK_DEPTH) { t.st = st; t.spp = sp; t.idx = *sp; t.pushed = 1; st[(*sp)++] = l->rank; }
     klock_irq_restore(rf);
     return t;
 }
@@ -4297,6 +4419,11 @@ static void klock_read_release(struct klock *l, struct klock_rtok t) {
 }
 #endif  /* VFS_EXCLUSIVE_ONLY */
 
+/* v1.1: the buddy allocator, physmap build and self-test. Here, after klock,
+ * because g_zone_lock is a rank-0 klock and alloc_pages takes it. The types
+ * and the frame-seam accessors were included at kernel/mm.c earlier. */
+#include "mm_impl.c"
+
 static void sched_init(void) {
     for (int i = 0; i < MAX_THREADS; i++) { g_threads[i].state = T_FREE; g_threads[i].id = i; }
     /* thread 0 = the current boot/main context; its state is captured on the  */
@@ -4317,7 +4444,7 @@ static void sched_init(void) {
      * nothing and stops the handover being a latent trap for whoever does take
      * one before this point. */
     g_threads[0].rank_sp = g_cpu[0].rank_sp;
-    for (int r = 0; r < 8; r++) g_threads[0].rank_stack[r] = g_cpu[0].rank_stack[r];
+    for (int r = 0; r < KLOCK_RANK_DEPTH; r++) g_threads[0].rank_stack[r] = g_cpu[0].rank_stack[r];
     g_cur = 0;
     g_idle_id = thread_create("idle", idle_fn, 0);
     g_sched_on = 1;                           /* cooperative switching live      */
@@ -8012,7 +8139,7 @@ static struct udbent g_udb[UDB_MAX];
  * complaint through a null pointer. It never fired, because every acquisition
  * here happens with no other lock held — which is exactly the kind of latent
  * fault that surfaces years later when someone adds the first caller that does. */
-static struct klock  g_udb_lock = { 0, "udb", 13, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock  g_udb_lock = { 0, "udb", 15, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static volatile uint64_t g_auth_ok = 0, g_auth_bad = 0, g_auth_lockouts = 0;
 /* v0.80: accounts migrated from PBKDF2 to scrypt, counted because a silent
  * migration is indistinguishable from one that never happened. */
@@ -11413,7 +11540,7 @@ static struct ipc_shmem g_ipc_shm[MAX_IPC_SHMEM];
  * unrelated raw spinlock, not part of this ranked array — no actual
  * collision, just two independent numbering schemes that happen to reuse
  * the same next integer.) */
-static struct klock g_ipc_lock = { 0, "ipc", 6, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_ipc_lock = { 0, "ipc", 8, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 
 static void ipc_queue_clear(int idx) {
     struct ipc_queue *q = &g_ipc_q[idx];
@@ -11706,7 +11833,7 @@ struct vgpu_resource_unref {
     uint32_t resource_id, padding;
 } __attribute__((packed));
 
-static struct klock g_gpu_lock = { 0, "gpu", 7, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_gpu_lock = { 0, "gpu", 9, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static volatile uint8_t *g_gpu_common = 0, *g_gpu_notify = 0;
 static uint32_t          g_gpu_notify_mul = 0;
 static struct vq         g_gpu_ctrl;
@@ -12432,7 +12559,7 @@ struct virtio_snd_pcm_set_params {
 struct virtio_snd_pcm_status { uint32_t status, latency_bytes; } __attribute__((packed));
 struct virtio_snd_pcm_xfer   { uint32_t stream_id; } __attribute__((packed));
 
-static struct klock g_audio_lock = { 0, "audio", 8, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_audio_lock = { 0, "audio", 10, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static volatile uint8_t *g_snd_common = 0, *g_snd_notify = 0;
 static uint32_t g_snd_notify_mul = 0;
 /* g_snd_isr / snd_isr_drain() are forward-declared above, right before
@@ -12879,7 +13006,7 @@ static void sock_slot_wipe(int si) {
     g_sock[si].gen = g + 1;
 }
 static void tcp_output(int si, uint16_t flags, const uint8_t *data, uint16_t len); /* fwd: v0.67 */
-static struct klock g_net_lock = { 0, "net", 9, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_net_lock = { 0, "net", 11, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static volatile uint64_t g_net_tx_frames = 0;
 static volatile uint64_t g_net_loop_deliveries = 0;
 /* v0.65: the numbers the suite cannot see from ring 3. An EAGAIN count that
@@ -13825,7 +13952,7 @@ static int wg_focused(int wi) {
 }
 static uint64_t g_wm_pagetab[NWMWIN][WIN_SURF_MAXPG];   /* phys of each window's surface pages */
 static uint64_t g_wm_pagetab_b[NWMWIN][WIN_SURF_MAXPG]; /* v0.96: the paired second set */
-static struct klock g_wm_lock = { 0, "wm", 10, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_wm_lock = { 0, "wm", 12, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 static int g_wm_focus = -1;              /* window index with keyboard focus, or -1     */
 static int g_wm_znext = 1;               /* monotonically increasing z stamp            */
 static int g_wm_drag = -1, g_wm_drag_dx = 0, g_wm_drag_dy = 0;   /* window being dragged */
@@ -15586,7 +15713,15 @@ static struct pjob g_pjob;
  * LIVE page tables — a genuine integrity check must observe current state, and
  * this is what lets it catch a corruption injected after enumeration. */
 struct auditunit { uint64_t *pde_ptr; uint64_t va_base; };
-#define AUDIT_MAX 4096
+/* v1.1: 4096 -> 16384. Sized in v0.37 for a 1 GiB identity map (512 PDEs) with
+ * room to spare; the first `-m 4G` boot enumerated EXACTLY 4096 units — 2048
+ * for boot.asm's four identity GiBs plus 2048 for the physmap's four — and the
+ * "no truncation" assertion fired, correctly, because a table that is exactly
+ * full cannot tell full from overflowing. 16384 covers a 16 GiB machine's
+ * identity+physmap PDEs and every kernel window with margin; a 32 GiB host
+ * will trip it again, and should, rather than auditing a prefix and calling
+ * it clean. 256 KiB of .bss. */
+#define AUDIT_MAX 16384
 static struct auditunit g_audit[AUDIT_MAX];
 static uint64_t g_audit_n = 0;
 static uint8_t  g_ap_stacks[MAX_CPUS][AP_STACK_SZ] __attribute__((aligned(64)));
@@ -18787,7 +18922,7 @@ static void posix_sigcheck_on_return(struct sysframe *sf, uint64_t rv) {
  * could not fully read. */
 #define REDIR_STAGE_MAX 32768
 static uint8_t g_redir_stage[REDIR_STAGE_MAX];
-static struct klock g_redir_lock = { 0, "redir", 0, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
+static struct klock g_redir_lock = { 0, "redir", 2, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 
 static int64_t redirect_write_bytes(int fd, const void *data, uint32_t len) {
     int vol = VOL_ROOT;
@@ -36756,6 +36891,12 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     kernel_cr3 = read_cr3();
     kprintf("[kernel ] paging: boot PML4 @ phys %X; process frame pool from 16 MiB\n",
             kernel_cr3);
+    /* v1.1: the physmap and page metadata, built from the memory map that
+     * multiboot_scan just recorded. Must follow kernel_cr3 capture (it edits
+     * that PML4) and precede harden_kernel_wx (whose W^X split must not touch
+     * the physmap's NX 2 MiB leaves). */
+    mm_init();
+    mm_selftest();
     harden_kernel_wx();
     kprintf("[kernel ] W^X enforced: kernel .text R+X, all other pages RW+NX\n");
     g_sweep.enabled = 1;                    /* start continuous background PTE audit */
