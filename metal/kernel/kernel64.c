@@ -476,6 +476,16 @@ static void pic_remap(void) {
 /* Registered device IRQ handlers (top halves). PCI INTx lines are shared, so  */
 /* each line holds a small chain; every handler checks its own device's ISR.   */
 static void (*g_irq_handlers[16][4])(void) = { { 0 } };
+/* v1.0+: LIVE interrupt counts, per line and per core.
+ *
+ * Incremented in the one place every hardware vector passes through (the
+ * dispatcher below), and printed by `sched` � a counter nothing increments and
+ * a counter nothing prints are both non-evidence, and this tree has shipped
+ * one of each. The per-core split is what makes IRQ distribution a measurement
+ * rather than a guess: on a uniprocessor boot every line lands on core 0 and
+ * the display says so, which is the correct answer, not a missing one. */
+static volatile uint64_t g_irq_line_count[16];
+static volatile uint64_t g_irq_cpu_count[16][MAX_CPUS];
 static void register_irq(uint8_t irq, void (*f)(void)) {
     for (int i = 0; i < 4; i++) if (!g_irq_handlers[irq][i]) { g_irq_handlers[irq][i] = f; return; }
 }
@@ -766,6 +776,16 @@ void isr_dispatch(struct isr_frame *f) {
             g_vfio_test_fire_at = 0;
         }
     }
+    /* v1.0+: count BEFORE dispatching, and count every hardware line � the
+     * timer and the keyboard included. Counting only the device chain below
+     * would leave IRQ 0 and IRQ 1 permanently zero while the machine was
+     * plainly taking them. */
+    if (f->vector >= 32 && f->vector < 48) {
+        unsigned line = (unsigned)(f->vector - 32);
+        unsigned c = (unsigned)cpu_idx();
+        __sync_fetch_and_add(&g_irq_line_count[line], 1);
+        if (c < MAX_CPUS) __sync_fetch_and_add(&g_irq_cpu_count[line][c], 1);
+    }
     if (f->vector == 33) keyboard_irq();             /* PS/2                    */
     if (f->vector >= 34 && f->vector < 48) {         /* device IRQs (top half)  */
         uint8_t irq = (uint8_t)(f->vector - 32);
@@ -796,7 +816,12 @@ static uint64_t g_user_elf = 0, g_user_elf_end = 0;    /* boot module: the user 
  * g_user_elf on each tag, so a second module silently displaced the first and
  * whichever GRUB listed last became "the user ELF". The desktop ships five
  * modules, so the name is the only thing that can identify them. */
-#define MAX_BOOT_MODULES 8
+/* v1.0+: 8 -> 24. The desktop image now carries user_init plus TWELVE
+ * applications, and eight slots would have silently dropped the last five:
+ * mod_find would miss them, desk_launch would print 'no boot module' for
+ * five tiles, and nothing in the build would have said why. 24 leaves room
+ * for the suite to grow rather than being exactly enough for today. */
+#define MAX_BOOT_MODULES 24
 struct boot_module { char name[24]; uint64_t start, end; };
 static struct boot_module g_modules[MAX_BOOT_MODULES];
 static int g_nmodules = 0;
@@ -861,6 +886,13 @@ static void multiboot_scan(uint64_t info_addr, bool print) {
                 struct boot_module *m = &g_modules[g_nmodules++];
                 kstrcpy_n_early(m->name, mname, sizeof m->name);
                 m->start = ms; m->end = me;
+            } else {
+                /* SAID OUT LOUD. A module dropped here is invisible everywhere
+                 * else: mod_find simply does not find it, and the only symptom
+                 * is a launcher tile that reports a missing module on an image
+                 * that plainly contains it. */
+                kprintf("[kernel ] boot module '%s' DROPPED: more than %d modules\n",
+                        mname, (uint64_t)MAX_BOOT_MODULES);
             }
             if (print) kprintf("[kernel ] boot module '%s' at phys %X..%X\n", mname, ms, me);
         }
@@ -1156,6 +1188,10 @@ static inline void     frame_refc_add(uint64_t idx, int delta);
  * halts the machine at the second free with the offending address, instead of
  * handing live memory to a second owner. */
 /* v1.1: g_frame_ref[] is gone; frame_refc_* resolve to struct page::refcount. */
+/* v1.0+: per-core ring-3 CPU time and excursion count. See the fold site in
+ * resume_kernel for why the accumulation lives there and nowhere else. */
+static volatile uint64_t g_cpu_busy_ns[MAX_CPUS];
+static volatile uint64_t g_cpu_excursions[MAX_CPUS];
 static volatile uint64_t g_frames_shared = 0;    /* share operations, lifetime */
 static volatile uint64_t g_frames_cow_copied = 0;/* COW faults that duplicated */
 
@@ -5838,6 +5874,12 @@ static void net_route(const uint8_t *frame, uint32_t len) {
  * round trip we would otherwise make asking back. */
 #define NET_GUEST_IP    0x0A000210u    /* 10.0.2.16: our SLIRP-side address    */
 static volatile uint64_t g_net_tx_frames;   /* defined with the socket layer   */
+/* v1.0+: BYTES, not just frames. A frame count is not bandwidth � a link
+ * carrying sixty 60-byte ARP frames and one carrying sixty 1514-byte segments
+ * report the same number � so a network monitor built on frame counts alone
+ * would draw the same graph for two links an order of magnitude apart. Both
+ * counters are incremented at the single chokepoint of their direction. */
+static volatile uint64_t g_net_tx_bytes = 0, g_net_rx_bytes = 0;
 static void vnet_tx(const uint8_t *frame, uint32_t len);   /* fwd: v0.69 */
 #define ARP_CACHE_N 8
 struct arpent { int used; uint32_t ip; uint8_t mac[6]; uint64_t seen; };
@@ -5928,7 +5970,14 @@ static void arp_input(const uint8_t *f, uint32_t len) {
     }
 }
 
+/* v1.0+: every frame this kernel receives passes through here, which is why
+ * the counter lives here and not in one protocol branch. g_net_tx_frames has
+ * had a transmit counterpart since v0.69; the receive side had none, so a
+ * network monitor could only ever have shown half a link. */
+static volatile uint64_t g_net_rx_frames = 0;
 static void net_dispatch(int idx, const uint8_t *frame, uint32_t len) {
+    __sync_fetch_and_add(&g_net_rx_frames, 1);
+    __sync_fetch_and_add(&g_net_rx_bytes, (uint64_t)len);
     uint16_t eth = (uint16_t)((frame[12] << 8) | frame[13]);
     if (eth == 0x0806) {                                  /* ARP               */
         arp_input(frame, len);                            /* v0.69: learn + reply */
@@ -6117,6 +6166,7 @@ static int vnet_reinit(void) {
 }
 
 static void vnet_tx(const uint8_t *frame, uint32_t flen) {
+    __sync_fetch_and_add(&g_net_tx_bytes, (uint64_t)flen);
     for (int i = 0; i < 12; i++) g_vnet_txbuf[i] = 0;      /* virtio_net_hdr (12B)  */
     for (uint32_t i = 0; i < flen; i++) g_vnet_txbuf[12 + i] = frame[i];
     struct vq *q = &g_vnet_tx;
@@ -6369,6 +6419,27 @@ static void cmd_sched(void) {
     kprintf("[sched  ] preemption proof: non-yielding spinner advanced to %d while main\n", observed);
     kprintf("[sched  ]   also ran (0 would mean no time-slicing occurred)\n");
     kprintf("[vblk   ] lifetime interrupt completions: %d\n", g_completions);
+    /* v1.0+: PRINT THE COUNTERS SYS_HW_INFO REPORTS.
+     *
+     * A counter nothing prints is not instrumentation � this tree has
+     * already read a grep for a string no code could produce as evidence
+     * of correctness. Every figure the HW_TRACE domain serves to ring 3
+     * appears here too, so a serial log can be checked against what the
+     * monitor displayed rather than being taken on the app's word. */
+    for (int l = 0; l < 16; l++) {
+        if (!g_irq_line_count[l]) continue;
+        kprintf("[irq    ] line %d: %d total", (uint64_t)l, g_irq_line_count[l]);
+        for (int c = 0; c < MAX_CPUS; c++)
+            if (g_irq_cpu_count[l][c]) kprintf("  cpu%d=%d", (uint64_t)c, g_irq_cpu_count[l][c]);
+        kputs("\n");
+    }
+    for (int c = 0; c < MAX_CPUS; c++) {
+        if (!g_cpu_excursions[c]) continue;
+        kprintf("[cpu    ] core %d: ring-3 busy %d us over %d excursions\n",
+                (uint64_t)c, g_cpu_busy_ns[c] / 1000ull, g_cpu_excursions[c]);
+    }
+    kprintf("[net    ] frames tx %d / rx %d, bytes tx %d / rx %d (lifetime)\n",
+            g_net_tx_frames, g_net_rx_frames, g_net_tx_bytes, g_net_rx_bytes);
     kputs("-- done --\n");
 }
 
@@ -16966,6 +17037,17 @@ static void cpu_exec_proc(int c, int p) {
         if (net) {
             __sync_fetch_and_add(&kprocs[p].cpu_ns, net);
             __sync_fetch_and_add(&kprocs[L].cpu_grp_ns, net);
+            /* v1.0+: THE SAME NANOSECONDS, ALSO BANKED PER CORE. This is the
+             * one site where a core knows both how long an excursion ran and
+             * that it ran HERE, so it is the only honest source for per-core
+             * load. Deriving it instead from the timer tick would report core 0
+             * alone: the PIT interrupts the BSP, and every AP's busy time would
+             * read zero on a machine that was plainly using all four. */
+            unsigned bc = (unsigned)cpu_idx();
+            if (bc < MAX_CPUS) {
+                __sync_fetch_and_add(&g_cpu_busy_ns[bc], net);
+                __sync_fetch_and_add(&g_cpu_excursions[bc], 1);
+            }
         }
         /* One atomic pair per EXCURSION, not per syscall: the hot syscall path
          * only ever touches the task-local cpu_stime_run, which is exactly the
@@ -18492,6 +18574,7 @@ static int ofile_deref(int fd, int *out_vol, int *out_oi) {
 }
 
 static void shell_exec(char *line);   /* fwd: v0.54 SYS_RUN_CMD runs the real shell dispatcher */
+static int fb_capture_rect(uint32_t *dst, int x, int y, int w, int h);  /* fwd: v1.0+ SYS_FB_CAPTURE */
 
 /* ===========================================================================
  * v0.55: fork()
@@ -21225,6 +21308,328 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                 (uint64_t)desk_w(), (uint64_t)desk_h(), (uint64_t)g_desk_accent,
                 (uint64_t)g_desk_rep_delay, (uint64_t)g_desk_rep_period);
         return 0;
+    }
+
+    case 119: {  /* v1.0+: SYS_HW_INFO(domain, out, size) -> entries reported, or -errno.
+                  *
+                  * ONE call, FOUR domains, each with its own struct in
+                  * include/outrun_abi.h — which is the master copy, and these
+                  * local declarations must move with it. `size` is checked
+                  * against the addressed domain and a disagreement is REFUSED
+                  * rather than partly filled, exactly as case 117 does: a
+                  * program built against a different revision of the header
+                  * must fail loudly, not read a struct that overlaps.
+                  *
+                  * READ-ONLY, and no field here is a placeholder. Every value
+                  * has a live source in this kernel; where a piece of hardware
+                  * is absent (there is no NVMe controller in this tree) the
+                  * count is zero and the caller can say so, rather than being
+                  * handed a fabricated row it cannot distinguish from a real
+                  * one. That is why the domain counts are RETURNED rather than
+                  * assumed by the caller. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        uint64_t dom = a0, ubuf = a1, usz = a2;
+        int hwme = (int)current_proc_idx;
+
+        if (dom == 0) {                                          /* HW_STORAGE */
+            struct ublockdev {
+                uint64_t capacity_sectors, irqs;
+                uint32_t sector_size, queue_size, ready, irq_line;
+                char name[16];
+            };
+            struct ustorage {
+                uint32_t version, size, ndev, cas_mounted;
+                uint32_t cas_version, cas_block_size, vfs_files_used, vfs_files_max;
+                uint64_t cas_total_blocks, cas_used_blocks;
+                uint64_t cas_put_count, cas_dedup_hits;
+                uint64_t cas_blocks_freed, cas_ref_drops, cas_ref_underflow;
+                uint64_t cas_recover_calls, cas_recover_replays;
+                uint64_t vfs_bytes;
+                struct ublockdev dev[4];
+            };
+            /* The runtime size check below rejects a caller built against a
+             * different header. This one rejects a KERNEL built against a
+             * different header � a divergence the runtime check could only
+             * ever report as every caller mysteriously getting -EINVAL. */
+            _Static_assert(sizeof(struct ustorage) == 304,
+                           "HW_STORAGE layout must match include/outrun_abi.h");
+            if (usz != sizeof(struct ustorage)) return (uint64_t)-22;
+            if (!access_ok(kprocs[hwme].cr3, ubuf, sizeof(struct ustorage), 1)) return (uint64_t)-14;
+            static struct ustorage k;
+            cmemset(&k, 0, sizeof k);
+            k.version = 1; k.size = (uint32_t)sizeof k;
+            k.cas_mounted = (uint32_t)g_cas_mounted;
+            if (g_cas_mounted) {
+                k.cas_version      = SB->version;
+                k.cas_block_size   = SB->block_size;
+                k.cas_total_blocks = SB->total_blocks;
+                k.cas_used_blocks  = SB->used_blocks;
+                k.cas_put_count    = SB->put_count;
+                k.cas_dedup_hits   = SB->dedup_hits;
+            }
+            k.cas_blocks_freed    = g_cas_blocks_freed;
+            k.cas_ref_drops       = g_cas_ref_drops;
+            k.cas_ref_underflow   = g_cas_ref_underflow;
+            k.cas_recover_calls   = g_cas_recover_calls;
+            k.cas_recover_replays = g_cas_recover_replays;
+            k.vfs_files_max = VFS_MAXFILES;
+            /* Unlocked, like SYS_READDIR beside it: this is a snapshot for a
+             * display, and taking g_vfs_lock here would put a monitor refresh
+             * in the path of every file operation on the machine. */
+            for (int i = 0; i < VFS_MAXFILES; i++) {
+                if (!DENTS[i].used) continue;
+                k.vfs_files_used++;
+                k.vfs_bytes += DENTS[i].len;
+            }
+            if (g_vblk_ready) {
+                struct ublockdev *d = &k.dev[k.ndev++];
+                d->capacity_sectors = g_vblk_capacity;
+                d->irqs        = g_vblk_irqs;
+                d->sector_size = 512;
+                d->queue_size  = g_vblk_qsize;
+                d->ready       = 1;
+                d->irq_line    = g_vblk_irq;
+                const char *nm = "virtio-blk0";
+                for (int c = 0; c < 15 && nm[c]; c++) d->name[c] = nm[c];
+            }
+            cmemcpy((void *)ubuf, &k, sizeof k);
+            return (uint64_t)k.ndev;
+        }
+
+        if (dom == 1) {                                              /* HW_PCI */
+            struct upcidev {
+                uint64_t bar_base[6], bar_len[6];
+                uint64_t req_cap, owner_pid;
+                uint32_t cfg[4];
+                uint32_t bdf, state, claim_flags, reserved;
+                char name[24];
+            };
+            struct upci { uint32_t version, size, ndev, iommu_on; struct upcidev dev[16]; };
+            /* The runtime size check below rejects a caller built against a
+             * different header. This one rejects a KERNEL built against a
+             * different header � a divergence the runtime check could only
+             * ever report as every caller mysteriously getting -EINVAL. */
+            _Static_assert(sizeof(struct upci) == 2704,
+                           "HW_PCI layout must match include/outrun_abi.h");
+            if (usz != sizeof(struct upci)) return (uint64_t)-22;
+            if (!access_ok(kprocs[hwme].cr3, ubuf, sizeof(struct upci), 1)) return (uint64_t)-14;
+            static struct upci k;
+            cmemset(&k, 0, sizeof k);
+            k.version = 1; k.size = (uint32_t)sizeof k;
+            k.iommu_on = (uint32_t)g_iommu_on;
+            /* The registry is read under its own lock — ownership is what
+             * another core can be changing — but the CONFIG READS happen after
+             * the release: pci_cfg_read32 drives the 0xCF8/0xCFC port pair, and
+             * holding rank 11 across sixteen probes would stall every claim on
+             * the machine for the length of a bus walk. */
+            uint16_t hwbdf[16]; int hwn = 0;
+            klock_acquire(&g_dev_lock);
+            for (int i = 0; i < n_kdev && hwn < 16; i++) {
+                struct kdev *d = &kdevs[i];
+                if (!d->used) continue;
+                struct upcidev *o = &k.dev[hwn];
+                for (int b = 0; b < 6; b++) {
+                    o->bar_base[b] = g_kdev_bar_phys[i][b];
+                    o->bar_len[b]  = g_kdev_bar_len[i][b];
+                }
+                /* BAR 0 falls back to the registry's own window: a synthetic
+                 * device has a real base and length but never went through the
+                 * bus walk that fills g_kdev_bar_phys. */
+                if (!o->bar_len[0]) { o->bar_base[0] = d->base; o->bar_len[0] = d->len; }
+                o->req_cap = d->req;
+                o->bdf = d->bdf;
+                o->claim_flags = d->claim_flags;
+                o->state = 0;
+                if (d->state & KDEV_BOUND_HOST) o->state |= 1u;
+                if (kdev_owner_live(d)) { o->state |= 2u; o->owner_pid = kprocs[d->owner].pid; }
+                if (d->bdf == KDEV_SYNTHETIC) o->state |= 4u;
+                /* Whether this device's driver can stand down. Read from the
+                 * hook table itself, so the bit cannot claim a handover path
+                 * that no function implements. */
+                if (g_kdev_quiesce[i]) o->state |= 8u;
+                for (int c = 0; c < 23 && d->name && d->name[c]; c++) o->name[c] = d->name[c];
+                hwbdf[hwn] = d->bdf;
+                hwn++;
+            }
+            klock_release(&g_dev_lock);
+            k.ndev = (uint32_t)hwn;
+            for (int i = 0; i < hwn; i++) {
+                if (hwbdf[i] == KDEV_SYNTHETIC) continue;
+                uint8_t bus = (uint8_t)(hwbdf[i] >> 8), sl = (uint8_t)((hwbdf[i] >> 3) & 0x1F),
+                        fn = (uint8_t)(hwbdf[i] & 7);
+                k.dev[i].cfg[0] = pci_cfg_read32(bus, sl, fn, 0x00);
+                k.dev[i].cfg[1] = pci_cfg_read32(bus, sl, fn, 0x08);
+                k.dev[i].cfg[2] = pci_cfg_read32(bus, sl, fn, 0x0C);
+                k.dev[i].cfg[3] = pci_cfg_read32(bus, sl, fn, 0x34);
+            }
+            cmemcpy((void *)ubuf, &k, sizeof k);
+            return (uint64_t)hwn;
+        }
+
+        if (dom == 2) {                                            /* HW_TRACE */
+            struct uirq { uint64_t total, percpu[8]; uint32_t line, reserved; };
+            struct uthr { uint64_t pid; uint32_t tid, state, uthread, proc_slot; char name[16]; };
+            struct utproc { uint64_t pid, cpu_ns; uint32_t flags, reserved; char name[24]; };
+            struct utrace {
+                uint32_t version, size, ncpu, nirq;
+                uint32_t nthread, nproc, reserved0, reserved1;
+                uint64_t ticks, wall_ns;
+                uint64_t frames_total, frames_used, frames_freed, frames_reused;
+                uint64_t frames_shared, frames_cow;
+                uint64_t cpu_busy_ns[8], cpu_excursions[8], cpu_cur_pid[8];
+                uint32_t cpu_online[8];
+                struct uirq irq[16];
+                struct uthr thread[16];
+                struct utproc proc[12];
+            };
+            /* The runtime size check below rejects a caller built against a
+             * different header. This one rejects a KERNEL built against a
+             * different header � a divergence the runtime check could only
+             * ever report as every caller mysteriously getting -EINVAL. */
+            _Static_assert(sizeof(struct utrace) == 2816,
+                           "HW_TRACE layout must match include/outrun_abi.h");
+            if (usz != sizeof(struct utrace)) return (uint64_t)-22;
+            if (!access_ok(kprocs[hwme].cr3, ubuf, sizeof(struct utrace), 1)) return (uint64_t)-14;
+            static struct utrace k;
+            cmemset(&k, 0, sizeof k);
+            k.version = 1; k.size = (uint32_t)sizeof k;
+            k.ncpu = (uint32_t)g_ncpu_online; k.nirq = 16;
+            k.ticks = g_ticks; k.wall_ns = ktime_get_ns();
+            k.frames_used  = (g_next_frame - FRAME_POOL_BASE) / 0x1000 - g_frame_free_depth;
+            k.frames_total = (g_total_ram > FRAME_POOL_BASE)
+                           ? (g_total_ram - FRAME_POOL_BASE) / 0x1000 : 0;
+            k.frames_freed = g_frames_freed; k.frames_reused = g_frames_reused;
+            k.frames_shared = g_frames_shared; k.frames_cow = g_frames_cow_copied;
+            for (int c = 0; c < 8 && c < MAX_CPUS; c++) {
+                k.cpu_busy_ns[c]    = g_cpu_busy_ns[c];
+                k.cpu_excursions[c] = g_cpu_excursions[c];
+                k.cpu_online[c]     = g_cpu[c].online ? 1u : 0u;
+                uint64_t cur = g_cpu[c].cur_proc;
+                if (cur < (uint64_t)n_kproc && kprocs[cur].used) k.cpu_cur_pid[c] = kprocs[cur].pid;
+            }
+            for (int l = 0; l < 16; l++) {
+                k.irq[l].line = (uint32_t)l;
+                k.irq[l].total = g_irq_line_count[l];
+                for (int c = 0; c < 8 && c < MAX_CPUS; c++) k.irq[l].percpu[c] = g_irq_cpu_count[l][c];
+            }
+            int nt = 0;
+            for (int i = 0; i < MAX_THREADS && nt < 16; i++) {
+                struct pcb *t = &g_threads[i];
+                if (t->state == T_FREE && !t->name) continue;
+                k.thread[nt].tid = (uint32_t)i;
+                k.thread[nt].state = (uint32_t)t->state;
+                k.thread[nt].uthread = (uint32_t)t->uthread;
+                k.thread[nt].proc_slot = (uint32_t)t->proc;
+                if (t->uthread && t->proc < (uint64_t)n_kproc && kprocs[t->proc].used)
+                    k.thread[nt].pid = kprocs[t->proc].pid;
+                for (int c = 0; c < 15 && t->name && t->name[c]; c++) k.thread[nt].name[c] = t->name[c];
+                nt++;
+            }
+            k.nthread = (uint32_t)nt;
+            int np = 0;
+            for (int i = 0; i < n_kproc && np < 12; i++) {
+                if (!kprocs[i].pid || tg_of(i) != i) continue;
+                k.proc[np].pid = kprocs[i].pid;
+                k.proc[np].cpu_ns = proc_cpu_live(i);
+                k.proc[np].flags = kprocs[i].exited ? 1u : 0u;
+                for (int c = 0; c < 23; c++) k.proc[np].name[c] = kprocs[i].name[c];
+                np++;
+            }
+            k.nproc = (uint32_t)np;
+            cmemcpy((void *)ubuf, &k, sizeof k);
+            return (uint64_t)np;
+        }
+
+        if (dom == 3) {                                              /* HW_NET */
+            struct unetif {
+                unsigned char mac[6]; uint16_t bdf;
+                uint64_t tx_frames, rx_frames, tx_bytes, rx_bytes, irqs;
+                uint32_t ready, irq_line, mtu, ipv4;
+                char name[16];
+            };
+            struct usock {
+                uint64_t owner_pid;
+                uint32_t lport, rport, raddr, state;
+                uint32_t flags, rx_queued, tx_queued, gen;
+            };
+            struct unet {
+                uint32_t version, size, nif, nsock;
+                uint64_t tx_frames, loop_deliveries, accepts, eagain, sessions;
+                struct unetif iface[2];
+                struct usock sock[16];
+            };
+            /* The runtime size check below rejects a caller built against a
+             * different header. This one rejects a KERNEL built against a
+             * different header � a divergence the runtime check could only
+             * ever report as every caller mysteriously getting -EINVAL. */
+            _Static_assert(sizeof(struct unet) == 856,
+                           "HW_NET layout must match include/outrun_abi.h");
+            if (usz != sizeof(struct unet)) return (uint64_t)-22;
+            if (!access_ok(kprocs[hwme].cr3, ubuf, sizeof(struct unet), 1)) return (uint64_t)-14;
+            static struct unet k;
+            cmemset(&k, 0, sizeof k);
+            k.version = 1; k.size = (uint32_t)sizeof k;
+            k.tx_frames = g_net_tx_frames; k.loop_deliveries = g_net_loop_deliveries;
+            k.accepts = g_net_accepts; k.eagain = g_net_eagain; k.sessions = g_net_sessions;
+            if (g_vnet_ready) {
+                struct unetif *n0 = &k.iface[k.nif++];
+                for (int c = 0; c < 6; c++) n0->mac[c] = g_vnet_mac[c];
+                n0->bdf = g_vnet_bdf;
+                n0->tx_frames = g_net_tx_frames;
+                n0->rx_frames = g_net_rx_frames;
+                n0->tx_bytes = g_net_tx_bytes;
+                n0->rx_bytes = g_net_rx_bytes;
+                n0->irqs = g_vnet_irqs;
+                n0->ready = 1; n0->irq_line = g_vnet_irq; n0->mtu = 1500;
+                n0->ipv4 = NET_GUEST_IP;
+                const char *nm = "virtio-net0";
+                for (int c = 0; c < 15 && nm[c]; c++) n0->name[c] = nm[c];
+            }
+            klock_acquire(&g_net_lock);
+            for (int i = 0; i < NSOCK && k.nsock < 16; i++) {
+                struct nsock *sk = &g_sock[i];
+                if (!sk->used) continue;
+                struct usock *o = &k.sock[k.nsock++];
+                o->lport = sk->lport; o->rport = sk->rport; o->raddr = sk->raddr;
+                o->state = (uint32_t)sk->state; o->gen = sk->gen;
+                if (sk->stream)     o->flags |= 1u;
+                if (sk->listening)  o->flags |= 2u;
+                if (sk->connected)  o->flags |= 4u;
+                o->rx_queued = sk->stream ? sk->rcount : (uint32_t)sk->qcount;
+                o->tx_queued = sk->stream ? sk->scount : 0u;
+                if (sk->owner >= 0 && sk->owner < n_kproc && kprocs[sk->owner].used)
+                    o->owner_pid = kprocs[sk->owner].pid;
+            }
+            klock_release(&g_net_lock);
+            cmemcpy((void *)ubuf, &k, sizeof k);
+            return (uint64_t)k.nsock;
+        }
+        return (uint64_t)-22;
+    }
+
+    case 120: {  /* v1.0+: SYS_FB_CAPTURE(out, (x<<16)|y, (w<<16)|h) -> bytes, or -errno.
+                  *
+                  * Copies a rectangle of the composited LOGICAL desktop into
+                  * the caller's buffer as packed 32-bit pixels. Written
+                  * straight into user memory after access_ok: a bounce buffer
+                  * able to hold a full-screen capture would be megabytes of
+                  * permanently resident kernel BSS serving an occasional
+                  * screenshot.
+                  *
+                  * Safe against a half-drawn frame for the same reason the
+                  * compositor's lock-free surface read is: desktop applications
+                  * are pinned to CPU 0, which is where the compositor runs, so
+                  * this call cannot execute while that core is mid-composite. */
+        if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_WIMP)) return (uint64_t)-13;
+        int cx = (int)((a1 >> 16) & 0xFFFF), cy = (int)(a1 & 0xFFFF);
+        int cw = (int)((a2 >> 16) & 0xFFFF), chh = (int)(a2 & 0xFFFF);
+        if (cw <= 0 || chh <= 0) return (uint64_t)-22;
+        uint64_t px = (uint64_t)cw * (uint64_t)chh;
+        if (px > 1920ull * 1200ull) return (uint64_t)-22;
+        uint64_t bytes = px * 4ull;
+        if (!access_ok(kprocs[current_proc_idx].cr3, a0, bytes, 1)) return (uint64_t)-14;
+        if (fb_capture_rect((uint32_t *)a0, cx, cy, cw, chh) < 0) return (uint64_t)-22;
+        return bytes;
     }
 
     /* =======================================================================
@@ -29922,6 +30327,29 @@ static volatile uint32_t *g_fb = 0;     /* mapped hardware framebuffer         *
 static uint32_t          *g_bb = 0;     /* RAM backbuffer                      */
 static uint32_t           g_stride = 0; /* pixels per row                      */
 static int                g_gfx_ready = 0;
+
+/* v1.0+: SYS_FB_CAPTURE's one reader of the composited desktop.
+ *
+ * LOGICAL coordinates, matching desk_w()/desk_h() and therefore matching what
+ * every window position and pointer coordinate in this kernel already means.
+ * g_bb is the physical-resolution back buffer and fb_flip magnifies out of its
+ * top-left region, so reading it at logical coordinates returns exactly the
+ * pixels the user is looking at, before scaling.
+ *
+ * AN OUT-OF-RANGE RECTANGLE IS REFUSED, NOT CLAMPED. A screenshot tool that
+ * silently saved a different region than the one it asked for would produce a
+ * file that could never afterwards be attributed to a request. */
+static int fb_capture_rect(uint32_t *dst, int x, int y, int w, int h) {
+    if (!g_bb || !g_stride) return -1;
+    if (x < 0 || y < 0 || w <= 0 || h <= 0) return -1;
+    if (x > desk_w() - w || y > desk_h() - h) return -1;
+    for (int r = 0; r < h; r++) {
+        const uint32_t *src = g_bb + (uint64_t)(y + r) * g_stride + x;
+        uint32_t *out = dst + (uint64_t)r * w;
+        for (int c = 0; c < w; c++) out[c] = src[c];
+    }
+    return 0;
+}
 
 /* Metropolis-Terminal palette (0x00RRGGBB) */
 #define C_OBS0 0x05060A
