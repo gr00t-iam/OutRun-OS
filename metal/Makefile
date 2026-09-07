@@ -127,10 +127,10 @@ $(BUILD)/user_init.elf: $(BUILD)/user_init.o user/user.ld
 # kernel64.c), so adding a program here is the whole of adding a program. They
 # share apps/gui.c and are held to the same -Wall -Wextra the kernel is: ring 3
 # being the quieter half is exactly how v0.77 hid three real defects.
-APPS      := vault_pad calc task_mgr settings outrun_term outrun_edit outrun_disks pci_view sys_trace net_deck
+APPS      := vault_pad calc task_mgr settings outrun_term outrun_edit outrun_disks pci_view sys_trace net_deck outrun_snap outrun_media
 APP_ELFS  := $(APPS:%=$(BUILD)/apps/%.elf)
 APP_SRC   := ../apps
-APP_DEPS  := $(APP_SRC)/gui.h $(APP_SRC)/font.h $(APP_SRC)/build_task.h ../include/outrun_abi.h
+APP_DEPS  := $(APP_SRC)/gui.h $(APP_SRC)/font.h $(APP_SRC)/build_task.h ../include/outrun_abi.h $(APP_SRC)/bmp.h
 
 $(BUILD)/apps:
 	mkdir -p $@
