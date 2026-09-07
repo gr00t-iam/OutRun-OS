@@ -15,6 +15,8 @@
 #define SYS_YIELD 15
 #define SYS_GETPID 16
 #define SYS_SURFACE_FLIP 17
+#define SYS_IPC_SEND 18
+#define SYS_IPC_RECV 19
 #define SYS_VFS_SYNC 22
 #define SYS_VFS_UNLINK 23
 #define SYS_WIN_CREATE 40
@@ -22,6 +24,7 @@
 #define SYS_WIN_POLL 42
 #define SYS_WIN_INFO 43
 #define SYS_SYSINFO 44
+#define SYS_RUN_CMD 46
 #define SYS_KILL 50
 #define SYS_LSEEK 100
 #define SYS_FTRUNCATE 101
@@ -38,6 +41,13 @@
  * buffer address after publication; a1 optionally supplies a NUL title.
  * Legacy a2=0 windows retain their old single-surface ABI. */
 struct outrun_event { int type, x, y, code; };
+/* Existing IPC wire layout, shared with kernel ipc_msg (104 bytes). */
+struct outrun_ipc_msg {
+    unsigned long long sender_pid, recipient_pid;
+    unsigned int msg_type, cap_mask, payload_len;
+    long long xfer_handle;
+    unsigned char inline_data[64];
+};
 struct outrun_process {
     unsigned long long pid, cpu_ns;
     unsigned int flags, reserved;

@@ -79,7 +79,7 @@ $(BUILD)/sdk_sources.h: $(SDK_SRCS) tools/mkstr.py | $(BUILD)
 $(BUILD)/scrypt.o: crypto/scrypt.c crypto/scrypt.h | $(BUILD)
 	$(CC) $(CFLAGS) $(EXTRA) -c $< -o $@
 
-$(BUILD)/kernel64.o: kernel/kernel64.c $(BUILD)/sdk_sources.h crypto/scrypt.h | $(BUILD)
+$(BUILD)/kernel64.o: kernel/kernel64.c kernel/files.c kernel/key_state.h $(BUILD)/sdk_sources.h crypto/scrypt.h | $(BUILD)
 	$(CC) $(CFLAGS) $(EXTRA) -c $< -o $@
 
 # ---- polyglot: Rust (no_core) + C++ (freestanding) linked into the kernel ---
@@ -127,25 +127,27 @@ $(BUILD)/user_init.elf: $(BUILD)/user_init.o user/user.ld
 # kernel64.c), so adding a program here is the whole of adding a program. They
 # share apps/gui.c and are held to the same -Wall -Wextra the kernel is: ring 3
 # being the quieter half is exactly how v0.77 hid three real defects.
-APPS      := vault_pad calc task_mgr settings
+APPS      := vault_pad calc task_mgr settings outrun_term outrun_edit
 APP_ELFS  := $(APPS:%=$(BUILD)/apps/%.elf)
 APP_SRC   := ../apps
-APP_DEPS  := $(APP_SRC)/gui.h $(APP_SRC)/font.h ../include/outrun_abi.h
+APP_DEPS  := $(APP_SRC)/gui.h $(APP_SRC)/font.h $(APP_SRC)/build_task.h ../include/outrun_abi.h
 
 $(BUILD)/apps:
 	mkdir -p $@
 
 $(BUILD)/apps/gui.o: $(APP_SRC)/gui.c $(APP_DEPS) | $(BUILD)/apps
-	$(CC) $(UCFLAGS) $(UEXTRA) -c $< -o $@
+	$(CC) $(UCFLAGS) -Werror $(UEXTRA) -c $< -o $@
 
 $(BUILD)/apps/%.o: $(APP_SRC)/%.c $(APP_DEPS) | $(BUILD)/apps
-	$(CC) $(UCFLAGS) $(UEXTRA) -c $< -o $@
+	$(CC) $(UCFLAGS) -Werror $(UEXTRA) -c $< -o $@
 
 $(BUILD)/apps/%.elf: $(BUILD)/apps/%.o $(BUILD)/apps/gui.o user/user.ld
 	$(LD) -n -T user/user.ld $< $(BUILD)/apps/gui.o -o $@
 	@echo "  app linked: $@"
 
 apps: $(APP_ELFS)
+
+$(BUILD)/apps/outrun_edit.o: $(APP_SRC)/vault_pad.c
 
 # The applications' own host-side unit tests. They run in under a second on the
 # build host and need no image, so there is no excuse for them not to run before
@@ -244,6 +246,9 @@ qemu: $(ISO) $(VBLK_IMG)
 # suites would change what every timing budget in this tree was calibrated
 # against, which CLAUDE.md rules out in as many words.
 DESKTOP_ISO := $(BUILD)/outrun-desktop-$(VERSION).iso
+
+# Prerequisites expand when read: the earlier recipes precede this variable.
+desktop-test desktop-test-smp desktop-soak: $(DESKTOP_ISO)
 
 $(DESKTOP_ISO): $(BUILD)/outrun-kernel.elf $(BUILD)/user_init.elf $(APP_ELFS) \
                 iso/boot/grub/grub-desktop.cfg

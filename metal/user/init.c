@@ -819,8 +819,9 @@ static void ipc_sender(void) {
      * never-deleted (v0.44) — a pid-keyed name here would claim a brand-new,
      * permanent VFS_MAXFILES dirent every round, exactly the growth v0.45's
      * kpstress hit and deliberately bounded. Reopening the SAME name every
-     * round still hands back a fresh, distinct global fd number each time
-     * (g_ofiles is the thing that's actually per-round here, not the name). */
+     * round hands back a fresh descriptor each time — v1.1: an fd number in
+     * THIS process's own table, not a global index, so nothing may be assumed
+     * about its value beyond fd >= 0. */
     i64 fd = (i64)sysc(SYS_OPEN, (u64)"ipc-payload", 0, 0);
     if (fd < 0) sysc(SYS_EXIT, 952, 0, 0);
 
@@ -834,6 +835,17 @@ static void ipc_sender(void) {
     const char *tag = "IPC-FD-XFER";
     for (int i = 0; i < 11; i++) m.inline_data[i] = (u8)tag[i];
     if ((i64)sysc(SYS_IPC_SEND, (u64)&m, 0, 0) != 0) sysc(SYS_EXIT, 953, 0, 0);
+    /* v1.1 Task 3: SEND is a TRANSFER, and the sender must have LOST it. The
+     * number is checked by USING it, not by comparing it: a read through a
+     * descriptor this process has given away must fail with EBADF. Comparing
+     * m.xfer_handle to `fd` would prove nothing either way now that the value
+     * written back is the RECIPIENT's number for the same description — it may
+     * legitimately equal `fd`, because two processes' tables are independent
+     * and both may have the same lowest free slot. */
+    {
+        u8 gone[4];
+        if ((i64)sysc(SYS_READ, (u64)fd, (u64)gone, 4) != -9) sysc(SYS_EXIT, 958, 0, 0);
+    }
 
     struct ipc_msg self;
     for (int i = 0; i < (int)sizeof self; i++) ((u8 *)&self)[i] = 0;
@@ -872,6 +884,12 @@ static void ipc_receiver(void) {
     struct ipc_msg m1;
     if ((i64)sysc(SYS_IPC_RECV, (u64)&m1, 1, 0) != 1) sysc(SYS_EXIT, 960, 0, 0);
     if (m1.msg_type != IPC_MSG_XFER_FD) sysc(SYS_EXIT, 961, 0, 0);
+    /* v1.1 Task 3: the handle is an fd number allocated in THIS process's table
+     * by the kernel's alloc_fd on the transfer. It is checked for VALIDITY —
+     * fd >= 0 — and then for identity of the underlying FILE DESCRIPTION, by
+     * reading the sender's payload through it below. It is NOT compared to the
+     * sender's number, which named a slot in a different table entirely. */
+    if (m1.xfer_handle < 0) sysc(SYS_EXIT, 969, 0, 0);
     const char *tag = "IPC-FD-XFER";
     for (int i = 0; i < 11; i++) if (m1.inline_data[i] != (u8)tag[i]) sysc(SYS_EXIT, 962, 0, 0);
 

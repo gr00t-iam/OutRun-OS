@@ -13,4 +13,10 @@ for name in calc vault_pad task_mgr settings; do
     gcc $CFLAGS "apps/tests/test_$name.c" -o "$OUT/$name"
     "$OUT/$name"
 done
+for source in apps/test_*.c; do
+    [ -f "$source" ] || continue
+    name=$(basename "$source" .c)
+    gcc $CFLAGS "$source" -o "$OUT/$name"
+    "$OUT/$name"
+done
 echo "apps: all host tests passed"

@@ -281,7 +281,7 @@ static void vp_paint(struct vp_editor *e,int w,int h,vp_draw_fn draw,void *ctx) 
 }
 #endif
 
-#ifndef APP_HOST_TEST
+#if !defined(APP_HOST_TEST) && !defined(VAULT_PAD_LIBRARY)
 #include "gui.h"
 static struct vp_editor vp_app;
 static long long vp_system(int op,unsigned long long a,unsigned long long b,unsigned long long c) {

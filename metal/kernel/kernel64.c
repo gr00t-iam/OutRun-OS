@@ -548,13 +548,16 @@ static const char sc_map_shift[128] = {
 static volatile char kbd_ring[64];
 static volatile uint32_t kbd_w = 0, kbd_r = 0;
 static bool shift_down = false;
+#include "key_state.h"
+static volatile unsigned char g_key_held[128];
 
 static void keyboard_irq(void) {
     uint8_t sc = inb(0x60);
     if (sc == 0x2A || sc == 0x36) { shift_down = true;  return; }
     if (sc == 0xAA || sc == 0xB6) { shift_down = false; return; }
-    if (sc & 0x80) return;                           /* other key releases     */
+    if (sc & 0x80) { key_state_update(g_key_held, sc, 0); return; }
     char c = shift_down ? sc_map_shift[sc & 0x7F] : sc_map[sc & 0x7F];
+    key_state_update(g_key_held, sc, (unsigned char)c);
     if (c && ((kbd_w - kbd_r) < 64))
         kbd_ring[kbd_w++ % 64] = c;
 }
@@ -1998,6 +2001,44 @@ struct dma_grant {
     int      used;
 };
 
+/* ===========================================================================
+ * v1.1 Phase 1 Task 3: PER-PROCESS DESCRIPTOR TABLES
+ * ===========================================================================
+ * See kernel/files.c for the full rationale. The two limits below are the
+ * ceilings this replaces:
+ *
+ *   OFILE_MAX  — open file DESCRIPTIONS, system-wide. Was 16, and 16 open
+ *                files across the whole machine is the first wall a
+ *                self-hosting toolchain hits.
+ *   FD_MAX     — descriptor NUMBERS in one process. The table starts at
+ *                FD_INLINE (no allocation for the common case) and doubles
+ *                from the buddy allocator up to this.
+ *
+ * `struct files_struct` is declared HERE rather than in files.c because it is
+ * a member of struct kproc below; the functions that operate on it need
+ * g_ofiles and the pipe/epoll helpers and are therefore included much later.
+ * One declaration, one definition site — the split that a second local copy of
+ * this struct would quietly undo.
+ *
+ * fd is int16_t: an ofile INDEX, or -1 for a free slot. OFILE_MAX is 64, so
+ * the width is not tight, and halving the table halves what files_expand has
+ * to allocate and copy. */
+#define OFILE_MAX  64
+#define FD_INLINE  16
+#define FD_MAX     256
+struct page;                                   /* fwd: kernel/mm.c            */
+struct files_struct {
+    int16_t     *fd;              /* -> fd_inline, or a grown buddy allocation */
+    int16_t      fd_inline[FD_INLINE];
+    uint32_t     max_fds;         /* entries addressable through `fd`          */
+    uint32_t     next_fd;         /* search hint: no free slot below this      */
+    uint32_t     nopen;           /* installed descriptors (audit + telemetry) */
+    struct page *grown;           /* the buddy allocation backing `fd`, or 0   */
+    uint32_t     grown_order;
+};
+static void files_init(struct files_struct *f);   /* fwd: kernel/files.c */
+static void files_free(struct files_struct *f);   /* fwd: kernel/files.c */
+
 struct kproc {
     uint64_t pid;
     char     name[24];
@@ -2081,6 +2122,19 @@ struct kproc {
      * all, and reset to -1 whenever the fd behind them is closed. */
     int      redir_in;
     int      redir_out;
+    /* v1.1 Task 3: the redirections name fd NUMBERS, which are now PER
+     * PROCESS — so the number alone no longer identifies anything outside this
+     * process, and two processes' fd 3 are unrelated. The DESCRIPTION each one
+     * currently resolves to is recorded beside it so a redirected write can be
+     * validated against the object it was set up on rather than re-resolved
+     * through a number that may since have been closed and reissued. -1 when
+     * no redirection is active. See SYS_SETREDIR. */
+    int      redir_in_oi;
+    int      redir_out_oi;
+    /* v1.1 Task 3: THE PER-PROCESS DESCRIPTOR TABLE. Lives on the thread-group
+     * leader and is reached through files_of()/tg_of() — never indexed by a
+     * thread's own slot, for exactly the reason fd_owner() exists. */
+    struct files_struct files;
     /* v0.49: SMP_SLOTS private scratch pages this process can remap/unmap at
      * will via SYS_SMP_REMAP/SYS_SMP_UNMAP, at fixed vaddrs SMP_USER_V+n*4K.
      * Holds the CURRENT backing frame's physical address (0 = unmapped) so a
@@ -2639,7 +2693,16 @@ static void kproc_reset(struct kproc *p) {
      * no test could see the difference because no test outlived a parent. See
      * role 53 in init.c, which is what finally measured it. */
     uint32_t gen_keep = p->gen;
+    /* v1.1 Task 3: the descriptor table may hold a BUDDY ALLOCATION, and the
+     * cmemset below would zero the pointer to it rather than free it — a leak
+     * of up to FD_MAX*2 bytes per recycled slot, invisible because nothing else
+     * names those pages. Released BEFORE the wipe and re-initialised after, so
+     * a slot is handed to its next occupant with a valid inline table rather
+     * than a zeroed `fd` pointer that the first fd_find_free_locked would
+     * dereference. */
+    files_free(&p->files);
     cmemset(p, 0, sizeof *p);
+    files_init(&p->files);
     p->pid = 0;
     p->name[0] = 0;
     p->caps = 0;
@@ -2655,6 +2718,8 @@ static void kproc_reset(struct kproc *p) {
     p->migrate_pin = -1;
     p->redir_in = -1;                 /* v0.59: -1 == the console, the default */
     p->redir_out = -1;
+    p->redir_in_oi = -1;              /* v1.1 Task 3: no description behind it */
+    p->redir_out_oi = -1;
     p->uctx = (struct uctx){0};
     p->ran_on = 0;
     p->enq_tick = 0; p->disp_lat = 0;              /* v0.78 fork telemetry */
@@ -2895,6 +2960,13 @@ static int kproc_spawn_thread(const char *name, int leader, int tid) {
     kprocs[i].affinity  = kprocs[leader].affinity;
     kprocs[i].redir_in  = kprocs[leader].redir_in;
     kprocs[i].redir_out = kprocs[leader].redir_out;
+    /* v1.1 Task 3: mirrored for the same reason the credentials are — every
+     * redirection check resolves through tg_of() to the leader, so this is the
+     * leader's state reflected for anything that reads a thread slot directly,
+     * NOT a second copy that could diverge. A thread has no descriptor table of
+     * its own at all: files_of() resolves to the leader's. */
+    kprocs[i].redir_in_oi  = kprocs[leader].redir_in_oi;
+    kprocs[i].redir_out_oi = kprocs[leader].redir_out_oi;
     /* v0.75: a thread inherits its leader's parent link, and must inherit the
      * GENERATION with it — the slot index alone would resolve against whatever
      * lives at that index now. */
@@ -10376,7 +10448,7 @@ static int64_t dev_read_file(void *buf, uint32_t max) {
  * pipe end carries no dirent and belongs to no volume — VOL_PIPE exists so
  * that every `switch (volume)` in the read/write paths has to account for it
  * explicitly rather than silently treating a pipe as a ROOT file.           */
-struct ofile { int used; int dirent; uint64_t off; uint64_t owner_mask; int volume;
+struct ofile { int used; int dirent; uint64_t off; int nref; int volume;
                int pipe; int pipe_w;
                /* v0.64: an epoll instance and an eventfd are DESCRIPTORS, which
                 * is not decoration — it is what gives them fork inheritance,
@@ -10389,7 +10461,12 @@ struct ofile { int used; int dirent; uint64_t off; uint64_t owner_mask; int volu
                 * socket: fork aliases a descriptor into a second slot and each
                 * alias carries its own blocking discipline. */
                int sock; int flags; };
-static struct ofile g_ofiles[16];
+/* v1.1 Task 3: OFILE_MAX descriptions, not 16, and the number is no longer an
+ * fd — it is an index into the DESCRIPTION table that per-process fd numbers
+ * point at. Every loop that used to walk `fd < 16` walks `i < OFILE_MAX` and
+ * is asking about descriptions; anything asking about a process's descriptors
+ * goes through its files_struct instead. */
+static struct ofile g_ofiles[OFILE_MAX];
 
 /* ===========================================================================
  * v0.59: KERNEL PIPE OBJECTS — the byte channel behind `|`
@@ -10488,6 +10565,19 @@ static void pipe_unref_locked(int pi, int is_w) {
 
 struct epwatch {
     int      used;
+    /* v1.1 Task 3: THE DESCRIPTION, not the fd number. An fd number is
+     * meaningful only inside one process, so a watch list keyed by number
+     * would answer for whichever process's fd 3 asked last — and a watch
+     * would survive its own descriptor being closed and the number reissued to
+     * an unrelated object, reporting readiness for something the caller never
+     * registered. `oi` is an index into g_ofiles (or EPOLL_TTY_FD).
+     *
+     * `fd` is retained ALONGSIDE it, and is the number the REGISTERING process
+     * used. It is not consulted for readiness — only for EPOLL_CTL_DEL/MOD,
+     * which POSIX specifies in terms of the descriptor the caller names. Two
+     * fields because they are two different questions; collapsing them is what
+     * made the pre-v1.1 code look correct. */
+    int      oi;
     int      fd;
     uint32_t events;      /* what the caller asked to hear about        */
     uint64_t data;        /* opaque cookie handed back verbatim         */
@@ -10515,21 +10605,26 @@ static int futex_wake_key(uint64_t key, int n, uint64_t rv);   /* fwd: v0.61 */
 static uint32_t net_sock_events(int si);                       /* fwd: v0.65 */
 static void net_sock_release(int si);                          /* fwd: v0.65 */
 
-/* What is `fd` ready for RIGHT NOW? Caller holds g_ofile_lock.
+/* What is DESCRIPTION `oi` ready for RIGHT NOW? Caller holds g_ofile_lock.
+ *
+ * v1.1 Task 3: takes a description index rather than an fd number, because
+ * readiness is a property of the open file description and not of any one
+ * process's name for it. EPOLL_TTY_FD is still accepted as the reserved
+ * console target, which has no description of its own.
  *
  * The pipe rules are the ones with content, and they are the same distinctions
  * v0.59 had to get right for read(): data means readable, but so does EOF —
  * a reader must be woken to *learn* there is nothing more coming, or a
  * pipeline hangs at its last byte instead of finishing. */
-static uint32_t ep_poll_fd_locked(int fd) {
-    if (fd == EPOLL_TTY_FD) {
+static uint32_t ep_poll_oi_locked(int oi) {
+    if (oi == EPOLL_TTY_FD) {
         /* Readable exactly when a keystroke is queued — the same condition
          * SYS_TTY_READ consults, asked of the same ring. Nothing is cached, so
          * this cannot disagree with what a subsequent read would find. */
         return (kbd_w != kbd_r) ? EPOLLIN : 0;
     }
-    if (fd < 0 || fd >= 16 || !g_ofiles[fd].used) return EPOLLERR;
-    struct ofile *o = &g_ofiles[fd];
+    if (oi < 0 || oi >= OFILE_MAX || !g_ofiles[oi].used) return EPOLLERR;
+    struct ofile *o = &g_ofiles[oi];
     uint32_t r = 0;
     if (o->volume == VOL_PIPE) {
         int pi = o->pipe;
@@ -10570,11 +10665,15 @@ static uint32_t ep_poll_fd_locked(int fd) {
     return EPOLLIN | EPOLLOUT;
 }
 
-/* Something happened on `fd`: wake any thread parked in epoll_wait on an
- * instance watching it. Scanning every instance is cheap at MAX_EPOLL = 4, and
- * it means a notifier does not have to maintain a reverse index that could go
- * stale — the same reason readiness itself is computed rather than cached. */
-static void ep_notify_fd(int fd) {
+/* Something happened on DESCRIPTION `oi`: wake any thread parked in epoll_wait
+ * on an instance watching it. Scanning every instance is cheap at MAX_EPOLL = 4,
+ * and it means a notifier does not have to maintain a reverse index that could
+ * go stale — the same reason readiness itself is computed rather than cached.
+ *
+ * v1.1 Task 3: keyed by description. A notifier knows which OBJECT changed —
+ * bytes landed in a pipe, a counter was posted — and does not and cannot know
+ * what any watcher's process calls it. */
+static void ep_notify_oi(int oi) {
     /* v0.64 Phase 2: the watch lists are mutated by EPOLL_CTL_ADD/DEL under
      * g_ofile_lock, and on SMP a notifier scanning them lock-free can read a
      * half-installed entry — a watch whose `used` is set before its `fd` is,
@@ -10586,7 +10685,7 @@ static void ep_notify_fd(int fd) {
     for (int i = 0; i < MAX_EPOLL; i++) {
         if (!g_epoll[i].used) continue;
         for (int k = 0; k < EPOLL_MAXWATCH; k++) {
-            if (!g_epoll[i].w[k].used || g_epoll[i].w[k].fd != fd) continue;
+            if (!g_epoll[i].w[k].used || g_epoll[i].w[k].oi != oi) continue;
             hit[nh++] = i;
             break;
         }
@@ -10604,10 +10703,10 @@ static void ep_notify_fd(int fd) {
  * A read DRAINS the counter and returns what it held; in semaphore mode it
  * takes exactly 1. Reading zero is EAGAIN rather than a short read, because
  * "no events" is a state to wait on, not an end of file. */
-static int64_t evfd_read_fd(int fd, void *dst, uint32_t len) {
+static int64_t evfd_read_oi(int oi, void *dst, uint32_t len) {
     if (len < 8) return -22;                                  /* EINVAL */
     klock_acquire(&g_ofile_lock);
-    int ei = (fd >= 0 && fd < 16 && g_ofiles[fd].used) ? g_ofiles[fd].efd : -1;
+    int ei = (oi >= 0 && oi < OFILE_MAX && g_ofiles[oi].used) ? g_ofiles[oi].efd : -1;
     if (ei < 0 || ei >= MAX_EVENTFD || !g_evfd[ei].used) { klock_release(&g_ofile_lock); return -9; }
     uint64_t v = g_evfd[ei].counter;
     int64_t r;
@@ -10626,10 +10725,10 @@ static int64_t evfd_read_fd(int fd, void *dst, uint32_t len) {
 /* A write ADDS to the counter and wakes anything parked in epoll_wait on it.
  * The wake happens after the lock is released: waking takes run-queue locks,
  * and the ordering discipline puts those outside the descriptor lock. */
-static int64_t evfd_write_fd(int fd, const void *src, uint32_t len) {
+static int64_t evfd_write_oi(int oi, const void *src, uint32_t len) {
     if (len < 8) return -22;
     klock_acquire(&g_ofile_lock);
-    int ei = (fd >= 0 && fd < 16 && g_ofiles[fd].used) ? g_ofiles[fd].efd : -1;
+    int ei = (oi >= 0 && oi < OFILE_MAX && g_ofiles[oi].used) ? g_ofiles[oi].efd : -1;
     if (ei < 0 || ei >= MAX_EVENTFD || !g_evfd[ei].used) { klock_release(&g_ofile_lock); return -9; }
     uint64_t add = *(const uint64_t *)src;
     int64_t r;
@@ -10637,63 +10736,29 @@ static int64_t evfd_write_fd(int fd, const void *src, uint32_t len) {
     else if (g_evfd[ei].counter + add < g_evfd[ei].counter) r = -11;   /* would wrap: EAGAIN */
     else { g_evfd[ei].counter += add; r = 8; }
     klock_release(&g_ofile_lock);
-    if (r == 8) { __sync_fetch_and_add(&g_evfd_writes, 1); ep_notify_fd(fd); }
+    if (r == 8) { __sync_fetch_and_add(&g_evfd_writes, 1); ep_notify_oi(oi); }
     return r;
 }
 
-static int ofile_claim(int owner, int volume, int dirent) {
-    klock_acquire(&g_ofile_lock);
-    for (int fd = 0; fd < 16; fd++)
-        if (!g_ofiles[fd].used) {
-            g_ofiles[fd].used = 1; g_ofiles[fd].dirent = dirent;
-            g_ofiles[fd].off = 0;
-            g_ofiles[fd].owner_mask = 1ull << owner;
-            g_ofiles[fd].volume = volume;
-            g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
-            g_ofiles[fd].ep = -1;   g_ofiles[fd].efd = -1;
-            /* v0.65: -1, not 0 — g_ofiles is zero-initialised and socket 0 is
-             * a perfectly valid slot, so a defaulted 0 would make every fresh
-             * descriptor claim to be socket 0. */
-            g_ofiles[fd].sock = -1; g_ofiles[fd].flags = 0;
-            klock_release(&g_ofile_lock);
-            return fd;
-        }
-    klock_release(&g_ofile_lock);
-    return -1;
-}
-
-/* Release one slot's claim on a descriptor. The entry only goes away when the
- * LAST owner drops it — that single rule is what makes fork-inherited fds and
- * IPC-transferred fds safe, and it is the one place a pipe end's refcount is
- * given back. Caller holds g_ofile_lock. Returns 1 if the entry was freed. */
-static int ofile_drop_locked(int fd, int slot) {
-    if (fd < 0 || fd >= 16 || !g_ofiles[fd].used) return 0;
-    if (!(g_ofiles[fd].owner_mask & (1ull << slot))) return 0;
-    g_ofiles[fd].owner_mask &= ~(1ull << slot);
-    /* A pipe end is refcounted PER OWNER, because fork took a reference per
-     * owner — so the release has to happen on every owner's drop, not only on
-     * the one that empties the mask. Deferring it to the last drop leaves
-     * `writers` permanently above zero, and a reader that can never reach zero
-     * writers never sees end-of-file: `a | b` hangs, and the pipe object is
-     * never reclaimed. (Caught by pipestrs' cross-fork round on the first run
-     * of this suite — the failure mode is invisible to a single-process test,
-     * which is exactly why the suite forks.) */
-    if (g_ofiles[fd].pipe >= 0) pipe_unref_locked(g_ofiles[fd].pipe, g_ofiles[fd].pipe_w);
-    /* v0.59: a redirection is a REFERENCE to this descriptor, so dropping the
-     * descriptor has to drop the reference with it. Otherwise the fd number is
-     * recycled by the next open and this process's stdout silently reattaches
-     * to a stranger's file — a data-corruption bug, not a leak, and invisible
-     * until something writes. Cleared for this slot always; for every slot
-     * once the entry itself is gone. */
-    if (kprocs[slot].redir_in  == fd) kprocs[slot].redir_in  = -1;
-    if (kprocs[slot].redir_out == fd) kprocs[slot].redir_out = -1;
-    /* v0.64: an epoll instance and an eventfd belong to the DESCRIPTOR, not to
-     * any one owner, so they are released exactly when the entry itself goes —
-     * unlike a pipe end above, whose refcount is per owner because fork takes
-     * a reference per owner. Getting these two the same way round would either
-     * free an instance a forked sibling still holds, or never free it at all. */
-    if (g_ofiles[fd].owner_mask) return 0;             /* other owners remain */
-    /* v0.64 Phase 2: a closed descriptor must not stay watched. ep_poll_fd
+/* ---------------------------------------------------------------------------
+ * v1.1 Task 3: THE LAST-REFERENCE DROP OF A DESCRIPTION.
+ *
+ * Everything here was the tail of ofile_drop_locked, from the point where the
+ * owner mask emptied. It is separated because the two halves answer different
+ * questions and now have different callers: fd_release_locked (files.c) drops
+ * ONE descriptor slot, and calls this only when the last one goes.
+ *
+ * The rules are unchanged and each is load-bearing — see files.c's header. A
+ * pipe end is refcounted PER SLOT and is therefore given back by
+ * fd_release_locked, NOT here; epoll instances, eventfds and sockets belong to
+ * the DESCRIPTION and are released exactly here. Getting those two the same
+ * way round would either free an instance a forked sibling still holds, or
+ * never free it at all.
+ *
+ * Caller holds g_ofile_lock. Returns 1 — the description was freed. */
+static int ofile_last_drop_locked(int oi) {
+    if (oi < 0 || oi >= OFILE_MAX || !g_ofiles[oi].used) return 0;
+    /* v0.64 Phase 2: a closed descriptor must not stay watched. ep_poll_oi
      * answers EPOLLERR for an unused slot, and EPOLLERR is reported whether or
      * not it was asked for — so a watch left behind by a close fires on every
      * subsequent wait, forever, for a descriptor that no longer exists. Linux
@@ -10701,41 +10766,76 @@ static int ofile_drop_locked(int fd, int slot) {
      * suite closed a watched pipe end and the next wait returned two events
      * where one was expected.
      *
-     * Purged on the LAST drop, matching when the fd number itself becomes
-     * free to reissue — an fd still held by a forked sibling is still a real
-     * descriptor and its watch is still meaningful. */
+     * Purged on the LAST reference, matching when the DESCRIPTION itself
+     * becomes free to reissue — a description another process still names
+     * through its own fd is still a real object and its watch is still
+     * meaningful. v1.1: matched by description, so a watch is purged when the
+     * object dies rather than when some process's number for it is reused. */
     for (int i = 0; i < MAX_EPOLL; i++) {
         if (!g_epoll[i].used) continue;
         for (int k = 0; k < EPOLL_MAXWATCH; k++)
-            if (g_epoll[i].w[k].used && g_epoll[i].w[k].fd == fd) g_epoll[i].w[k].used = 0;
+            if (g_epoll[i].w[k].used && g_epoll[i].w[k].oi == oi) g_epoll[i].w[k].used = 0;
     }
-    if (g_ofiles[fd].ep >= 0 && g_ofiles[fd].ep < MAX_EPOLL) {
-        g_epoll[g_ofiles[fd].ep].used = 0;
-        for (int k = 0; k < EPOLL_MAXWATCH; k++) g_epoll[g_ofiles[fd].ep].w[k].used = 0;
-        g_ofiles[fd].ep = -1;
+    if (g_ofiles[oi].ep >= 0 && g_ofiles[oi].ep < MAX_EPOLL) {
+        g_epoll[g_ofiles[oi].ep].used = 0;
+        for (int k = 0; k < EPOLL_MAXWATCH; k++) g_epoll[g_ofiles[oi].ep].w[k].used = 0;
+        g_ofiles[oi].ep = -1;
     }
-    if (g_ofiles[fd].efd >= 0 && g_ofiles[fd].efd < MAX_EVENTFD) {
-        g_evfd[g_ofiles[fd].efd].used = 0;
-        g_evfd[g_ofiles[fd].efd].counter = 0;
-        g_ofiles[fd].efd = -1;
+    if (g_ofiles[oi].efd >= 0 && g_ofiles[oi].efd < MAX_EVENTFD) {
+        g_evfd[g_ofiles[oi].efd].used = 0;
+        g_evfd[g_ofiles[oi].efd].counter = 0;
+        g_ofiles[oi].efd = -1;
     }
-    /* v0.65: a socket belongs to the DESCRIPTOR, like an epoll instance and
-     * unlike a pipe end — so it is released exactly when the entry itself
-     * goes, not per owner. This is what finally gives sockets SYS_CLOSE and
+    /* v0.65: a socket belongs to the DESCRIPTION, like an epoll instance and
+     * unlike a pipe end — so it is released exactly when the description goes,
+     * not per slot. This is what finally gives sockets SYS_CLOSE and
      * force-close-on-exit; before it, the only way a socket was ever reclaimed
      * was net_teardown_kproc at process death. */
-    if (g_ofiles[fd].sock >= 0) {
-        net_sock_release(g_ofiles[fd].sock);
-        g_ofiles[fd].sock = -1;
+    if (g_ofiles[oi].sock >= 0) {
+        net_sock_release(g_ofiles[oi].sock);
+        g_ofiles[oi].sock = -1;
     }
-    g_ofiles[fd].flags = 0;
-    for (int s = 0; s < n_kproc; s++) {
-        if (kprocs[s].redir_in  == fd) kprocs[s].redir_in  = -1;
-        if (kprocs[s].redir_out == fd) kprocs[s].redir_out = -1;
-    }
-    g_ofiles[fd].used = 0; g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
-    return 1;   /* the pipe reference was already given back above, per owner */
+    g_ofiles[oi].flags = 0;
+    g_ofiles[oi].nref = 0;
+    g_ofiles[oi].used = 0; g_ofiles[oi].pipe = -1; g_ofiles[oi].pipe_w = 0;
+    return 1;   /* the pipe reference was given back per slot, in fd_release_locked */
 }
+
+/* The per-process descriptor table itself. Included HERE, after the
+ * description layer and the pipe refcounts it calls into, and before the first
+ * caller below. */
+#include "files.c"
+
+/* v1.1 Task 3: claim a description AND install it at the lowest free fd number
+ * in `owner`'s table. The two-layer split means this can now fail in two
+ * distinguishable ways, and it must not leave a half-claimed description
+ * behind when the second one happens — hence the explicit release. Returns the
+ * fd NUMBER (meaningful only inside `owner`), or -1. */
+static int ofile_claim(int owner, int volume, int dirent) {
+    klock_acquire(&g_ofile_lock);
+    int oi = ofile_new_locked(volume, dirent);
+    klock_release(&g_ofile_lock);
+    if (oi < 0) return -1;                        /* description table full */
+    int fd = fd_alloc_install(owner, oi, 0);
+    if (fd < 0) {                                 /* EMFILE: no fd number for it */
+        klock_acquire(&g_ofile_lock);
+        /* nref is still 0 — no slot ever pointed at it, so there is no pipe
+         * reference to give back and no last-drop teardown to run. Marking it
+         * free is the whole of the undo. */
+        g_ofiles[oi].used = 0;
+        klock_release(&g_ofile_lock);
+        return -1;
+    }
+    return fd;
+}
+
+/* v1.1 Task 3: ofile_drop_locked(fd, slot) USED TO BE HERE, and it is gone
+ * rather than kept as a wrapper. Every one of its ~20 callers now calls
+ * fd_release_locked(slot, fd) directly, and the argument order is deliberately
+ * the other way round so a call written against the old signature does not
+ * silently compile: the two arguments were both ints and both plausible, which
+ * is exactly the shape of mistake that survives a refactor. A wrapper would
+ * have preserved that hazard for no benefit. */
 
 /* v0.64 Phase 2: which pipe READ ends are now at end-of-file? Caller holds
  * g_ofile_lock and does the waking OUTSIDE it.
@@ -10754,7 +10854,7 @@ static int ofile_drop_locked(int fd, int slot) {
  * rejects a transferred descriptor. */
 static int ep_collect_eof_locked(int *out) {
     int n = 0;
-    for (int q = 0; q < 16; q++) {
+    for (int q = 0; q < OFILE_MAX; q++) {
         int pi = g_ofiles[q].pipe;
         if (!g_ofiles[q].used || g_ofiles[q].volume != VOL_PIPE || g_ofiles[q].pipe_w) continue;
         if (pi < 0 || pi >= MAX_PIPES || !g_pipes[pi].used) continue;
@@ -10777,15 +10877,13 @@ static int ep_collect_eof_locked(int *out) {
  * with no writers left is 0, real end-of-file. A reader that cannot tell those
  * two apart either exits early on a slow producer or hangs forever on a
  * finished one, so pipestrs tests the boundary from both sides.              */
-static int64_t pipe_read_fd(int fd, void *dst, uint32_t len) {
-    int slot = fd_owner();
+static int64_t pipe_read_oi(int oi, void *dst, uint32_t len) {
     klock_acquire(&g_ofile_lock);
-    if (fd < 0 || fd >= 16 || !g_ofiles[fd].used ||
-        !(g_ofiles[fd].owner_mask & (1ull << slot)) ||
-        g_ofiles[fd].pipe < 0 || g_ofiles[fd].pipe_w) {
-        klock_release(&g_ofile_lock); return -9;           /* EBADF: not a read end we hold */
+    if (oi < 0 || oi >= OFILE_MAX || !g_ofiles[oi].used ||
+        g_ofiles[oi].pipe < 0 || g_ofiles[oi].pipe_w) {
+        klock_release(&g_ofile_lock); return -9;           /* EBADF: not a read end */
     }
-    struct kpipe *pp = &g_pipes[g_ofiles[fd].pipe];
+    struct kpipe *pp = &g_pipes[g_ofiles[oi].pipe];
     int64_t r;
     if (pp->count == 0) {
         r = pp->writers ? -11 : 0;                         /* EAGAIN vs true EOF */
@@ -10801,15 +10899,19 @@ static int64_t pipe_read_fd(int fd, void *dst, uint32_t len) {
     klock_release(&g_ofile_lock);
     return r;
 }
-static int64_t pipe_write_fd(int fd, const void *src, uint32_t len) {
-    int slot = fd_owner();
+/* v1.1 Task 3: takes a DESCRIPTION. The ownership test the fd-taking version
+ * did here is gone because it has already happened, once, in the caller: every
+ * path into this function resolves an fd number through the calling process's
+ * own table (ofile_deref / fd_lookup_locked), and a number that is not in that
+ * table does not resolve at all. Re-deriving ownership from a global index was
+ * only ever possible while fd numbers WERE global. */
+static int64_t pipe_write_oi(int oi, const void *src, uint32_t len) {
     klock_acquire(&g_ofile_lock);
-    if (fd < 0 || fd >= 16 || !g_ofiles[fd].used ||
-        !(g_ofiles[fd].owner_mask & (1ull << slot)) ||
-        g_ofiles[fd].pipe < 0 || !g_ofiles[fd].pipe_w) {
-        klock_release(&g_ofile_lock); return -9;           /* EBADF: not a write end we hold */
+    if (oi < 0 || oi >= OFILE_MAX || !g_ofiles[oi].used ||
+        g_ofiles[oi].pipe < 0 || !g_ofiles[oi].pipe_w) {
+        klock_release(&g_ofile_lock); return -9;           /* EBADF: not a write end */
     }
-    struct kpipe *pp = &g_pipes[g_ofiles[fd].pipe];
+    struct kpipe *pp = &g_pipes[g_ofiles[oi].pipe];
     int64_t r;
     if (pp->readers == 0) {
         r = -32;                                           /* EPIPE: nobody can ever read it */
@@ -10842,15 +10944,15 @@ static int64_t pipe_write_fd(int fd, const void *src, uint32_t len) {
      * lock would be worse: the wake takes run-queue locks, and the ordering
      * discipline puts those strictly outside the descriptor lock. Collecting
      * first satisfies both. */
-    int rq[16], nr = 0;
+    int rq[OFILE_MAX], nr = 0;
     if (r > 0) {
-        int pi = g_ofiles[fd].pipe;
-        for (int q = 0; q < 16; q++)
+        int pi = g_ofiles[oi].pipe;
+        for (int q = 0; q < OFILE_MAX; q++)
             if (g_ofiles[q].used && g_ofiles[q].volume == VOL_PIPE &&
                 g_ofiles[q].pipe == pi && !g_ofiles[q].pipe_w) rq[nr++] = q;
     }
     klock_release(&g_ofile_lock);
-    for (int i = 0; i < nr; i++) ep_notify_fd(rq[i]);
+    for (int i = 0; i < nr; i++) ep_notify_oi(rq[i]);
     return r;
 }
 
@@ -10873,15 +10975,31 @@ static int pipe_create_for(int owner, int *rfd, int *wfd) {
     if (r < 0) { klock_acquire(&g_ofile_lock); g_pipes[pi].used = 0; klock_release(&g_ofile_lock); return -24; }
     int w = ofile_claim(owner, VOL_PIPE, pi);
     if (w < 0) {
+        /* v1.1 Task 3: the read end is now a real installed DESCRIPTOR with a
+         * reference on its description, so undoing it means releasing it
+         * properly rather than clearing a `used` flag. It is not yet a pipe end
+         * (the .pipe field is set below, after both claims succeed), so
+         * fd_release_locked finds nothing to unref on the pipe and simply gives
+         * the slot and the description back. */
         klock_acquire(&g_ofile_lock);
-        g_ofiles[r].used = 0; g_ofiles[r].owner_mask = 0;  /* not yet a pipe end: no refcount to give back */
+        fd_release_locked(owner, r);
         g_pipes[pi].used = 0;
         klock_release(&g_ofile_lock);
         return -24;
     }
     klock_acquire(&g_ofile_lock);
-    g_ofiles[r].pipe = pi; g_ofiles[r].pipe_w = 0; g_pipes[pi].readers = 1;
-    g_ofiles[w].pipe = pi; g_ofiles[w].pipe_w = 1; g_pipes[pi].writers = 1;
+    /* Both ends exist as descriptors; NOW they become pipe ends. The per-slot
+     * refcounts are set to 1 each directly rather than through
+     * pipe_ref_locked, because fd_install_locked has already run for both and
+     * saw .pipe == -1 — it could not have taken a reference for an end that was
+     * not yet one. This is the one place the two-step is visible. */
+    int roi = fd_lookup_locked(owner, r), woi = fd_lookup_locked(owner, w);
+    if (roi < 0 || woi < 0) {                 /* cannot happen: we just made them */
+        klock_release(&g_ofile_lock);
+        return -24;
+    }
+    g_ofiles[roi].pipe = pi; g_ofiles[roi].pipe_w = 0; g_pipes[pi].readers = 1;
+    g_ofiles[woi].pipe = pi; g_ofiles[woi].pipe_w = 1; g_pipes[pi].writers = 1;
     klock_release(&g_ofile_lock);
     *rfd = r; *wfd = w;
     return 0;
@@ -10907,10 +11025,15 @@ static int pipe_create_for(int owner, int *rfd, int *wfd) {
  * second slot, and each alias carries its own discipline. Applied after the
  * claim rather than inside ofile_claim so the claim keeps its single job and
  * its existing callers keep their signatures. */
-static int vfs_apply_oflags(int fd, uint32_t oflags) {
+/* v1.1 Task 3: takes the OWNER as well as the fd number, because a number on
+ * its own no longer names anything — it has to be resolved through the table
+ * of the process the open was performed for, which is not necessarily the
+ * process that is running (vfs_open_for opens on behalf of `owner`). */
+static int vfs_apply_oflags(int owner, int fd, uint32_t oflags) {
     if (fd < 0 || !(oflags & VFS_O_APPEND)) return fd;
     klock_acquire(&g_ofile_lock);
-    if (g_ofiles[fd].used) g_ofiles[fd].flags |= (int)VFS_O_APPEND;
+    int oi = fd_lookup_locked(owner, fd);
+    if (oi >= 0) g_ofiles[oi].flags |= (int)VFS_O_APPEND;
     klock_release(&g_ofile_lock);
     return fd;
 }
@@ -10977,7 +11100,7 @@ static int vfs_open_for(const char *name, int owner, uint32_t oflags) {
         if (ti >= 0 && trunc) g_tmpfiles[ti].len = 0;
         klock_release(&g_vfs_lock);
         if (ti < 0) return -1;
-        return vfs_apply_oflags(ofile_claim(owner, VOL_TMP, ti), oflags);
+        return vfs_apply_oflags(owner, ofile_claim(owner, VOL_TMP, ti), oflags);
     }
     if (path_has_prefix(name, "dev/"))
         return ofile_claim(owner, VOL_DEV, 0);     /* dirent unused: a live view, not a file */
@@ -11018,7 +11141,7 @@ static int vfs_open_for(const char *name, int owner, uint32_t oflags) {
             int ok = vfs_permit(&DENTS[pdi], o_uid, o_gid, VFS_P_READ);
             klock_read_release(&g_vfs_lock, pt);
             if (!ok) return -13;                                   /* EACCES */
-            return vfs_apply_oflags(ofile_claim(owner, VOL_ROOT, pdi), oflags);
+            return vfs_apply_oflags(owner, ofile_claim(owner, VOL_ROOT, pdi), oflags);
         }
         klock_read_release(&g_vfs_lock, pt);
     }
@@ -11130,7 +11253,7 @@ static int vfs_open_for(const char *name, int owner, uint32_t oflags) {
     }
     klock_release(&g_vfs_lock);                /* released BEFORE the fd claim  */
     if (di < 0) return -1;
-    return vfs_apply_oflags(ofile_claim(owner, VOL_ROOT, di), oflags);
+    return vfs_apply_oflags(owner, ofile_claim(owner, VOL_ROOT, di), oflags);
 }
 /* v0.84: ONE flags-taking entry point.
  *
@@ -11219,10 +11342,17 @@ static int vfs_rename(const char *oldp, const char *newp) {
      * before rank 1 is taken. */
     if (victim >= 0) {
         klock_acquire(&g_ofile_lock);
-        for (int fd = 0; fd < 16; fd++)
-            if (g_ofiles[fd].used && g_ofiles[fd].volume == VOL_ROOT &&
-                g_ofiles[fd].dirent == victim)
-                { g_ofiles[fd].used = 0; g_ofiles[fd].owner_mask = 0; }
+        /* v1.1 Task 3: DESCRIPTIONS, not fd numbers, and the fd numbers that
+         * pointed here are deliberately left in place. A stale fd resolves
+         * through fd_lookup_locked, which tests g_ofiles[oi].used and answers
+         * -1 for a description that has been invalidated — so the descriptor
+         * stops working, which is the guarantee, without this path having to
+         * walk every process's table under the ofile lock. The number is
+         * reclaimed by the owner's own close or by descriptor teardown. */
+        for (int oi = 0; oi < OFILE_MAX; oi++)
+            if (g_ofiles[oi].used && g_ofiles[oi].volume == VOL_ROOT &&
+                g_ofiles[oi].dirent == victim)
+                { g_ofiles[oi].used = 0; g_ofiles[oi].nref = 0; }
         klock_release(&g_ofile_lock);
     }
     return 0;
@@ -11297,9 +11427,9 @@ static int vfs_unlink(const char *name) {
          * would read the next file to claim the index. Separate, non-nested
          * section — rank 2 released before rank 1 is taken. */
         klock_acquire(&g_ofile_lock);
-        for (int fd = 0; fd < 16; fd++)
-            if (g_ofiles[fd].used && g_ofiles[fd].volume == VOL_TMP && g_ofiles[fd].dirent == ti)
-                { g_ofiles[fd].used = 0; g_ofiles[fd].owner_mask = 0; }
+        for (int oi = 0; oi < OFILE_MAX; oi++)          /* v1.1: descriptions */
+            if (g_ofiles[oi].used && g_ofiles[oi].volume == VOL_TMP && g_ofiles[oi].dirent == ti)
+                { g_ofiles[oi].used = 0; g_ofiles[oi].nref = 0; }
         klock_release(&g_ofile_lock);
         return 0;
     }
@@ -11328,9 +11458,9 @@ static int vfs_unlink(const char *name) {
     klock_release(&g_vfs_lock);
 
     klock_acquire(&g_ofile_lock);              /* separate, non-nested section (rank 1) */
-    for (int fd = 0; fd < 16; fd++)
-        if (g_ofiles[fd].used && g_ofiles[fd].volume == VOL_ROOT && g_ofiles[fd].dirent == idx)
-            { g_ofiles[fd].used = 0; g_ofiles[fd].owner_mask = 0; }
+    for (int oi = 0; oi < OFILE_MAX; oi++)     /* v1.1: descriptions */
+        if (g_ofiles[oi].used && g_ofiles[oi].volume == VOL_ROOT && g_ofiles[oi].dirent == idx)
+            { g_ofiles[oi].used = 0; g_ofiles[oi].nref = 0; }
     klock_release(&g_ofile_lock);
     return 0;
 }
@@ -11416,28 +11546,43 @@ static int suite_fixture_reset(const char *name) {
 static void descriptor_teardown_kproc(int proc_idx) {
     struct kproc *p = &kprocs[proc_idx];
     int before = 0, after = 0;
+    /* v1.1 Task 3: THIS SLOT'S OWN TABLE, and only if it has one. A THREAD
+     * shares its leader's table and owns nothing of its own — files_of() would
+     * resolve to the leader's, and walking that here would close the whole
+     * process's descriptors on the first thread to exit. The old code was safe
+     * from this by accident (a thread's bit was never set in any owner mask);
+     * the new code has to say it, so the table is reached through the RAW slot
+     * and a thread is skipped outright.
+     *
+     * This is the one place in the kernel that deliberately does NOT resolve
+     * through tg_of(), and it is the same exception fd_owner()'s comment
+     * already names. */
+    if (proc_idx < 0 || proc_idx >= n_kproc) return;
+    if (tg_of(proc_idx) != proc_idx) return;             /* a thread: nothing of its own */
+    struct files_struct *f = &kprocs[proc_idx].files;
     klock_acquire(&g_ofile_lock);
-    uint64_t bit = 1ull << proc_idx;
-    for (int fd = 0; fd < 16; fd++)
-        if (g_ofiles[fd].used && (g_ofiles[fd].owner_mask & bit)) before++;
-    for (int fd = 0; fd < 16; fd++) {
-        if (!g_ofiles[fd].used || !(g_ofiles[fd].owner_mask & bit)) continue;
+    for (uint32_t i = 0; i < f->max_fds; i++) if (f->fd[i] >= 0) before++;
+    for (uint32_t i = 0; i < f->max_fds; i++) {
+        if (f->fd[i] < 0) continue;
         if (g_debug_kproc_lifetime)
             kprintf("[dbgkpr ] pid %u slot %d: force-closing fd %d (dirent %d) — never reached SYS_CLOSE\n",
-                    p->pid, proc_idx, fd, g_ofiles[fd].dirent);
-        /* v0.59: dropping THIS slot's claim, which frees the entry only if no
-         * other slot still holds it. A forked child that faults with an
-         * inherited fd open must not yank that fd out from under its parent —
-         * before the owner mask that was not even expressible. */
-        ofile_drop_locked(fd, proc_idx);
+                    p->pid, proc_idx, (uint64_t)i, g_ofiles[f->fd[i]].dirent);
+        /* v0.59: dropping THIS process's reference, which frees the description
+         * only if no other process still names it. A forked child that faults
+         * with an inherited fd open must not yank that description out from
+         * under its parent. */
+        fd_release_locked(proc_idx, (int)i);
     }
-    for (int fd = 0; fd < 16; fd++)
-        if (g_ofiles[fd].used && (g_ofiles[fd].owner_mask & bit)) after++;
+    for (uint32_t i = 0; i < f->max_fds; i++) if (f->fd[i] >= 0) after++;
     /* A dying pipeline stage still closes its write end, and the next stage
      * may be parked in epoll_wait waiting to learn exactly that. */
-    int eof[16], ne = ep_collect_eof_locked(eof);
+    int eof[OFILE_MAX], ne = ep_collect_eof_locked(eof);
     klock_release(&g_ofile_lock);
-    for (int i = 0; i < ne; i++) ep_notify_fd(eof[i]);
+    for (int i = 0; i < ne; i++) ep_notify_oi(eof[i]);
+    /* The grown table itself, if this process ever needed one. Released AFTER
+     * the lock: free_pages takes g_zone_lock (rank 0), which is beneath
+     * g_ofile_lock — the same one-way rule files_expand follows on the way up. */
+    files_free(f);
 
     if (g_debug_kproc_lifetime)
         kprintf("[dbgkpr ] pid %u slot %d: descriptors before=%d after=%d, DMA grants=%u\n",
@@ -12955,7 +13100,13 @@ struct nsock {
     int      qhead, qtail, qcount;
     int      waiter_tid;                     /* thread parked in SYS_RECV, or -1 */
     /* v0.65 */
-    int      fd;                             /* descriptor naming this socket, or -1 */
+    /* v1.1 Task 3: the DESCRIPTION naming this socket, or -1. It was an fd
+     * NUMBER, which stopped being a global identity the moment descriptor
+     * tables became per process: two processes' fd 3 are unrelated, so a
+     * back-pointer holding 3 would let one process's stale-descriptor check
+     * (sock_fd_still_ours) pass against another process's socket. An ofile
+     * index is machine-wide and unique, which is what this check needs. */
+    int      oi;
     int      listening;                      /* 1 = accepts peer sessions          */
     struct npend pend[SOCK_BACKLOG];         /* peers heard from, not yet accepted */
     int      phead, ptail, pcount;
@@ -13054,7 +13205,7 @@ static void net_sock_release_locked(int si) {
                 g_sock[i].hup = 1;
     sock_slot_wipe(si);
     g_sock[si].waiter_tid = -1;
-    g_sock[si].fd = -1;
+    g_sock[si].oi = -1;
 }
 
 /* Same, taking the lock itself — for callers that hold g_ofile_lock (rank 1)
@@ -13070,15 +13221,22 @@ static void net_sock_release(int si) {
  * serve a socket its leader opened — which is the entire shape of a threaded
  * server and was impossible before v0.64's fd_owner() landed. Takes only the
  * ofile lock (rank 1); the caller climbs to the net lock afterwards. */
-static int sock_of_fd(int fd, int *flags_out) {
+/* v1.1 Task 3: also reports the DESCRIPTION it resolved through, because
+ * sock_fd_still_ours() now compares descriptions rather than fd numbers and
+ * would otherwise have to re-resolve the number under a lock it must not take
+ * (rank 1 while holding rank 9). Resolved once, both answers returned — the
+ * same "one resolution, not two" rule v0.75 established here. */
+static int sock_of_fd(int fd, int *flags_out, int *oi_out) {
     if (flags_out) *flags_out = 0;
-    if (fd < 0 || fd >= 16) return -1;
+    if (oi_out) *oi_out = -1;
+    if (fd < 0) return -1;
     int si = -1;
     klock_acquire(&g_ofile_lock);
-    if (g_ofiles[fd].used && g_ofiles[fd].volume == VOL_SOCK &&
-        (g_ofiles[fd].owner_mask & (1ull << fd_owner()))) {
-        si = g_ofiles[fd].sock;
-        if (flags_out) *flags_out = g_ofiles[fd].flags;
+    int oi = fd_lookup_locked(fd_owner(), fd);        /* v1.1: this process's table */
+    if (oi >= 0 && g_ofiles[oi].volume == VOL_SOCK) {
+        si = g_ofiles[oi].sock;
+        if (flags_out) *flags_out = g_ofiles[oi].flags;
+        if (oi_out) *oi_out = oi;
     }
     klock_release(&g_ofile_lock);
     return si;
@@ -13101,8 +13259,8 @@ static int sock_of_fd(int fd, int *flags_out) {
  *
  * A close frees the slot (used=0, fd=-1); a reissue repoints it at a different
  * descriptor. Either way this compares unequal. */
-static inline int sock_fd_still_ours(int si, int fd) {
-    return si >= 0 && si < NSOCK && g_sock[si].used && g_sock[si].fd == fd;
+static inline int sock_fd_still_ours(int si, int oi) {
+    return si >= 0 && si < NSOCK && g_sock[si].used && oi >= 0 && g_sock[si].oi == oi;
 }
 
 /* Enqueue a datagram into a socket's RX ring and wake any parked receiver.
@@ -13353,7 +13511,7 @@ static void tcp_input(int si, struct tseg *g) {
         if (ci < 0) return;
         sock_slot_wipe(ci);
         struct nsock *c = &g_sock[ci];
-        c->used = 1; c->owner = s->owner; c->waiter_tid = -1; c->fd = -1;
+        c->used = 1; c->owner = s->owner; c->waiter_tid = -1; c->oi = -1;
         c->stream = 1; c->bound = 1; c->lport = s->lport;
         c->raddr = NET_LOOPBACK; c->rport = g->sport;   /* the port it spoke from */
         /* An accepted socket IS connected — it has a peer, and every send path
@@ -13784,7 +13942,7 @@ static void net_teardown_kproc(int proc_idx) {
     int L = tg_of(proc_idx);
     klock_acquire(&g_net_lock);
     for (int i = 0; i < NSOCK; i++) {
-        if (g_sock[i].used && g_sock[i].fd < 0 && g_sock[i].owner == L) {
+        if (g_sock[i].used && g_sock[i].oi < 0 && g_sock[i].owner == L) {
             if (g_debug_net)
                 kprintf("[dbgnet ] pid %u slot %d: released undescribed socket (lport %u)\n",
                         kprocs[proc_idx].pid, i, (uint64_t)g_sock[i].lport);
@@ -18306,14 +18464,29 @@ static inline void fs_witness_leave(void) { __sync_fetch_and_sub(&g_fs_inflight,
 /* Resolve fd -> dirent index under the ofile lock, enforcing ownership.
  * v0.48: also reports which VOLUME the fd was opened against, so callers can
  * dispatch to the right backing store — a fd's volume never changes after
- * open, so this is the one place that isolation boundary is enforced.        */
-static int ofile_deref(int fd, int *out_vol) {
-    if (fd < 0 || fd >= 16) return -1;
+ * open, so this is the one place that isolation boundary is enforced.
+ *
+ * v1.1 Task 3: ownership is no longer a mask test — it is the lookup itself.
+ * An fd number is resolved through the CALLING PROCESS's own table, so a
+ * number this process does not hold does not resolve at all, and a number
+ * another process holds is simply a different table's entry. That is a
+ * stronger guarantee than the mask gave, and it is structural rather than
+ * checked.
+ *
+ * `out_oi` reports the DESCRIPTION, which every caller that then reads or
+ * writes an offset, a pipe or an eventfd needs — those live on the
+ * description, and re-deriving it from the number a second time would be the
+ * two-lookup race v0.75 removed from the socket paths. */
+static int ofile_deref(int fd, int *out_vol, int *out_oi) {
+    if (out_oi) *out_oi = -1;
+    if (fd < 0) return -1;
     klock_acquire(&g_ofile_lock);
-    int di = (g_ofiles[fd].used &&
-              (g_ofiles[fd].owner_mask & (1ull << fd_owner())))
-           ? g_ofiles[fd].dirent : -1;
-    if (di >= 0 && out_vol) *out_vol = g_ofiles[fd].volume;
+    int oi = fd_lookup_locked(fd_owner(), fd);
+    int di = (oi >= 0) ? g_ofiles[oi].dirent : -1;
+    if (oi >= 0) {
+        if (out_vol) *out_vol = g_ofiles[oi].volume;
+        if (out_oi)  *out_oi  = oi;
+    }
     klock_release(&g_ofile_lock);
     return di;
 }
@@ -18419,21 +18592,37 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
      * per-process refcount instead of a per-descriptor one would cause).
      * The redirections come across too: a shell sets up the child's stdout
      * before forking, and the fork is what carries it into the new process. */
-    klock_acquire(&g_ofile_lock);
-    int inherited = 0;
-    /* v0.64 Phase 2: the descriptors to hand on are the PROCESS's, so the mask
-     * is read against the thread-group leader — v0.64 got here first, by the
-     * route v0.75 defect C generalises: a thread's own bit is never set, so a
-     * forking thread's child would inherit nothing at all.
-     * v0.75: `par` is now already the leader, so this resolves to itself. Kept
-     * as a tg_of() call rather than quietly aliased to `par`, because it states
-     * which identity the fd mask is indexed by, and that is the thing v0.64
-     * discovered the hard way. */
+    /* v1.1 Task 3: the child gets a COPY OF THE TABLE — every fd NUMBER the
+     * parent holds names the same DESCRIPTION in the child, which is what
+     * POSIX fork means and what the owner mask was approximating. The numbers
+     * are preserved exactly (a shell sets up fd 1 before forking and the child
+     * must still find it at 1), so this is a copy and not a re-allocation.
+     *
+     * Each copied slot takes its own reference on the description, and each
+     * inherited pipe end takes its own per-slot pipe refcount — the child's
+     * right to read or write that pipe is independent of the parent's. A
+     * parent that closes its write end while the child still holds one must
+     * NOT give the reader a spurious EOF; that is precisely the bug a
+     * per-process refcount instead of a per-slot one would cause.
+     *
+     * The child's table is GROWN FIRST, outside the lock, because expansion
+     * takes buddy frames under g_zone_lock (rank 0) which is beneath
+     * g_ofile_lock — the invariant files.c states and this is its second
+     * consumer. If the parent never grew, no allocation happens at all. */
     int par_fds = tg_of(par);
-    for (int fd = 0; fd < 16; fd++) {
-        if (!g_ofiles[fd].used || !(g_ofiles[fd].owner_mask & (1ull << par_fds))) continue;
-        g_ofiles[fd].owner_mask |= (1ull << ch);
-        if (g_ofiles[fd].pipe >= 0) pipe_ref_locked(g_ofiles[fd].pipe, g_ofiles[fd].pipe_w);
+    int inherited = 0;
+    struct files_struct *pf = &kprocs[par_fds].files;
+    struct files_struct *cf = &kprocs[ch].files;
+    if (pf->max_fds > cf->max_fds && files_expand(cf, pf->max_fds) < 0) {
+        page_free_tree(kprocs[ch].cr3);
+        kprocs[ch].torn_down = 1; kprocs[ch].exited = 1; kprocs[ch].exit_code = (uint64_t)-12;
+        return (uint64_t)-12;                    /* out of frames: undo cleanly */
+    }
+    klock_acquire(&g_ofile_lock);
+    for (uint32_t i = 0; i < pf->max_fds && i < cf->max_fds; i++) {
+        int oi = pf->fd[i];
+        if (oi < 0 || !g_ofiles[oi].used) continue;
+        fd_install_locked(ch, (int)i, oi);        /* +1 description ref, +1 pipe ref */
         inherited++;
     }
     klock_release(&g_ofile_lock);
@@ -18455,6 +18644,11 @@ static uint64_t sys_fork(struct sysframe *sf, uint64_t flags) {
     klock_release(&g_vm_lock);
     kprocs[ch].redir_in  = kprocs[par].redir_in;
     kprocs[ch].redir_out = kprocs[par].redir_out;
+    /* v1.1 Task 3: the DESCRIPTION each redirection names comes across with the
+     * number, because the child's copied table maps that number to the very
+     * same description — so the pair is still consistent in the child. */
+    kprocs[ch].redir_in_oi  = kprocs[par].redir_in_oi;
+    kprocs[ch].redir_out_oi = kprocs[par].redir_out_oi;
 
     struct uctx *u = &kprocs[ch].uctx;
     u->r15 = sf->r15; u->r14 = sf->r14; u->r13 = sf->r13; u->r12 = sf->r12;
@@ -18823,18 +19017,18 @@ static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, ui
     int epfd = (int)(int64_t)a0;
     int maxev = (int)(a2 & 0xFFFFFFFFu);
     int64_t tmo_ms = (int64_t)(int32_t)(a2 >> 32);
-    if (epfd < 0 || epfd >= 16 || maxev <= 0) { kprocs[me].ep_deadline = 0; return (uint64_t)-22; }
+    if (epfd < 0 || maxev <= 0) { kprocs[me].ep_deadline = 0; return (uint64_t)-22; }
     if (maxev > EPOLL_MAXWATCH) maxev = EPOLL_MAXWATCH;
     if (!access_ok(kprocs[p].cr3, a1, (uint64_t)maxev * sizeof(struct uepoll_event), 1)) {
         kprocs[me].ep_deadline = 0; return (uint64_t)-14;
     }
 
     klock_acquire(&g_ofile_lock);
-    if (!g_ofiles[epfd].used || g_ofiles[epfd].volume != VOL_EPOLL ||
-        !(g_ofiles[epfd].owner_mask & (1ull << p))) {
+    int epoi = fd_lookup_locked(p, epfd);                /* v1.1: our table */
+    if (epoi < 0 || g_ofiles[epoi].volume != VOL_EPOLL) {
         klock_release(&g_ofile_lock); kprocs[me].ep_deadline = 0; return (uint64_t)-9;
     }
-    int epi = g_ofiles[epfd].ep;
+    int epi = g_ofiles[epoi].ep;
     if (epi < 0 || epi >= MAX_EPOLL || !g_epoll[epi].used) {
         klock_release(&g_ofile_lock); kprocs[me].ep_deadline = 0; return (uint64_t)-9;
     }
@@ -18847,7 +19041,7 @@ static uint64_t sys_epoll_wait(struct sysframe *sf, uint64_t a0, uint64_t a1, ui
          * for — POSIX requires it, and a caller that only asked for EPOLLIN
          * still has to learn that its peer is gone or it waits forever. */
         uint32_t want = E->w[k].events | EPOLLERR | EPOLLHUP;
-        uint32_t got = ep_poll_fd_locked(E->w[k].fd) & want;
+        uint32_t got = ep_poll_oi_locked(E->w[k].oi) & want;
         if (!got) { E->w[k].seen = 0; continue; }
         if ((E->w[k].events & EPOLLET) && got == E->w[k].seen) continue;  /* no edge */
         E->w[k].seen = got;
@@ -19158,11 +19352,11 @@ static uint8_t g_redir_stage[REDIR_STAGE_MAX];
 static struct klock g_redir_lock = { 0, "redir", 2, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK_DBG_INIT };
 
 static int64_t redirect_write_bytes(int fd, const void *data, uint32_t len) {
-    int vol = VOL_ROOT;
-    int di = ofile_deref(fd, &vol);
+    int vol = VOL_ROOT, oi = -1;
+    int di = ofile_deref(fd, &vol, &oi);
     if (di < 0) return -9;                                  /* EBADF */
-    if (vol == VOL_PIPE) return pipe_write_fd(fd, data, len);
-    if (vol == VOL_EVFD) return evfd_write_fd(fd, data, len);
+    if (vol == VOL_PIPE) return pipe_write_oi(oi, data, len);
+    if (vol == VOL_EVFD) return evfd_write_oi(oi, data, len);
     if (vol == VOL_DEV)  return -13;                        /* read-only volume */
     if (!len) return 0;
 
@@ -19325,10 +19519,10 @@ static int64_t vfs_write_at(int di, uint64_t off, const void *data, uint32_t len
 }
 
 static int64_t redirect_read_bytes(int fd, void *buf, uint32_t len) {
-    int vol = VOL_ROOT;
-    int di = ofile_deref(fd, &vol);
+    int vol = VOL_ROOT, oi = -1;
+    int di = ofile_deref(fd, &vol, &oi);
     if (di < 0) return -9;
-    if (vol == VOL_PIPE) return pipe_read_fd(fd, buf, len);
+    if (vol == VOL_PIPE) return pipe_read_oi(oi, buf, len);
     if (!len) return 0;
 
     klock_acquire(&g_redir_lock);
@@ -19337,13 +19531,13 @@ static int64_t redirect_read_bytes(int fd, void *buf, uint32_t len) {
                                      : dev_read_file(g_redir_stage, REDIR_STAGE_MAX);
     if (have < 0) have = 0;
     klock_acquire(&g_ofile_lock);                           /* rank 0 -> 1: the declared order */
-    uint64_t off = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
+    uint64_t off = g_ofiles[oi].used ? g_ofiles[oi].off : 0;
     uint32_t n = 0;
     if (off < (uint64_t)have) {
         uint64_t left = (uint64_t)have - off;
         n = len < left ? len : (uint32_t)left;
         cmemcpy(buf, g_redir_stage + off, n);
-        if (g_ofiles[fd].used) g_ofiles[fd].off = off + n;
+        if (g_ofiles[oi].used) g_ofiles[oi].off = off + n;
     }
     klock_release(&g_ofile_lock);
     klock_release(&g_redir_lock);
@@ -19363,7 +19557,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
          * can take nothing. Callers that may be redirected therefore have to
          * loop; libc.oc's puts() does, which is what makes an ordinary
          * puts()-based program survive being put in a pipeline. */
-        int ro = kprocs[current_proc_idx].redir_out;
+        /* v1.1 Task 3: the LEADER's, because the redirection and the fd table
+         * it names are both properties of the process. A thread reading its own
+         * slot would find the mirror kproc_spawn_thread installed, which is the
+         * same value — but only by construction, and the identity rule is that
+         * every fd question resolves through tg_of(). */
+        int ro = kprocs[tg_of((int)current_proc_idx)].redir_out;
         if (ro >= 0) {
             uint32_t n = 0; while (buf[n]) n++;
             if (!n) return 0;
@@ -19445,8 +19644,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         uint32_t len = (uint32_t)a2; if (len > 65536) len = 65536;
         if (!access_ok(kprocs[current_proc_idx].cr3, a1, len, 1)) return (uint64_t)-14;  /* must be USER-writable */
         fs_witness_enter();
-        int vol = VOL_ROOT;
-        int di = ofile_deref(fd, &vol);                     /* owner-checked      */
+        int vol = VOL_ROOT, oi = -1;
+        int di = ofile_deref(fd, &vol, &oi);                /* resolved in OUR table */
         int64_t n = -9;
         if (di >= 0) {
             /* v0.66: dispatched EXHAUSTIVELY. This was a chain ending in
@@ -19486,12 +19685,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                  * argued about. Not holding it needs no argument. */
                 uint64_t off;
                 klock_acquire(&g_ofile_lock);
-                off = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
+                off = g_ofiles[oi].used ? g_ofiles[oi].off : 0;
                 klock_release(&g_ofile_lock);
                 n = vfs_read_range(di, off, (void *)a1, len);
                 if (n > 0) {
                     klock_acquire(&g_ofile_lock);
-                    if (g_ofiles[fd].used) g_ofiles[fd].off = off + (uint64_t)n;
+                    if (g_ofiles[oi].used) g_ofiles[oi].off = off + (uint64_t)n;
                     klock_release(&g_ofile_lock);
                 }
             }
@@ -19508,17 +19707,17 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             else if (vol == VOL_TMP) {
                 uint64_t toff;
                 klock_acquire(&g_ofile_lock);
-                toff = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
+                toff = g_ofiles[oi].used ? g_ofiles[oi].off : 0;
                 klock_release(&g_ofile_lock);
                 n = tmp_read_range(di, toff, (void *)a1, len);
                 if (n > 0) {
                     klock_acquire(&g_ofile_lock);
-                    if (g_ofiles[fd].used) g_ofiles[fd].off = toff + (uint64_t)n;
+                    if (g_ofiles[oi].used) g_ofiles[oi].off = toff + (uint64_t)n;
                     klock_release(&g_ofile_lock);
                 }
             }
-            else if (vol == VOL_PIPE) n = pipe_read_fd(fd, (void *)a1, len);   /* v0.59 */
-            else if (vol == VOL_EVFD) n = evfd_read_fd(fd, (void *)a1, len);   /* v0.64 */
+            else if (vol == VOL_PIPE) n = pipe_read_oi(oi, (void *)a1, len);   /* v0.59 */
+            else if (vol == VOL_EVFD) n = evfd_read_oi(oi, (void *)a1, len);   /* v0.64 */
             else if (vol == VOL_DEV)  n = dev_read_file((void *)a1, len);
             else if (vol == VOL_SOCK) n = -22;   /* EINVAL: use SYS_RECV       */
             else if (vol == VOL_EPOLL) n = -22;  /* EINVAL: use SYS_EPOLL_WAIT */
@@ -19533,16 +19732,16 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         uint32_t len = (uint32_t)a2; if (len > 65536) len = 65536;
         if (!access_ok(kprocs[current_proc_idx].cr3, a1, len, 0)) return (uint64_t)-14;  /* must be USER-readable */
         fs_witness_enter();
-        int vol = VOL_ROOT;
-        int di = ofile_deref(fd, &vol);
+        int vol = VOL_ROOT, oi = -1;
+        int di = ofile_deref(fd, &vol, &oi);
         int64_t r = -9;
         /* v0.84: does this DESCRIPTION append? Read once, here, rather than at
          * each volume's branch — the answer is a property of the descriptor and
          * cannot change between the branches. */
         int appending = 0;
-        if (fd >= 0 && fd < 16) {
+        if (oi >= 0) {
             klock_acquire(&g_ofile_lock);
-            appending = g_ofiles[fd].used && (g_ofiles[fd].flags & (int)VFS_O_APPEND);
+            appending = g_ofiles[oi].used && (g_ofiles[oi].flags & (int)VFS_O_APPEND);
             klock_release(&g_ofile_lock);
         }
         if (di >= 0) {
@@ -19578,7 +19777,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                 uint64_t woff = 0;
                 if (ok && !appending) {
                     klock_acquire(&g_ofile_lock);
-                    woff = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
+                    woff = g_ofiles[oi].used ? g_ofiles[oi].off : 0;
                     klock_release(&g_ofile_lock);
                 }
                 /* v0.84: O_APPEND does NOT read the offset here, and that is the
@@ -19594,7 +19793,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                 else                r = vfs_write_at(di, woff, (const void *)a1, len);
                 if (r > 0) {
                     klock_acquire(&g_ofile_lock);
-                    if (g_ofiles[fd].used) g_ofiles[fd].off = woff + (uint64_t)r;
+                    if (g_ofiles[oi].used) g_ofiles[oi].off = woff + (uint64_t)r;
                     klock_release(&g_ofile_lock);
                 }
             }
@@ -19606,7 +19805,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                 uint64_t toff = 0;
                 if (!appending) {
                     klock_acquire(&g_ofile_lock);
-                    toff = g_ofiles[fd].used ? g_ofiles[fd].off : 0;
+                    toff = g_ofiles[oi].used ? g_ofiles[oi].off : 0;
                     klock_release(&g_ofile_lock);
                 }
                 /* v0.84: same atomic append as the root volume — both volumes
@@ -19616,12 +19815,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                               : tmp_write_at(di, toff, (const void *)a1, len);
                 if (r > 0) {
                     klock_acquire(&g_ofile_lock);
-                    if (g_ofiles[fd].used) g_ofiles[fd].off = toff + (uint64_t)r;
+                    if (g_ofiles[oi].used) g_ofiles[oi].off = toff + (uint64_t)r;
                     klock_release(&g_ofile_lock);
                 }
             }
-            else if (vol == VOL_PIPE) r = pipe_write_fd(fd, (const void *)a1, len);        /* v0.59 */
-            else if (vol == VOL_EVFD) r = evfd_write_fd(fd, (const void *)a1, len);        /* v0.64 */
+            else if (vol == VOL_PIPE) r = pipe_write_oi(oi, (const void *)a1, len);       /* v0.59 */
+            else if (vol == VOL_EVFD) r = evfd_write_oi(oi, (const void *)a1, len);       /* v0.64 */
             else if (vol == VOL_DEV)  r = -13;   /* read-only volume: capability-style denial */
             else if (vol == VOL_SOCK) r = -22;   /* EINVAL: use SYS_SEND        */
             else if (vol == VOL_EPOLL) r = -22;  /* EINVAL: an epoll set is not a stream */
@@ -19637,15 +19836,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     }
     case 8: {                                              /* SYS_CLOSE(fd)              */
         int fd = (int)a0;
-        if (fd >= 0 && fd < 16) {
-            int eof[16], ne = 0;
+        if (fd >= 0) {                       /* v1.1: no global upper bound to test */
+            int eof[OFILE_MAX], ne = 0;
             fs_witness_enter();
             klock_acquire(&g_ofile_lock);
-            ofile_drop_locked(fd, fd_owner());
+            fd_release_locked(fd_owner(), fd);
             ne = ep_collect_eof_locked(eof);   /* woken below, outside the lock */
             klock_release(&g_ofile_lock);
             fs_witness_leave();
-            for (int i = 0; i < ne; i++) ep_notify_fd(eof[i]);
+            for (int i = 0; i < ne; i++) ep_notify_oi(eof[i]);
         }
         return 0;
     }
@@ -19808,16 +20007,40 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (kmsg.msg_type == IPC_MSG_XFER_FD) {
             if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
             int fd = (int)kmsg.xfer_handle;
+            /* v1.1 Task 3: SCM_RIGHTS SEMANTICS. Through v1.0 this moved an
+             * owner-mask bit and the recipient then used THE SAME NUMBER, which
+             * was coherent only because a number was a global index. It is not
+             * one any more: the sender's fd 5 and the recipient's fd 5 are
+             * unrelated entries in two different tables, and moving a bit would
+             * hand the recipient a descriptor it cannot name.
+             *
+             * So the transfer now does what a real SCM_RIGHTS does — the
+             * DESCRIPTION is what moves, and the recipient gets the LOWEST fd
+             * number free in ITS OWN table, which is what the number handed
+             * back in xfer_handle means. It is still a TRANSFER and not a
+             * share: the recipient's slot is installed first and the sender's
+             * is released after, so the description's reference count never
+             * touches zero in between and the object cannot be torn down
+             * mid-flight. Installing first also means a failure to allocate an
+             * fd in the recipient leaves the SENDER still holding it, which is
+             * the only safe way to fail.
+             *
+             * Ownership still moves at SEND time, exactly as before: the
+             * recipient's descriptor teardown force-closes it if the recipient
+             * dies before ever calling SYS_IPC_RECV. */
             klock_acquire(&g_ofile_lock);
-            /* v0.59: a TRANSFER, still — the sender's bit clears as the recipient's
-             * sets, so the descriptor never has two owners by way of this path.
-             * That keeps "handing someone a key" exactly as it read before the
-             * mask existed; fork is the one thing that genuinely shares.       */
-            uint64_t sbit = 1ull << (int)current_proc_idx;
-            int ok = fd >= 0 && fd < 16 && g_ofiles[fd].used && (g_ofiles[fd].owner_mask & sbit);
-            if (ok) g_ofiles[fd].owner_mask = (g_ofiles[fd].owner_mask & ~sbit) | (1ull << rcpt);
+            int oi = fd_lookup_locked(fd_owner(), fd);
             klock_release(&g_ofile_lock);
-            if (!ok) return (uint64_t)-9;
+            if (oi < 0) return (uint64_t)-9;                    /* EBADF: not ours */
+            int rcpt_fd = fd_alloc_install(tg_of(rcpt), oi, 0);
+            if (rcpt_fd < 0) return (uint64_t)-24;              /* EMFILE in the recipient */
+            klock_acquire(&g_ofile_lock);
+            fd_release_locked(fd_owner(), fd);                  /* the sender gives it up */
+            klock_release(&g_ofile_lock);
+            /* The recipient is told what to call it. Without this the number in
+             * the message would name the SENDER's slot, and the recipient would
+             * use a number that means something else or nothing at all. */
+            kmsg.xfer_handle = (uint64_t)(int64_t)rcpt_fd;
         } else if (kmsg.msg_type == IPC_MSG_XFER_SHM) {
             int64_t id = ipc_shmem_grant(kmsg.xfer_handle, (int)current_proc_idx, rcpt);
             if (id < 0) return (uint64_t)-9;
@@ -19855,12 +20078,17 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             /* accept path instead of inventing a return-to-sender protocol.          */
             if (kmsg.msg_type == IPC_MSG_XFER_FD) {
                 int fd = (int)kmsg.xfer_handle;
-                int eof[16], ne;
+                /* v1.1 Task 3: the number in the message is THE RECIPIENT'S —
+                 * SYS_IPC_SEND installed it in this process's table and wrote
+                 * the number it chose back into the message. So releasing it
+                 * against fd_owner() releases the right slot; before v1.1 this
+                 * happened to work only because the number was global. */
+                int eof[OFILE_MAX], ne;
                 klock_acquire(&g_ofile_lock);
-                ofile_drop_locked(fd, fd_owner());
+                fd_release_locked(fd_owner(), fd);
                 ne = ep_collect_eof_locked(eof);
                 klock_release(&g_ofile_lock);
-                for (int i = 0; i < ne; i++) ep_notify_fd(eof[i]);
+                for (int i = 0; i < ne; i++) ep_notify_oi(eof[i]);
             } else if (kmsg.msg_type == IPC_MSG_XFER_SHM) {
                 klock_acquire(&g_ipc_lock);
                 if (kmsg.xfer_handle >= 0 && kmsg.xfer_handle < MAX_IPC_SHMEM)
@@ -20281,7 +20509,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) {
             sock_slot_wipe(i);
             g_sock[i].used = 1; g_sock[i].owner = owner;
-            g_sock[i].waiter_tid = -1; g_sock[i].fd = -1;
+            g_sock[i].waiter_tid = -1; g_sock[i].oi = -1;
             g_sock[i].stream = want_stream; g_sock[i].parent = -1;
             g_sock[i].state = want_stream ? TCPS_CLOSED : 0;
             si = i; break;
@@ -20290,12 +20518,20 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (si < 0) return (uint64_t)-1;                    /* socket table full */
         int fd = ofile_claim(owner, VOL_SOCK, si);
         if (fd < 0) { net_sock_release(si); return (uint64_t)-24; }   /* EMFILE */
+        /* v1.1 Task 3: the fd NUMBER indexes the owner's table, not g_ofiles —
+         * resolve it to the description once and use that for both the socket
+         * field and the socket's back-pointer. Indexing g_ofiles by an fd
+         * number is the exact mistake this milestone exists to make
+         * impossible. */
         klock_acquire(&g_ofile_lock);
-        g_ofiles[fd].sock = si;
-        if (nonblock) g_ofiles[fd].flags |= O_NONBLOCK;
+        int noi = fd_lookup_locked(owner, fd);
+        if (noi >= 0) {
+            g_ofiles[noi].sock = si;
+            if (nonblock) g_ofiles[noi].flags |= O_NONBLOCK;
+        }
         klock_release(&g_ofile_lock);
         klock_acquire(&g_net_lock);
-        g_sock[si].fd = fd;
+        g_sock[si].oi = noi;
         klock_release(&g_net_lock);
         if (g_debug_net) kprintf("[dbgnet ] pid %u: SOCKET -> fd %d (socket %d)%s\n",
                                  kprocs[current_proc_idx].pid, (uint64_t)(int64_t)fd,
@@ -20305,12 +20541,13 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     case 36: {   /* SYS_BIND(fd, port) -> 0 ok, negative error */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
         int sfd = (int)(int64_t)a0;
-        int si = sock_of_fd(sfd, 0); uint16_t port = (uint16_t)a1;
+        int soi = -1;
+        int si = sock_of_fd(sfd, 0, &soi); uint16_t port = (uint16_t)a1;
         if (si < 0 || port == 0) return (uint64_t)-9;                  /* EBADF/EINVAL */
         klock_acquire(&g_net_lock);
         /* v0.75: `si` was resolved under the ofile lock, which is now released.
          * Re-establish that the slot is still ours before writing to it. */
-        if (!sock_fd_still_ours(si, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
+        if (!sock_fd_still_ours(si, soi)) { klock_release(&g_net_lock); return (uint64_t)-9; }
         int rc = -1;
         int taken = net_find_bound(port);
         if (taken < 0 || taken == si) { g_sock[si].lport = port; g_sock[si].bound = 1; rc = 0; }
@@ -20334,15 +20571,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
          * lookups of a descriptor that can change between them, with the second
          * discarding the slot it had just resolved. A single call cannot
          * disagree with itself. */
-        int fl = 0;
-        int si = sock_of_fd(sfd, &fl);
+        int fl = 0, soi = -1;
+        int si = sock_of_fd(sfd, &fl, &soi);
         if (si < 0) return (uint64_t)-9;                    /* EBADF */
         klock_acquire(&g_net_lock);
         /* v0.75: close the resolve->acquire window. `si` was read under the
          * ofile lock, which is now released; re-establish that this slot is
          * still the socket `sfd` names before touching it. See
          * sock_fd_still_ours() for why this is not a second sock_of_fd(). */
-        if (!sock_fd_still_ours(si, sfd)) {
+        if (!sock_fd_still_ours(si, soi)) {
             __sync_fetch_and_add(&g_connect_stale, 1);
             klock_release(&g_net_lock);
             return (uint64_t)-9;                            /* EBADF */
@@ -20483,7 +20720,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                          * not liveness: `used` alone cannot tell a slot that
                          * was never freed from one freed and immediately
                          * reallocated, which is the common case under load. */
-                        if (!sock_fd_still_ours(si, sfd) || c->gen != expected_gen) {
+                        if (!sock_fd_still_ours(si, soi) || c->gen != expected_gen) {
                             __sync_fetch_and_add(&g_connect_stale, 1);
                             klock_release(&g_net_lock);
                             return (uint64_t)(int64_t)-104;     /* ECONNRESET */
@@ -20510,7 +20747,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
         int fl = 0;
         int sfd = (int)(int64_t)a0;
-        int si = sock_of_fd(sfd, &fl);
+        int soi = -1;
+        int si = sock_of_fd(sfd, &fl, &soi);
         uint64_t ubuf = a1; uint32_t len = (uint32_t)a2;
         if (si < 0) return (uint64_t)-9;
         if (len > SOCK_DGRAM_MAX) len = SOCK_DGRAM_MAX;
@@ -20522,7 +20760,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
          * resolved. Checked BEFORE the ENOTCONN test below so a stale handle
          * reports EBADF rather than being described as a live-but-unconnected
          * socket — the caller's fd is the thing that went away. */
-        if (!sock_fd_still_ours(si, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
+        if (!sock_fd_still_ours(si, soi)) { klock_release(&g_net_lock); return (uint64_t)-9; }
         if (!g_sock[si].used || !g_sock[si].connected || g_sock[si].listening) {
             klock_release(&g_net_lock); return (uint64_t)-107;         /* ENOTCONN */
         }
@@ -20558,14 +20796,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             else if (d >= 0) { woke = d; delivered_loop = 1; }
             /* d == -1: nothing bound locally, so it goes on the wire below. */
         }
-        int wake_fd = (woke >= 0) ? g_sock[woke].fd : -1;
+        int wake_oi = (woke >= 0) ? g_sock[woke].oi : -1;
         klock_release(&g_net_lock);
         if (rc < 0) return (uint64_t)rc;
         if (!delivered_loop) net_tx_udp(daddr, sport, dport, stage, (uint16_t)len);  /* real wire */
-        /* Notified AFTER the net lock is dropped: ep_notify_fd takes the ofile
+        /* Notified AFTER the net lock is dropped: ep_notify_oi takes the ofile
          * lock (rank 1) and waking takes run-queue locks, and both rank BELOW
          * the net lock (9). Doing it inside would be a clean rank inversion. */
-        if (wake_fd >= 0) ep_notify_fd(wake_fd);
+        if (wake_oi >= 0) ep_notify_oi(wake_oi);
         if (g_debug_net) kprintf("[dbgnet ] pid %u: SEND socket %d %u bytes -> %s\n",
                                  kprocs[current_proc_idx].pid, (uint64_t)(int64_t)si,
                                  (uint64_t)len, delivered_loop ? "loopback" : "wire");
@@ -20579,7 +20817,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
         int fl = 0;
         int sfd = (int)(int64_t)a0;
-        int si = sock_of_fd(sfd, &fl);
+        int soi = -1;
+        int si = sock_of_fd(sfd, &fl, &soi);
         uint64_t ubuf = a1; uint32_t maxlen = (uint32_t)a2;
         if (si < 0) return (uint64_t)-9;
         if (!access_ok(kprocs[tg_of((int)current_proc_idx)].cr3, ubuf, maxlen, 1)) return (uint64_t)-14;
@@ -20590,7 +20829,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
              * never freed from one freed and immediately reallocated. This is a
              * BLOCKING poll, so the window is not the resolve->acquire gap
              * alone — it reopens on every iteration of this loop. */
-            if (!sock_fd_still_ours(si, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
+            if (!sock_fd_still_ours(si, soi)) { klock_release(&g_net_lock); return (uint64_t)-9; }
             if (g_sock[si].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
             if (g_sock[si].stream) {
                 struct nsock *c = &g_sock[si];
@@ -21489,7 +21728,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         /* v0.59: an active stdin redirection replaces the keyboard entirely —
          * the same substitution stdout gets, and what lets a filter read a
          * file or an upstream pipe without knowing it is not a terminal. */
-        int ri = kprocs[current_proc_idx].redir_in;
+        int ri = kprocs[tg_of((int)current_proc_idx)].redir_in;   /* v1.1: the leader's */
         if (ri >= 0) return (uint64_t)redirect_read_bytes(ri, (void *)a0, want);
         char *dst = (char *)a0;
         uint32_t n = 0;
@@ -21572,12 +21811,25 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
         int which = (int)a0, fd = (int)(int64_t)a1;
         if (which != 0 && which != 1) return (uint64_t)-22;   /* EINVAL */
+        /* v1.1 Task 3: the fd is resolved to its DESCRIPTION and both are
+         * recorded. The number alone stopped being a durable name when tables
+         * became per-process — and even within one process it is only durable
+         * until the descriptor is closed and the number reissued, which is the
+         * "stdout silently reattaches to a stranger's file" corruption v0.59
+         * documented at ofile_drop_locked. Storing what the redirection was set
+         * up ON, beside the number it was set up WITH, is what lets the write
+         * path tell "still the same object" from "the same number, now
+         * something else". The redirection is CLEARED by fd_release_locked
+         * when that number is given back, so the pair cannot go stale
+         * silently. */
+        int oi = -1;
         if (fd >= 0) {
             int vol = VOL_ROOT;
-            if (ofile_deref(fd, &vol) < 0) return (uint64_t)-9;  /* EBADF: not ours */
+            if (ofile_deref(fd, &vol, &oi) < 0) return (uint64_t)-9;  /* EBADF: not ours */
         }
-        if (which) kprocs[current_proc_idx].redir_out = fd;
-        else       kprocs[current_proc_idx].redir_in  = fd;
+        int L = tg_of((int)current_proc_idx);
+        if (which) { kprocs[L].redir_out = fd; kprocs[L].redir_out_oi = oi; }
+        else       { kprocs[L].redir_in  = fd; kprocs[L].redir_in_oi  = oi; }
         if (g_debug_posix)
             kprintf("[dbgposix] setredir pid %u %s -> fd %d\n", kprocs[current_proc_idx].pid,
                     which ? "stdout" : "stdin", (uint64_t)(int64_t)fd);
@@ -21607,20 +21859,29 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int epi = -1;
         for (int i = 0; i < MAX_EPOLL; i++) if (!g_epoll[i].used) { epi = i; break; }
         if (epi < 0) { klock_release(&g_ofile_lock); return (uint64_t)-11; }
-        int fd = -1;
-        for (int i = 0; i < 16; i++) if (!g_ofiles[i].used) { fd = i; break; }
-        if (fd < 0) { klock_release(&g_ofile_lock); return (uint64_t)-24; }   /* EMFILE */
-        g_epoll[epi].used = 1;
-        for (int k = 0; k < EPOLL_MAXWATCH; k++) g_epoll[epi].w[k].used = 0;
         /* dirent carries the INSTANCE INDEX, exactly as a pipe end carries its
          * pipe index. ofile_deref returns this field and every read/write path
          * gates on `di >= 0`, so a descriptor with dirent -1 is unusable — it
          * dereferences as EBADF no matter how well-formed the rest of it is. */
-        g_ofiles[fd].used = 1; g_ofiles[fd].dirent = epi; g_ofiles[fd].off = 0;
-        g_ofiles[fd].owner_mask = 1ull << p; g_ofiles[fd].volume = VOL_EPOLL;
-        g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
-        g_ofiles[fd].ep = epi; g_ofiles[fd].efd = -1;
+        int oi = ofile_new_locked(VOL_EPOLL, epi);       /* v1.1: a description */
+        if (oi < 0) { klock_release(&g_ofile_lock); return (uint64_t)-24; }   /* EMFILE */
+        g_epoll[epi].used = 1;
+        for (int k = 0; k < EPOLL_MAXWATCH; k++) g_epoll[epi].w[k].used = 0;
+        g_ofiles[oi].ep = epi;
         klock_release(&g_ofile_lock);
+        /* v1.1: the fd NUMBER is allocated outside the lock, because installing
+         * it may have to GROW this process's table from the buddy allocator and
+         * g_zone_lock (rank 0) is beneath g_ofile_lock. On failure the epoll
+         * instance and the description are both given back — a half-created
+         * epoll set would be a leak of one of only MAX_EPOLL instances. */
+        int fd = fd_alloc_install(p, oi, 0);
+        if (fd < 0) {
+            klock_acquire(&g_ofile_lock);
+            g_epoll[epi].used = 0;
+            g_ofiles[oi].ep = -1; g_ofiles[oi].used = 0;
+            klock_release(&g_ofile_lock);
+            return (uint64_t)-24;                                            /* EMFILE */
+        }
         __sync_fetch_and_add(&g_epoll_creates, 1);
         if (g_debug_posix)
             kprintf("[dbgep  ] epoll_create pid %u -> fd %d (instance %d)\n",
@@ -21641,18 +21902,33 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int fd   = (int)(int32_t)(a1 & 0xFFFFFFFFu);
         uint32_t evmask = (uint32_t)(a2 & 0xFFFFFFFFu);
         uint64_t cookie = a2 >> 32;
-        if (epfd < 0 || epfd >= 16) return (uint64_t)-9;                        /* EBADF */
-        if (fd != EPOLL_TTY_FD && (fd < 0 || fd >= 16)) return (uint64_t)-9;
+        if (epfd < 0) return (uint64_t)-9;                                      /* EBADF */
+        if (fd != EPOLL_TTY_FD && fd < 0) return (uint64_t)-9;
         klock_acquire(&g_ofile_lock);
-        if (!g_ofiles[epfd].used || g_ofiles[epfd].volume != VOL_EPOLL ||
-            !(g_ofiles[epfd].owner_mask & (1ull << p))) {
+        /* v1.1 Task 3: BOTH descriptors are resolved through THIS process's
+         * table. The epoll set and the target are named by numbers that mean
+         * nothing outside it, and the watch that gets installed records the
+         * DESCRIPTION so the notifier and the readiness scan agree about which
+         * object is being watched however many processes name it. */
+        int epoi = fd_lookup_locked(p, epfd);
+        if (epoi < 0 || g_ofiles[epoi].volume != VOL_EPOLL) {
             klock_release(&g_ofile_lock); return (uint64_t)-9;
         }
-        int epi = g_ofiles[epfd].ep;
+        int toi = (fd == EPOLL_TTY_FD) ? EPOLL_TTY_FD : fd_lookup_locked(p, fd);
+        /* EPOLL_TTY_FD is a NEGATIVE sentinel (-2), so "did the target resolve"
+         * cannot be spelled `toi >= 0` — the console is a legal target with no
+         * description at all, and testing the sign alone refuses it. That is
+         * not hypothetical: it is exactly what the first draft of this change
+         * did, and epollstrs caught it at round 6 with exit 953. */
+        int t_ok = (fd == EPOLL_TTY_FD) || (toi >= 0);
+        int epi = g_ofiles[epoi].ep;
         if (epi < 0 || epi >= MAX_EPOLL || !g_epoll[epi].used) {
             klock_release(&g_ofile_lock); return (uint64_t)-9;
         }
         struct kepoll *E = &g_epoll[epi];
+        /* Located by the CALLER'S fd number, which is what POSIX names an
+         * existing watch by — and it is unambiguous because an epoll set and
+         * every watch in it belong to the one process that created it. */
         int slot = -1, freeslot = -1;
         for (int k = 0; k < EPOLL_MAXWATCH; k++) {
             if (E->w[k].used && E->w[k].fd == fd) { slot = k; break; }
@@ -21661,10 +21937,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int64_t rc = 0;
         if (op == EPOLL_CTL_ADD) {
             if (slot >= 0) rc = -17;                        /* EEXIST */
-            else if (fd != EPOLL_TTY_FD && !g_ofiles[fd].used) rc = -9;
+            else if (!t_ok) rc = -9;                        /* EBADF: not ours */
             else if (freeslot < 0) rc = -28;                /* ENOSPC */
             else {
-                E->w[freeslot].used = 1; E->w[freeslot].fd = fd;
+                E->w[freeslot].used = 1;
+                E->w[freeslot].fd = fd; E->w[freeslot].oi = toi;
                 E->w[freeslot].events = evmask; E->w[freeslot].data = cookie;
                 E->w[freeslot].seen = 0;
             }
@@ -21687,11 +21964,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * them disagree about blocking. Putting the flag on the socket
                   * would make one process's fcntl silently retune the other's. */
         int fd = (int)(int64_t)a0, cmd = (int)(int64_t)a1;
-        if (fd < 0 || fd >= 16) return (uint64_t)-9;
+        if (fd < 0) return (uint64_t)-9;
         int64_t rc;
         klock_acquire(&g_ofile_lock);
-        if (!g_ofiles[fd].used || !(g_ofiles[fd].owner_mask & (1ull << fd_owner()))) rc = -9;
-        else if (cmd == F_GETFL) rc = (int64_t)g_ofiles[fd].flags;
+        int oi = fd_lookup_locked(fd_owner(), fd);       /* v1.1: our table */
+        if (oi < 0) rc = -9;
+        else if (cmd == F_GETFL) rc = (int64_t)g_ofiles[oi].flags;
         else if (cmd == F_SETFL) {
             /* v0.84: O_NONBLOCK is still the only bit a caller may SET here, but
              * O_APPEND must SURVIVE. This was a wholesale replace, so once
@@ -21702,7 +21980,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
              * settable: changing an open file's append discipline after the fact
              * is a separate decision, and this is not the change that should
              * make it. */
-            g_ofiles[fd].flags = (g_ofiles[fd].flags & (int)VFS_O_APPEND) |
+            g_ofiles[oi].flags = (g_ofiles[oi].flags & (int)VFS_O_APPEND) |
                                  (int)(a2 & O_NONBLOCK);
             rc = 0;
         } else rc = -22;                                   /* EINVAL */
@@ -21717,13 +21995,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * no effect. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
         int sfd = (int)(int64_t)a0;
-        int si = sock_of_fd(sfd, 0);
+        int soi = -1;
+        int si = sock_of_fd(sfd, 0, &soi);
         if (si < 0) return (uint64_t)-9;
         int64_t rc;
         klock_acquire(&g_net_lock);
         /* v0.75: see sock_fd_still_ours() — the descriptor may have been closed
          * and reissued between the ofile lock and this one. */
-        if (!sock_fd_still_ours(si, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
+        if (!sock_fd_still_ours(si, soi)) { klock_release(&g_net_lock); return (uint64_t)-9; }
         if (!g_sock[si].bound)         rc = -22;    /* EINVAL: nothing to listen on */
         else if (g_sock[si].connected) rc = -22;    /* EINVAL: already a peer socket */
         else { g_sock[si].listening = 1;
@@ -21750,7 +22029,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                   * descriptor. */
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_NET)) return (uint64_t)-13;
         int sfd = (int)(int64_t)a0;
-        int li = sock_of_fd(sfd, 0);
+        int soi = -1;
+        int li = sock_of_fd(sfd, 0, &soi);
         if (li < 0) return (uint64_t)-9;
         uint64_t upeer = a1;
         int owner = fd_owner();
@@ -21774,7 +22054,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             klock_acquire(&g_net_lock);
             /* v0.75: the listener's descriptor may have been closed and
              * reissued since it was resolved. */
-            if (!sock_fd_still_ours(li, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
+            if (!sock_fd_still_ours(li, soi)) { klock_release(&g_net_lock); return (uint64_t)-9; }
             if (g_sock[li].state != TCPS_LISTEN) { klock_release(&g_net_lock); return (uint64_t)-22; }
             if (g_sock[li].aq_count == 0) {
                 klock_release(&g_net_lock);
@@ -21790,11 +22070,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             int nfd2 = ofile_claim(owner, VOL_SOCK, ci);
             if (nfd2 < 0) { net_sock_release(ci); return (uint64_t)-24; }
             klock_acquire(&g_ofile_lock);
-            g_ofiles[nfd2].sock = ci;
-            if ((uint32_t)a2 & SOCK_NONBLOCK) g_ofiles[nfd2].flags |= O_NONBLOCK;
+            int noi2 = fd_lookup_locked(owner, nfd2);      /* v1.1: number -> description */
+            if (noi2 >= 0) {
+                g_ofiles[noi2].sock = ci;
+                if ((uint32_t)a2 & SOCK_NONBLOCK) g_ofiles[noi2].flags |= O_NONBLOCK;
+            }
             klock_release(&g_ofile_lock);
             klock_acquire(&g_net_lock);
-            g_sock[ci].fd = nfd2;
+            g_sock[ci].oi = noi2;
             klock_release(&g_net_lock);
             if (upeer) { ((uint32_t *)upeer)[0] = paddr; ((uint32_t *)upeer)[1] = (uint32_t)pport; }
             __sync_fetch_and_add(&g_net_accepts, 1);
@@ -21804,7 +22087,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         /* v0.75: EBADF for a descriptor that went away, EINVAL only for a live
          * socket that is not a listener. The old test collapsed both into
          * EINVAL, which describes the wrong fault to the caller. */
-        if (!sock_fd_still_ours(li, sfd)) { klock_release(&g_net_lock); return (uint64_t)-9; }
+        if (!sock_fd_still_ours(li, soi)) { klock_release(&g_net_lock); return (uint64_t)-9; }
         if (!g_sock[li].listening) { klock_release(&g_net_lock); return (uint64_t)-22; }
         if (g_sock[li].pcount == 0) { klock_release(&g_net_lock);
                                       __sync_fetch_and_add(&g_net_eagain, 1);
@@ -21812,7 +22095,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int ci = -1;
         for (int i = 0; i < NSOCK; i++) if (!g_sock[i].used) {
             sock_slot_wipe(i);
-            g_sock[i].used = 1; g_sock[i].waiter_tid = -1; g_sock[i].fd = -1;
+            g_sock[i].used = 1; g_sock[i].waiter_tid = -1; g_sock[i].oi = -1;
             ci = i; break;
         }
         if (ci < 0) { klock_release(&g_net_lock); return (uint64_t)-11; }   /* EAGAIN: retry */
@@ -21830,11 +22113,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int nfd = ofile_claim(owner, VOL_SOCK, ci);
         if (nfd < 0) { net_sock_release(ci); return (uint64_t)-24; }        /* EMFILE */
         klock_acquire(&g_ofile_lock);
-        g_ofiles[nfd].sock = ci;
-        if ((uint32_t)a2 & SOCK_NONBLOCK) g_ofiles[nfd].flags |= O_NONBLOCK;
+        int noi = fd_lookup_locked(owner, nfd);            /* v1.1: number -> description */
+        if (noi >= 0) {
+            g_ofiles[noi].sock = ci;
+            if ((uint32_t)a2 & SOCK_NONBLOCK) g_ofiles[noi].flags |= O_NONBLOCK;
+        }
         klock_release(&g_ofile_lock);
         klock_acquire(&g_net_lock);
-        g_sock[ci].fd = nfd;
+        g_sock[ci].oi = noi;
         klock_release(&g_net_lock);
         if (upeer) { ((uint32_t *)upeer)[0] = paddr; ((uint32_t *)upeer)[1] = (uint32_t)pport; }
         __sync_fetch_and_add(&g_net_accepts, 1);
@@ -21850,17 +22136,23 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int ei = -1;
         for (int i = 0; i < MAX_EVENTFD; i++) if (!g_evfd[i].used) { ei = i; break; }
         if (ei < 0) { klock_release(&g_ofile_lock); return (uint64_t)-11; }
-        int fd = -1;
-        for (int i = 0; i < 16; i++) if (!g_ofiles[i].used) { fd = i; break; }
-        if (fd < 0) { klock_release(&g_ofile_lock); return (uint64_t)-24; }
+        int oi = ofile_new_locked(VOL_EVFD, ei);         /* v1.1: a description */
+        if (oi < 0) { klock_release(&g_ofile_lock); return (uint64_t)-24; }
         g_evfd[ei].used = 1;
         g_evfd[ei].counter = a0;
         g_evfd[ei].semaphore = (a1 & 1) ? 1 : 0;
-        g_ofiles[fd].used = 1; g_ofiles[fd].dirent = ei; g_ofiles[fd].off = 0;
-        g_ofiles[fd].owner_mask = 1ull << p; g_ofiles[fd].volume = VOL_EVFD;
-        g_ofiles[fd].pipe = -1; g_ofiles[fd].pipe_w = 0;
-        g_ofiles[fd].ep = -1; g_ofiles[fd].efd = ei;
+        g_ofiles[oi].efd = ei;
         klock_release(&g_ofile_lock);
+        /* v1.1: fd number outside the lock — see SYS_EPOLL_CREATE for why, and
+         * for why both objects are given back together on failure. */
+        int fd = fd_alloc_install(p, oi, 0);
+        if (fd < 0) {
+            klock_acquire(&g_ofile_lock);
+            g_evfd[ei].used = 0; g_evfd[ei].counter = 0;
+            g_ofiles[oi].efd = -1; g_ofiles[oi].used = 0;
+            klock_release(&g_ofile_lock);
+            return (uint64_t)-24;
+        }
         __sync_fetch_and_add(&g_evfd_creates, 1);
         if (g_debug_posix)
             kprintf("[dbgep  ] eventfd pid %u -> fd %d (counter %u%s)\n",
@@ -22287,7 +22579,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if ((prot & 0x2) && (prot & 0x4)) return (uint64_t)-1;          /* W^X */
         if ((flags & 0x03) == 0 || (flags & 0x03) == 0x03) return (uint64_t)-22;
         int vol = VOL_ROOT;
-        int di = ofile_deref(fd, &vol);
+        int di = ofile_deref(fd, &vol, 0);
         if (di < 0) return (uint64_t)-9;                     /* EBADF */
         if (vol != VOL_ROOT) return (uint64_t)-22;           /* only real files are mappable */
         int shared = (flags & 0x01) ? 1 : 0;
@@ -22546,7 +22838,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int fd = (int)(int64_t)a0;
         int64_t rel = (int64_t)a1;
         int whence = (int)(int64_t)a2;
-        if (fd < 0 || fd >= 16)          return (uint64_t)-9;    /* EBADF       */
+        if (fd < 0)                      return (uint64_t)-9;    /* EBADF       */
         if (whence < 0 || whence > 2)    return (uint64_t)-22;   /* EINVAL      */
 
         /* v0.83: TWO PHASES, and SEEK_END now asks the right volume.
@@ -22570,19 +22862,19 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         int64_t rc;
 
         klock_acquire(&g_ofile_lock);
-        if (!g_ofiles[fd].used ||
-            !(g_ofiles[fd].owner_mask & (1ull << fd_owner()))) {
+        int oi = fd_lookup_locked(fd_owner(), fd);       /* v1.1: our table */
+        if (oi < 0) {
             klock_release(&g_ofile_lock);
             return (uint64_t)-9;                                 /* EBADF       */
         }
-        if (g_ofiles[fd].pipe >= 0 || g_ofiles[fd].ep >= 0 ||
-            g_ofiles[fd].efd  >= 0 || g_ofiles[fd].sock >= 0) {
+        if (g_ofiles[oi].pipe >= 0 || g_ofiles[oi].ep >= 0 ||
+            g_ofiles[oi].efd  >= 0 || g_ofiles[oi].sock >= 0) {
             klock_release(&g_ofile_lock);
             return (uint64_t)-29;                                /* ESPIPE      */
         }
-        snap_vol = g_ofiles[fd].volume;
-        snap_di  = g_ofiles[fd].dirent;
-        snap_off = g_ofiles[fd].off;
+        snap_vol = g_ofiles[oi].volume;
+        snap_di  = g_ofiles[oi].dirent;
+        snap_off = g_ofiles[oi].off;
         klock_release(&g_ofile_lock);
 
         int64_t base;
@@ -22594,9 +22886,13 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (want < 0) return (uint64_t)-22;                      /* EINVAL      */
 
         klock_acquire(&g_ofile_lock);
-        if (!g_ofiles[fd].used ||
-            !(g_ofiles[fd].owner_mask & (1ull << fd_owner()))) rc = -9;
-        else { g_ofiles[fd].off = (uint64_t)want; rc = want; }
+        /* Re-resolved rather than reusing `oi`: the descriptor could have been
+         * closed while the lock was released, and a stale description index
+         * would write an offset into whatever now occupies that slot. The
+         * number is the stable name here; the description is not. */
+        int oi2 = fd_lookup_locked(fd_owner(), fd);
+        if (oi2 < 0) rc = -9;
+        else { g_ofiles[oi2].off = (uint64_t)want; rc = want; }
         klock_release(&g_ofile_lock);
         return (uint64_t)rc;
     }
@@ -22617,23 +22913,23 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         if (!rust_cap_check(kprocs[current_proc_idx].caps, PCAP_FILESYSTEM)) return (uint64_t)-13;
         int fd = (int)(int64_t)a0;
         int64_t want = (int64_t)a1;
-        if (fd < 0 || fd >= 16) return (uint64_t)-9;                 /* EBADF  */
+        if (fd < 0) return (uint64_t)-9;                             /* EBADF  */
         if (want < 0) return (uint64_t)-22;                          /* EINVAL */
 
         int snap_vol, snap_di;
         klock_acquire(&g_ofile_lock);
-        if (!g_ofiles[fd].used ||
-            !(g_ofiles[fd].owner_mask & (1ull << fd_owner()))) {
+        int oi = fd_lookup_locked(fd_owner(), fd);       /* v1.1: our table */
+        if (oi < 0) {
             klock_release(&g_ofile_lock);
             return (uint64_t)-9;                                     /* EBADF  */
         }
-        if (g_ofiles[fd].pipe >= 0 || g_ofiles[fd].ep >= 0 ||
-            g_ofiles[fd].efd  >= 0 || g_ofiles[fd].sock >= 0) {
+        if (g_ofiles[oi].pipe >= 0 || g_ofiles[oi].ep >= 0 ||
+            g_ofiles[oi].efd  >= 0 || g_ofiles[oi].sock >= 0) {
             klock_release(&g_ofile_lock);
             return (uint64_t)-22;                                    /* EINVAL */
         }
-        snap_vol = g_ofiles[fd].volume;
-        snap_di  = g_ofiles[fd].dirent;
+        snap_vol = g_ofiles[oi].volume;
+        snap_di  = g_ofiles[oi].dirent;
         klock_release(&g_ofile_lock);
 
         /* THE OFFSET IS DELIBERATELY NOT MOVED. POSIX is explicit that
@@ -22693,7 +22989,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         struct { uint64_t hash, len; uint32_t mtime, atime; } st;
         if (!access_ok(kprocs[current_proc_idx].cr3, a1, sizeof st, 1)) return (uint64_t)-14;
         int vol = VOL_ROOT;
-        int di = ofile_deref((int)a0, &vol);
+        int di = ofile_deref((int)a0, &vol, 0);
         if (di < 0) return (uint64_t)-9;                            /* EBADF */
 #ifndef TMP_FSTAT_LEAK_REPRO
         if (vol != VOL_ROOT) return (uint64_t)-22;                  /* EINVAL: no dirent */
@@ -23847,7 +24143,7 @@ static void cmd_cio(void) {
 
     int fds_leaked = 0;
     klock_acquire(&g_ofile_lock);
-    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds_leaked++;
     klock_release(&g_ofile_lock);
     ciocheck("descriptor array fully released after the storm", fds_leaked == 0);
 
@@ -24227,7 +24523,7 @@ static void cmd_dma_stress(void) {
 
     int fds_leaked = 0;
     klock_acquire(&g_ofile_lock);
-    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds_leaked++;
     klock_release(&g_ofile_lock);
     dmstrcheck("no descriptor leaks (open-file table fully released)", fds_leaked == 0);
 
@@ -24465,7 +24761,7 @@ static void cmd_kproc_stress(void) {
         }
         int cyc_fds = 0;
         klock_acquire(&g_ofile_lock);
-        for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) cyc_fds++;
+        for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) cyc_fds++;
         klock_release(&g_ofile_lock);
 
         if (!cyc_ok) cycles_ok = 0;
@@ -24608,14 +24904,29 @@ static void cmd_ipc_stress(void) {
         int ok = kprocs[sp].exited && kprocs[sp].exit_code == kprocs[sp].pid
               && kprocs[rp].exited && kprocs[rp].exit_code == kprocs[rp].pid;
         if (!ok) {
-            kprintf("[ipcstrs] round %d FAILED: sender exit %u (want %u), receiver exit %u (want %u)\n",
-                    rnd, kprocs[sp].exit_code, kprocs[sp].pid, kprocs[rp].exit_code, kprocs[rp].pid);
+            /* v1.1 Task 3: name WHICH rule broke rather than only reporting a
+             * mismatched exit code. 958 and 969 are the two descriptor-transfer
+             * assertions this milestone added, and a suite that reports them as
+             * "sender exit 958 (want 41)" makes the reader go and find them. */
+            uint64_t sc = kprocs[sp].exit_code, rc2 = kprocs[rp].exit_code;
+            const char *why =
+                sc == 952 ? " — sender could not open the payload file" :
+                sc == 953 ? " — SYS_IPC_SEND refused the fd transfer" :
+                sc == 958 ? " — *** the SENDER can still READ a descriptor it transferred away"
+                            " (the transfer shared it instead of moving it)" :
+                rc2 == 969 ? " — *** the recipient was handed a NEGATIVE fd: alloc_fd did not"
+                             " install the transferred description in its table" :
+                rc2 == 963 ? " — the recipient could not read through the transferred fd" :
+                rc2 == 964 ? " — *** the transferred fd read the WRONG BYTES: it does not name"
+                             " the sender's file description" : "";
+            kprintf("[ipcstrs] round %d FAILED: sender exit %u (want %u), receiver exit %u (want %u)%s\n",
+                    rnd, kprocs[sp].exit_code, kprocs[sp].pid, kprocs[rp].exit_code, kprocs[rp].pid, why);
             rounds_ok = 0;
         }
 
         int fds_leaked = 0;
         klock_acquire(&g_ofile_lock);
-        for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+        for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds_leaked++;
         klock_release(&g_ofile_lock);
         if (fds_leaked) fds_ok = 0;
 
@@ -26046,7 +26357,7 @@ static void cmd_vfs_stress(void) {
 
         int fds_leaked = 0;
         klock_acquire(&g_ofile_lock);
-        for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+        for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds_leaked++;
         klock_release(&g_ofile_lock);
         if (fds_leaked) fds_ok = 0;
 
@@ -27516,7 +27827,7 @@ static void cmd_vfs_stress(void) {
          * struct klock has carried it since v0.75. */
         int used0 = 0;
         klock_acquire(&g_ofile_lock);
-        for (int i = 0; i < 16; i++) if (g_ofiles[i].used) used0++;
+        for (int i = 0; i < OFILE_MAX; i++) if (g_ofiles[i].used) used0++;
         klock_release(&g_ofile_lock);
         uint32_t ocon0 = g_ofile_lock.contended, oacq0 = g_ofile_lock.acq;
 
@@ -27563,11 +27874,20 @@ static void cmd_vfs_stress(void) {
 
         /* POST-DRAIN STATE. Taken under the lock: a torn read of the table would
          * make a leak look like a miscount or the reverse. */
+        /* v1.1 Task 3: "stranded" is now asked of the WORKERS' OWN TABLES
+         * rather than of an owner mask that no longer exists — and it is the
+         * better question, because it counts descriptors a dead process still
+         * holds rather than descriptions that merely remember it. A slot whose
+         * table is non-empty after teardown is a leak by definition;
+         * descriptor_teardown_kproc panics on exactly that condition, so this
+         * is the assertion form of the same invariant, checked from outside. */
         int used1 = 0, stranded = 0;
         klock_acquire(&g_ofile_lock);
-        for (int i = 0; i < 16; i++) {
-            if (g_ofiles[i].used) used1++;
-            if (g_ofiles[i].owner_mask & ownmask) stranded++;
+        for (int i = 0; i < OFILE_MAX; i++) if (g_ofiles[i].used) used1++;
+        for (int sl = 0; sl < n_kproc; sl++) {
+            if (!(ownmask & (1ull << sl))) continue;
+            struct files_struct *wf = &kprocs[sl].files;
+            for (uint32_t k = 0; k < wf->max_fds; k++) if (wf->fd[k] >= 0) stranded++;
         }
         klock_release(&g_ofile_lock);
         uint32_t ocon = g_ofile_lock.contended - ocon0, oacq = g_ofile_lock.acq - oacq0;
@@ -27578,7 +27898,7 @@ static void cmd_vfs_stress(void) {
                 (uint64_t)(int64_t)ook, (uint64_t)(int64_t)odead, (uint64_t)(int64_t)obad,
                 ofirst >= 0 ? " — first bad: " : "", owhy, g_ticks - t_start);
         kprintf("[vfsstrs] ofilestrs: g_ofile_lock acq %u contended %u (%u%%); "
-                "slots used %d -> %d, stranded owner_mask bits %d\n",
+                "slots used %d -> %d, descriptors still held by role-62 slots %d\n",
                 (uint64_t)oacq, (uint64_t)ocon, (uint64_t)(oacq ? (ocon * 100u) / oacq : 0),
                 (uint64_t)(int64_t)used0, (uint64_t)(int64_t)used1, (uint64_t)(int64_t)stranded);
 
@@ -27595,8 +27915,9 @@ static void cmd_vfs_stress(void) {
                  "iteration (all-deadline would leave the checks below true of nothing)",
                  ook > 0);
         /* (a) */
-        vfscheck("ofilestrs: NO descriptor is still owned by a role-62 worker — every "
-                 "owner_mask bit the phase set has been given back", stranded == 0);
+        vfscheck("ofilestrs: NO descriptor is still installed in a role-62 worker's "
+                 "descriptor table — every fd the phase took has been given back",
+                 stranded == 0);
         /* (b) */
         vfscheck("ofilestrs: the used-slot count returns to EXACTLY its pre-phase value, "
                  "not 'no worse than' — one slot leaked per pipe is invisible until the "
@@ -28299,6 +28620,128 @@ static void cmd_vfs_stress(void) {
                  "premature-free risk, caught before either becomes corruption)",
                  ti >= 0 && agree);
         vfs_unlink("tally-probe");
+    }
+
+    /* ===================================================================
+     * v1.1 Task 3: THE CEILING TEST — and it is the whole point of the
+     * milestone, so it is written to be able to FAIL.
+     * ===================================================================
+     * Every other suite in this boot passes on the PRE-Task-3 kernel too:
+     * none of them opens more than a handful of descriptors, so none of them
+     * can tell a per-process table of 16 from a global one. A milestone whose
+     * only evidence is "the existing suites still pass" has demonstrated that
+     * it broke nothing, which is not the same as demonstrating that it did
+     * anything.
+     *
+     * So this opens MORE THAN THE OLD GLOBAL LIMIT from one process, and reads
+     * its own state back through every one. Under the v1.0 design the 17th
+     * open returns EMFILE and this goes red. The reverted-build check the
+     * standing rule asks for is
+     *     make EXTRA=-DFDCEIL_FALSIFY
+     * which forces the target back under 16 so the first assertion MUST fail —
+     * a falsifier, not a kernel.
+     *
+     * It also proves the two-layer split at the same time: distinct fd NUMBERS
+     * naming distinct DESCRIPTIONS, each with its own independent offset. A
+     * table that handed back the same description twice would read the wrong
+     * bytes here, not merely run out of slots. */
+    {
+        /* THE TARGET IS FIXED AT 24 IN EVERY BUILD, and the assertion below
+         * compares against the FIXED number 16 rather than against this.
+         *
+         * The first draft made FDCEIL itself conditional, so -DFDCEIL_FALSIFY
+         * lowered the target to 8 and the test then asserted "I opened 8 of a
+         * target of 8" — and PASSED. That is a test that cannot fail: it moved
+         * the goalpost with the ball. The falsifier now shrinks the KERNEL's
+         * description table (OFILE_LIMIT, files.c) back to the old global 16,
+         * leaving the target and the assertion alone, so the 17th open really
+         * is refused and this really does go red. */
+        const int FDCEIL = 24;         /* > 16: unreachable before v1.1 */
+        int me = tg_of((int)current_proc_idx);
+        int fds[32]; int nopen = 0, first_fail = 0;
+        suite_fixture_reset("fdceil");
+        /* One file, opened many times: this is about DESCRIPTORS, not dirents,
+         * and a distinct file per open would be testing VFS_MAXFILES instead. */
+        int seed = vfs_open_for("fdceil", me, VFS_O_CREAT | VFS_O_TRUNC);
+        if (seed >= 0) {
+            klock_acquire(&g_ofile_lock);
+            fd_release_locked(me, seed);
+            klock_release(&g_ofile_lock);
+        }
+        for (int i = 0; i < FDCEIL && i < 32; i++) {
+            int f = vfs_open_for("fdceil", me, 0);
+            if (f < 0) { if (!first_fail) first_fail = i + 1; break; }
+            fds[nopen++] = f;
+        }
+        /* DISTINCT NUMBERS, and distinct DESCRIPTIONS. A table that reissued a
+         * number still in use would pass a naive "did every open succeed" test
+         * while being catastrophically wrong. */
+        int dup_num = 0, dup_desc = 0;
+        klock_acquire(&g_ofile_lock);
+        for (int i = 0; i < nopen; i++)
+            for (int j = i + 1; j < nopen; j++) {
+                if (fds[i] == fds[j]) dup_num++;
+                if (fd_lookup_locked(me, fds[i]) == fd_lookup_locked(me, fds[j])) dup_desc++;
+            }
+        klock_release(&g_ofile_lock);
+        /* INDEPENDENT OFFSETS. Each descriptor is given a different position
+         * and then asked for it back: one shared offset behind several numbers
+         * is exactly what separating the description from the number exists to
+         * prevent, and it is invisible to any test that only reads from 0. */
+        int off_ok = (nopen > 1);
+        klock_acquire(&g_ofile_lock);
+        for (int i = 0; i < nopen && off_ok; i++) {
+            int oi = fd_lookup_locked(me, fds[i]);
+            if (oi < 0) { off_ok = 0; break; }
+            g_ofiles[oi].off = (uint64_t)i;
+        }
+        for (int i = 0; i < nopen && off_ok; i++) {
+            int oi = fd_lookup_locked(me, fds[i]);
+            if (oi < 0 || g_ofiles[oi].off != (uint64_t)i) off_ok = 0;
+        }
+        klock_release(&g_ofile_lock);
+
+        kprintf("[vfsstrs] fdceil: %d/%d descriptor(s) open at once in ONE process "
+                "(old global ceiling was 16; OFILE_LIMIT %d of OFILE_MAX %d, "
+                "FD_INLINE %d, FD_MAX %d)%s\n",
+                (uint64_t)(int64_t)nopen, (uint64_t)(int64_t)FDCEIL,
+                (uint64_t)OFILE_LIMIT, (uint64_t)OFILE_MAX,
+                (uint64_t)FD_INLINE, (uint64_t)FD_MAX,
+                first_fail ? " — AN OPEN WAS REFUSED before the target" : "");
+#ifdef FDCEIL_FALSIFY
+        kprintf("[vfsstrs] fdceil: *** BUILT WITH FDCEIL_FALSIFY — the description "
+                "table is forced back to the old global 16. This build is a "
+                "falsifier, not a kernel, and the next assertion MUST fail.\n");
+#endif
+        /* 16 is a LITERAL, not a symbol: it is the historical ceiling this
+         * milestone removed, and it must not move when a build option does. */
+        vfscheck("fdceil: one process holds MORE THAN 16 descriptors at once — the "
+                 "global 16-entry table is genuinely gone, not merely reorganised "
+                 "(this is the assertion that fails on a pre-v1.1 kernel and under "
+                 "-DFDCEIL_FALSIFY)",
+                 nopen > 16 && nopen == FDCEIL);
+        vfscheck("fdceil: every descriptor number is DISTINCT (no fd was reissued "
+                 "while still installed)", dup_num == 0);
+        vfscheck("fdceil: every descriptor names a DISTINCT open file description "
+                 "(separate opens of one file do not alias)", dup_desc == 0);
+        vfscheck("fdceil: each descriptor carries its OWN offset — the position is a "
+                 "property of the description, not of the file", off_ok);
+
+        /* Give every one back IN THIS BLOCK, and prove it. The suite that
+         * starved the toolchain twenty minutes later by leaking five slots is
+         * why this is not left to process teardown. */
+        int used_before_release = 0;
+        klock_acquire(&g_ofile_lock);
+        for (int i = 0; i < OFILE_MAX; i++) if (g_ofiles[i].used) used_before_release++;
+        for (int i = 0; i < nopen; i++) fd_release_locked(me, fds[i]);
+        int still_held = 0;
+        struct files_struct *mf = &kprocs[me].files;
+        for (uint32_t k = 0; k < mf->max_fds; k++) if (mf->fd[k] >= 0) still_held++;
+        klock_release(&g_ofile_lock);
+        vfscheck("fdceil: every descriptor the round opened was released again "
+                 "(nothing left installed in this process's table)",
+                 still_held == 0 && used_before_release >= nopen);
+        vfs_unlink("fdceil");
     }
 
     kprintf("[vfsstrs] RESULT: %d passed, %d failed\n", (uint64_t)g_vfspass, (uint64_t)g_vfsfail);
@@ -30256,10 +30699,10 @@ static void wimp_input_step(void) {
      * them, and it cannot be changed per-desktop. Repeating here means the
      * delay and period are the ones SYS_DESKTOP_SETTINGS was given.
      *
-     * A key stops repeating when it is released — which this map cannot see,
-     * since keyboard_irq discards releases — so repetition is bounded and
-     * cancelled by the next real keystroke. It is deliberately conservative:
-     * a stuck repeat is worse than one that stops early. */
+     * IRQ make/break tracking stops repeats on physical release, including
+     * when Shift changed after the key press. A released key must never keep
+     * injecting text into a newly focused application. */
+    if (g_desk_last_key && !key_state_held(g_key_held, g_desk_last_key)) g_desk_last_key = 0;
     if (g_desk_last_key && g_desk_key_repeats < DESK_MAX_REPEATS) {
         uint64_t due = g_desk_key_tick + (g_desk_key_repeats ? g_desk_rep_period
                                                             : g_desk_rep_delay);
@@ -30444,7 +30887,7 @@ static void cmd_users_stress(void) {
     /* ---- enforcement, through the real open path, as two real users ---- */
     int fds0 = 0;
     klock_acquire(&g_ofile_lock);
-    for (int f = 0; f < 16; f++) if (g_ofiles[f].used) fds0++;
+    for (int f = 0; f < OFILE_MAX; f++) if (g_ofiles[f].used) fds0++;
     klock_release(&g_ofile_lock);
     int alice = kproc_spawn("u-alice", PCAP_FILESYSTEM);
     int bob   = kproc_spawn("u-bob",   PCAP_FILESYSTEM);
@@ -30476,7 +30919,14 @@ static void cmd_users_stress(void) {
          * of them and starved the toolchain suites twenty minutes later,
          * which reported itself as "could not create /src/t.c" and looked
          * for all the world like a permission bug in this milestone. */
-        int held[6], nheld = 0;
+        /* v1.1 Task 3: a held descriptor is now a (PROCESS, NUMBER) PAIR, and
+         * recording only the number would be wrong in a way that used to be
+         * invisible. alice's fd 0 and bob's fd 0 are both 0 and are different
+         * descriptors; the old cleanup released every recorded number against
+         * BOTH owners, which was harmless only while a number was a global
+         * index. Releasing bob's table with a number alice happened to hold
+         * would now close a descriptor this block never opened. */
+        int held[6], held_by[6], nheld = 0;
         /* v0.76: this block asserts things about a file it BELIEVES it just
          * created — that it has the default mode, and that a stranger can read
          * it at 0644. On a re-used volume "m72own" is already there, carrying
@@ -30485,7 +30935,7 @@ static void cmd_users_stress(void) {
          * first. Reset it so "newly created" is true again. */
         suite_fixture_reset("m72own");
         int fa = vfs_open_for("m72own", alice, VFS_O_CREAT);          /* alice creates it */
-        if (fa >= 0) held[nheld++] = fa;
+        if (fa >= 0) { held_by[nheld] = alice; held[nheld++] = fa; }
         int di = vfs_find("m72own");
         usercheck("a file created by a user is owned by that user",
                   fa >= 0 && di >= 0 && DENTS[di].uid == 1000 && DENTS[di].gid == 100);
@@ -30494,7 +30944,7 @@ static void cmd_users_stress(void) {
 
         /* 0644: a stranger may read it. Permission is not ownership. */
         int fb = vfs_open_for("m72own", bob, 0);
-        if (fb >= 0) held[nheld++] = fb;
+        if (fb >= 0) { held_by[nheld] = bob;   held[nheld++] = fb; }
         usercheck("a stranger CAN open another user's 0644 file for reading", fb >= 0);
         usercheck("but the stranger has no write right to it",
                   di >= 0 && !vfs_permit(&DENTS[di], kprocs[bob].uid, kprocs[bob].gid, VFS_P_WRITE));
@@ -30504,10 +30954,10 @@ static void cmd_users_stress(void) {
         /* Tighten it, and the stranger loses the descriptor it could have had. */
         if (di >= 0) { klock_acquire(&g_vfs_lock); DENTS[di].mode = 0600; klock_release(&g_vfs_lock); }
         int fb2 = vfs_open_for("m72own", bob, 0);
-        if (fb2 >= 0) held[nheld++] = fb2;
+        if (fb2 >= 0) { held_by[nheld] = bob;   held[nheld++] = fb2; }
         usercheck("after chmod 0600 the stranger can no longer open it at all", fb2 == -13);
         int fa2 = vfs_open_for("m72own", alice, 0);
-        if (fa2 >= 0) held[nheld++] = fa2;
+        if (fa2 >= 0) { held_by[nheld] = alice; held[nheld++] = fa2; }
         usercheck("and the owner still can", fa2 >= 0);
         /* Root is not stopped by a mode that stops everybody else. */
         int rooted = kproc_spawn("u-root", PCAP_FILESYSTEM);
@@ -30523,13 +30973,11 @@ static void cmd_users_stress(void) {
         /* Give every slot back, and prove it: the descriptor table must be
          * exactly as full as it was before this suite ran. */
         klock_acquire(&g_ofile_lock);
-        for (int h = 0; h < nheld; h++) {
-            ofile_drop_locked(held[h], alice);
-            ofile_drop_locked(held[h], bob);
-        }
-        if (fr >= 0 && rooted >= 0) ofile_drop_locked(fr, rooted);
+        for (int h = 0; h < nheld; h++)
+            fd_release_locked(held_by[h], held[h]);       /* each to ITS owner */
+        if (fr >= 0 && rooted >= 0) fd_release_locked(rooted, fr);
         int fds_now = 0;
-        for (int f = 0; f < 16; f++) if (g_ofiles[f].used) fds_now++;
+        for (int f = 0; f < OFILE_MAX; f++) if (g_ofiles[f].used) fds_now++;
         klock_release(&g_ofile_lock);
         usercheck("the suite returned every descriptor it took", fds_now == fds0);
         if (rooted >= 0) { kprocs[rooted].exited = 1; kprocs[rooted].torn_down = 1; }
@@ -32319,7 +32767,7 @@ static void cmd_posix_stress(void) {
 
     int fds_leaked = 0;
     klock_acquire(&g_ofile_lock);
-    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds_leaked++;
     klock_release(&g_ofile_lock);
     pxcheck("no descriptor leaked across the storm (incl. fds inherited by forked children)",
             fds_leaked == 0);
@@ -32580,7 +33028,7 @@ static void cmd_compiler_stress(void) {
 
     int fds_leaked = 0;
     klock_acquire(&g_ofile_lock);
-    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds_leaked++;
     klock_release(&g_ofile_lock);
     cscheck("no descriptor leaked across seven compiler processes", fds_leaked == 0);
 
@@ -32746,7 +33194,7 @@ static void cmd_lang_stress(void) {
 
     int fds_leaked = 0;
     klock_acquire(&g_ofile_lock);
-    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds_leaked++;
     klock_release(&g_ofile_lock);
     lscheck("no descriptor leaked across the compiler and build-tool processes", fds_leaked == 0);
 
@@ -33120,7 +33568,7 @@ static void cmd_thread_stress(void) {
 
     int fds_leaked = 0;
     klock_acquire(&g_ofile_lock);
-    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds_leaked++;
     klock_release(&g_ofile_lock);
     utcheck("no descriptor leaked across the thread group", fds_leaked == 0);
 
@@ -33635,11 +34083,11 @@ static void cmd_epoll_stress(void) {
     int tty_idle = (kbd_w != kbd_r) ? 0 : 1;
     canvas_inject_char('x');
     klock_acquire(&g_ofile_lock);
-    uint32_t tty_now = ep_poll_fd_locked(EPOLL_TTY_FD);
+    uint32_t tty_now = ep_poll_oi_locked(EPOLL_TTY_FD);
     klock_release(&g_ofile_lock);
     (void)kbd_getc_nonblock();                 /* consume it again */
     klock_acquire(&g_ofile_lock);
-    uint32_t tty_after = ep_poll_fd_locked(EPOLL_TTY_FD);
+    uint32_t tty_after = ep_poll_oi_locked(EPOLL_TTY_FD);
     klock_release(&g_ofile_lock);
     epcheck("a queued keystroke makes the console readable, and draining it clears that",
             tty_idle && (tty_now & EPOLLIN) && !(tty_after & EPOLLIN));
@@ -33648,7 +34096,7 @@ static void cmd_epoll_stress(void) {
      * descriptor layer already knows how to give: nothing left in the table. */
     int fds_leaked = 0, ep_live = 0, ev_live = 0;
     klock_acquire(&g_ofile_lock);
-    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds_leaked++;
     klock_release(&g_ofile_lock);
     for (int i = 0; i < MAX_EPOLL; i++)   if (g_epoll[i].used) ep_live++;
     for (int i = 0; i < MAX_EVENTFD; i++) if (g_evfd[i].used)  ev_live++;
@@ -33787,7 +34235,7 @@ static void cmd_netepoll_stress(void) {
      * keyed by process would have made permanent. */
     int fds_leaked = 0;
     klock_acquire(&g_ofile_lock);
-    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds_leaked++;
     klock_release(&g_ofile_lock);
     necheck("no descriptor leaked across the suite", fds_leaked == 0);
     necheck("every socket was reclaimed with its descriptor",
@@ -33955,7 +34403,7 @@ static int tcpstrs_grab_sock(void) {
     if (si >= 0) {
         sock_slot_wipe(si);
         struct nsock *t = &g_sock[si];
-        t->used = 1; t->stream = 1; t->waiter_tid = -1; t->fd = -1;
+        t->used = 1; t->stream = 1; t->waiter_tid = -1; t->oi = -1;
         t->connected = 1; t->bound = 1;
         t->raddr = NET_LOOPBACK;
         /* Ports nothing else in this suite binds, so tcp_output's loopback
@@ -34057,7 +34505,7 @@ static void cmd_tcp_stress(void) {
              net_sock_count_used() == socks0);
     int fds_leaked = 0;
     klock_acquire(&g_ofile_lock);
-    for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds_leaked++;
+    for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds_leaked++;
     klock_release(&g_ofile_lock);
     tccheck2("no descriptor leaked across the suite", fds_leaked == 0);
     tccheck2("no lock-rank violation across the TCP paths", g_rank_violations == viol0);
@@ -34548,7 +34996,7 @@ static void cmd_pipe_stress(void) {
     uint64_t freed0 = g_frames_freed, reused0 = g_frames_reused;
     uint32_t viol0 = g_rank_violations;
     uint64_t pipes0 = g_pipes_made;
-    int fds0 = 0; for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds0++;
+    int fds0 = 0; for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds0++;
 
     /* ---- round A: the mechanism ---------------------------------------- */
     int64_t a = pipe_run_role("pipe", PCAP_FILESYSTEM | PCAP_CONSOLE, 40, 20000);
@@ -34612,9 +35060,10 @@ static void cmd_pipe_stress(void) {
             pipe_tmp_is("two.txt", "8"));
 
     /* ---- audits from outside -------------------------------------------- */
-    int fds1 = 0; for (int fd = 0; fd < 16; fd++) if (g_ofiles[fd].used) fds1++;
-    ppcheck("no descriptor leaked across the suite (owner_mask emptied on every "
-            "exit, including fds shared with forked children)", fds1 == fds0);
+    int fds1 = 0; for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds1++;
+    ppcheck("no descriptor leaked across the suite (every description's last "
+            "reference dropped on exit, including fds shared with forked children)",
+            fds1 == fds0);
 
     int pl = 0; for (int i = 0; i < MAX_PIPES; i++) if (g_pipes[i].used) pl++;
     ppcheck("every pipe object was reclaimed (both ends closed, pool empty)", pl == 0);
