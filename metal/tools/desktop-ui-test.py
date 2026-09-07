@@ -11,7 +11,7 @@ user reaches.
 Verdicts come from the serial log, which is why the desktop prints a heartbeat
 naming its window count and launch tally.
 """
-import json, os, socket, subprocess, sys, time
+import hashlib, json, os, re, socket, subprocess, sys, time
 
 ISO = sys.argv[1] if len(sys.argv) > 1 else "build/outrun-desktop-1.0.0.iso"
 LOG = sys.argv[2] if len(sys.argv) > 2 else "/tmp/desktop-ui.log"
@@ -145,6 +145,12 @@ def size_of(log):
 
 
 def main():
+    os.makedirs(os.path.dirname(LOG) or ".", exist_ok=True)
+    with open(ISO, "rb") as image:
+        stamp = hashlib.md5(image.read()).hexdigest()
+    print("image md5: " + stamp, flush=True)
+    with open(LOG + ".image", "w") as evidence:
+        evidence.write(ISO + " md5=" + stamp + "\n")
     for stale in (QMP, LOG):
         if os.path.exists(stale):
             os.remove(stale)
@@ -171,6 +177,134 @@ def main():
         check("the editor is launched at boot", wait_for("launched 'VAULT PAD'", STEP_DEADLINE))
         check("a frame is composited with a window on it",
               wait_for("window(s), 1 launched, 0 launch failure", STEP_DEADLINE))
+
+        # New apps must exercise their actual launcher, input, publication and
+        # teardown paths before the original four-window tests. Reuse slot 1
+        # and compare post-close allocator samples after a warm-up cycle.
+        resting = []
+        for cycle in range(3):
+            mark = size_of(LOG)
+            qmp.click(56, 32 + 4 * 44 + 18)
+            check("terminal launch %d" % cycle,
+                  wait_for("launched 'OUTRUN TERM'", STEP_DEADLINE, mark)
+                  and wait_for("2 window(s)", STEP_DEADLINE, mark))
+            before = LOG + ".term-before.ppm"
+            after = LOG + ".term-after.ppm"
+            qmp.screenshot(before)
+            for key in ("h", "e", "l", "p", "ret"):
+                qmp.key(key)
+            time.sleep(2)
+            qmp.screenshot(after)
+            # Text viewport only, excluding cursor and command-entry row.
+            _, _, bp = read_ppm(before)
+            _, _, ap = read_ppm(after)
+            changed = sum(bp[(y*W+x)*3:(y*W+x)*3+3] != ap[(y*W+x)*3:(y*W+x)*3+3]
+                          for y in range(127, 415) for x in range(110, 686))
+            check("terminal keyboard command changes published text (%d pixels)" % changed,
+                  changed > 30)
+            qmp.key("esc"); qmp.key("2")
+            time.sleep(1)
+            qmp.screenshot(before)
+            _, _, tabpx = read_ppm(before)
+            check("terminal second tab has independent viewport",
+                  any(tabpx[(y*W+110)*3:(y*W+686)*3] != ap[(y*W+110)*3:(y*W+686)*3]
+                      for y in range(127, 415)))
+            mark = size_of(LOG)
+            qmp.click(690, 84)  # slot 1: (100,74), 600px outer width
+            closed = wait_for("1 window(s)", STEP_DEADLINE, mark)
+            check("terminal close returns to one window", closed)
+            samples = []
+            deadline = time.time() + STEP_DEADLINE
+            while time.time() < deadline and not samples:
+                with open(LOG, "rb") as serial:
+                    serial.seek(mark)
+                    samples = re.findall(rb"\[desktop\] (\d+) frames, 1 window\(s\).*frames_used=(\d+)\r?\n", serial.read())
+                if not samples:
+                    time.sleep(0.2)
+            if samples:
+                frames, used = map(int, samples[-1])
+                resting.append(used)
+                print("terminal cycle %d: frames=%d resting_frames_used=%d" % (cycle, frames, used), flush=True)
+        check("terminal teardown has zero allocator drift after warm-up: %s" % resting,
+              len(resting) == 3 and resting[1] == resting[2])
+
+        # ---- the six observability and media applications ------------------
+        #
+        # Run here, while only VAULT PAD is open, so each one lands in window
+        # slot 1 and its close box is at a KNOWN position: slots cascade from
+        # (60,40) by (40,34), so slot 1 is at (100,74), and the close box of a
+        # 430-wide window is the 14px cell ending 3px short of its right edge.
+        #
+        # Each app is launched, seen to own a window, PHOTOGRAPHED, and closed.
+        # The screenshot is the part that matters: the log proves the process
+        # started, and only the framebuffer proves it published a frame. An
+        # application that started and then died inside its first SYS_HW_INFO
+        # call would satisfy every log-only check here.
+        #
+        # Every one of these programs EXITS on an ABI mismatch rather than
+        # rendering a default — so a window that is still there after the
+        # screenshot is itself the assertion that its domain of SYS_HW_INFO
+        # returned a valid, correctly-sized struct.
+        new_apps = [
+            ("DISK DECK",   6, 430),
+            ("PCI EXPLORE", 7, 430),
+            ("SYS TRACE",   8, 430),
+            ("NET DECK",    9, 430),
+            ("SNAPSHOT",   10, 430),
+            ("MEDIA",      11, 430),
+        ]
+        new_resting = []
+        for label, tile, width in new_apps:
+            mark = size_of(LOG)
+            qmp.click(56, 32 + tile * 44 + 18)
+            launched = wait_for("launched '%s'" % label, STEP_DEADLINE, mark)
+            check("clicking the %s tile starts its program" % label, launched)
+            check("%s owns a window" % label,
+                  wait_for("2 window(s)", STEP_DEADLINE, mark))
+            shot = LOG + (".%s.ppm" % label.split()[0].lower())
+            qmp.screenshot(shot)
+            # The window's content rectangle, sampled inside its own borders.
+            painted = 0
+            try:
+                _, _, px = read_ppm(shot)
+                seen = set()
+                for y in range(100, 260):
+                    for x in range(110, 520):
+                        seen.add(px[(y * W + x) * 3:(y * W + x) * 3 + 3])
+                painted = len(seen)
+            except (OSError, ValueError):
+                painted = 0
+            # More than a handful of distinct colours means text and panels were
+            # drawn, not a cleared surface: a window that published one flat
+            # fill would score 1 or 2 here.
+            check("%s published a painted frame (%d distinct colours)" % (label, painted),
+                  painted > 4)
+            mark = size_of(LOG)
+            qmp.click(60 + 40 + width - 10, 40 + 34 + 10)      # slot 1 close box
+            check("%s closes and the window count returns" % label,
+                  wait_for("1 window(s)", STEP_DEADLINE, mark))
+            samples = []
+            deadline = time.time() + STEP_DEADLINE
+            while time.time() < deadline and not samples:
+                with open(LOG, "rb") as serial:
+                    serial.seek(mark)
+                    samples = re.findall(
+                        rb"\[desktop\] (\d+) frames, 1 window\(s\).*frames_used=(\d+)\r?\n",
+                        serial.read())
+                if not samples:
+                    time.sleep(0.2)
+            if samples:
+                frames, used = map(int, samples[-1])
+                new_resting.append((label, used))
+                print("%s: frames=%d resting_frames_used=%d" % (label, frames, used),
+                      flush=True)
+        # ZERO ALLOCATOR DRIFT ACROSS SIX LAUNCH/CLOSE PAIRS. Compared from the
+        # SECOND sample onward: the first app to run pays for whatever the
+        # desktop allocates once and never returns, and charging that to a leak
+        # is how the v1.0 soak first reported one that was not there.
+        levels = [used for _label, used in new_resting]
+        check("six applications launch and close with no allocator drift: %s" % new_resting,
+              len(levels) == len(new_apps) and len(set(levels[1:])) == 1)
 
         # Launcher rail: tiles are 44px apart from y=32, centred at x=56.
         for index, (label, tile_y) in enumerate(

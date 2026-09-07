@@ -217,3 +217,308 @@ what evidence, and — deliberately — what is not.
   This section is an uncommitted edit to Progress.txt made AFTER the tag, and
   is deliberately left uncommitted: committing it would move HEAD past v1.0.0
   and the artefact checksums in §2 belong to c94305a.
+
+8. NATIVE APPLICATION EXPANSION — 2026-09-07 (IN PROGRESS)
+--------------------------------------------------------
+
+  Phase 1, OutRun Terminal:
+  - Added native apps/outrun_term.c and test-first apps/test_outrun_term.c.
+    Observed the missing implementation fail before writing the application.
+    Host tests pass under GCC -Wall -Wextra -Werror and ASan/UBSan, including
+    fragmented/malformed ANSI, cursor/erase/color sequences, command errors,
+    1000-line history rollover, bounded selection copy, and four-tab isolation.
+  - Native app build now enforces -Werror, including shared GUI code. Terminal
+    ELF: text/rodata 7644 bytes, data 0, BSS 887272; four-tab state 885512 bytes.
+  - Backend uses existing SYS_RUN_CMD, now named in the shared ABI header.
+    This is a synchronous shell-capture terminal, NOT a streaming PTY. Capture
+    is limited by the existing syscall to 4095 bytes per command; UI discloses
+    this and reports the capture limit. Parser implements a bounded ANSI subset,
+    not complete VT100 conformance. Two clicks select; COPY/PASTE is app-local.
+  - Added terminal launcher/module and three launch/input/tab/close UI cycles.
+    Desktop harness now stamps image MD5 and checks complete allocator lines.
+    The initial UI negative control failed on repeats of RELEASED keys injected
+    into later terminal windows. keyboard_irq discarded breaks. Shared,
+    host-tested make/break state now stops desktop repeat on physical release.
+  - Corrected desktop-test's missing ISO prerequisite (variable expansion order).
+    Both desktop-test and gate initially failed to compile the pre-existing
+    descriptor refactor: undefined OFILE_LIMIT. User authorized repair. Added
+    its intended 16-entry FDCEIL_FALSIFY limit, default OFILE_MAX, at allocation;
+    added kernel/files.c and key_state.h as kernel build dependencies.
+  - Current desktop image MD5: 842aad2689748131a27c7b49ece9a249.
+    Three terminal close cycles: frames 2086 / 3812 / 5535; resting allocator
+    2477 / 2477 / 2477 pages (zero drift). Open terminal: 3197 pages, a 720-page
+    increase (2949120 bytes, whole-process/surface allocation, not just BSS).
+    Command output changed 19723 viewport pixels in each of the three cycles.
+    Full desktop-test and system gate verdicts are pending below.
+
+  Phase 1's editor and Phases 2 and 3 are covered by section 9 below.
+
+9. PHASES 2 AND 3 — HARDWARE, OBSERVABILITY, NETWORK AND MEDIA — 2026-09-07
+--------------------------------------------------------------------------
+
+  Six new ring-3 applications, one new read-only kernel ABI, and the
+  instrumentation that ABI reports. Phase 1's editor is also confirmed
+  complete: apps/outrun_edit.c and apps/test_outrun_edit.c were present but
+  unverified in section 8; they pass, and a negative control was not run on
+  them because the suite they belong to now runs on every change below.
+
+  9a. WHY A NEW SYSCALL RATHER THAN DRIVING THE SHELL
+  ---------------------------------------------------
+
+  The obvious way to build a disk manager on this system is to call
+  SYS_RUN_CMD("cas") and parse the output, the way OUTRUN TERM does. That was
+  rejected. `disk`, `cas` and `vfs` are SELF-TESTS: they write sectors, put
+  blocks and create files. A monitor whose refresh mutates the volume it is
+  monitoring is not a monitor, and a pool-usage figure that the act of reading
+  it increased is not a measurement.
+
+  So SYS_HW_INFO (119) was added: read-only, four domains, one struct each in
+  include/outrun_abi.h.
+
+      HW_STORAGE  CAS superblock, pool counters, journal recovery counters,
+                  VFS directory occupancy, the block-device inventory
+      HW_PCI      the device registry: BAR windows, required capability,
+                  host-binding, ring-3 ownership, quiesce availability, and
+                  config dwords 0x00/0x08/0x0C/0x34 read by the kernel
+      HW_TRACE    per-core ring-3 busy time and excursion counts, per-line and
+                  per-core interrupt counts, the frame allocator, the thread
+                  table and the process table
+      HW_NET      the interface's frame AND byte counters, its MAC and address,
+                  and every live socket with its TCP state
+
+  SYS_FB_CAPTURE (120) was added for the screenshot tool: it copies a rectangle
+  of the composited LOGICAL desktop into the caller's buffer.
+
+  Both calls follow case 117's contract exactly — PCAP_WIMP, access_ok before
+  any write, and a SIZE THAT IS CHECKED rather than assumed, so a program built
+  against a different revision of the header is refused instead of partly
+  filled. Four _Static_asserts were added beside the kernel's local struct
+  declarations pinning each domain's size (304 / 2704 / 2816 / 856 bytes). The
+  runtime check catches a stale CALLER; the static one catches a stale KERNEL,
+  which the runtime check could only ever have reported as every caller
+  mysteriously receiving -EINVAL.
+
+  NOTHING IN THESE STRUCTS IS A PLACEHOLDER. Three fields were designed and
+  then removed because no live source existed for them, rather than shipped
+  reading zero:
+
+    - cpu_busy_ticks / cpu_idle_ticks, derived from the timer tick. The PIT
+      interrupts the BSP, so every AP would have read zero on a machine plainly
+      using all four cores. Replaced by cpu_busy_ns, accumulated at the site in
+      resume_kernel that ALREADY charges the process — the one place a core
+      knows both how long an excursion ran and that it ran there.
+    - a mount table for the disk manager. This kernel's VFS is flat and has no
+      mounts; the FILES tab derives directory prefixes from the names instead,
+      and says so.
+    - a link-configuration pane for the network deck. The stack's address and
+      MTU are compile-time constants with no syscall to change them, so the app
+      displays them and states on screen that it does not configure the link.
+      A settings pane reading back a constant could never be wrong and could
+      never do anything.
+
+  Three counters DID have to be created, and each was created with its
+  increment site at a chokepoint and a print site that emits it:
+
+    - g_irq_line_count[16] and g_irq_cpu_count[16][MAX_CPUS], incremented in
+      the interrupt dispatcher for every vector 32..47 — the timer and keyboard
+      included, which the device-chain-only alternative would have left
+      permanently zero on a machine plainly taking them.
+    - g_cpu_busy_ns[] / g_cpu_excursions[], at the excursion fold above.
+    - g_net_rx_frames and g_net_tx_bytes / g_net_rx_bytes. TX frames had been
+      counted since v0.69 and RX had never been counted at all, so a network
+      monitor could only ever have shown half a link. Bytes matter separately:
+      sixty ARP frames and sixty full segments are the same frame count and two
+      orders of magnitude apart.
+
+  All of them are printed by `sched`, so a serial log can be checked against
+  what the monitor displayed rather than the display being taken on its word.
+
+  9b. THE APPLICATIONS
+  ---------------------
+
+  Every one was built test-first and every test was shown to be capable of
+  failing — see 9c.
+
+    apps/outrun_disks.c   DISK DECK.    CAS pool, block devices, VFS browser.
+    apps/pci_view.c       PCI EXPLORE.  Bus inventory and the 0x34 capability
+                          walk via SYS_PCI_CFG_READ on a claimed device.
+    apps/sys_trace.c      SYS TRACE.    Per-core load, memory, IRQ
+                          distribution, thread states.
+    apps/net_deck.c       NET DECK.     Link, bandwidth, socket table.
+    apps/outrun_snap.c    SNAPSHOT.     Desktop capture to a 24-bit BMP.
+    apps/outrun_media.c   MEDIA.        Plays those BMPs into a paired window.
+    apps/bmp.h            One codec, shared by the two above. A second copy in
+                          the reader would be a second thing to keep correct
+                          and the tests would only have covered one of them.
+
+  Two design points worth recording because they were arrived at the hard way:
+
+    - PCI EXPLORER CLAIMS AND RELEASES PER READ. SYS_PCI_CFG_READ serves only a
+      device this process owns. Holding an exclusive claim for as long as a
+      viewer window is open would make the tool a denial of service against
+      every real driver that wanted the device. It is also the only tile
+      granted PCAP_VFIO; the read-only inventory needs nothing but WIMP.
+    - SNAP WRITES IN STRIPS. A 1024x768 capture is 3 MiB of pixels and 2.25 MiB
+      of output; reserving that as BSS to take an occasional screenshot would
+      cost it on every boot. The strip plan is asserted on the host to tile the
+      rectangle EXACTLY for every height from 1 to 200 and every strip size
+      from 1 to 70: overlap would duplicate rows and a gap would produce a file
+      shorter than its own header claims — which is the truncation bmp_parse
+      refuses.
+
+  MEDIA's first blit called app_rect once per pixel. 129,000 clipped rectangle
+  calls per frame, on a TCG-emulated machine, would have cost more per frame
+  than the compositor spends on a hundred. It writes into the back surface
+  directly; the bounds it skips re-checking are the ones media_fit establishes,
+  and those are what the host tests assert for every size combination.
+
+  9c. NEGATIVE CONTROLS
+  ----------------------
+
+  Per the standing rule that a test which cannot fail has not passed, each new
+  test was run against a deliberately broken implementation:
+
+    outrun_disks  truncation flag never set          -> caught (line 126)
+    pci_view      capability loop reported as OK     -> caught (line 129)
+    sys_trace     unsigned wrap instead of a floor   -> caught (line 99)
+    net_deck      unsigned wrap instead of a floor   -> caught (line 57)
+    outrun_media  frame timing catches up on a stall -> caught (line 93)
+    bmp.h         truncation length check removed    -> caught (snap line 106)
+
+  Two of these found real defects in the tests themselves rather than in the
+  code, and both are recorded because the failure mode is subtle:
+
+    - net_deck's first control did NOT fire. net_rate's overflow guard halved
+      both terms until the product fitted, which drove the interval to zero for
+      a large enough delta and then returned 0 — turning an absurd input into
+      "no traffic", the one answer indistinguishable from a quiet link. The
+      guard was replaced with a divide-first branch and the primitive is now
+      asserted directly, because the sampled path cannot discriminate: a
+      backwards counter produces a near-2^64 delta and every plausible rate
+      calculation on a number that size lands back near zero somehow.
+    - outrun_media's first control did not fire either. With three frames, a
+      stall of 49 periods lands on the same frame whether the player advances
+      by one or catches up. The stall lengths in the test are now chosen so the
+      two policies disagree (3 periods and 9 periods).
+
+  9d. THINGS THAT WERE ALREADY BROKEN AND ARE NOW NOT
+  ----------------------------------------------------
+
+    - MAX_BOOT_MODULES was 8. The desktop image now carries user_init plus
+      TWELVE applications. Five modules would have been dropped SILENTLY:
+      mod_find would simply not find them, five launcher tiles would have
+      reported "no boot module" on an image that plainly contained them, and
+      nothing in the build would have said why. Raised to 24, and the overflow
+      now prints the name it dropped.
+    - The launcher rail's tile height was the constant 44. Twelve tiles at 44px
+      is 560 pixels; at scale 2 the logical desktop is 384 tall, so six tiles
+      would have been drawn past the taskbar and been unclickable — which looks
+      exactly like a launcher that ignores clicks. desk_tile_h() now derives
+      the height from the space available and BOTH the compositor and the
+      pointer call it, so the drawn tile and the hit box cannot disagree. At
+      scale 1 it still evaluates to 44, which is why the existing UI test's
+      hardcoded tile coordinates continue to hold.
+    - pci_bdf_str masked the slot to four bits. Slot 0x1F is a real address and
+      would have aliased onto slot 0x0F.
+
+  9e. RESULTS
+  ------------
+
+  Host unit tests — `make apps-test`, GCC -Wall -Wextra -Werror with
+  -fsanitize=address,undefined, in under two seconds:
+
+      gui, calc, vault_pad, task_mgr, settings, build IPC, files, keyboard,
+      net_deck, outrun_disks, outrun_edit, outrun_media, outrun_snap,
+      outrun_term, pci_view, sys_trace                    ALL PASS
+
+  Freestanding build — every application compiled with -Werror, no warnings:
+
+      app             text    data       bss
+      outrun_disks    8812       0      7736
+      pci_view        8236      16      2892
+      sys_trace       7852       0      7152
+      net_deck        8220       0      2032
+      outrun_snap     6012       8    134240   (one 32-row capture strip)
+      outrun_media    5980      12   2361590   (one decoded 1024x768 frame)
+
+  Desktop integration — `make desktop-test`, image md5
+  7163f80b9aebaf5504acf721fea28ccc, 17,873 frames composited:
+
+      58 / 58 CHECKS PASSED  (34 pre-existing, 24 new)
+
+  The 24 new checks are, for each of the six applications: the launcher tile
+  starts it, it owns a window, it PUBLISHED A PAINTED FRAME, and it closes with
+  the window count returning. The painted-frame check is the one that matters —
+  the log proves a process started, and only the framebuffer proves it
+  published. Each of these programs EXITS on an ABI mismatch rather than
+  rendering a default, so a window still present at the screenshot IS the
+  assertion that its domain of SYS_HW_INFO returned a valid, correctly sized
+  struct. Distinct colours sampled inside each window's content rectangle:
+
+      DISK DECK 9, PCI EXPLORE 8, SYS TRACE 8, NET DECK 6, SNAPSHOT 6, MEDIA 7
+
+  ZERO WINDOW-HANDLE OR ALLOCATOR LEAKS. Resting frames_used after every one of
+  the nine launch/close pairs in the run — three terminal cycles and six new
+  applications — was 2477 pages, identically:
+
+      terminal   2477 / 2477 / 2477
+      six apps   2477 / 2477 / 2477 / 2477 / 2477 / 2477
+
+  Also still green in the same run, with twelve tiles instead of six: no
+  tearing across six sampled frames, SYS_DESKTOP_SETTINGS scale change to
+  512x384 with the framebuffer genuinely magnified 2x (80000/80000 blocks
+  uniform), no panic, fault or lock-rank violation, and the compositor still
+  running at the end.
+
+
+  System gate — `make gate GATE_CAP=2400`, all three fresh-image
+  configurations plus smp2, one boot each, on the REGRESSION image
+  outrun-os-1.0.0.iso, md5 fdb3ad7dc42e626abd02284b547bfe55:
+
+      gate-selftest   17 passed, 0 failed  (the classifier, on synthetic logs)
+      uniprocessor    OK   suites=46  passed=574  failed=0  ranks=0  (495 s)
+      smp2-bios       OK   suites=46  passed=588  failed=0  ranks=0  (445 s)
+      smp4-bios       OK   suites=46  passed=594  failed=0  ranks=0  (460 s)
+      smp4-iommu      OK   suites=48  passed=619  failed=0  ranks=0  (460 s)
+
+      FRESH-IMAGE MATRIX: PASS
+      2,375 assertions, 0 failed, 0 lock-rank violations, across 4 boots.
+
+  This is the number that matters for the kernel changes in 9a: the two new
+  syscalls, the interrupt counters on the dispatch path, the per-core
+  accumulation inside the excursion fold, and the two network counters are all
+  live in this build, and none of them moved a suite. The gate boots the
+  REGRESSION image, which runs no desktop loop at all — so the launcher and
+  module-table changes are covered by desktop-test above, not by this.
+
+  Baseline note: the v0.82 development baseline in CLAUDE.md records 495/505/
+  511/524 assertions for these four tiers. The counts here are higher (574/588/
+  594/619) because the suite set has grown since; the comparison that matters
+  is failed=0 and ranks=0, which hold.
+
+  NOT run in this session: gate-dirty, gate-dirty-smp, desktop-test-smp,
+  desktop-soak, release-iso and release-verify. No version tag was made and
+  VERSION is untouched at 1.0.0 — this is development work on top of the
+  v1.0.0 tag, not a release.
+
+  9f. NOT COVERED (so "verified" stays "measured")
+  -------------------------------------------------
+
+  - The PCI capability WALK has not been exercised against a real device on
+    this machine. Every enumerated function here is host-bound, and a device
+    the kernel is driving is not claimable by design — so on a stock boot the
+    walk reports its denial, which is correct behaviour and is what the app
+    displays. The walk's loop, out-of-range, overflow and denial paths are
+    covered on the host against a synthetic configuration space; its behaviour
+    on a genuinely free device is NOT covered by any run in this session.
+  - SYS_FB_CAPTURE is exercised only by SNAPSHOT rendering its own screen. No
+    run in this session pressed its CAPTURE button, so no BMP has been written
+    to a volume by the machine, and MEDIA has therefore only ever been observed
+    playing an EMPTY playlist. The codec's round trip is covered on the host;
+    the write-then-read loop between the two programs is not.
+  - HW_NET's socket table was observed with no sockets open. The TCP state
+    decoding is host-tested against every state value; it has not been seen
+    against a live connection.
+  - Per-core load was observed on a uniprocessor desktop run. desktop-test-smp
+    was not run in this session.
+  - One desktop boot. It cannot see an intermittent below roughly 1 in 10.

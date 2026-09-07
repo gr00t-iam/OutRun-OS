@@ -30649,22 +30649,61 @@ static void compositor_frame(int frame) {
  * The names are this system's own. */
 #define DESK_RAIL_W   112
 #define DESK_RAIL_Y   32
-#define DESK_TILE_H   44
-#define DESK_NLAUNCH  4
+#define DESK_TILE_MAX 44
+#define DESK_TILE_MIN 20
+#define DESK_TILE_GAP  6
+#define DESK_NLAUNCH  12
 struct launch_tile { const char *label, *module; uint32_t tint; };
+/* Labels are at most 12 characters: the rail is DESK_RAIL_W wide, the text
+ * starts 12 pixels in, and the font is 8 pixels per glyph. A longer label does
+ * not wrap � it runs off the rail and over whatever window is beneath it. */
 static const struct launch_tile g_launch[DESK_NLAUNCH] = {
     { "VAULT PAD", "vault_pad", C_MAGE  },
     { "NUMWORKS",  "calc",      C_MINT  },
     { "SYS-DIAG",  "task_mgr",  C_CYAN  },
     { "CTRL DECK", "settings",  C_AMBER },
+    { "OUTRUN TERM", "outrun_term", C_MINT },
+    { "OUTRUN CODE", "outrun_edit", C_MAGE },
+    { "DISK DECK",   "outrun_disks", C_MINT  },
+    { "PCI EXPLORE", "pci_view",     C_AMBER },
+    { "SYS TRACE",   "sys_trace",    C_CYAN  },
+    { "NET DECK",    "net_deck",     C_MINT  },
+    { "SNAPSHOT",    "outrun_snap",  C_MAGE  },
+    { "MEDIA",       "outrun_media", C_MAGE  },
 };
+/* THE TILE HEIGHT IS DERIVED, NOT FIXED.
+ *
+ * A constant 44 fitted six tiles into any desktop this kernel can produce.
+ * Twelve do not: at scale 2 the logical desktop is 512x384, and twelve fixed
+ * tiles would run 176 pixels past the taskbar � the last several unreachable,
+ * and unreachable in a way that looks exactly like a launcher that ignores
+ * clicks. Deriving the height from the space actually available makes the rail
+ * fit whatever the settings app has chosen, and the clamp at DESK_TILE_MIN
+ * means a desktop too small for all twelve produces tiles that are too short
+ * rather than tiles nothing can click.
+ *
+ * Both the compositor and the pointer call THIS function. That is the same
+ * discipline the chip hit box already follows and for the same reason: a
+ * second copy of the geometry is how a control becomes decoration. */
+static int desk_tile_h(void) {
+    int avail = desk_h() - WIN_TASKBAR_H - DESK_RAIL_Y;
+    if (avail <= 0) return DESK_TILE_MIN;
+    int h = avail / DESK_NLAUNCH;
+    if (h > DESK_TILE_MAX) h = DESK_TILE_MAX;
+    if (h < DESK_TILE_MIN) h = DESK_TILE_MIN;
+    return h;
+}
 /* Which launcher tile contains a logical-desktop point, or -1. */
 static int desk_launch_at(int sx, int sy) {
     if (sx < 6 || sx >= DESK_RAIL_W - 6) return -1;
     if (sy < DESK_RAIL_Y) return -1;
-    int i = (sy - DESK_RAIL_Y) / DESK_TILE_H;
+    int th = desk_tile_h();
+    /* A tile drawn under the taskbar is not clickable, and must not be
+     * reported as clicked either. */
+    if (sy >= desk_h() - WIN_TASKBAR_H) return -1;
+    int i = (sy - DESK_RAIL_Y) / th;
     if (i < 0 || i >= DESK_NLAUNCH) return -1;
-    if ((sy - DESK_RAIL_Y) % DESK_TILE_H >= DESK_TILE_H - 8) return -1;   /* the gap */
+    if ((sy - DESK_RAIL_Y) % th >= th - DESK_TILE_GAP) return -1;   /* the gap */
     return i;
 }
 /* Where window `id`'s taskbar chip sits, given the window table `snap`.
@@ -30833,11 +30872,13 @@ static void wimp_compose(void) {
      * pointer does not look for it. */
     rect(0, 0, DESK_RAIL_W, H - WIN_TASKBAR_H, C_OBS1);
     vline(DESK_RAIL_W - 1, 0, H - WIN_TASKBAR_H, C_HAIR);
+    int tile_h = desk_tile_h();
     for (int i = 0; i < DESK_NLAUNCH; i++) {
-        int y = DESK_RAIL_Y + i * DESK_TILE_H;
-        rect(6, y, DESK_RAIL_W - 12, DESK_TILE_H - 8, C_OBS2);
+        int y = DESK_RAIL_Y + i * tile_h;
+        if (y + tile_h - DESK_TILE_GAP > H - WIN_TASKBAR_H) break;   /* see desk_tile_h */
+        rect(6, y, DESK_RAIL_W - 12, tile_h - DESK_TILE_GAP, C_OBS2);
         hline(6, y, DESK_RAIL_W - 12, g_launch[i].tint);
-        draw_str(12, y + 10, g_launch[i].label, g_launch[i].tint);
+        draw_str(12, y + (tile_h - DESK_TILE_GAP - 8) / 2, g_launch[i].label, g_launch[i].tint);
     }
 
     /* Snapshot the window table under the lock, then draw without holding it
@@ -31051,7 +31092,16 @@ static int desk_launch(int t) {
         return -1;
     }
     uint64_t save = current_proc_idx;
-    int p = kproc_spawn(g_launch[t].label, PCAP_WIMP | PCAP_FILESYSTEM);
+    uint64_t caps = PCAP_WIMP | PCAP_FILESYSTEM;
+    if (!kstrcmp(g_launch[t].module, "outrun_term") || !kstrcmp(g_launch[t].module, "outrun_edit")) caps |= PCAP_IPC;
+    /* The PCI explorer is the only application that CLAIMS a device.
+     * SYS_PCI_CFG_READ serves a claimed device only � configuration
+     * space is where a driver discovers a virtio register layout � so
+     * without VFIO its capability walk can report nothing but the
+     * denial. No other tile gets it: read-only inventory comes from
+     * SYS_HW_INFO, which needs only WIMP. */
+    if (!kstrcmp(g_launch[t].module, "pci_view")) caps |= PCAP_VFIO;
+    int p = kproc_spawn(g_launch[t].label, caps);
     if (p < 0) { current_proc_idx = save; g_desk_launch_fail++; return -1; }
     uint64_t entry = elf_load(p, m->start, m->end - m->start);
     current_proc_idx = save;
