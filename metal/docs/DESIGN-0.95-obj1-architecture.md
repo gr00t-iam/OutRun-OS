@@ -438,3 +438,156 @@ what exposed v0.94's split as real; the same discipline applies here.
 5. **How large must the IDT become for MSI-X, and what allocates vectors?**
    `idt[52]` is exact today. This is Objective 2's first question and is
    recorded here so it is not discovered late.
+
+---
+
+## 8. Phase 2 as built — driver quiesce and the handover path
+
+Phase 1 shipped the *shape* of `kdev_unbind_host()` and none of its content:
+the hook table `g_kdev_quiesce[]` existed, every slot was `NULL`, so every
+unbind refused and the success path was unreachable code. The refusal was
+tested; the handover was not. **A hook table nothing registers into is the
+same class of non-evidence as a counter nothing increments** — the suite was
+green on a path that could not run.
+
+### 8a. This answers open question 6
+
+Question 6 asked whether a device the kernel is actively driving should be
+claimable, and named the two honest options: refuse, or mark it so the refusal
+is explicit. Both were already done. Phase 2 adds the third state the question
+implied but did not state — a device whose driver **can be told to stand
+down** — without weakening either of the first two.
+
+`SYS_CLAIM_PCI_DEVICE` still returns `EBUSY` on a host-bound device. It does
+**not** call `kdev_unbind_host()`, and that is deliberate: letting a claim
+unbind on demand would let any `PCAP_VFIO` caller take the boot disk's
+controller away from the kernel by asking for it, which is the exact hazard
+`KDEV_BOUND_HOST` exists to prevent. Unbinding stays kernel-side policy.
+
+### 8b. The device that could be handed over, and why it is the only one
+
+Every host-bound function on the gate topology is load-bearing:
+
+| device | why it cannot be quiesced mid-boot |
+|---|---|
+| virtio-blk `0:1.0` | holds the filesystem every later suite reads |
+| virtio-net `0:2.0` | `cmd_net`, `cmd_capdma`, `cmd_tcp_stress` all run *after* `cmd_vfio_stress` |
+| virtio-gpu | the compositor |
+| virtio-sound | polled, but shares the INTx line story above |
+
+virtio-rng is the opposite: nothing in this kernel reads from it, no suite
+depends on it, and the gate already places one behind the IOMMU. It now has a
+**real driver** (`virtio_rng_probe`) — reset, feature negotiation, a live
+virtqueue, `DRIVER_OK` — so what the quiesce hook stands down is an actually
+running device rather than a flag someone set.
+
+### 8c. Ordering, which is load-bearing
+
+Binding a driver to the rng makes it `KDEV_BOUND_HOST`, which is what role 66
+sweeps past looking for something claimable. `cmd_vfio_stress` therefore
+unbinds it **before** it spawns role 66. Reverse that order and role 66
+reports `NOT EXERCISED` on a machine that does have a free device — a silent
+regression indistinguishable from a topology without one.
+
+### 8d. Two defects this found, both in code written for this phase
+
+Recorded because the boot log caught them and inspection had not:
+
+1. **Feature negotiation.** The first driver offered `VIRTIO_F_VERSION_1` as a
+   constant; the device cleared `FEATURES_OK`. Offering a feature the device
+   did not advertise is a protocol violation. The second version read the
+   offered word and returned the intersection — and still failed, because the
+   gate places this device with `iommu_platform=on`, which makes
+   `VIRTIO_F_ACCESS_PLATFORM` (bit 33) **mandatory**. `virtio_blk_probe`
+   negotiates the same pair for the same reason.
+
+2. **`pci_quiesce_generic` cleared memory decode (command bit 1).** Correct for
+   "shut this device down", wrong for "hand it to ring 3" — its only caller.
+   With decode off the BAR still maps and every read returns zero, so the new
+   owner gets a window onto a device that cannot answer. **Role 66's phase-1
+   COMMON_CFG assertion caught this**, firing on a real defect rather than a
+   hypothetical one: it claimed the quiesced device, mapped its BAR, and read
+   `device_feature[1] = 0` and `num_queues = 0`. Bus master and INTx are what
+   must stop; decode is a passive property of the window. A dedicated
+   assertion now names the property directly.
+
+### 8e. What is asserted, and why the return code is not enough
+
+A hook returning 0 without touching hardware would pass a check on its own
+result. The suite therefore reads the **PCI command register** back and a
+quiesce **counter** the driver increments:
+
+```
+PASS  kdev_unbind_host REFUSES a driver that cannot quiesce   (unchanged, now
+      scoped to a HOOKLESS bound device so it keeps testing refusal)
+PASS  virtio-rng starts out HOST-BOUND (its driver is running)
+PASS  virtio-rng is bus-mastering before the unbind
+PASS  kdev_unbind_host SUCCEEDS on a driver that can quiesce
+PASS  the driver's own quiesce hook ran (counter moved)
+PASS  the device is no longer marked host-bound
+PASS  BUS MASTER is off after the unbind (the device cannot DMA)
+PASS  INTx is disabled after the unbind (it cannot raise a line)
+PASS  MEMORY DECODE stays on (the new owner can reach the BAR)
+PASS  the driver released its virtqueue frame
+PASS  a second unbind of the same device is REFUSED
+```
+
+Measured on `smp4-iommu`: `cmd 0x100107 -> 0x100503` (bus master cleared, INTx
+disable set, memory decode retained), `quiesces 1`, and role 66 then read
+`device_feature[1] = 0x103`, `num_queues = 1` through the handed-over BAR —
+values a zero page cannot produce.
+
+### 8f. Negative control
+
+The standing rule is that a test which cannot fail has not passed. Building
+with the hook registration disabled (`if (0 && f->bdf == g_vrng_bdf ...)`)
+turned the whole gate red — image `be0baf00…`, `.logs/gate/negctl-2939/`:
+
+```
+[vfiostrs]  NOT EXERCISED  unbind success: virtio-rng bound no driver
+[vfiostrs]  FAIL  role 66: claim -> map BAR -> release -> re-claim
+[vfiostrs] RESULT: 10 passed, 1 failed
+FRESH-IMAGE MATRIX: FAIL
+```
+
+Two distinct things are demonstrated, and the second was not anticipated:
+
+1. The success block reports **NOT EXERCISED rather than passing**. It cannot
+   go green on a boot where no hook was registered.
+2. Role 66 actively **FAILS**. With the rng still host-bound, its sweep falls
+   through to the next claimable function — the q35 AHCI controller at
+   `0:31.2` — which has no virtio capability, so the COMMON_CFG walk finds
+   nothing and it exits 1934.
+
+### 8f-i. A latent sharp edge this exposed, not introduced
+
+Point 2 is worth stating plainly because it is a property of **phase 1's**
+role 66, surfaced by phase 2 rather than caused by it: role 66's MMIO
+assertion assumes the device it claimed is a virtio device. Claim a non-virtio
+function and it reports a defect, when what actually happened is that it could
+not find a device it knows how to verify.
+
+On the shipped configuration this cannot fire: the rng is unbound before role
+66 runs and sits at `0:4.0`, which the slot-order sweep reaches long before
+AHCI at `0:31.2`. But the margin is one topology change wide, and the failure
+it would produce ("no virtio COMMON_CFG capability in a mapped BAR") names a
+symptom rather than the cause. The honest fix is for role 66 to distinguish
+"claimed a device I cannot verify" (NOT EXERCISED) from "claimed a virtio
+device whose BAR reads zero" (FAIL). **Not done in this phase** — it changes a
+passing test's semantics and would need its own matrix run.
+
+### 8g. What phase 2 does NOT cover
+
+- **virtio-net and virtio-blk still have no quiesce hook**, so they still
+  refuse to unbind. That is a correct refusal, not a gap that was overlooked:
+  neither driver can currently drain its rings or tell its upper layer the
+  device is gone, and unbinding one mid-boot would break the suites that use
+  it. Writing those hooks is a larger piece of work than this phase.
+- **Ring 3 still cannot trigger an unbind.** There is no syscall, by design.
+- **Only `smp4-iommu` has a virtio-rng on the bus.** On the other three
+  configurations the success block prints NOT EXERCISED, which is honest and
+  is why the count differs between tiers (611 vs 601 assertions).
+- **Host access to a quiesced device is not tested.** After unbind the kernel
+  driver has dropped its state and the mapping is gone; there is no remaining
+  host code path that touches it, so there is nothing to observe failing
+  gracefully. Asserting on this would need a deliberate use-after-unbind probe.

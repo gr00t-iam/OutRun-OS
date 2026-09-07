@@ -15120,6 +15120,212 @@ static uint64_t pci_bar_size(uint8_t bus, uint8_t dev, uint8_t fn, int idx,
 }
 
 /* Record one present function, and bind a driver to it if we have one. */
+/* ===========================================================================
+ * VIRTIO-RNG  —  the device whose driver CAN hand it over  (v0.95 obj 1, ph 2)
+ * ===========================================================================
+ * WHY THIS DRIVER EXISTS AT ALL. kdev_unbind_host() has had a hook table since
+ * phase 1 and no driver ever filled a slot in it, so every unbind refused and
+ * the SUCCESS path was dead code. A hook table nothing registers into is the
+ * same class of non-evidence as a counter nothing increments: the refusal was
+ * tested, the handover was not.
+ *
+ * It could not be tested on the drivers already here, and that is a property
+ * of the machine rather than an omission. virtio-blk holds the filesystem
+ * every later suite reads, virtio-net the socket layer that cmd_net,
+ * cmd_capdma and cmd_tcp_stress all use AFTER this point in the boot, and
+ * virtio-gpu the compositor. Quiescing any of them to make a test green would
+ * break the boot the test runs in.
+ *
+ * virtio-rng is the opposite in every respect: nothing in this kernel reads
+ * from it, no suite depends on it, and the gate already places one on the bus
+ * (smp4-iommu, behind the IOMMU). It is entropy — losing it costs nothing.
+ * So it gets a REAL driver: a real reset/feature/queue bring-up, so that what
+ * the quiesce hook stands down is an actually-running device rather than a
+ * flag someone set.
+ *
+ * ORDERING THIS CREATES, AND IT IS LOAD-BEARING. Binding a driver here makes
+ * the rng device KDEV_BOUND_HOST, which is exactly what role 66 sweeps past
+ * looking for something claimable. cmd_vfio_stress therefore unbinds it
+ * BEFORE it spawns role 66 (see that suite). If that order is ever reversed,
+ * role 66 goes back to reporting NOT EXERCISED and the regression is silent —
+ * it looks like a machine with no free device, not like a broken test.
+ * =========================================================================== */
+#define VRNG_MMIO_V (VBLK_MMIO_V + 0xB0000)   /* clear of vblk +0/+0x10000,   */
+                                              /* vnet +0x20000, iommu +0x30000,*/
+                                              /* gpu +0x50000/+0x60000,        */
+                                              /* snd +0x90000/+0xA0000         */
+static volatile uint8_t *g_vrng_common = 0;   /* mapped common-cfg base        */
+static uint16_t          g_vrng_bdf    = 0xFFFF;
+static int               g_vrng_ready  = 0;
+static uint64_t          g_vrng_ring   = 0;   /* one frame: desc+avail+used    */
+/* Counts the quiesce path actually running. Printed by cmd_vfio_stress, so a
+ * claim that "the hook ran" is backed by a number the boot produced rather
+ * than by the absence of an error. */
+static uint32_t          g_vrng_quiesced = 0;
+
+/* Forward declarations. The quiesce hook TABLE is defined further down, beside
+ * kdev_unbind_host which consumes it, but the slot has to be filled in
+ * pci_register_claimable above that point — that is where a device's registry
+ * index first exists. Declaring it here keeps the definition next to its
+ * consumer instead of hoisting the whole unbind machinery up the file. */
+typedef int (*kdev_quiesce_fn)(uint16_t bdf);
+static kdev_quiesce_fn g_kdev_quiesce[MAX_KDEV];
+
+static int virtio_rng_probe(uint8_t bus, uint8_t dev, uint8_t fn) {
+    uint64_t common_off = 0;
+    int common_bar = -1;
+    uint8_t cap = (uint8_t)(pci_cfg_read32(bus, dev, fn, 0x34) & 0xFC);
+    while (cap) {
+        uint32_t c0 = pci_cfg_read32(bus, dev, fn, cap);
+        if ((uint8_t)c0 == 0x09) {                       /* virtio vendor cap  */
+            uint8_t cfg = (uint8_t)(c0 >> 24);
+            uint8_t bar = (uint8_t)(pci_cfg_read32(bus, dev, fn, cap + 4) & 0xFF);
+            uint32_t off = pci_cfg_read32(bus, dev, fn, cap + 8);
+            if (cfg == 1) { common_bar = bar; common_off = off; }
+        }
+        cap = (uint8_t)((c0 >> 8) & 0xFC);
+    }
+    if (common_bar < 0) {
+        kprintf("[rng    ] virtio-rng at %d:%d.%d has no COMMON_CFG — not bound\n",
+                (uint64_t)bus, (uint64_t)dev, (uint64_t)fn);
+        return 0;                                  /* leaves it claimable      */
+    }
+
+    uint32_t cmd = pci_cfg_read32(bus, dev, fn, 0x04);
+    pci_cfg_write32(bus, dev, fn, 0x04, cmd | 0x6);      /* mem decode + master */
+
+    uint64_t cbase = pci_bar_base(bus, dev, fn, common_bar);
+    map_mmio(VRNG_MMIO_V, cbase, 0x4000);
+    volatile uint8_t *cc = (volatile uint8_t *)(VRNG_MMIO_V + common_off);
+
+    /* Standard modern-virtio bring-up. RESET FIRST: the device may have been
+     * left running by firmware, and every later write is only defined from a
+     * reset state. */
+    *(volatile uint8_t *)(cc + VCC_DEV_STATUS) = 0;
+    while (*(volatile uint8_t *)(cc + VCC_DEV_STATUS) != 0) { }
+    *(volatile uint8_t *)(cc + VCC_DEV_STATUS) = VSTAT_ACK;
+    *(volatile uint8_t *)(cc + VCC_DEV_STATUS) = VSTAT_ACK | VSTAT_DRIVER;
+
+    /* FEATURE NEGOTIATION. The driver may only accept a SUBSET of what the
+     * device offers, so read what is offered and hand back the intersection
+     * with what this driver understands.
+     *
+     * BIT 33 (VIRTIO_F_ACCESS_PLATFORM) IS NOT OPTIONAL HERE. The gate places
+     * this device with iommu_platform=on, which is what puts it behind the
+     * IOMMU — and a device configured that way REQUIRES the driver to accept
+     * ACCESS_PLATFORM. Omitting it is not "declining a feature we don't need";
+     * the device answers by refusing FEATURES_OK outright and the bind fails.
+     * That is exactly what the first two boots of this driver did, and the
+     * serial log named it both times. virtio_blk_probe negotiates the same
+     * pair for the same reason.
+     *
+     * Accepting only what is OFFERED, rather than a fixed constant, is the
+     * other half: offering the device a feature it never advertised is a
+     * protocol violation, which is how the first attempt failed. */
+    *(volatile uint32_t *)(cc + VCC_DEV_FEAT_SEL) = 1;
+    uint32_t offered_hi = *(volatile uint32_t *)(cc + VCC_DEV_FEAT);
+    if (!(offered_hi & 1u)) {
+        kprintf("[rng    ] device does not offer VIRTIO_F_VERSION_1 — not bound\n");
+        *(volatile uint8_t *)(cc + VCC_DEV_STATUS) = VSTAT_FAILED;
+        return 0;
+    }
+    *(volatile uint32_t *)(cc + VCC_DRV_FEAT_SEL) = 0;
+    *(volatile uint32_t *)(cc + VCC_DRV_FEAT)     = 0;      /* no low features */
+    *(volatile uint32_t *)(cc + VCC_DRV_FEAT_SEL) = 1;
+    *(volatile uint32_t *)(cc + VCC_DRV_FEAT)     = 1u | (offered_hi & 2u);
+    *(volatile uint8_t *)(cc + VCC_DEV_STATUS) =
+        VSTAT_ACK | VSTAT_DRIVER | VSTAT_FEAT_OK;
+    if (!(*(volatile uint8_t *)(cc + VCC_DEV_STATUS) & VSTAT_FEAT_OK)) {
+        kprintf("[rng    ] device rejected the accepted feature set (offered hi %x)"
+                " — not bound\n", (uint64_t)offered_hi);
+        *(volatile uint8_t *)(cc + VCC_DEV_STATUS) = VSTAT_FAILED;
+        return 0;
+    }
+
+    /* Queue 0, sized down to what one frame holds. The ring is built and
+     * enabled but never fed: this driver exists to be a REAL bound device for
+     * the handover test, and a queue with no buffers on it is still a queue
+     * the device has latched addresses for — which is precisely the state a
+     * quiesce has to undo. */
+    *(volatile uint16_t *)(cc + VCC_Q_SELECT) = 0;
+    uint16_t qsz = *(volatile uint16_t *)(cc + VCC_Q_SIZE);
+    if (qsz > 64) qsz = 64;
+    if (qsz) {
+        g_vrng_ring = alloc_frame();
+        if (!g_vrng_ring) {
+            kprintf("[rng    ] no frame for the virtqueue — not bound\n");
+            *(volatile uint8_t *)(cc + VCC_DEV_STATUS) = VSTAT_FAILED;
+            return 0;
+        }
+        for (uint64_t i = 0; i < 0x1000; i++) ((volatile uint8_t *)g_vrng_ring)[i] = 0;
+        uint64_t desc  = g_vrng_ring;
+        uint64_t avail = desc + (uint64_t)qsz * 16;
+        uint64_t used  = (avail + 6 + (uint64_t)qsz * 2 + 3) & ~3ull;
+        *(volatile uint16_t *)(cc + VCC_Q_SIZE)   = qsz;
+        *(volatile uint64_t *)(cc + VCC_Q_DESC)   = desc;
+        *(volatile uint64_t *)(cc + VCC_Q_DRIVER) = avail;
+        *(volatile uint64_t *)(cc + VCC_Q_DEVICE) = used;
+        *(volatile uint16_t *)(cc + VCC_Q_ENABLE) = 1;
+    }
+    *(volatile uint8_t *)(cc + VCC_DEV_STATUS) =
+        VSTAT_ACK | VSTAT_DRIVER | VSTAT_FEAT_OK | VSTAT_DRIVER_OK;
+
+    g_vrng_common = cc;
+    g_vrng_bdf    = pci_bdf(bus, dev, fn);
+    g_vrng_ready  = 1;
+    kprintf("[rng    ] virtio-rng at %d:%d.%d bound: status %x, queue0 size %d "
+            "— HOST-BOUND and quiescable\n",
+            (uint64_t)bus, (uint64_t)dev, (uint64_t)fn,
+            (uint64_t)*(volatile uint8_t *)(cc + VCC_DEV_STATUS), (uint64_t)qsz);
+    return 1;
+}
+
+/* THE HOOK. Returns 0 only when the device is genuinely stood down.
+ *
+ * Order matters and is the reverse of bring-up: stop the device's own engine
+ * first (status 0 is a full virtio reset — it drops queue_enable and forgets
+ * every ring address it latched), and only then take away its ability to
+ * master the bus. Doing it the other way round would leave a device that
+ * still believes its rings are armed but can no longer reach them, which is a
+ * device in an undefined state rather than a stopped one.
+ *
+ * kdev_unbind_host calls pci_quiesce_generic() after this returns, which is
+ * what clears bus-master and memory decode at the PCI level; the command-
+ * register write here is deliberately NOT relied upon for that. What this
+ * does is the part only a driver can do: reset the device and forget its
+ * rings, so nothing is left pointing at kernel frames when ring 3 takes
+ * over. */
+static int virtio_rng_quiesce(uint16_t bdf) {
+    if (!g_vrng_ready || bdf != g_vrng_bdf || !g_vrng_common) return -1;
+    volatile uint8_t *cc = g_vrng_common;
+
+    *(volatile uint8_t *)(cc + VCC_DEV_STATUS) = 0;          /* full reset     */
+    /* The spec requires the driver to wait for the reset to be observed. A
+     * bounded wait, because a device that never clears its status must fail
+     * the unbind rather than hang the boot — a stuck spin here would be
+     * indistinguishable from a hung kernel. */
+    int spins = 0;
+    while (*(volatile uint8_t *)(cc + VCC_DEV_STATUS) != 0) {
+        if (++spins > 1000000) {
+            kprintf("[rng    ] device did not acknowledge reset — quiesce FAILED\n");
+            return -1;
+        }
+    }
+    /* The rings are now forgotten by the device, so the frame is ours to drop.
+     * Released only AFTER the reset is confirmed: freeing it first would hand
+     * a frame back to the allocator while a live device still held its
+     * physical address in queue_desc. */
+    if (g_vrng_ring) { free_frame(g_vrng_ring); g_vrng_ring = 0; }
+
+    g_vrng_ready  = 0;
+    g_vrng_common = 0;                    /* the mapping must not be used again */
+    g_vrng_quiesced++;
+    kprintf("[rng    ] quiesced bdf %x: status 0, queue released, driver detached\n",
+            (uint64_t)bdf);
+    return 0;
+}
+
+
 static void pci_probe_fn(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t id) {
     uint32_t cls  = pci_cfg_read32(bus, dev, fn, 0x08);
     uint32_t hdr  = pci_cfg_read32(bus, dev, fn, 0x0C);
@@ -15187,6 +15393,15 @@ static void pci_probe_fn(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t id) {
         else if (class == 0x02) { virtionet_probe(bus, dev, fn);    bound = 1; }
         else if (class == 0x03) { virtio_gpu_probe(bus, dev, fn);   bound = 1; }
         else if (class == 0x04) { virtio_sound_probe(bus, dev, fn); bound = 1; }
+        /* v0.95 ph2: virtio-rng is PCI class 0x00 (unclassified) and device id
+         * 0x1005 legacy / 0x1044 modern. Unlike the four above, this probe's
+         * RETURN VALUE decides binding: a device it declines (no COMMON_CFG,
+         * refused features, no frame for the ring) must stay claimable rather
+         * than be marked host-bound by a driver that is not driving it. The
+         * others are dispatched blind because their probes ignore their own
+         * result; this one does not, so the flag can follow the truth. */
+        else if (class == 0x00 && ((id >> 16) == 0x1005 || (id >> 16) == 0x1044))
+            bound = virtio_rng_probe(bus, dev, fn);
     } else if (class == 0x0C) {                         /* serial bus controller */
         if (subclass == 0x03 && progif == 0x30) { xhci_probe(bus, dev, fn); bound = 1; }
     }
@@ -15258,6 +15473,14 @@ static void pci_register_claimable(void) {
          * for, where an absent device would be indistinguishable from one
          * that is not on this machine at all. */
         if (f->bound) { kdevs[n_kdev - 1].state |= KDEV_BOUND_HOST; bound++; }
+        /* v0.95 ph2: THE HOOK IS ATTACHED HERE, where the kdev index exists.
+         * A driver knows its bdf but not its registry slot, and the slot is
+         * what g_kdev_quiesce is indexed by — so attaching it inside the probe
+         * would mean guessing an index that has not been assigned yet. A NULL
+         * slot means "this driver cannot hand its device over", which stays
+         * the honest default for the other four. */
+        if (f->bdf == g_vrng_bdf && g_vrng_ready)
+            g_kdev_quiesce[n_kdev - 1] = virtio_rng_quiesce;
         added++;
         /* NAMED, NOT JUST COUNTED. "1 function registered" was true and
          * useless: it did not say WHICH, so a device missing for the wrong
@@ -15287,11 +15510,23 @@ static void pci_register_claimable(void) {
  * device's licence to initiate DMA, and while it is set the device can write to
  * memory whether or not any driver is still talking to it. Sets INTERRUPT
  * DISABLE (bit 10) so a line the kernel has stopped servicing cannot be left
- * asserted, and clears MEMORY SPACE (bit 1) so the old window stops decoding.
+ * asserted.
  *
- * ORDER: bus master first. Dropping memory decode while DMA is still enabled
- * leaves a device that can write to RAM but whose registers the driver can no
- * longer reach to stop it.
+ * ORDER: bus master first, because it is the bit with teeth.
+ *
+ * MEMORY DECODE IS DELIBERATELY LEFT ON — a v0.95-ph2 correction. The first
+ * version cleared bit 1 as well, which is right for "shut this device down"
+ * and wrong for "hand this device to ring 3", and handing over is this
+ * function's only caller. With decode off the BAR still maps, but nothing
+ * answers on the bus, so the new owner gets a window onto a device that reads
+ * as zeroes. Role 66 caught precisely that: it claimed the quiesced device,
+ * mapped its BAR, and read 0 from both COMMON_CFG registers — the assertion
+ * phase 1 added to catch a mapping that points at no device, firing on a real
+ * defect rather than a hypothetical one.
+ *
+ * What has to stop is DMA and interrupts, and both do. Decode is a passive
+ * property of the window: a device that cannot master the bus and cannot raise
+ * a line is quiesced whether or not its registers answer reads.
  *
  * This is necessary and NOT sufficient. It stops the device at the PCI level;
  * it does not tell a driver that its rings are gone, does not wait for
@@ -15304,14 +15539,12 @@ static void pci_quiesce_generic(uint16_t bdf) {
     cmd &= ~(1u << 2);                       /* BUS MASTER off: no more DMA    */
     pci_cfg_write32(bus, dev, fn, 0x04, cmd);
     cmd |=  (1u << 10);                      /* INTx disable                   */
-    cmd &= ~(1u << 1);                       /* memory decode off              */
     pci_cfg_write32(bus, dev, fn, 0x04, cmd);
 }
 
 /* Per-device quiesce. NULL means THIS DRIVER CANNOT HAND ITS DEVICE OVER, and
- * that is the honest default rather than an oversight — see kdev_unbind_host. */
-typedef int (*kdev_quiesce_fn)(uint16_t bdf);
-static kdev_quiesce_fn g_kdev_quiesce[MAX_KDEV];
+ * that is the honest default rather than an oversight — see kdev_unbind_host.
+ * Declared above pci_register_claimable, which is where slots get filled. */
 
 /* v0.95: THE EXPLICIT RELEASE. A kernel driver that can stop its device —
  * stop its rings, mask its interrupt, and stop issuing DMA — becomes claimable
@@ -24577,7 +24810,8 @@ static void cmd_vfio_stress(void) {
     {
         int bound_idx = -1;
         for (int i = 0; i < n_kdev; i++)
-            if (kdevs[i].used && (kdevs[i].state & KDEV_BOUND_HOST)) { bound_idx = i; break; }
+            if (kdevs[i].used && (kdevs[i].state & KDEV_BOUND_HOST) &&
+                !g_kdev_quiesce[i]) { bound_idx = i; break; }
         if (bound_idx < 0) {
             kprintf("[vfiostrs]  NOT EXERCISED  unbind refusal: no host-bound device\n");
         } else {
@@ -24589,6 +24823,81 @@ static void cmd_vfio_stress(void) {
             kprintf("[vfiostrs] unbind(bdf %x) -> %d, still bound=%d\n",
                     (uint64_t)bb, (uint64_t)(int64_t)r,
                     (uint64_t)(int64_t)((kdevs[bound_idx].state & KDEV_BOUND_HOST) != 0));
+        }
+    }
+
+    /* v0.95 ph2: THE SUCCESS PATH, on the one device whose driver can stand
+     * down. Everything above tests that a device the kernel needs STAYS bound;
+     * this tests that a device it does not need can actually be handed over —
+     * the half that was dead code for a whole release because no driver ever
+     * registered a hook.
+     *
+     * IT RUNS BEFORE ROLE 66 IS SPAWNED, and that order is the test. Role 66
+     * sweeps for any claimable device; the rng is host-bound until this block
+     * releases it. Move this below the spawn and role 66 reports NOT EXERCISED
+     * on a machine that does have a free device — a silent regression that
+     * looks exactly like a topology without one.
+     *
+     * WHAT IS ASSERTED IS THE DEVICE, NOT THE RETURN CODE. A hook that
+     * returned 0 without touching the hardware would pass a check on its own
+     * result, so the checks below read the PCI command register back and the
+     * quiesce counter: bus-master off is the property that actually stops DMA,
+     * and the counter proves the driver's own path ran rather than some other
+     * code clearing the flag. */
+    {
+        int ri = (g_vrng_bdf != 0xFFFF) ? kdev_find_bdf(g_vrng_bdf) : -1;
+        if (ri < 0) {
+            kprintf("[vfiostrs]  NOT EXERCISED  unbind success: no virtio-rng on "
+                    "this topology (expected outside smp4-iommu)\n");
+        } else if (!g_kdev_quiesce[ri]) {
+            /* Registered but hookless: the driver declined the device. Say so
+             * rather than passing — this is the NOT EXERCISED case, not a win. */
+            kprintf("[vfiostrs]  NOT EXERCISED  unbind success: virtio-rng bound "
+                    "no driver (no COMMON_CFG or feature refusal)\n");
+        } else {
+            uint16_t rb = kdevs[ri].bdf;
+            uint8_t rbus = (uint8_t)(rb >> 8), rdev = (uint8_t)((rb >> 3) & 0x1F),
+                    rfn = (uint8_t)(rb & 7);
+            uint32_t before = pci_cfg_read32(rbus, rdev, rfn, 0x04);
+            uint32_t q0 = g_vrng_quiesced;
+
+            vfiocheck("virtio-rng starts out HOST-BOUND (its driver is running)",
+                      (kdevs[ri].state & KDEV_BOUND_HOST) != 0);
+            vfiocheck("virtio-rng is bus-mastering before the unbind",
+                      (before & (1u << 2)) != 0);
+
+            int r = kdev_unbind_host(rb);
+            vfiocheck("kdev_unbind_host SUCCEEDS on a driver that can quiesce", r >= 0);
+            vfiocheck("the driver's own quiesce hook ran (counter moved)",
+                      g_vrng_quiesced == q0 + 1);
+            vfiocheck("the device is no longer marked host-bound",
+                      (kdevs[ri].state & KDEV_BOUND_HOST) == 0);
+
+            uint32_t after = pci_cfg_read32(rbus, rdev, rfn, 0x04);
+            vfiocheck("BUS MASTER is off after the unbind (the device cannot DMA)",
+                      (after & (1u << 2)) == 0);
+            vfiocheck("INTx is disabled after the unbind (it cannot raise a line)",
+                      (after & (1u << 10)) != 0);
+            /* MEMORY DECODE MUST SURVIVE. The point of unbinding is to give the
+             * device to ring 3, and a device whose BAR has stopped decoding
+             * reads as zeroes through a perfectly valid mapping. Role 66's
+             * COMMON_CFG assertion below is what caught this when
+             * pci_quiesce_generic cleared bit 1; this check names the property
+             * directly, so a re-break is a one-line failure here rather than a
+             * confusing "the BAR maps no device" three suites later. */
+            vfiocheck("MEMORY DECODE stays on (the new owner can reach the BAR)",
+                      (after & (1u << 1)) != 0);
+            vfiocheck("the driver released its virtqueue frame",
+                      g_vrng_ring == 0 && g_vrng_ready == 0);
+            kprintf("[vfiostrs] rng unbind(bdf %x) -> %d, cmd %x -> %x, quiesces %d\n",
+                    (uint64_t)rb, (uint64_t)(int64_t)r, (uint64_t)before,
+                    (uint64_t)after, (uint64_t)g_vrng_quiesced);
+
+            /* A SECOND unbind must refuse: the device is no longer bound. This
+             * is what makes the first result mean something — a function that
+             * returned success unconditionally would pass every check above. */
+            vfiocheck("a second unbind of the same device is REFUSED",
+                      kdev_unbind_host(rb) < 0);
         }
     }
 
