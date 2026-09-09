@@ -511,14 +511,130 @@ what evidence, and — deliberately — what is not.
     displays. The walk's loop, out-of-range, overflow and denial paths are
     covered on the host against a synthetic configuration space; its behaviour
     on a genuinely free device is NOT covered by any run in this session.
-  - SYS_FB_CAPTURE is exercised only by SNAPSHOT rendering its own screen. No
-    run in this session pressed its CAPTURE button, so no BMP has been written
-    to a volume by the machine, and MEDIA has therefore only ever been observed
-    playing an EMPTY playlist. The codec's round trip is covered on the host;
-    the write-then-read loop between the two programs is not.
   - HW_NET's socket table was observed with no sockets open. The TCP state
     decoding is host-tested against every state value; it has not been seen
     against a live connection.
   - Per-core load was observed on a uniprocessor desktop run. desktop-test-smp
     was not run in this session.
-  - One desktop boot. It cannot see an intermittent below roughly 1 in 10.
+  - One desktop boot per configuration. It cannot see an intermittent below
+    roughly 1 in 10.
+
+  The snap -> VFS -> media loop WAS on this list. It is now covered; see 9g.
+
+
+10. THE SNAP -> VFS -> MEDIA LOOP, ON A LIVE VOLUME — 2026-09-08
+----------------------------------------------------------------
+
+  (Section 9g by intent; numbered 10 because it is its own milestone.)
+
+  §9f recorded that OUTRUN SNAP had never written a file and OUTRUN MEDIA had
+  only ever been watched rendering an empty playlist. Both halves were covered
+  by host tests; neither had been joined to the other on real storage. The
+  reason was structural rather than an oversight: EVERY desktop target in this
+  tree boots with no block device, so the desktop session had no volume to
+  write to at all.
+
+  `make desktop-media-test` (tools/desktop-media-test.py) attaches a virtio-blk
+  volume to the desktop image and drives the whole loop through the real input
+  path. 24/24 checks, image md5 6635d69968431b34aa2c30e7fe3855cb.
+
+  THE EVIDENCE COMES FROM THREE INDEPENDENT PLACES, deliberately, because a
+  screenshot alone cannot distinguish "it worked" from "it painted something":
+
+    1. THE APPLICATION'S OWN WORDS, on the serial console. Both programs now
+       announce every attempt through SYS_WRITE:
+
+         [snap   ] capture 320x240@352,264 230454 bytes: SAVED
+         [media  ] snap0000.bmp 320x240 DECODED
+
+    2. THE GUEST'S OWN DIRECTORY. OUTRUN TERM ran the real `vfs` shell command,
+       whose output kputc tees to serial, and the kernel listed the file in its
+       own words:
+
+         snap0000.bmp  (230454 bytes, 451 chunks, hash 1081bbe15813e7a8)
+
+       230,454 is exactly 54 + 960*240: a 320x240 24-bit BMP to the byte.
+
+    3. THE VOLUME, read by the HOST after shutdown. A block on vblk.img begins
+       'BM' (0x4D42) and its little-endian size dword reads 230454 — the magic
+       checked against the bytes actually on the disk, and tied to THIS file
+       rather than to any BMP-shaped data by requiring the size to match what
+       the directory reported. One matching block, one BM-like block.
+
+  And the frame reached the screen: with the player relaunched, 95% of its
+  video area changed against the same window's empty-playlist screenshot.
+
+  10a. FOUR DEFECTS THE LIVE RUN FOUND, NONE VISIBLE TO A HOST TEST
+  ------------------------------------------------------------------
+
+  Every one of these was in code that passed its unit tests, and every one was
+  found only by writing to a real filesystem.
+
+  a. ONE WRITE PER ROW IS O(N^2). Writes on this VFS are not appends into an
+     open extent — each one re-stores the file's WHOLE chunk map through the
+     CAS. The first version issued one SYS_WRITE_FILE per row: 384 writes
+     against a 450-chunk file. The first live boot spent ten minutes emitting
+     the same four `put len 512` lines over and over and never finished. The
+     image is now encoded whole and written in as few calls as the syscall
+     allows.
+
+  b. SYS_WRITE_FILE SILENTLY CLAMPS A SINGLE WRITE TO 64 KiB and returns the
+     shorter count; it does not fail. So the one-call fix wrote an eighth of
+     the image and reported success for that eighth. The write loops in 64 KiB
+     chunks, and snap_chunk() is host-tested to tile any total exactly.
+
+  c. THE FILE SIZE CEILING IS 256 KiB, NOT 2 MiB. The on-disk indirect map
+     could address 2 MiB and the application's first guard was derived from
+     the FORMAT — but VFS_MAX_FILE_BYTES caps a file at 512 chunks and it is
+     the cap that decides. Deriving a limit from a structure rather than from
+     the code that enforces it is how an application comes to believe a
+     589,878-byte capture will fit.
+
+     The consequence is worth recording plainly: on a 1024x768 desktop NO
+     proportional region can be saved — a half-screen capture is 1.1 MiB. The
+     CENTRE preset is therefore a FIXED 320x240 window, and it is the default,
+     because a default the CAPTURE button would always refuse is not a
+     default. The other three presets are refused, and the screen says TOO
+     LARGE beside the byte count BEFORE the button is pressed.
+
+  d. A SILENT APPLICATION CANNOT BE DEBUGGED FROM OUTSIDE. Two boots were
+     spent unable to tell whether a click had missed its button, whether the
+     region had been refused, or whether the write had failed — because the
+     application's only account of itself was a status string on a surface.
+     The SYS_WRITE lines in (1) above were added for that reason and are the
+     thing that diagnosed (b) and (c) in one boot each.
+
+  10b. THREE DEFECTS IN THE HARNESS ITSELF
+  -----------------------------------------
+
+  Recorded because a test that fails for its own reasons is worse than no test:
+  it spends real boots and teaches nothing.
+
+  - THE CLOSE BOX DEPENDS ON THE WINDOW'S WIDTH. The harness assumed 430 for
+    every application; OUTRUN TERM is 600 wide, so its close click landed in
+    content, the terminal stayed open, the player opened in window slot 2, and
+    every subsequent screen sample looked at the wrong rectangle. Three checks
+    failed downstream of one wrong constant.
+  - A "WAIT UNTIL THE LOG GOES QUIET" HELPER CAN NEVER FIRE HERE. The desktop
+    heartbeat prints forever. Completion is now taken from the application's
+    own SAVED and DECODED lines, which are printed once and only after the
+    work they describe.
+  - A DISTINCT-COLOUR THRESHOLD WAS A GUESS, AND A WRONG ONE. A correctly
+    decoded frame scored 11 colours against an invented floor of 32, because
+    the captured region is mostly flat desktop. Replaced by a pixel difference
+    against the same window's empty state, which needs no constant: 95%.
+
+  10c. NOT COVERED BY THIS RUN
+  -----------------------------
+
+  - One capture, of one region, at one size. Multi-frame playback — the
+    playlist ordering and frame advance that media_tick implements — is host-
+    tested but has never been driven on a volume holding more than one .bmp.
+  - The volume scan finds the header block; it does not reassemble the file
+    from the CAS index and compare all 230,454 bytes against the framebuffer.
+    Doing so would mean reimplementing the filesystem inside the test, which
+    is verifying a system against a second copy of itself.
+  - Uniprocessor only. This test has not been run at -smp 4.
+  - The 16 MiB volume is far larger than the gate's 4 MiB. Behaviour when the
+    volume is nearly full is not covered, and snap's "VOLUME FULL?" branch has
+    therefore still never been taken.

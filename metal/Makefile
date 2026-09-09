@@ -173,6 +173,17 @@ desktop-test-smp: $(DESKTOP_ISO)
 	DESKTOP_QEMU="-smp 4" python3 tools/desktop-ui-test.py $(DESKTOP_ISO) \
 	  $(GATE_LOGS)/desktop-ui-smp-$$$$.log
 
+# The snap -> VFS -> media pipeline on a LIVE VOLUME. Every other desktop
+# target boots with no block device, so OUTRUN SNAP has never written a file
+# and OUTRUN MEDIA has only ever been seen rendering an empty playlist. This
+# one attaches a virtio-blk volume, captures a region in the guest, reads the
+# guest's own `vfs` listing back out of the serial log, decodes the frame in
+# the player, and then scans the raw volume from the host for the BMP magic.
+# About 8 minutes.
+.PHONY: desktop-media-test
+desktop-media-test: $(DESKTOP_ISO)
+	python3 tools/desktop-media-test.py $(DESKTOP_ISO) $(GATE_LOGS)/desktop-media-$$$$.log
+
 # Long-run desktop soak: holds the session open past SOAK_FRAMES composited
 # frames while opening and closing applications continuously, and fails if
 # the compositor stalls, a window fails to close, or the allocator's resting

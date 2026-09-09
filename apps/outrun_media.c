@@ -162,6 +162,33 @@ static int fw, fh;
 static unsigned foff;
 static const char *status = "SCANNING THE VOLUME FOR FRAMES";
 
+/* EVERY LOAD SAYS WHAT IT DID, on the serial console, for the same reason
+ * OUTRUN SNAP does: the player's only other account of itself is a status
+ * string on a surface, so "the frame decoded", "the file was not a BMP" and
+ * "the player never got that far" are otherwise indistinguishable from
+ * outside — and a harness that could only count colours would be guessing
+ * between them. */
+static void media_say(const char *name, int fw2, int fh2, const char *outcome) {
+    char line[160];
+    int at = 0;
+    const char *p = "[media  ] ";
+    while (*p) line[at++] = *p++;
+    for (p = name; *p && at < 80; ++p) line[at++] = *p;
+    line[at++] = ' ';
+    int dims[2] = { fw2, fh2 };
+    for (int i = 0; i < 2; i++) {
+        char d[12];
+        int n = 0, v = dims[i] < 0 ? 0 : dims[i];
+        do { d[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+        while (n) line[at++] = d[--n];
+        line[at++] = i ? ' ' : 'x';
+    }
+    for (p = outcome; *p && at < (int)sizeof line - 2; ++p) line[at++] = *p;
+    line[at++] = '\n';
+    line[at] = 0;
+    sysc(SYS_WRITE, (u64)line, 0, 0);
+}
+
 static void media_scan(void) {
     int keep = media.fps, was_playing = media.playing;
     media_reset(&media);
@@ -188,9 +215,12 @@ static void media_scan(void) {
  * showed the previous frame again would look like a stall. */
 static int media_load(int i) {
     if (i < 0 || i >= media.count) return -1;
-    if (media.len[i] > MEDIA_MAXBYTES) { status = "FRAME LARGER THAN THIS PLAYER'S BUFFER"; return -1; }
+    if (media.len[i] > MEDIA_MAXBYTES) {
+        status = "FRAME LARGER THAN THIS PLAYER'S BUFFER";
+        media_say(media.name[i], 0, 0, status); return -1;
+    }
     i64 fd = (i64)sysc(SYS_OPEN, (u64)media.name[i], 0, 0);
-    if (fd < 0) { status = "COULD NOT OPEN FRAME"; return -1; }
+    if (fd < 0) { status = "COULD NOT OPEN FRAME"; media_say(media.name[i], 0, 0, status); return -1; }
     unsigned got = 0;
     while (got < media.len[i]) {
         i64 r = (i64)sysc(SYS_READ, (u64)fd, (u64)(framebuf + got), media.len[i] - got);
@@ -198,13 +228,18 @@ static int media_load(int i) {
         got += (unsigned)r;
     }
     sysc(SYS_CLOSE, (u64)fd, 0, 0);
-    if (got < media.len[i]) { status = "SHORT READ: FRAME IS TRUNCATED ON THE VOLUME"; return -1; }
+    if (got < media.len[i]) {
+        status = "SHORT READ: FRAME IS TRUNCATED ON THE VOLUME";
+        media_say(media.name[i], 0, 0, status); return -1;
+    }
     if (bmp_parse(framebuf, got, &fw, &fh, &foff) < 0) {
         status = "NOT A 24-BIT UNCOMPRESSED BMP";
+        media_say(media.name[i], 0, 0, status);
         return -1;
     }
     loaded = i;
     status = "PLAYING";
+    media_say(media.name[i], fw, fh, "DECODED");
     return 0;
 }
 static void media_render(struct app_win *w) {

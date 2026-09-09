@@ -114,8 +114,10 @@ int main(void) {
     assert(r.x == 0 && r.w == 512 && r.h == 768);
     snap_preset(&r, SNAP_RIGHT, 1024, 768);
     assert(r.x == 512 && r.w == 512);
+    /* CENTRE is a fixed 320x240 window, not a fraction: see the file-size
+     * ceiling further down for why it is the only preset that can be saved. */
     snap_preset(&r, SNAP_CENTRE, 1024, 768);
-    assert(r.x == 256 && r.y == 192 && r.w == 512 && r.h == 384);
+    assert(r.x == 352 && r.y == 264 && r.w == 320 && r.h == 240);
     /* An odd desktop width must not produce a rectangle that runs one pixel
      * off the right edge. */
     snap_preset(&r, SNAP_RIGHT, 1025, 769);
@@ -158,6 +160,63 @@ int main(void) {
             assert(expect_top == 0);                    /* reaches the top     */
             assert(covered == height);                  /* no gap, no overlap  */
         }
+    }
+
+    /* ---- what this filesystem can actually hold --------------------------
+     * A file on this VFS reaches at most 8 KiB of direct chunks, one
+     * single-indirect block of 64, and one double-indirect block of 64 of
+     * those — 2,138,112 bytes. A full 1024x768 capture is 2,359,350 and cannot
+     * be stored at all, so the region is REFUSED before a byte is written
+     * rather than failing part-way through and leaving a truncated file whose
+     * header describes an image that is not there. */
+    assert(SNAP_MAX_FILE_BYTES == 256u * 1024u);
+    /* The CENTRE preset is a FIXED 320x240, not a fraction of the screen,
+     * precisely so it fits this ceiling on any desktop this kernel produces.
+     * Every proportional preset is far too large at 1024x768 — a half-screen
+     * capture is 1.1 MiB — so without a fixed one the application would have
+     * had no region it could actually save. */
+    snap_preset(&r, SNAP_CENTRE, 1024, 768);
+    assert(r.w == 320 && r.h == 240 && r.x == 352 && r.y == 264);
+    assert(bmp_size(r.w, r.h) == 230454);
+    assert(snap_fits(&r));
+    assert(snap_valid(&r, 1024, 768));
+    snap_preset(&r, SNAP_FULL, 1024, 768);
+    assert(bmp_size(r.w, r.h) == 2359350);
+    assert(!snap_fits(&r));
+    snap_preset(&r, SNAP_LEFT, 1024, 768);
+    assert(!snap_fits(&r));
+    /* On a desktop smaller than the fixed region, CENTRE shrinks to the
+     * screen rather than producing a rectangle that is refused as off-screen. */
+    snap_preset(&r, SNAP_CENTRE, 200, 150);
+    assert(r.x == 0 && r.y == 0 && r.w == 200 && r.h == 150);
+    assert(snap_valid(&r, 200, 150) && snap_fits(&r));
+    /* The boundary itself, both sides of it. */
+    r.x = 0; r.y = 0; r.w = 1; r.h = (int)((SNAP_MAX_FILE_BYTES - 54) / 4);
+    assert(snap_fits(&r));
+    r.h += 1;
+    assert(!snap_fits(&r));
+
+    /* ---- the write is chunked, because the syscall clamps ----------------
+     * SYS_WRITE_FILE silently clamps a single write to 65,536 bytes and
+     * returns the shorter count, so a 589,878-byte image handed over in one
+     * call writes an eighth of itself and reports success for that eighth.
+     * The capture must therefore loop, and the LAST chunk is the short one. */
+    assert(SNAP_WRITE_CHUNK == 65536u);
+    assert(snap_chunk(589878u, 0) == 65536u);
+    /* 589,878 is nine full chunks (589,824) and a 54-byte tail. */
+    assert(snap_chunk(589878u, 65536u * 8u) == 65536u);
+    assert(snap_chunk(589878u, 65536u * 9u) == 54u);
+    assert(snap_chunk(589878u, 589878u) == 0u);
+    assert(snap_chunk(100u, 0) == 100u);
+    assert(snap_chunk(0u, 0) == 0u);
+    /* The loop must terminate having written exactly `total`, for any total. */
+    for (unsigned total = 1; total < 400000u; total += 6151u) {
+        unsigned done = 0, guard = 0;
+        while (snap_chunk(total, done)) {
+            done += snap_chunk(total, done);
+            assert(++guard < 64u);
+        }
+        assert(done == total);
     }
 
     /* ---- generated file names -------------------------------------------- */
