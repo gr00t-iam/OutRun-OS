@@ -26,16 +26,34 @@ QMP, W, H = "/tmp/outrun-desktop.qmp", 1024, 768
 BOOT_DEADLINE, STEP_DEADLINE = 420, 90
 
 
-def wait_for(text, deadline, since=0):
-    end = time.time() + deadline
-    while time.time() < end:
+def read_log(since=0):
+    """Everything the guest has written since `since`, or b"" if it cannot be
+    read right now.
+
+    TRANSIENT OSError IS EXPECTED, NOT EXCEPTIONAL. The serial log lives on a
+    Windows drive reached through a 9p mount, and reading a file the emulator
+    is actively appending to across that mount returns EAGAIN (errno 61, "No
+    data available") often enough that a long run WILL hit it. Two runs died
+    that way with the guest working perfectly -- one of them nine checks in.
+    Every read of the log goes through here so no call site can forget."""
+    for _ in range(5):
         try:
             with open(LOG, "rb") as fh:
                 fh.seek(since)
-                if text.encode() in fh.read():
-                    return True
+                return fh.read()
         except FileNotFoundError:
-            pass
+            return b""
+        except OSError:
+            time.sleep(0.4)
+    return b""
+
+
+def wait_for(text, deadline, since=0):
+    end = time.time() + deadline
+    needle = text.encode()
+    while time.time() < end:
+        if needle in read_log(since):
+            return True
         time.sleep(1)
     return False
 
@@ -141,7 +159,10 @@ def scanline(path, y, x0, x1):
 
 
 def size_of(log):
-    return os.path.getsize(log) if os.path.exists(log) else 0
+    try:
+        return os.path.getsize(log) if os.path.exists(log) else 0
+    except OSError:
+        return 0
 
 
 def main():
@@ -216,9 +237,7 @@ def main():
             samples = []
             deadline = time.time() + STEP_DEADLINE
             while time.time() < deadline and not samples:
-                with open(LOG, "rb") as serial:
-                    serial.seek(mark)
-                    samples = re.findall(rb"\[desktop\] (\d+) frames, 1 window\(s\).*frames_used=(\d+)\r?\n", serial.read())
+                samples = re.findall(rb"\[desktop\] (\d+) frames, 1 window\(s\).*frames_used=(\d+)\r?\n", read_log(mark))
                 if not samples:
                     time.sleep(0.2)
             if samples:
@@ -286,11 +305,9 @@ def main():
             samples = []
             deadline = time.time() + STEP_DEADLINE
             while time.time() < deadline and not samples:
-                with open(LOG, "rb") as serial:
-                    serial.seek(mark)
-                    samples = re.findall(
-                        rb"\[desktop\] (\d+) frames, 1 window\(s\).*frames_used=(\d+)\r?\n",
-                        serial.read())
+                samples = re.findall(
+                    rb"\[desktop\] (\d+) frames, 1 window\(s\).*frames_used=(\d+)\r?\n",
+                    read_log(mark))
                 if not samples:
                     time.sleep(0.2)
             if samples:
@@ -322,17 +339,14 @@ def main():
         # calls it at startup and exits(1) on failure. So both windows still
         # being present after thousands of frames IS the assertion that 117
         # returns valid state — repeatedly, not once.
-        with open(LOG, "rb") as fh:
-            sofar = fh.read().decode("utf-8", "replace")
+        sofar = read_log().decode("utf-8", "replace")
         check("every launch succeeded", "0 launch failure(s)" in sofar
               and "1 launch failure" not in sofar)
         check("all four applications own a window at once", "4 window(s)" in sofar)
 
         mark = size_of(LOG)
         time.sleep(12)
-        with open(LOG, "rb") as fh:
-            fh.seek(mark)
-            later = fh.read().decode("utf-8", "replace")
+        later = read_log(mark).decode("utf-8", "replace")
         check("SYS_DESKTOP_INFO keeps returning valid state (its readers stay alive)",
               "4 window(s)" in later and "3 window(s)" not in later)
 
@@ -368,9 +382,7 @@ def main():
         qmp.click(282, 227)                          # scale -> 2, applied at once
         check("SYS_DESKTOP_SETTINGS applies a scale change",
               wait_for("settings applied by pid", STEP_DEADLINE, mark))
-        with open(LOG, "rb") as fh:
-            fh.seek(mark)
-            applied = fh.read().decode("utf-8", "replace")
+        applied = read_log(mark).decode("utf-8", "replace")
         check("the logical desktop really halves (512x384)", "scale 2 (512x384)" in applied)
 
         # And the screen must actually show it. At scale 2 fb_flip doubles every
@@ -399,8 +411,7 @@ def main():
         time.sleep(3)
         check("the session survives keyboard input", not wait_for("PANIC", 2, mark))
 
-        with open(LOG, "rb") as fh:
-            tail = fh.read().decode("utf-8", "replace")
+        tail = read_log().decode("utf-8", "replace")
         shot = os.path.join(os.path.dirname(LOG) or ".", "desktop.ppm")
         check("the framebuffer can be captured with four windows on it",
               qmp.screenshot(shot) and os.path.getsize(shot) > 1024)

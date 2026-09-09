@@ -27,11 +27,18 @@ taken from three independent places rather than from the screen alone:
      second screenshot mean something -- a window full of colour proves nothing
      if nobody checked what the same window looked like with no frame in it.
 
-CENTRE, not FULL DESKTOP. This VFS stores at most VFS_MAX_FILE_BYTES = 256 KiB
-per file, so a full-screen 1024x768 capture (2,359,350 bytes) cannot be saved
-at all and neither can either half. The fixed 320x240 CENTRE region is
-230,454 bytes and is the only preset that fits -- which is why the test clicks
-it rather than accepting whatever the application opens with.
+THE FULL DESKTOP, as of v1.2. This VFS used to store at most 256 KiB per file,
+so a 1024x768 capture (2,359,350 bytes) could not be saved at all and the test
+had to settle for a 320x240 region. A second double-indirect block took the
+format past 4,176 chunks and the ceiling to 2.5 MiB, so the whole screen now
+fits -- and capturing it is what exercises the new map region end to end: a
+4,610-chunk file resolves through ind3 for every chunk past 4,176, and the
+player has to decode every one of them back.
+
+It is also the slowest thing this system does. 2.36 MiB is ~4,610 content
+blocks through the CAS, each a virtio-blk transaction under TCG, so the
+capture's deadline is minutes rather than seconds and is waited on by the
+application's own SAVED line rather than by a guess.
 """
 import hashlib, json, os, re, socket, struct, subprocess, sys, time
 
@@ -48,9 +55,6 @@ def tile_y(index):
     return 32 + index * 44 + 18
 TILE_TERM, TILE_SNAP, TILE_MEDIA = 4, 10, 11
 
-# Window slot 1: the cascade is (60,40) stepped by (40,34), and every one of
-# these applications is 430 wide. The close box is the 14px cell ending 3px
-# short of the right edge, inside the 20px title bar.
 # Window slot 1: the cascade is (60,40) stepped by (40,34). The close box is
 # the 14px cell ending 3px short of the window's RIGHT EDGE, inside the 20px
 # title bar -- so it depends on the window's WIDTH, and these applications are
@@ -62,20 +66,39 @@ WIDTH_APP, WIDTH_TERM = 430, 600
 def close_at(width):
     return (WIN_X + width - 10, WIN_Y + 10)
 
-EXPECT_W, EXPECT_H = 320, 240
-EXPECT_BYTES = 54 + ((EXPECT_W * 3 + 3) & ~3) * EXPECT_H     # 230454
+EXPECT_W, EXPECT_H = 1024, 768
+EXPECT_BYTES = 54 + ((EXPECT_W * 3 + 3) & ~3) * EXPECT_H     # 2359350
+
+
+def read_log(since=0):
+    """Everything the guest has written since `since`, or b"" if it cannot be
+    read right now.
+
+    TRANSIENT OSError IS EXPECTED, NOT EXCEPTIONAL. The serial log lives on a
+    Windows drive reached through a 9p mount, and a full-desktop capture writes
+    several megabytes to it while this loop is polling; reading a file being
+    appended to across that mount returns EAGAIN (errno 61, "No data
+    available") often enough that a run WILL hit it. The first full-screen run
+    died on exactly that, nine checks in, with the guest working perfectly.
+    Every read of the log goes through here so no call site can forget."""
+    for _ in range(5):
+        try:
+            with open(LOG, "rb") as fh:
+                fh.seek(since)
+                return fh.read()
+        except FileNotFoundError:
+            return b""
+        except OSError:
+            time.sleep(0.4)
+    return b""
 
 
 def wait_for(text, deadline, since=0):
     end = time.time() + deadline
+    needle = text.encode()
     while time.time() < end:
-        try:
-            with open(LOG, "rb") as fh:
-                fh.seek(since)
-                if text.encode() in fh.read():
-                    return True
-        except FileNotFoundError:
-            pass
+        if needle in read_log(since):
+            return True
         time.sleep(1)
     return False
 
@@ -200,7 +223,10 @@ def changed_fraction(before, after, x0, y0, x1, y1):
 
 
 def size_of(path):
-    return os.path.getsize(path) if os.path.exists(path) else 0
+    try:
+        return os.path.getsize(path) if os.path.exists(path) else 0
+    except OSError:
+        return 0
 
 
 def make_volume(path, mib=16):
@@ -302,24 +328,26 @@ def main():
         # here. The coordinates are derived once, from the kernel's own
         # mapping: a content click at screen (sx, sy) reaches the application
         # as (sx - WIN_X - 2, sy - WIN_Y - WIN_TITLE_H - 1).
-        qmp.click(WIN_X + 92, WIN_Y + 141)     # preset CENTRE  -> app (90, 112..130)
+        qmp.click(WIN_X + 92, WIN_Y + 75)      # preset FULL DESKTOP -> app (90, 46..64)
         time.sleep(1.0)
         mark = size_of(LOG)
         qmp.click(WIN_X + 80, WIN_Y + 248)     # CAPTURE        -> app (78, 216..238)
         # The application announces every capture attempt on the console, so
         # "the click never arrived", "the region was refused" and "it worked"
         # are three distinguishable outcomes rather than one silent screen.
-        spoke = wait_for("[snap   ] capture", 90, mark)
+        # A full-desktop capture is ~4,610 CAS block puts under TCG. The
+        # SAVED line is printed only after the last one, so this deadline
+        # sizes the whole write, not the click.
+        spoke = wait_for("[snap   ] capture", 900, mark)
         check("the CAPTURE button was actually pressed", spoke)
         said = ""
         if spoke:
-            with open(LOG, "rb") as fh:
-                fh.seek(mark)
-                m = re.search(r"\[snap   \] capture ([^\n]*)", fh.read().decode("utf-8", "replace"))
-                said = m.group(1) if m else ""
+            m = re.search(r"\[snap   \] capture ([^\n]*)",
+                          read_log(mark).decode("utf-8", "replace"))
+            said = m.group(1) if m else ""
             print("    guest said: %s" % said, flush=True)
-        check("the guest captured the CENTRE region, not the default (%s)" % said,
-              said.startswith("320x240@352,264"))
+        check("the guest captured the FULL DESKTOP region (%s)" % said,
+              said.startswith("1024x768@0,0"))
         check("the guest reports the capture SAVED", "SAVED" in said)
         after_snap = LOG + ".snap.ppm"
         qmp.screenshot(after_snap)
@@ -336,9 +364,7 @@ def main():
         listed = wait_for("snap0000.bmp", STEP_DEADLINE, mark)
         check("the guest's own `vfs` listing names snap0000.bmp", listed)
         if listed:
-            with open(LOG, "rb") as fh:
-                fh.seek(mark)
-                tail = fh.read().decode("utf-8", "replace")
+            tail = read_log(mark).decode("utf-8", "replace")
             m = re.search(r"snap0000\.bmp\s+\((\d+) bytes", tail)
             if m:
                 reported_bytes = int(m.group(1))
@@ -355,17 +381,15 @@ def main():
         check("MEDIA relaunches", wait_for("launched 'MEDIA'", STEP_DEADLINE, mark))
         # The player announces each load, so waiting is on ITS word rather than
         # on a guessed number of seconds.
-        decoded = wait_for("[media  ] snap0000.bmp", 300, mark)
+        decoded = wait_for("[media  ] snap0000.bmp", 600, mark)
         said_media = ""
         if decoded:
-            with open(LOG, "rb") as fh:
-                fh.seek(mark)
-                mm = re.search(r"\[media  \] ([^\n]*)",
-                               fh.read().decode("utf-8", "replace"))
-                said_media = mm.group(1) if mm else ""
+            mm = re.search(r"\[media  \] ([^\n]*)",
+                           read_log(mark).decode("utf-8", "replace"))
+            said_media = mm.group(1) if mm else ""
             print("    guest said: %s" % said_media, flush=True)
         check("MEDIA reports decoding the captured frame (%s)" % said_media,
-              said_media.startswith("snap0000.bmp 320x240 DECODED"))
+              said_media.startswith("snap0000.bmp 1024x768 DECODED"))
         time.sleep(4)          # let the decoded frame reach a published surface
         after = LOG + ".media-frame.ppm"
         qmp.screenshot(after)
@@ -381,8 +405,7 @@ def main():
         check("MEDIA closes cleanly after playback", close_window())
 
         # ---- the session survived it -------------------------------------
-        with open(LOG, "rb") as fh:
-            whole = fh.read().decode("utf-8", "replace")
+        whole = read_log().decode("utf-8", "replace")
         check("no panic, fault or lock-rank violation in the whole session",
               "PANIC" not in whole and "rank violation" not in whole
               and "EXCEPTION" not in whole)
