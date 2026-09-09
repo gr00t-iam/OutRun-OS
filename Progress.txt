@@ -696,3 +696,189 @@ what evidence, and — deliberately — what is not.
   than an inline shell loop, found that commit 1 did not compile at all —
   ofile_deref called with three arguments and declared with two — which is
   exactly the defect the first check existed to catch and could not.
+
+11. PHASE 4 — STORAGE SCALING: THE WRITE COST AND THE FILE CEILING — 2026-09-09
+-------------------------------------------------------------------------------
+
+  Two bottlenecks section 10 found, fixed. Both were real; ONE OF THEM WAS NOT
+  WHAT SECTION 10 SAID IT WAS, and that correction is the first thing here.
+
+  11a. WHAT THE O(N^2) ACTUALLY WAS
+  ----------------------------------
+
+  Section 10 recorded, and the commit message for 3893a7f repeated, that "each
+  write re-stores the file's whole chunk map through the CAS". That is WRONG,
+  and reading vfs_write_at_locked rather than inferring from the log is what
+  showed it. The kernel had already documented the true cause, in the function
+  itself, since v0.84:
+
+      THIS IS O(FILE), NOT O(WRITE) ... FNV-1a is sequential, so a byte changed
+      in the middle invalidates every fold after it ... A file built by N
+      sequential positional writes therefore costs O(N^2) in chunk reads.
+
+  The chunk MAP was never the problem: chunks a write does not touch are reused
+  by hash and never re-stored. What cost O(file) per write was recomputing
+  file_hash — the content IDENTITY — by streaming every chunk of the file back
+  out of the CAS through rust_cas_hash_cont. What I had seen in the log as
+  repeated `put len 512` lines was the indirect-block rebuild, a much smaller
+  term, and I attributed the whole cost to it without reading the code.
+
+  THE FIX IS FOUR LINES, and it is exact rather than approximate. FNV-1a folds
+  one byte at a time and rust_cas_hash_cont takes the running state as its
+  seed — the property that function was written for. So when a write APPENDS
+  ONTO A CHUNK BOUNDARY, the fold continues from the file's existing hash
+  instead of restarting:
+
+      if (oldlen && off == oldlen && (oldlen % 512) == 0) {
+          from = oldnch;
+          h = prev.file_hash;
+      }
+
+  Both preconditions are load-bearing and neither is a guess:
+
+    off == oldlen       the write adds bytes and changes none, so every
+                        existing chunk keeps its hash. The rebuild loop above
+                        it PROVES this rather than assuming it — for i < oldnch,
+                        cend <= off, so `overlaps` is false and the chunk is
+                        reused by hash.
+    oldlen % 512 == 0   the old file ended exactly on a chunk boundary, so its
+                        last chunk was folded at its full 512 bytes. Without
+                        this that chunk grows from partial to whole and its
+                        contribution changes, which a continuation cannot see.
+
+  oldlen == 0 deliberately takes the general path: file_hash is 0 for an empty
+  file, not FNV1A_SEED, so there is no prefix state to resume.
+
+  11b. THE CHECK, AND THAT IT CAN FAIL
+  -------------------------------------
+
+  `validate` now authors the same 3,584 bytes twice — once as a single
+  whole-file write, once as seven sequential 512-byte appends — and asserts the
+  two file_hashes are EQUAL. It asserts on the identity, not on a timing, so it
+  cannot pass for the wrong reason on a fast host.
+
+  NEGATIVE CONTROL, run before the real one: with the continuation seeded from
+  FNV1A_SEED instead of the previous hash, the boot reported
+
+      [valid  ]  PASS  VFS sequential appends all accepted
+      [valid  ]  PASS  VFS append-built file has the whole-file length
+      [valid  ]  FAIL  VFS incremental fold == whole-file fold
+      [valid  ]  PASS  VFS append-built file reads back byte-exact
+
+  which is exactly the shape that matters: the CONTENT was right and only the
+  IDENTITY was wrong, so length and byte-exact read-back both passed and only
+  the identity check caught it. A test suite without that assertion would have
+  shipped a filesystem where one content had two identities depending on how it
+  was written.
+
+  11c. THE FILE CEILING: 256 KiB -> 2.5 MiB
+  ------------------------------------------
+
+  A full 1024x768 24-bit capture is 2,359,350 bytes = 4,610 chunks. The format
+  reached 4,176 (16 direct + 64 single-indirect + 64*64 double-indirect), so the
+  most obvious thing a desktop might want to store missed by 434 chunks.
+
+  v1.2 adds ind3: a SECOND double-indirect block of the same shape as ind2,
+  not a true triple-indirect. A third level would add another resolution path
+  and 16 MiB of reach nothing here needs; a second D-block reuses the code that
+  already exists and doubles the ceiling to 8,272 chunks (4.04 MiB).
+  VFS_MAX_FILE_BYTES stops at 2.5 MiB because it also sizes two static
+  chunk-hash arrays and the exec buffer.
+
+  ITS HASH IS SPLIT ACROSS TWO NON-ADJACENT DIRENT FIELDS, and that is ugly on
+  purpose. The dirent is exactly 256 bytes, every byte is on disk, and there
+  were only two 4-byte holes left — _pad after nchunks and reserved[4] at the
+  end — with no eight contiguous free bytes anywhere. Widening the dirent would
+  break the on-disk directory layout, VFS_DIR_BLOCKS, the journal record and
+  cas_mount's restore simultaneously and stop every existing volume mounting:
+  a format break with a version bump and a reformat behind it, which is far
+  more than a screenshot is worth. Both halves read ZERO on a volume written by
+  any earlier kernel, and zero already means "this level is unused" for ind1
+  and ind2 — the same compatibility rule v0.72 wrote for mode and v0.85 for the
+  timestamps. Nothing open-codes the split: every read goes through
+  vfs_ind3_get and every write through vfs_ind3_set.
+
+  Two helpers were extracted so ind2 and ind3 cannot be handled differently by
+  accident — vfs_build_dblock for construction and vfs_map_walk_dblock for the
+  reference walk. A second copy of either is how a retain and a release drift
+  apart and a live file's blocks get freed.
+
+  11d. MEASURED
+  --------------
+
+  make desktop-media-test, retargeted to the FULL DESKTOP: 24/24, image md5
+  da94e9be58cddb0082b4629da55cea8f.
+
+      [snap   ] capture 1024x768@0,0 2359350 bytes: SAVED
+      snap0000.bmp  (2359350 bytes, 4609 chunks, hash d267e8dcb...)
+      [media  ] snap0000.bmp 1024x768 DECODED
+
+  4,609 chunks is 433 past the old format ceiling, so every chunk beyond 4,176
+  resolved through ind3 — and the player decoded all of them back. The volume
+  scan found the BMP magic and a declared size of 2,359,350 on the disk itself.
+
+  CAS traffic for the whole boot including the capture: 7,667 puts, of which
+  1,134 stored and 6,533 deduped.
+
+  WHAT THIS DOES NOT CLAIM. The dominant quadratic term is gone; a smaller one
+  remains. vfs_build_map_locked still rebuilds BOTH double-indirect blocks and
+  all their L1 blocks on every write, which is O(file/64) per write, or roughly
+  2,300 of those 7,667 puts across 36 writes. Making it incremental for appends
+  is a further ~1.5x on this workload and was NOT done: it touches map
+  construction, where an error frees a live file's blocks, and the measured
+  cost was already inside every deadline. So "O(N^2) -> O(N)" is true of the
+  identity recompute, which was the dominant term, and NOT yet true of the map
+  rebuild. Calling the whole write path linear would overstate it.
+
+  11e. THE HARNESSES BOTH DIED OF THE SAME HOST BUG
+  --------------------------------------------------
+
+  The first full-screen run failed nine checks in, and the second failed at
+  check one, both with OSError errno 61 "No data available" — reading a serial
+  log the emulator was appending to, across the 9p mount that reaches the
+  Windows drive. Nothing was wrong with the guest either time. Both harnesses
+  now read the log through one read_log() helper that retries on OSError;
+  desktop-ui-test.py had carried the same fragility since it was written and
+  had simply been lucky.
+
+  11e2. THE GATE
+  ---------------
+
+    make apps-test           16/16 suites PASS (ASan/UBSan, -Wall -Wextra
+                             -Werror), including snap's new 2.5 MiB ceiling and
+                             the FULL/LEFT/RIGHT presets that now fit
+    make desktop-media-test  24/24, full 1024x768 capture
+    make desktop-test        58/58, 18,609 frames composited
+    make gate GATE_CAP=2400  gate-selftest 17/17, then on the REGRESSION image
+                             md5 d31ab6d305823c9943af1a3baad05640:
+
+      uniprocessor    OK   suites=46  passed=578  failed=0  ranks=0  (465 s)
+      smp2-bios       OK   suites=46  passed=592  failed=0  ranks=0  (400 s)
+      smp4-bios       OK   suites=46  passed=598  failed=0  ranks=0  (430 s)
+      smp4-iommu      OK   suites=48  passed=623  failed=0  ranks=0  (440 s)
+
+      FRESH-IMAGE MATRIX: PASS
+      2,391 assertions, 0 failed, 0 lock-rank violations, across 4 boots.
+
+  2,391 is exactly 16 more than the 2,375 of section 10d, and the arithmetic is
+  worth stating: the four new `validate` checks run on all four tiers. A jump
+  that did not reconcile would mean a suite had started or stopped reporting
+  for a reason nobody had accounted for.
+
+  11f. NOT COVERED
+  -----------------
+
+  - ind3 is exercised by ONE file of 4,609 chunks. Nothing tests the boundary
+    itself — a file of exactly 4,176 or 4,177 chunks — and nothing tests a file
+    large enough to fill ind3 (8,272 chunks), which VFS_MAX_FILE_BYTES forbids
+    anyway at 5,120.
+  - The incremental fold is exercised by seven 512-byte appends in `validate`
+    and by 36 64-KiB appends in the media test. A write that appends at an
+    UNALIGNED offset takes the general path and is covered only by the
+    pre-existing suites.
+  - No volume written by a pre-v1.2 kernel was mounted by this one. The
+    compatibility argument for ind3 reading as zero is from the format and the
+    code, not from an observed cross-version mount.
+  - The gate does not exercise ind3 at all: no suite writes a file past 4,176
+    chunks, and adding one would cost ~4,300 CAS puts on every tier of every
+    gate run. That region is covered by desktop-media-test only.
