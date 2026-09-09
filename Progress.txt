@@ -638,3 +638,61 @@ what evidence, and — deliberately — what is not.
   - The 16 MiB volume is far larger than the gate's 4 MiB. Behaviour when the
     volume is nearly full is not covered, and snap's "VOLUME FULL?" branch has
     therefore still never been taken.
+
+  10d. POST-CHANGE VERIFICATION — 2026-09-09
+  -------------------------------------------
+
+  Everything re-run after the fixes above, on the committed tree:
+
+    make apps-test           16/16 suites PASS (ASan/UBSan, -Wall -Wextra
+                             -Werror), snap's new chunk and ceiling guards
+                             included
+    make desktop-media-test  24/24, image md5 6635d69968431b34aa2c30e7fe3855cb
+    make desktop-test        58/58, 18,068 frames composited
+    make gate GATE_CAP=2400  gate-selftest 17/17, then on the REGRESSION image
+                             md5 abd6d5e87ad8b44e94e5622a43a40755:
+
+      uniprocessor    OK   suites=46  passed=574  failed=0  ranks=0  (475 s)
+      smp2-bios       OK   suites=46  passed=588  failed=0  ranks=0  (415 s)
+      smp4-bios       OK   suites=46  passed=594  failed=0  ranks=0  (445 s)
+      smp4-iommu      OK   suites=48  passed=619  failed=0  ranks=0  (450 s)
+
+      FRESH-IMAGE MATRIX: PASS
+      2,375 assertions, 0 failed, 0 lock-rank violations, across 4 boots.
+
+  The gate boots the REGRESSION image, which runs no desktop loop, so it does
+  not exercise anything in section 10; it is here to show that the two
+  SYS_WRITE console lines and the application changes moved no suite.
+
+  10e. THE COMMIT SEQUENCE
+  -------------------------
+
+  The Phase 1-3 work was committed as five bisectable commits, each of which
+  was checked out into its own worktree and built:
+
+    8ed4c50  Phase 1: terminal, editor, ring-3 descriptor refactor   6 app ELFs
+    938f604  SYS_HW_INFO (119), SYS_FB_CAPTURE (120), 24 modules     6 app ELFs
+    9df62e2  outrun_disks, pci_view, sys_trace, net_deck            10 app ELFs
+    7b2be8b  bmp.h, outrun_snap, outrun_media                       12 app ELFs
+    0fb1ddb  launcher geometry, desktop-ui-test coverage            12 app ELFs
+    3893a7f  the live-volume pipeline fixes in this section
+
+  The first of those was NOT among the four that were asked for. It had to
+  exist: the tree carried a Phase 1 change set of 114 kernel hunks that none of
+  the four commit messages described, and kernel/files.c and kernel/key_state.h
+  are new translation units without which none of the later four compile.
+
+  Splitting one 1,655-line kernel diff three ways was done by CONTENT rather
+  than by line range, and the split was verified LOSSLESS — the three patches
+  applied in order reproduce the working file byte for byte — before any commit
+  was made. One hunk carried both change sets (the Phase 1 ofile_deref
+  signature change and, three lines later, this milestone's fb_capture_rect
+  forward declaration) and had to be separated by hand; no context width splits
+  them without breaking application.
+
+  THE FIRST BISECTION CHECK WAS INVALID, AND SAYING SO IS THE POINT. Its loop
+  reused one worktree path for all five commits, so it verified the same tree
+  five times and reported five passes. The second, run from a script rather
+  than an inline shell loop, found that commit 1 did not compile at all —
+  ofile_deref called with three arguments and declared with two — which is
+  exactly the defect the first check existed to catch and could not.
