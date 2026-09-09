@@ -16,10 +16,12 @@
  * would duplicate rows, and a gap would produce a file shorter than its own
  * header claims.
  *
- * WHAT CAN ACTUALLY BE SAVED IS SMALL. This kernel's VFS stores at most 256
- * KiB per file, so of the four regions offered only the fixed 320x240 CENTRE
- * one fits; the others are refused, and the screen says TOO LARGE beside the
- * byte count before the button is pressed rather than after.
+ * EVERY REGION FITS AGAIN. Until v1.2 this kernel's VFS stored at most 256 KiB
+ * per file, so of the four regions offered only the fixed 320x240 CENTRE one
+ * could be saved and the other three were refused. The ceiling is now 2.5 MiB
+ * and a full 1024x768 desktop is 2,359,350 bytes, so all four are live. The
+ * TOO LARGE indicator stays: it is driven by snap_fits() against whatever the
+ * ceiling currently is, not by a list of regions someone decided were safe.
  *
  * The output is an ordinary 24-bit BMP (apps/bmp.h), so a captured screen can
  * be opened by a host tool once the volume is extracted, and can be played
@@ -31,18 +33,23 @@ enum { SNAP_FULL = 0, SNAP_LEFT = 1, SNAP_RIGHT = 2, SNAP_CENTRE = 3, SNAP_NPRES
 struct snap_rect { int x, y, w, h; };
 
 /* THE LARGEST FILE THIS VFS WILL STORE. Mirrors VFS_MAX_FILE_BYTES in
- * kernel64.c, which is the SOURCE OF TRUTH: the on-disk indirect map could
- * address 2 MiB, but the staging buffer the write path runs through caps a
- * file at 512 chunks, and it is the cap that decides. Deriving this number
- * from the format instead — which the first version of this did — produced an
- * application that believed a 589,878-byte capture would fit, wrote it, and
- * got a silently clamped short write back.
+ * kernel64.c, which is the SOURCE OF TRUTH — not the on-disk format, whose
+ * reach is larger. Deriving this number from the format instead is what an
+ * earlier version of this file did, and it produced an application that
+ * believed a 589,878-byte capture would fit, wrote it, and got a silently
+ * clamped short write back.
+ *
+ * v1.2: 256 KiB -> 2.5 MiB, following the kernel. A second double-indirect
+ * block took the format past 4,176 chunks, which is what a full 1024x768
+ * capture needs: at 2,359,350 bytes it was 434 chunks over the old ceiling, so
+ * the whole-desktop region — the most obvious thing to screenshot — was the
+ * one region that could not be stored.
  *
  * The region is refused BEFORE anything is written, because a capture that
  * failed part-way would leave a file whose header describes an image the file
  * does not contain: the exact truncation bmp_parse exists to catch, only
  * manufactured by the writer instead of by a full disk. */
-#define SNAP_MAX_FILE_BYTES (256u * 1024u)
+#define SNAP_MAX_FILE_BYTES (2560u * 1024u)
 
 /* SYS_WRITE_FILE CLAMPS A SINGLE WRITE TO 64 KiB and returns the shorter
  * count; it does not fail. So a 589,878-byte image handed over in one call
@@ -73,12 +80,12 @@ static int snap_valid(const struct snap_rect *r, int dw, int dh) {
  * pixel, and a rectangle computed the other way would run one column off the
  * screen and be refused.
  *
- * CENTRE IS A FIXED 320x240 WINDOW, not a fraction of the screen. Every
- * proportional preset is far larger than SNAP_MAX_FILE_BYTES on any desktop
- * this kernel produces — a half-screen capture at 1024x768 is 1.1 MiB against
- * a 256 KiB ceiling — so without one fixed region the application would have
- * had nothing it could actually save. It shrinks to fit a smaller desktop
- * rather than producing a rectangle that would then be refused as off-screen. */
+ * CENTRE IS A FIXED 320x240 WINDOW, not a fraction of the screen. It was added
+ * when it was the ONLY region that fitted the old 256 KiB ceiling; it stays as
+ * the CHEAP option now that the others fit, because 230,454 bytes stores in a
+ * small fraction of the time 2,359,350 does and most captures do not need the
+ * whole screen. It shrinks to fit a smaller desktop rather than producing a
+ * rectangle that would then be refused as off-screen. */
 #define SNAP_CENTRE_W 320
 #define SNAP_CENTRE_H 240
 static void snap_preset(struct snap_rect *r, int which, int dw, int dh) {

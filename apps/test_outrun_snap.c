@@ -169,32 +169,40 @@ int main(void) {
      * be stored at all, so the region is REFUSED before a byte is written
      * rather than failing part-way through and leaving a truncated file whose
      * header describes an image that is not there. */
-    assert(SNAP_MAX_FILE_BYTES == 256u * 1024u);
-    /* The CENTRE preset is a FIXED 320x240, not a fraction of the screen,
-     * precisely so it fits this ceiling on any desktop this kernel produces.
-     * Every proportional preset is far too large at 1024x768 — a half-screen
-     * capture is 1.1 MiB — so without a fixed one the application would have
-     * had no region it could actually save. */
+    /* v1.2: 2.5 MiB, following the kernel's VFS_MAX_FILE_BYTES. A second
+     * double-indirect block took the format past 4,176 chunks, so a full
+     * 1024x768 capture — 2,359,350 bytes, which was 434 chunks over the old
+     * 256 KiB ceiling — now fits, and so does every other preset. */
+    assert(SNAP_MAX_FILE_BYTES == 2560u * 1024u);
     snap_preset(&r, SNAP_CENTRE, 1024, 768);
     assert(r.w == 320 && r.h == 240 && r.x == 352 && r.y == 264);
     assert(bmp_size(r.w, r.h) == 230454);
     assert(snap_fits(&r));
     assert(snap_valid(&r, 1024, 768));
+    /* THE FULL DESKTOP, which is the region this milestone exists for. */
     snap_preset(&r, SNAP_FULL, 1024, 768);
     assert(bmp_size(r.w, r.h) == 2359350);
-    assert(!snap_fits(&r));
+    assert(snap_fits(&r));
+    assert(snap_valid(&r, 1024, 768));
+    /* Half the screen: 512x768 -> 1,179,702 bytes. */
     snap_preset(&r, SNAP_LEFT, 1024, 768);
+    assert(bmp_size(r.w, r.h) == 1179702);
+    assert(snap_fits(&r));
+    snap_preset(&r, SNAP_RIGHT, 1024, 768);
+    assert(bmp_size(r.w, r.h) == 1179702);
+    assert(snap_fits(&r));
+    /* The ceiling still REFUSES rather than clamps, and the boundary is
+     * asserted from both sides so "everything fits" cannot quietly become
+     * "the check was removed". */
+    r.x = 0; r.y = 0; r.w = 1; r.h = (int)((SNAP_MAX_FILE_BYTES - 54) / 4);
+    assert(snap_fits(&r));
+    r.h += 1;
     assert(!snap_fits(&r));
     /* On a desktop smaller than the fixed region, CENTRE shrinks to the
      * screen rather than producing a rectangle that is refused as off-screen. */
     snap_preset(&r, SNAP_CENTRE, 200, 150);
     assert(r.x == 0 && r.y == 0 && r.w == 200 && r.h == 150);
     assert(snap_valid(&r, 200, 150) && snap_fits(&r));
-    /* The boundary itself, both sides of it. */
-    r.x = 0; r.y = 0; r.w = 1; r.h = (int)((SNAP_MAX_FILE_BYTES - 54) / 4);
-    assert(snap_fits(&r));
-    r.h += 1;
-    assert(!snap_fits(&r));
 
     /* ---- the write is chunked, because the syscall clamps ----------------
      * SYS_WRITE_FILE silently clamps a single write to 65,536 bytes and
