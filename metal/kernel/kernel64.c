@@ -6684,16 +6684,38 @@ static uint64_t cas_scratch_base(uint64_t fallback) {
  *
  *   direct                     16 chunks       8 KiB
  *   + single-indirect          64 chunks      32 KiB
- *   + double-indirect    64*64 chunks       2 MiB   (ceiling of the format)
+ *   + double-indirect    64*64 chunks       2 MiB
+ *   + a SECOND double-indirect (v1.2)       2 MiB   (ceiling of the format)
  *
  * The practical ceiling is set by VFS_MAX_FILE_BYTES below, which sizes the
- * kernel's staging buffers; the format itself reaches ~2 MiB. A native
- * toolchain needs this: /bin/occ alone is far past 8 KiB. */
+ * kernel's staging buffers and the exec buffer; the format itself now reaches
+ * 4.04 MiB. A native toolchain needs more than the direct blocks: /bin/occ
+ * alone is far past 8 KiB. */
 #define VFS_MAX_CHUNKS 16                     /* DIRECT chunk hashes, inline in dirent */
 #define VFS_IND_PER_BLK (CAS_BS / 8)          /* 64 hashes per indirect block          */
 #define VFS_CHUNKS_L1   (VFS_MAX_CHUNKS + VFS_IND_PER_BLK)                  /* 80  */
-#define VFS_CHUNKS_MAX  (VFS_CHUNKS_L1 + VFS_IND_PER_BLK * VFS_IND_PER_BLK) /* 4176 */
-#define VFS_MAX_FILE_BYTES (256u * 1024u)     /* staging-buffer ceiling: 512 chunks    */
+#define VFS_CHUNKS_L2   (VFS_CHUNKS_L1 + VFS_IND_PER_BLK * VFS_IND_PER_BLK) /* 4176 */
+/* v1.2: A SECOND DOUBLE-INDIRECT BLOCK, and the ceiling it buys.
+ *
+ * 4,176 chunks is 2,138,112 bytes, and a full 1024x768 24-bit screen capture is
+ * 2,359,350 � so the format ran out 434 chunks short of the one file the
+ * desktop most obviously wants to store. ind3 is a second block of the same
+ * shape as ind2 rather than a true triple-indirect: the extra level would add
+ * a third resolution path and 16 MiB of reach nothing here needs, where a
+ * second D-block reuses the code that already exists and doubles the ceiling.
+ *
+ *   direct                        16 chunks        8 KiB
+ *   + single-indirect             64 chunks       32 KiB
+ *   + double-indirect       64*64 chunks        2 MiB
+ *   + second double-indirect 64*64 chunks        2 MiB   (v1.2)
+ *                                              --------
+ *   format ceiling               8272 chunks   4.04 MiB
+ *
+ * VFS_MAX_FILE_BYTES stops well short of that, at 2.5 MiB, because it also
+ * sizes two static chunk-hash arrays (40 KiB each) and there is no reason to
+ * reserve reach the system has no use for. */
+#define VFS_CHUNKS_MAX  (VFS_CHUNKS_L2 + VFS_IND_PER_BLK * VFS_IND_PER_BLK) /* 8272 */
+#define VFS_MAX_FILE_BYTES (2560u * 1024u)    /* 2.5 MiB: 5120 chunks                  */
 /* v0.48: the ACTUAL number of 512B blocks needed to hold VFS_MAXFILES 256-byte
  * dirents — cas_format()/vfs_flush()/cas_mount() used to hardcode "8" (vfs_flush
  * was removed in v0.88 with the legacy mount mode; see cas_mount), which
@@ -6726,7 +6748,8 @@ struct dirent {
     uint32_t used;
     uint32_t len;
     uint32_t nchunks;
-    uint32_t _pad;
+    /* v1.2: the LOW half of ind3's CAS hash. Was _pad. See vfs_ind3_get. */
+    uint32_t ind3_lo;
     uint64_t file_hash;                       /* hash of whole content (identity) */
     uint64_t chunk_hash[VFS_MAX_CHUNKS];      /* DIRECT per-512B-block hashes     */
     /* v0.56: indirect chunk map. Both are CAS hashes of 512-byte blocks holding
@@ -6776,10 +6799,38 @@ struct dirent {
      * been touched at startup. vfs_now() never returns 0 for that reason. */
     uint32_t mtime;                           /* ticks at last content change    */
     uint32_t atime;                           /* ticks at last read (lazy)       */
-    uint8_t  reserved[4];                     /* pad dirent to exactly 256 bytes  */
+    /* v1.2: the HIGH half of ind3's CAS hash. Was reserved[4]. */
+    uint32_t ind3_hi;
 } __attribute__((packed));
 /* Compile-time guard: if this ever trips, the on-disk layout has been broken. */
 _Static_assert(sizeof(struct dirent) == 256, "dirent must stay exactly 256 bytes");
+
+/* v1.2: ind3's hash is SPLIT ACROSS TWO NON-ADJACENT FIELDS, and that is ugly
+ * on purpose rather than by accident.
+ *
+ * The dirent is exactly 256 bytes and every byte of it is on disk. There were
+ * two 4-byte holes left � _pad after nchunks, and reserved[4] at the end � and
+ * no eight contiguous free bytes anywhere. Widening the dirent would break the
+ * on-disk directory layout, VFS_DIR_BLOCKS, the journal record and cas_mount's
+ * restore all at once, and would stop every existing volume mounting; that is
+ * a format break with a version bump and a reformat behind it, which is far
+ * more than a screenshot is worth.
+ *
+ * Both halves read ZERO on a volume written by any earlier kernel, and zero
+ * means "this level is unused" exactly as it already does for ind1 and ind2 �
+ * the same compatibility rule v0.72 wrote for mode and v0.85 for the
+ * timestamps. A pre-v1.2 file therefore resolves unchanged.
+ *
+ * NOTHING OPEN-CODES THE SPLIT. Every read goes through vfs_ind3_get and every
+ * write through vfs_ind3_set, so the two halves cannot drift apart in one call
+ * site and stay consistent in the others. */
+static inline uint64_t vfs_ind3_get(const struct dirent *d) {
+    return ((uint64_t)d->ind3_hi << 32) | (uint64_t)d->ind3_lo;
+}
+static inline void vfs_ind3_set(struct dirent *d, uint64_t h) {
+    d->ind3_lo = (uint32_t)h;
+    d->ind3_hi = (uint32_t)(h >> 32);
+}
 
 /* v0.72: permission bits, POSIX values so the SDK headers can carry them
  * verbatim and so nobody has to learn a second numbering. */
@@ -8922,8 +8973,16 @@ static uint64_t vfs_chunk_hash_at(const struct dirent *d, uint32_t i) {
         return blk[i - VFS_MAX_CHUNKS];
     }
     uint32_t j = i - VFS_CHUNKS_L1;                        /* double-indirect     */
-    if (j >= VFS_IND_PER_BLK * VFS_IND_PER_BLK || !d->ind2_hash) return 0;
-    if (cas_get(d->ind2_hash, blk, sizeof blk) < 0) return 0;
+    /* v1.2: the two D-blocks resolve identically; only which top block and
+     * which slot within it differ, so the walk below is written once. */
+    uint64_t top = d->ind2_hash;
+    if (j >= VFS_IND_PER_BLK * VFS_IND_PER_BLK) {
+        j -= VFS_IND_PER_BLK * VFS_IND_PER_BLK;             /* second D-block      */
+        if (j >= VFS_IND_PER_BLK * VFS_IND_PER_BLK) return 0;
+        top = vfs_ind3_get(d);
+    }
+    if (!top) return 0;
+    if (cas_get(top, blk, sizeof blk) < 0) return 0;
     uint64_t l1 = blk[j / VFS_IND_PER_BLK];
     if (!l1) return 0;
     if (cas_get(l1, blk, sizeof blk) < 0) return 0;
@@ -9062,6 +9121,16 @@ static void cas_direct_burst(int cpu) {
     }
 }
 
+/* v1.2: one D-block's own references � its 64 single-indirect blocks and then
+ * itself. Written once because ind2 and ind3 have identical shape, so they
+ * cannot be walked differently by accident. */
+static void vfs_map_walk_dblock(uint64_t top_hash, int mode) {
+    if (!top_hash) return;
+    uint64_t top[VFS_IND_PER_BLK];
+    if (cas_get(top_hash, top, sizeof top) >= 0)
+        for (uint32_t g = 0; g < VFS_IND_PER_BLK; g++) vfs_map_ref_one(top[g], mode);
+    vfs_map_ref_one(top_hash, mode);
+}
 static void vfs_map_walk_locked(const struct dirent *d, int mode) {
     uint32_t nch = d->nchunks;
     if (nch > VFS_CHUNKS_MAX) nch = VFS_CHUNKS_MAX;
@@ -9069,12 +9138,11 @@ static void vfs_map_walk_locked(const struct dirent *d, int mode) {
      * chunk i of a large file READS the indirect blocks, so freeing those first
      * would make the rest of the map unresolvable. */
     for (uint32_t c = 0; c < nch; c++) vfs_map_ref_one(vfs_chunk_hash_at(d, c), mode);
-    if (d->ind2_hash) {
-        uint64_t top[VFS_IND_PER_BLK];
-        if (cas_get(d->ind2_hash, top, sizeof top) >= 0)
-            for (uint32_t g = 0; g < VFS_IND_PER_BLK; g++) vfs_map_ref_one(top[g], mode);
-        vfs_map_ref_one(d->ind2_hash, mode);
-    }
+    /* v1.2: BOTH D-blocks, and the second one first. The order rule is the
+     * same one the comment above states for ind2: a block is released only
+     * after everything whose resolution needs it. */
+    vfs_map_walk_dblock(vfs_ind3_get(d), mode);
+    vfs_map_walk_dblock(d->ind2_hash, mode);
     vfs_map_ref_one(d->ind1_hash, mode);
 }
 static void vfs_retain_map_locked(const struct dirent *d)  { vfs_map_walk_locked(d, VFS_MAP_RETAIN); }
@@ -9217,6 +9285,29 @@ static void cas_refs_rebuild(void) {
  *
  * Returns 0 if any cas_put failed; the CALLER owns the rollback, because only
  * the caller knows what the dirent looked like before. */
+/* v1.2: ONE double-indirect block covering chunks [base, base + 64*64).
+ *
+ * Lifted verbatim out of vfs_build_map_locked so ind2 and ind3 are built by the
+ * same code rather than by two copies that must agree forever � the argument
+ * the reference walk above already makes for vfs_map_walk_dblock. A group whose
+ * first chunk is past the end of the file is stored as 0, which is what the
+ * resolver reads as "unused". */
+static uint64_t vfs_build_dblock(const uint64_t *ch, uint32_t nch, uint32_t base, int *ok) {
+    uint64_t l1[VFS_IND_PER_BLK], top[VFS_IND_PER_BLK];
+    for (uint32_t g = 0; g < VFS_IND_PER_BLK; g++) {
+        uint32_t first = base + g * VFS_IND_PER_BLK;
+        if (first >= nch) { top[g] = 0; continue; }
+        for (uint32_t k = 0; k < VFS_IND_PER_BLK; k++) {
+            uint32_t src = first + k;
+            l1[k] = (src < nch) ? ch[src] : 0;
+        }
+        top[g] = cas_put(l1, sizeof l1);
+        if (!top[g]) *ok = 0;
+    }
+    uint64_t h = cas_put(top, sizeof top);
+    if (!h) *ok = 0;
+    return h;
+}
 static int vfs_build_map_locked(struct dirent *d, const uint64_t *ch, uint32_t nch) {
     int ok = 1;
     for (uint32_t i = 0; i < nch && i < VFS_MAX_CHUNKS; i++) d->chunk_hash[i] = ch[i];
@@ -9229,22 +9320,10 @@ static int vfs_build_map_locked(struct dirent *d, const uint64_t *ch, uint32_t n
         d->ind1_hash = cas_put(blk, sizeof blk);
         if (!d->ind1_hash) ok = 0;
     }
-    if (nch > VFS_CHUNKS_L1) {                             /* double-indirect     */
-        uint64_t l1[VFS_IND_PER_BLK], top[VFS_IND_PER_BLK];
-        uint32_t rem = nch - VFS_CHUNKS_L1;
-        uint32_t nl1 = (rem + VFS_IND_PER_BLK - 1) / VFS_IND_PER_BLK;
-        for (uint32_t g = 0; g < VFS_IND_PER_BLK; g++) {
-            if (g >= nl1) { top[g] = 0; continue; }
-            for (uint32_t k = 0; k < VFS_IND_PER_BLK; k++) {
-                uint32_t src = VFS_CHUNKS_L1 + g * VFS_IND_PER_BLK + k;
-                l1[k] = (src < nch) ? ch[src] : 0;
-            }
-            top[g] = cas_put(l1, sizeof l1);
-            if (!top[g]) ok = 0;
-        }
-        d->ind2_hash = cas_put(top, sizeof top);
-        if (!d->ind2_hash) ok = 0;
-    }
+    if (nch > VFS_CHUNKS_L1)                               /* double-indirect     */
+        d->ind2_hash = vfs_build_dblock(ch, nch, VFS_CHUNKS_L1, &ok);
+    if (nch > VFS_CHUNKS_L2)                               /* v1.2: the second    */
+        vfs_ind3_set(d, vfs_build_dblock(ch, nch, VFS_CHUNKS_L2, &ok));
     return ok;
 }
 
@@ -9413,7 +9492,7 @@ static int vfs_write_at_locked(int di, uint64_t off, const void *data, uint32_t 
     }
 
     cmemset(d->chunk_hash, 0, sizeof d->chunk_hash);
-    d->ind1_hash = 0; d->ind2_hash = 0;
+    d->ind1_hash = 0; d->ind2_hash = 0; vfs_ind3_set(d, 0);
     d->len = newlen; d->nchunks = nch;
     if (!vfs_build_map_locked(d, g_wa_ch, nch)) put_failed = 1;
     if (put_failed) { *d = prev; return -1; }
@@ -9434,9 +9513,45 @@ static int vfs_write_at_locked(int di, uint64_t off, const void *data, uint32_t 
      * unstaged path above, which hashes the caller's contiguous buffer in one
      * pass — so the cheap way to author a file is still the obvious way. What
      * pays this cost is editing an existing large file, which is exactly the
-     * operation that could not be done at all before v0.84. */
+     * operation that could not be done at all before v0.84.
+     *
+     * v1.2: AN APPEND ONTO A CHUNK BOUNDARY NOW CONTINUES THE FOLD INSTEAD OF
+     * REDOING IT, which is what turns a file built by N sequential writes from
+     * O(N^2) chunk reads into O(N). The paragraph above still describes every
+     * other shape of write.
+     *
+     * The continuation is exact, not an approximation. FNV-1a folds one byte at
+     * a time and rust_cas_hash_cont takes the running state as its seed, so
+     * folding a prefix and then the rest gives bit-for-bit what folding the
+     * whole file gives — the property that function was written for, and the
+     * reason the two write paths can agree on one identity at all.
+     *
+     * BOTH PRECONDITIONS ARE LOAD-BEARING:
+     *
+     *   off == oldlen       the write adds bytes and changes none, so every
+     *                       existing chunk keeps its hash. The rebuild loop
+     *                       above proves it rather than assuming it: for
+     *                       i < oldnch, cend <= off, so `overlaps` is false and
+     *                       the chunk is REUSED by hash, not re-stored.
+     *   oldlen % 512 == 0   the old file ended exactly on a chunk boundary, so
+     *                       its last chunk was folded at its full 512 bytes.
+     *                       Without this that chunk grows from partial to whole
+     *                       and its contribution changes, which a continuation
+     *                       cannot see.
+     *
+     * oldlen == 0 deliberately takes the general path: file_hash is 0 for an
+     * empty file rather than FNV1A_SEED, so there is no prefix state to resume.
+     *
+     * `validate` cross-checks the two paths against each other on the same
+     * bytes. A fold that drifted would give one content two identities, which
+     * is precisely the failure this file's header warns about. */
+    uint32_t from = 0;
     uint64_t h = FNV1A_SEED;
-    for (uint32_t i = 0; i < nch; i++) {
+    if (oldlen && off == (uint64_t)oldlen && (oldlen % 512u) == 0) {
+        from = oldnch;
+        h = prev.file_hash;
+    }
+    for (uint32_t i = from; i < nch; i++) {
         uint32_t clen = (newlen - i * 512) < 512 ? (newlen - i * 512) : 512;
         uint64_t hh = vfs_chunk_hash_at(d, i);
         for (uint32_t k = 0; k < 512; k++) blk[k] = 0;
@@ -9539,7 +9654,7 @@ static int vfs_truncate_locked(int di, uint32_t newlen) {
     }
 
     cmemset(d->chunk_hash, 0, sizeof d->chunk_hash);
-    d->ind1_hash = 0; d->ind2_hash = 0;
+    d->ind1_hash = 0; d->ind2_hash = 0; vfs_ind3_set(d, 0);
     d->len = newlen; d->nchunks = nch;
     if (!vfs_build_map_locked(d, g_wa_ch, nch)) put_failed = 1;
     if (put_failed) { *d = prev; return -1; }
@@ -11316,6 +11431,7 @@ static int vfs_open_for(const char *name, int owner, uint32_t oflags) {
         cmemset(DENTS[di].chunk_hash, 0, sizeof DENTS[di].chunk_hash);
         DENTS[di].ind1_hash = 0;
         DENTS[di].ind2_hash = 0;
+        vfs_ind3_set(&DENTS[di], 0);
         DENTS[di].len = 0;
         DENTS[di].nchunks = 0;
         DENTS[di].file_hash = 0;
@@ -11396,6 +11512,7 @@ static int vfs_rename(const char *oldp, const char *newp) {
         cmemset(DENTS[ti].chunk_hash, 0, sizeof DENTS[ti].chunk_hash);
         DENTS[ti].ind1_hash = 0;
         DENTS[ti].ind2_hash = 0;
+        vfs_ind3_set(&DENTS[ti], 0);
         DENTS[ti].nchunks = 0;
         DENTS[ti].used = 0;
         victim = ti;
@@ -11523,6 +11640,7 @@ static int vfs_unlink(const char *name) {
     cmemset(DENTS[idx].chunk_hash, 0, sizeof DENTS[idx].chunk_hash);
     DENTS[idx].ind1_hash = 0;
     DENTS[idx].ind2_hash = 0;
+    vfs_ind3_set(&DENTS[idx], 0);
     DENTS[idx].nchunks = 0;
     DENTS[idx].used = 0;
     vfs_journal_commit_idx(idx);
@@ -36682,6 +36800,49 @@ static void cmd_validate(void) {
         uint64_t fh1 = DENTS[di].file_hash;
         vfs_write_file("vtest", big, 900);
         vcheck("VFS copy-on-write changes file hash", DENTS[vfs_find("vtest")].file_hash != fh1);
+
+        /* v1.2: ONE CONTENT, ONE IDENTITY — across both write paths.
+         *
+         * vfs_write_at_locked now CONTINUES the FNV-1a fold when a write
+         * appends onto a chunk boundary, instead of re-streaming the whole
+         * file. That is what makes a file built by N sequential writes cost
+         * O(N) instead of O(N^2), and it is only sound if the continued fold
+         * is bit-identical to the full one.
+         *
+         * So the same bytes are authored twice: once as a single whole-file
+         * write, which hashes a contiguous buffer in one pass, and once as
+         * SEVEN sequential appends of 512 bytes each, which takes the
+         * incremental path six times. The hashes must be equal. If the
+         * continuation ever drifts, this is what says so — and it fails on the
+         * identity, not on a timing, so it cannot pass for the wrong reason on
+         * a fast host.
+         *
+         * 3,584 bytes on purpose: past VFS_MAX_CHUNKS (16 direct = 8 KiB is
+         * not reached, but seven chunks exercises the direct array) and every
+         * append lands exactly on a 512 boundary, which is the precondition
+         * the fast path tests for. */
+        static uint8_t seq[7 * 512];
+        for (int i = 0; i < 7 * 512; i++) seq[i] = (uint8_t)(i * 31 + 11);
+        vfs_write_file("vseq_whole", seq, sizeof seq);
+        int dw = vfs_find("vseq_whole");
+        int da = vfs_write_file("vseq_parts", seq, 512);      /* first 512 whole */
+        int appended_ok = (dw >= 0 && da >= 0);
+        for (int c = 1; c < 7 && appended_ok; c++) {
+            klock_acquire(&g_vfs_lock);
+            int wr = vfs_write_at_locked(da, (uint64_t)c * 512, seq + c * 512, 512);
+            klock_release(&g_vfs_lock);
+            if (wr != 512) appended_ok = 0;
+        }
+        vcheck("VFS sequential appends all accepted", appended_ok);
+        vcheck("VFS append-built file has the whole-file length",
+               appended_ok && DENTS[da].len == sizeof seq);
+        vcheck("VFS incremental fold == whole-file fold (one content, one identity)",
+               appended_ok && dw >= 0 && DENTS[da].file_hash == DENTS[dw].file_hash);
+        static uint8_t seqrb[7 * 512];
+        int64_t sn = vfs_read_file(da, seqrb, sizeof seqrb);
+        int seqmatch = (sn == (int64_t)sizeof seq);
+        for (int i = 0; i < 7 * 512 && seqmatch; i++) if (seqrb[i] != seq[i]) seqmatch = 0;
+        vcheck("VFS append-built file reads back byte-exact", seqmatch);
     }
 
     kprintf("[valid  ] RESULT: %d passed, %d failed\n", g_vpass, g_vfail);
