@@ -8839,6 +8839,59 @@ static void vj_stage_block(uint64_t b, uint64_t nblk) {
  * makes the transaction visible: until it lands, the previous header still
  * describes a complete, replayable set, so a crash mid-transaction replays the
  * old state rather than a partial new one. */
+/* v1.3: DEFERRED JOURNALLING FOR SEQUENTIAL APPENDS.
+ *
+ * A commit is TWO disk writes: the dirty directory block into its shadow slot,
+ * then the header that makes the transaction PENDING. For a file built by N
+ * appends that is 2N synchronous virtio-blk transactions, and after the Phase 5
+ * map work it was the whole of the remaining cost -- 256 appends measured at
+ * 19,970 ms with only 666 cas_get calls behind it.
+ *
+ * Every one of those appends dirties the SAME directory block, and only the
+ * last state of it is worth writing. So an append marks its dirent dirty here
+ * and returns; the shadow write and the header are done once, later.
+ *
+ * WHAT THIS DOES AND DOES NOT PROMISE. It does not weaken the journal: a
+ * transaction that IS published is still all-or-nothing, and recovery is
+ * unchanged. What changes is WHEN an append becomes durable, and the answer
+ * becomes the POSIX one -- data written without fsync may be lost in a crash.
+ * The filesystem stays CONSISTENT either way, which is the invariant that
+ * actually matters: content chunks reach the CAS before the dirent naming them
+ * is committed, so a dirent that reverts to an older length simply describes a
+ * shorter file, and the chunks past its end are unreferenced and reclaimed by
+ * the next refs rebuild. There is no state in which the directory names a
+ * chunk that is not there.
+ *
+ * ONLY THE APPEND FAST PATH DEFERS. Every other mutation -- a whole-file
+ * write, truncate, rename, unlink -- still commits eagerly, which is why the
+ * cross-reboot journal probe (which writes a file and halts WITHOUT syncing)
+ * still finds its transaction pending on the next boot. That test exercises
+ * vfs_write_locked, not the append path, and its guarantee is untouched.
+ *
+ * THE THRESHOLD AND THE EPOCH ARE CHECKED ON VFS ACTIVITY, NOT BY A TIMER.
+ * There is no background flusher: a deferred append with no VFS operation
+ * after it stays deferred until a sync or a close. Calling this a "timed
+ * flush" without that sentence would overstate it. */
+#define VJ_LAZY_MAX   32          /* dirents pending before a flush is forced   */
+#define VJ_LAZY_TICKS 100         /* 1 s at 100 Hz, checked on the next commit  */
+static uint8_t  g_vj_lazy[VFS_MAXFILES];
+static volatile uint32_t g_vj_lazy_n = 0;   /* read unlocked by SYS_CLOSE */
+static uint64_t g_vj_lazy_epoch = 0;
+/* Live counters, printed by `sched` and by the append benchmark: a deferral
+ * that never fires and a flush that never happens must both be visible. */
+static uint64_t g_vj_lazy_deferred = 0, g_vj_lazy_flushes = 0, g_vj_lazy_forced = 0;
+
+/* Stage every deferred dirent into the journal. Caller publishes. */
+static void vj_stage_lazy(uint64_t nblk) {
+    if (!g_vj_lazy_n) return;
+    for (int i = 0; i < VFS_MAXFILES; i++) {
+        if (!g_vj_lazy[i]) continue;
+        vj_stage_block(((uint64_t)i * 256u) / CAS_BS, nblk);
+        g_vj_lazy[i] = 0;
+    }
+    g_vj_lazy_n = 0;
+}
+
 static void vj_publish(void) {
     struct vjournal_header h; cmemset(&h, 0, sizeof h);
     const char mg[8] = { 'V','J','R','N','L','0','0','2' };
@@ -8895,7 +8948,48 @@ static void vfs_journal_commit_idx(int idx) {
     else for (uint64_t b = 0; b < nblk && !g_vj_inject_stop; b++) vj_stage_block(b, nblk);
 
     if (g_vj_inject_stop) { g_vj_inject_stop = 0; return; }
+    /* v1.3: ANY eager commit carries the deferred dirents with it. The header
+     * about to be written names every slot in the map, so a deferred block
+     * that was not staged would be left out of a transaction that is otherwise
+     * about to make the directory durable -- and the next crash would recover
+     * a directory that is current for one dirent and stale for another. It
+     * costs nothing extra: same header, same publish. */
+    vj_stage_lazy(nblk);
     vj_publish();
+}
+
+/* v1.3: an append's commit. Marks the dirent dirty and returns; the two disk
+ * writes happen at the next flush point. Returns having done no I/O at all in
+ * the common case, which is the entire point. */
+static void vfs_journal_commit_lazy(int idx) {
+    if (idx < 0 || idx >= VFS_MAXFILES) { vfs_journal_commit_idx(idx); return; }
+    if (!g_vj_init) vj_reset_slots();
+    if (!g_vj_lazy[idx]) {
+        g_vj_lazy[idx] = 1;
+        if (!g_vj_lazy_n++) g_vj_lazy_epoch = g_ticks;
+    }
+    g_vj_lazy_deferred++;
+    /* Bounded two ways: by how many dirents may sit unpublished, and by how
+     * long the oldest may wait. Both are checked here, on the next append,
+     * because there is no background flusher -- see the note above. */
+    if (g_vj_lazy_n >= VJ_LAZY_MAX || (g_ticks - g_vj_lazy_epoch) >= VJ_LAZY_TICKS) {
+        g_vj_lazy_forced++;
+        uint64_t nblk = SB->dir_blocks < VFS_DIR_BLOCKS ? SB->dir_blocks : VFS_DIR_BLOCKS;
+        vj_stage_lazy(nblk);
+        vj_publish();
+        g_vj_lazy_flushes++;
+    }
+}
+
+/* v1.3: publish whatever is deferred, if anything. The explicit flush point,
+ * called by SYS_VFS_SYNC and by close. Caller holds g_vfs_lock. */
+static void vfs_journal_flush_lazy(void) {
+    if (!g_vj_lazy_n) return;
+    if (!g_vj_init) vj_reset_slots();
+    uint64_t nblk = SB->dir_blocks < VFS_DIR_BLOCKS ? SB->dir_blocks : VFS_DIR_BLOCKS;
+    vj_stage_lazy(nblk);
+    vj_publish();
+    g_vj_lazy_flushes++;
 }
 /* No no-argument wrapper. All six mutation sites name the dirent they changed,
  * and a wrapper that quietly shadowed the whole directory would be the easy
@@ -8908,6 +9002,11 @@ static void vfs_journal_commit_idx(int idx) {
  * it actually applied a pending commit, 0 otherwise.                        */
 static int g_vfs_last_sync_applied = 0;   /* diagnostic only, read by cmd_vfs_stress */
 static void vfs_journal_apply(void) {
+    /* v1.3: anything deferred becomes part of THIS transaction before it is
+     * replayed. Applying first and flushing after would write the deferred
+     * dirents into a journal that had just been marked clean, leaving them
+     * pending with nothing to trigger them. */
+    vfs_journal_flush_lazy();
     uint8_t hdrblk[CAS_BS]; virtio_read_block(SB->vjournal_start + 0, hdrblk);
     struct vjournal_header *h = (struct vjournal_header *)hdrblk;
     const char mg2[8] = { 'V','J','R','N','L','0','0','2' };
@@ -9640,7 +9739,9 @@ static int vfs_append_locked(int di, uint64_t off, const void *data, uint32_t le
     /* (5) ONLY NOW are the replaced indirect blocks released. */
     for (int i = 0; i < nold; i++) vfs_map_ref_one(old[i], VFS_MAP_RELEASE);
 
-    vfs_journal_commit_idx(di);
+    /* v1.3: DEFERRED, not skipped. See vfs_journal_commit_lazy for what that
+     * costs a crash and why the filesystem stays consistent regardless. */
+    vfs_journal_commit_lazy(di);
     return 1;
 }
 
@@ -20261,6 +20362,41 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             klock_release(&g_ofile_lock);
             fs_witness_leave();
             for (int i = 0; i < ne; i++) ep_notify_oi(eof[i]);
+            /* v1.3: CLOSE PUBLISHES WHAT APPENDS DEFERRED.
+             *
+             * An append marks its dirent dirty and does no I/O; this is where
+             * "I have finished writing this file" turns into two disk writes.
+             * Without it a program could write a file, close it, and find the
+             * directory still describing the file it was before -- which is
+             * not the POSIX bargain. Data written without fsync may be lost in
+             * a CRASH; it may not be lost by closing the descriptor.
+             *
+             * Taken AFTER g_ofile_lock (rank 1) is released, because
+             * g_vfs_lock is rank 2 and acquiring it while holding rank 1 is
+             * the inversion klock exists to catch. */
+            /* THE UNLOCKED READ OF g_vj_lazy_n IS THE POINT, not an oversight.
+             *
+             * The first version took g_vfs_lock on EVERY close. Almost every
+             * close has nothing deferred, so that put a rank-2 acquisition on
+             * one of the hottest syscalls in the system — and behind any
+             * thread holding that lock across disk I/O. It cost the gate a
+             * whole tier: smp4-bios came back with 29 failures, every one a
+             * ring-3 worker missing its deadline in cas-contend, ofilestrs,
+             * appsstrs and posixstrs. Nothing was broken; everything was
+             * queued behind a lock it did not need to take.
+             *
+             * Reading the counter without the lock is safe because being WRONG
+             * is safe in one direction only, and it is this one: a stale zero
+             * means this close skips a flush that another core is in the
+             * middle of arranging, and that core's own flush point — or the
+             * next close, sync or epoch — still publishes it. A stale non-zero
+             * costs one needless lock acquisition. Neither loses data, because
+             * the deferred set itself is only ever mutated under the lock. */
+            if (g_cas_mounted && g_vj_lazy_n) {
+                klock_acquire(&g_vfs_lock);
+                vfs_journal_flush_lazy();
+                klock_release(&g_vfs_lock);
+            }
         }
         return 0;
     }
@@ -26751,6 +26887,200 @@ static void cmd_timebench(void) {
     kputs("-- done --\n");
 }
 
+/* ===========================================================================
+ * v1.3: THE APPEND/READ RACE — map patching under real multi-core contention
+ * ===========================================================================
+ * vfs_append_locked PATCHES the chunk map in place: it rewrites one indirect
+ * block, then its parent, and swaps two hashes in the dirent. The general path
+ * it replaced rebuilt the whole map and swapped it in at the end. Patching has
+ * a property rebuilding does not — there are intermediate states in which the
+ * map is partly old and partly new — and the only thing that makes those
+ * states unobservable is that every reader and every writer holds g_vfs_lock.
+ *
+ * THIS TEST EXISTS TO ATTACK THAT CLAIM, not to confirm it. Appenders and
+ * readers run on different cores at the same time against ONE file, and every
+ * reader verifies the ENTIRE file it can see, chunk by chunk.
+ *
+ * WHY THE CONTENT IS DERIVED FROM THE CHUNK INDEX and not from the core that
+ * wrote it: any reader must be able to check any chunk without knowing who
+ * appended it or when. Chunk i holds a pattern computed from i alone, so a
+ * reader that sees N chunks can verify all N. A torn patch — a parent block
+ * pointing at a stale child, a dirent length that outran its map — shows up as
+ * a chunk whose bytes are wrong or missing, which is exactly what is counted.
+ *
+ * PREFIX CONSISTENCY IS THE INVARIANT. A concurrent reader may legitimately
+ * see any length between the one at its last read and the current one; what it
+ * may never see is a length whose chunks do not all resolve, or a chunk with
+ * the wrong bytes. Length is also checked to be monotonic: it is only ever
+ * extended, so a reader observing it shrink would mean an appender published a
+ * dirent built from a stale snapshot.
+ *
+ * IT RUNS IN THE KERNEL RATHER THAN RING 3, and that is not a shortcut. The
+ * thing under test is a function that runs with g_vfs_lock HELD; a ring-3
+ * worker reaches it only through SYS_WRITE_FILE, which clamps, buffers and
+ * takes the descriptor locks first, so the contention it generates lands on
+ * the descriptor layer rather than on the map. cas_direct_burst is in the tree
+ * for the same reason one layer down.
+ *
+ * IT RUNS ON BSP KERNEL THREADS, NOT ON THE APs, AND THE FIRST VERSION PROVED
+ * WHY. Driving it from the AP idle loop the way cas_direct_burst is driven
+ * DEADLOCKED THE BOOT: an AP took g_vfs_lock, issued a virtio-blk read, and
+ * waited for a completion it could not be woken for from that context, with
+ * the lock still held and every other core queuing behind it. The boot got one
+ * cas_put in and then sat until the 900 s harness timeout. cas_direct_burst
+ * gets away with that context because it touches only the in-memory index and
+ * never blocks on the device; anything that can wait for the disk may not run
+ * there.
+ *
+ * Kernel threads are the vehicle the tree already uses for blocking VFS work
+ * (see worker_fn in cmd_sched), and they are not a weaker test of THIS claim:
+ * klock tracks rank per THREAD precisely because a lock holder can park on a
+ * vblk wait while another thread runs, so these workers genuinely interleave
+ * inside g_vfs_lock's critical sections. What they do not do is put two cores
+ * in the map at once -- and since g_vfs_lock serialises that by construction,
+ * what would be tested there is the lock, not the patching. That gap is
+ * recorded rather than papered over. */
+#define SMPR_CHUNKS 48                 /* file ceiling: keep each read cheap    */
+#define SMPR_ROUNDS 24                 /* per core                              */
+static volatile uint64_t g_smpr_appends[MAX_CPUS];
+static volatile uint64_t g_smpr_reads[MAX_CPUS];
+static volatile uint64_t g_smpr_badbytes[MAX_CPUS];   /* a chunk read wrong     */
+static volatile uint64_t g_smpr_badlen[MAX_CPUS];     /* length went BACKWARDS  */
+static volatile uint64_t g_smpr_short[MAX_CPUS];      /* fewer bytes than len   */
+static volatile uint32_t g_smpr_lastlen[MAX_CPUS];
+static int g_smpr_di = -1;
+
+static uint8_t smpr_byte(uint32_t chunk, uint32_t off) {
+    return (uint8_t)(chunk * 37u + off * 11u + 5u);
+}
+
+static void smpr_run(int cpu) {
+    static uint8_t wbuf[MAX_CPUS][512];
+    static uint8_t rbuf[MAX_CPUS][SMPR_CHUNKS * 512];
+    if (cpu < 0 || cpu >= MAX_CPUS || g_smpr_di < 0) return;   /* index is the worker id */
+
+    for (uint32_t r = 0; r < SMPR_ROUNDS; r++) {
+        /* Odd cores read, even cores append. Both hammer the same dirent. */
+        if (cpu & 1) {
+            /* NO LOCK HELD HERE. vfs_read_file acquires g_vfs_lock itself, and
+             * the first version of this wrapped it in another acquisition --
+             * a recursive take of a rank-2 klock, which the rank checker
+             * reported and which left the readers making no progress at all.
+             * The suite caught it because it asserts the workload HAPPENED
+             * before it asserts anything about the workload: 0 verified reads
+             * failed the first check rather than passing the other four
+             * vacuously. */
+            int64_t got = vfs_read_file(g_smpr_di, rbuf[cpu], sizeof rbuf[cpu]);
+            if (got < 0) continue;
+            uint32_t len = (uint32_t)got;
+            if (len < g_smpr_lastlen[cpu]) g_smpr_badlen[cpu]++;
+            else g_smpr_lastlen[cpu] = len;
+            if (len % 512u) { g_smpr_short[cpu]++; continue; }
+            uint32_t nch = (uint32_t)got / 512u;
+            for (uint32_t c = 0; c < nch; c++)
+                for (uint32_t i = 0; i < 512; i += 37)      /* sampled, not all  */
+                    if (rbuf[cpu][c * 512 + i] != smpr_byte(c, i)) {
+                        g_smpr_badbytes[cpu]++;
+                        c = nch; break;
+                    }
+            g_smpr_reads[cpu]++;
+        } else {
+            klock_acquire(&g_vfs_lock);
+            uint32_t len = DENTS[g_smpr_di].len;
+            if (len < SMPR_CHUNKS * 512u) {
+                uint32_t chunk = len / 512u;
+                for (uint32_t i = 0; i < 512; i++) wbuf[cpu][i] = smpr_byte(chunk, i);
+                /* off == len, taken under the SAME acquisition that read it:
+                 * two cores computing the offset outside the lock would both
+                 * aim at the same chunk and one would be rejected. */
+                int rr = vfs_append_locked(g_smpr_di, (uint64_t)len, wbuf[cpu], 512);
+                klock_release(&g_vfs_lock);
+                if (rr == 1) g_smpr_appends[cpu]++;
+            } else {
+                klock_release(&g_vfs_lock);
+            }
+        }
+    }
+}
+
+#define SMPR_WORKERS 4
+static volatile int g_smpr_left = 0;
+static void smpr_thread(void *arg) {
+    smpr_run((int)(uint64_t)arg);
+    /* Returning is how a kernel thread ends here; see worker_fn. */
+    __sync_fetch_and_sub(&g_smpr_left, 1);
+}
+
+static void cmd_smp_vfs_race(void) {
+    kputs("-- SMP VFS RACE: concurrent map patching and reads on one file --\n");
+    if (!g_cas_mounted) { kputs("[smprace] CAS not mounted\n-- done --\n"); return; }
+    int pass = 0, fail = 0;
+    #define rcheck(name, cond) do { if (cond) { pass++; kprintf("[smprace]  PASS  %s\n", name); } \
+                                    else { fail++; kprintf("[smprace]  FAIL  %s\n", name); } } while (0)
+
+    static uint8_t seed[512];
+    for (uint32_t i = 0; i < 512; i++) seed[i] = smpr_byte(0, i);
+    vfs_write_file("vsmprace", seed, sizeof seed);
+    g_smpr_di = vfs_find("vsmprace");
+    if (g_smpr_di < 0) { kputs("[smprace] could not create the target\n-- done --\n"); return; }
+
+    for (int c = 0; c < MAX_CPUS; c++) {
+        g_smpr_appends[c] = g_smpr_reads[c] = 0;
+        g_smpr_badbytes[c] = g_smpr_badlen[c] = g_smpr_short[c] = 0;
+        g_smpr_lastlen[c] = 0;
+    }
+    uint64_t uf0 = g_cas_ref_underflow;
+    uint32_t rv0 = g_rank_violations;
+    int q0 = g_quiet; g_quiet = 1;
+
+    /* Four workers: two appending, two reading, interleaving inside the lock
+     * whenever one of them parks on the disk. */
+    g_smpr_left = SMPR_WORKERS;
+    preempt_enable();
+    for (int i = 0; i < SMPR_WORKERS; i++)
+        thread_create("smprace", smpr_thread, (void *)(uint64_t)i);
+    uint64_t t0 = g_ticks;
+    while (g_smpr_left > 0) {
+        if (g_ticks - t0 > 3000) break;               /* DEADLINE, not a count  */
+        sched_yield();
+    }
+    preempt_disable();
+    g_quiet = q0;
+
+    uint64_t app = 0, rd = 0, bb = 0, bl = 0, sh = 0;
+    for (int c = 0; c < MAX_CPUS; c++) {
+        app += g_smpr_appends[c]; rd += g_smpr_reads[c];
+        bb += g_smpr_badbytes[c]; bl += g_smpr_badlen[c]; sh += g_smpr_short[c];
+    }
+    kprintf("[smprace] %u append(s), %u verified read(s) across %u worker(s) on "
+            "%u core(s); file is %u bytes\n", app, rd, (uint64_t)SMPR_WORKERS,
+            (uint64_t)g_ncpu_online, (uint64_t)DENTS[g_smpr_di].len);
+
+    /* THE WORKLOAD HAPPENED. A suite whose workload never ran reports zero
+     * failures, which is why this is checked before any of them. */
+    rcheck("the race actually ran: appends and verified reads both happened",
+           app > 0 && rd > 0);
+    rcheck("no reader ever saw a chunk with the wrong bytes (no torn map)", bb == 0);
+    rcheck("no reader ever saw the file SHRINK (no stale-snapshot publish)", bl == 0);
+    rcheck("no reader ever saw fewer bytes than the length it read", sh == 0);
+    rcheck("the file grew to its ceiling under contention",
+           DENTS[g_smpr_di].len == SMPR_CHUNKS * 512u);
+    rcheck("every worker finished (no thread stuck holding the VFS lock)",
+           g_smpr_left == 0);
+    rcheck("no reference-count underflow during concurrent map patching",
+           g_cas_ref_underflow == uf0);
+    /* The lock is the whole safety argument, so a violation of its order
+     * during this workload would invalidate every result above. */
+    rcheck("no lock-rank violation was reported during the race",
+           g_rank_violations == rv0);
+
+    vfs_unlink("vsmprace");
+    g_smpr_di = -1;
+    kprintf("[smprace] RESULT: %d passed, %d failed\n", pass, fail);
+    kputs("-- done --\n");
+    #undef rcheck
+}
+
 /* v1.2: THE APPEND BENCHMARK — what a file built by N sequential writes costs.
  *
  * `vfsappend [chunks]` builds one file by appending 512 bytes at a time onto a
@@ -26792,6 +27122,10 @@ static void cmd_vfs_append_bench(int argc, char **argv) {
 
     uint64_t t0 = g_ticks;
     uint64_t p0 = g_cas_puts, g0 = g_cas_gets;
+    /* v1.3: the journal is the other half of the cost, and after the Phase 5
+     * map work it was ALL of it. Counted here so the two can be compared. */
+    uint64_t c0 = g_vj_commits, b0 = g_vj_blocks_written;
+    uint64_t d0 = g_vj_lazy_deferred, f0 = g_vj_lazy_flushes, x0 = g_vj_lazy_forced;
     uint64_t first_p = 0, first_g = 0, last_p = 0, last_g = 0;
     uint32_t built = 1;
     int failed = 0;
@@ -26809,6 +27143,7 @@ static void cmd_vfs_append_bench(int argc, char **argv) {
     }
     uint64_t ticks = g_ticks - t0;
     uint64_t tot_p = g_cas_puts - p0, tot_g = g_cas_gets - g0;
+    uint64_t jc = g_vj_commits - c0, jb = g_vj_blocks_written - b0;
     g_quiet = q0;
 
     kprintf("[vfsapp ] built %u chunks by sequential append%s in %u ticks (%u ms)\n",
@@ -26822,6 +27157,9 @@ static void cmd_vfs_append_bench(int argc, char **argv) {
             "(1.0x means O(write); growth means O(file))\n",
             first_p ? last_p / first_p : 0, first_p ? (last_p * 10u / first_p) % 10u : 0,
             first_g ? last_g / first_g : 0, first_g ? (last_g * 10u / first_g) % 10u : 0);
+    kprintf("[vfsapp ] journal: %u commits, %u disk blocks written\n", jc, jb);
+    kprintf("[vfsapp ] deferred %u append commit(s), %u flush(es), %u forced\n",
+            g_vj_lazy_deferred - d0, g_vj_lazy_flushes - f0, g_vj_lazy_forced - x0);
     kprintf("[vfsapp ] file: %u bytes, %u chunks, ind3 %s\n",
             (uint64_t)DENTS[di].len, (uint64_t)DENTS[di].nchunks,
             vfs_ind3_get(&DENTS[di]) ? "IN USE" : "unused");
@@ -37219,6 +37557,59 @@ static void cmd_validate(void) {
                g_cas_blocks_freed > freed0);
         vcheck("VFS refcount underflow never occurred across the boundary work",
                g_cas_ref_underflow == 0);
+
+        /* v1.3: DEFERRED JOURNALLING — that it defers, and that a sync makes
+         * it durable anyway.
+         *
+         * Two things have to be true and they pull in opposite directions. The
+         * appends must NOT each write the journal, or the optimisation does
+         * nothing; and after a sync the directory on disk must describe the
+         * file as it now is, or the optimisation has lost data. Asserting only
+         * the first would pass for a filesystem that silently dropped writes.
+         *
+         * The disk-block counter is what makes the first half checkable: it
+         * counts real virtio-blk writes, so "deferred" means measurably fewer
+         * of them rather than a flag someone set. */
+        static uint8_t lz[512];
+        for (uint32_t i = 0; i < sizeof lz; i++) lz[i] = (uint8_t)(i * 5u + 3u);
+        vfs_write_file("vlazy", lz, sizeof lz);
+        int li = vfs_find("vlazy");
+        uint64_t jb0 = g_vj_blocks_written, jd0 = g_vj_lazy_deferred;
+        int lok = (li >= 0);
+        for (uint32_t c = 1; c < 8 && lok; c++) {
+            klock_acquire(&g_vfs_lock);
+            int rr = vfs_append_locked(li, (uint64_t)c * 512, lz, sizeof lz);
+            klock_release(&g_vfs_lock);
+            if (rr != 1) lok = 0;
+        }
+        uint64_t jb_appends = g_vj_blocks_written - jb0;
+        vcheck("VFS seven deferred appends accepted", lok);
+        vcheck("VFS the appends were DEFERRED, not committed one by one",
+               lok && (g_vj_lazy_deferred - jd0) == 7);
+        /* Seven eager commits would be fourteen disk writes. Deferred, the
+         * appends should write nothing at all until something flushes them. */
+        vcheck("VFS deferring the appends wrote no journal blocks", jb_appends == 0);
+        vcheck("VFS a flush is pending after the appends", g_vj_lazy_n > 0);
+
+        klock_acquire(&g_vfs_lock);
+        vfs_journal_flush_lazy();
+        klock_release(&g_vfs_lock);
+        vcheck("VFS the flush published exactly one transaction",
+               (g_vj_blocks_written - jb0) >= 2 && g_vj_lazy_n == 0);
+
+        /* AND THE CONTENT SURVIVED IT. The dirent must still describe all
+         * eight chunks, and reading it back must give the bytes written --
+         * a deferral that lost the tail would pass every count above. */
+        vcheck("VFS the deferred file is still 8 chunks",
+               lok && DENTS[li].len == 8u * 512u && DENTS[li].nchunks == 8);
+        static uint8_t lzrb[8 * 512];
+        int64_t ln = vfs_read_file(li, lzrb, sizeof lzrb);
+        int lmatch = (ln == (int64_t)sizeof lzrb);
+        for (uint32_t c = 0; c < 8 && lmatch; c++)
+            for (uint32_t i = 0; i < 512 && lmatch; i++)
+                if (lzrb[c * 512 + i] != lz[i]) lmatch = 0;
+        vcheck("VFS the deferred file reads back byte-exact after the flush", lmatch);
+        vfs_unlink("vlazy");
     }
 
     kprintf("[valid  ] RESULT: %d passed, %d failed\n", g_vpass, g_vfail);
@@ -38420,6 +38811,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "vfsstress")) cmd_vfs_stress();
     else if (!kstrcmp(argv[0], "vfsbench")) cmd_vfs_bench();
     else if (!kstrcmp(argv[0], "vfsappend")) cmd_vfs_append_bench(argc, argv);
+    else if (!kstrcmp(argv[0], "smprace")) cmd_smp_vfs_race();
     else if (!kstrcmp(argv[0], "timebench")) cmd_timebench();
     else if (!kstrcmp(argv[0], "gpustress")) cmd_gpu_stress();
     else if (!kstrcmp(argv[0], "audiostress")) cmd_audio_stress();
@@ -38811,6 +39203,7 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_mcpre();            /* v0.39: IPI preemption + cross-core context migration */
     cmd_slice();            /* v0.40: AP-local LAPIC timer round-robin time-slicing */
     cmd_cio();              /* v0.41: BSP + APs concurrently inside the VFS/CAS/surfaces */
+    cmd_smp_vfs_race();     /* v1.3: concurrent map PATCHING and reads on one dirent      */
     cmd_smp_stress();       /* v0.43: mixed syscall/VFS/compositor workload, every core   */
     cmd_dma_stress();       /* v0.44: real DMA/IOMMU grants revoked across genuine exit    */
     cmd_leakcheck();        /* v0.42: heavy spawn/destroy proves 100% frame reclamation  */
