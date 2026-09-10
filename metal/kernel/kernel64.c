@@ -479,7 +479,7 @@ static void (*g_irq_handlers[16][4])(void) = { { 0 } };
 /* v1.0+: LIVE interrupt counts, per line and per core.
  *
  * Incremented in the one place every hardware vector passes through (the
- * dispatcher below), and printed by `sched` � a counter nothing increments and
+ * dispatcher below), and printed by `sched` — a counter nothing increments and
  * a counter nothing prints are both non-evidence, and this tree has shipped
  * one of each. The per-core split is what makes IRQ distribution a measurement
  * rather than a guess: on a uniprocessor boot every line lands on core 0 and
@@ -776,7 +776,7 @@ void isr_dispatch(struct isr_frame *f) {
             g_vfio_test_fire_at = 0;
         }
     }
-    /* v1.0+: count BEFORE dispatching, and count every hardware line � the
+    /* v1.0+: count BEFORE dispatching, and count every hardware line — the
      * timer and the keyboard included. Counting only the device chain below
      * would leave IRQ 0 and IRQ 1 permanently zero while the machine was
      * plainly taking them. */
@@ -5874,9 +5874,9 @@ static void net_route(const uint8_t *frame, uint32_t len) {
  * round trip we would otherwise make asking back. */
 #define NET_GUEST_IP    0x0A000210u    /* 10.0.2.16: our SLIRP-side address    */
 static volatile uint64_t g_net_tx_frames;   /* defined with the socket layer   */
-/* v1.0+: BYTES, not just frames. A frame count is not bandwidth � a link
+/* v1.0+: BYTES, not just frames. A frame count is not bandwidth — a link
  * carrying sixty 60-byte ARP frames and one carrying sixty 1514-byte segments
- * report the same number � so a network monitor built on frame counts alone
+ * report the same number — so a network monitor built on frame counts alone
  * would draw the same graph for two links an order of magnitude apart. Both
  * counters are incremented at the single chokepoint of their direction. */
 static volatile uint64_t g_net_tx_bytes = 0, g_net_rx_bytes = 0;
@@ -6421,7 +6421,7 @@ static void cmd_sched(void) {
     kprintf("[vblk   ] lifetime interrupt completions: %d\n", g_completions);
     /* v1.0+: PRINT THE COUNTERS SYS_HW_INFO REPORTS.
      *
-     * A counter nothing prints is not instrumentation � this tree has
+     * A counter nothing prints is not instrumentation — this tree has
      * already read a grep for a string no code could produce as evidence
      * of correctness. Every figure the HW_TRACE domain serves to ring 3
      * appears here too, so a serial log can be checked against what the
@@ -6698,7 +6698,7 @@ static uint64_t cas_scratch_base(uint64_t fallback) {
 /* v1.2: A SECOND DOUBLE-INDIRECT BLOCK, and the ceiling it buys.
  *
  * 4,176 chunks is 2,138,112 bytes, and a full 1024x768 24-bit screen capture is
- * 2,359,350 � so the format ran out 434 chunks short of the one file the
+ * 2,359,350 — so the format ran out 434 chunks short of the one file the
  * desktop most obviously wants to store. ind3 is a second block of the same
  * shape as ind2 rather than a true triple-indirect: the extra level would add
  * a third resolution path and 16 MiB of reach nothing here needs, where a
@@ -6809,7 +6809,7 @@ _Static_assert(sizeof(struct dirent) == 256, "dirent must stay exactly 256 bytes
  * on purpose rather than by accident.
  *
  * The dirent is exactly 256 bytes and every byte of it is on disk. There were
- * two 4-byte holes left � _pad after nchunks, and reserved[4] at the end � and
+ * two 4-byte holes left — _pad after nchunks, and reserved[4] at the end — and
  * no eight contiguous free bytes anywhere. Widening the dirent would break the
  * on-disk directory layout, VFS_DIR_BLOCKS, the journal record and cas_mount's
  * restore all at once, and would stop every existing volume mounting; that is
@@ -6817,7 +6817,7 @@ _Static_assert(sizeof(struct dirent) == 256, "dirent must stay exactly 256 bytes
  * more than a screenshot is worth.
  *
  * Both halves read ZERO on a volume written by any earlier kernel, and zero
- * means "this level is unused" exactly as it already does for ind1 and ind2 �
+ * means "this level is unused" exactly as it already does for ind1 and ind2 —
  * the same compatibility rule v0.72 wrote for mode and v0.85 for the
  * timestamps. A pre-v1.2 file therefore resolves unchanged.
  *
@@ -9121,7 +9121,7 @@ static void cas_direct_burst(int cpu) {
     }
 }
 
-/* v1.2: one D-block's own references � its 64 single-indirect blocks and then
+/* v1.2: one D-block's own references — its 64 single-indirect blocks and then
  * itself. Written once because ind2 and ind3 have identical shape, so they
  * cannot be walked differently by accident. */
 static void vfs_map_walk_dblock(uint64_t top_hash, int mode) {
@@ -9288,7 +9288,7 @@ static void cas_refs_rebuild(void) {
 /* v1.2: ONE double-indirect block covering chunks [base, base + 64*64).
  *
  * Lifted verbatim out of vfs_build_map_locked so ind2 and ind3 are built by the
- * same code rather than by two copies that must agree forever � the argument
+ * same code rather than by two copies that must agree forever — the argument
  * the reference walk above already makes for vfs_map_walk_dblock. A group whose
  * first chunk is past the end of the file is stored as 0, which is what the
  * resolver reads as "unused". */
@@ -21467,7 +21467,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             };
             /* The runtime size check below rejects a caller built against a
              * different header. This one rejects a KERNEL built against a
-             * different header � a divergence the runtime check could only
+             * different header — a divergence the runtime check could only
              * ever report as every caller mysteriously getting -EINVAL. */
             _Static_assert(sizeof(struct ustorage) == 304,
                            "HW_STORAGE layout must match include/outrun_abi.h");
@@ -21525,7 +21525,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             struct upci { uint32_t version, size, ndev, iommu_on; struct upcidev dev[16]; };
             /* The runtime size check below rejects a caller built against a
              * different header. This one rejects a KERNEL built against a
-             * different header � a divergence the runtime check could only
+             * different header — a divergence the runtime check could only
              * ever report as every caller mysteriously getting -EINVAL. */
             _Static_assert(sizeof(struct upci) == 2704,
                            "HW_PCI layout must match include/outrun_abi.h");
@@ -21602,7 +21602,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             };
             /* The runtime size check below rejects a caller built against a
              * different header. This one rejects a KERNEL built against a
-             * different header � a divergence the runtime check could only
+             * different header — a divergence the runtime check could only
              * ever report as every caller mysteriously getting -EINVAL. */
             _Static_assert(sizeof(struct utrace) == 2816,
                            "HW_TRACE layout must match include/outrun_abi.h");
@@ -21678,7 +21678,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
             };
             /* The runtime size check below rejects a caller built against a
              * different header. This one rejects a KERNEL built against a
-             * different header � a divergence the runtime check could only
+             * different header — a divergence the runtime check could only
              * ever report as every caller mysteriously getting -EINVAL. */
             _Static_assert(sizeof(struct unet) == 856,
                            "HW_NET layout must match include/outrun_abi.h");
@@ -30774,7 +30774,7 @@ static void compositor_frame(int frame) {
 struct launch_tile { const char *label, *module; uint32_t tint; };
 /* Labels are at most 12 characters: the rail is DESK_RAIL_W wide, the text
  * starts 12 pixels in, and the font is 8 pixels per glyph. A longer label does
- * not wrap � it runs off the rail and over whatever window is beneath it. */
+ * not wrap — it runs off the rail and over whatever window is beneath it. */
 static const struct launch_tile g_launch[DESK_NLAUNCH] = {
     { "VAULT PAD", "vault_pad", C_MAGE  },
     { "NUMWORKS",  "calc",      C_MINT  },
@@ -30793,7 +30793,7 @@ static const struct launch_tile g_launch[DESK_NLAUNCH] = {
  *
  * A constant 44 fitted six tiles into any desktop this kernel can produce.
  * Twelve do not: at scale 2 the logical desktop is 512x384, and twelve fixed
- * tiles would run 176 pixels past the taskbar � the last several unreachable,
+ * tiles would run 176 pixels past the taskbar — the last several unreachable,
  * and unreachable in a way that looks exactly like a launcher that ignores
  * clicks. Deriving the height from the space actually available makes the rail
  * fit whatever the settings app has chosen, and the clamp at DESK_TILE_MIN
@@ -31213,8 +31213,8 @@ static int desk_launch(int t) {
     uint64_t caps = PCAP_WIMP | PCAP_FILESYSTEM;
     if (!kstrcmp(g_launch[t].module, "outrun_term") || !kstrcmp(g_launch[t].module, "outrun_edit")) caps |= PCAP_IPC;
     /* The PCI explorer is the only application that CLAIMS a device.
-     * SYS_PCI_CFG_READ serves a claimed device only � configuration
-     * space is where a driver discovers a virtio register layout � so
+     * SYS_PCI_CFG_READ serves a claimed device only — configuration
+     * space is where a driver discovers a virtio register layout — so
      * without VFIO its capability walk can report nothing but the
      * denial. No other tile gets it: read-only inventory comes from
      * SYS_HW_INFO, which needs only WIMP. */

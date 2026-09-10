@@ -82,7 +82,7 @@ struct outrun_settings {
 };
 
 /* ===========================================================================
- * v1.0+ HARDWARE / SYSTEM OBSERVABILITY  �  SYS_HW_INFO(domain, out, size)
+ * v1.0+ HARDWARE / SYSTEM OBSERVABILITY  —  SYS_HW_INFO(domain, out, size)
  *
  * Read-only. One call, four domains, each with its own struct; `size` is
  * checked against that domain's struct and a disagreement is REFUSED rather
