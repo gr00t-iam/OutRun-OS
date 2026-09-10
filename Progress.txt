@@ -882,3 +882,188 @@ what evidence, and — deliberately — what is not.
   - The gate does not exercise ind3 at all: no suite writes a file past 4,176
     chunks, and adding one would cost ~4,300 CAS puts on every tier of every
     gate run. That region is covered by desktop-media-test only.
+
+12. PHASE 5 — THE APPEND FAST PATH AND THE ind2/ind3 BOUNDARY — 2026-09-10
+---------------------------------------------------------------------------
+
+  Section 11f listed two gaps: nothing tested the ind2 -> ind3 transition, and
+  the map rebuild was still not linear. Both are closed. The second one turned
+  out to be a bigger and different problem than section 11 described, and the
+  correction is again the first thing here.
+
+  12a. MEASURED FIRST. THE COST WAS NOT WHERE SECTION 11 PUT IT
+  --------------------------------------------------------------
+
+  Section 11d named the remaining non-linear term as vfs_build_map_locked
+  rebuilding the indirect blocks, "roughly 2,300 of those 7,667 puts". A
+  benchmark was written before any optimisation — `vfsappend`, which builds a
+  file by sequential 512-byte appends and reports the CAS operations of the
+  LAST append against the FIRST. On the unmodified tree:
+
+      built 256 chunks by sequential append in 6233 ticks (62330 ms)
+      cas ops total: 1007 put, 133678 get
+      first append: 1 put, 1 get
+      last  append: 6 put, 1249 get
+      per-write growth: last/first = 6.0x put, 1249.0x get
+
+  Six puts. The indirect rebuild was never the expensive part. The cost was
+  133,678 cas_GET calls, from three O(file) walks that ran on every write:
+
+    1. the rebuild loop re-resolved every existing chunk through the indirect
+       map (~2 cas_get each) only to hand the array to a builder that rewrote
+       the same blocks;
+    2. vfs_retain_map_locked walked all N chunks of the new map;
+    3. vfs_release_map_locked walked all N of the old one.
+
+  A claim about complexity that is made from reading code and not from counting
+  operations is a guess. This one was wrong by two orders of magnitude in where
+  the time went, and the counters are now permanent (g_cas_puts, g_cas_gets,
+  incremented on every call in a shipping build and printed by `vfsappend`).
+
+  12b. THE FIX: PATCH THE MAP, DO NOT REBUILD IT
+  -----------------------------------------------
+
+  vfs_append_locked handles a write that only ADDS bytes onto a chunk boundary
+  and hands everything else back to the general path. It:
+
+    - stores only the NEW chunks; nothing the file already had is read,
+      resolved or re-stored;
+    - PATCHES the map — a new chunk lands in the direct array, in ind1, or in
+      one 64-entry group of ind2 or ind3, and only the blocks on that path are
+      re-stored;
+    - retains only the NEW chunks and the NEW indirect blocks, and releases
+      only the REPLACED indirect blocks. Every chunk present in both maps would
+      have been retained and then released, which cancels; doing neither is the
+      same answer without the two O(file) walks.
+
+  ORDER IS THE ROLLBACK ARGUMENT. Every cas_put happens before any cas_free.
+  A release that ran first would return the old indirect blocks to the free
+  pool, and a later failure would restore a dirent whose map points into
+  reclaimed storage. The blocks to release are collected and freed only after
+  the whole patch has succeeded.
+
+  It DECLINES rather than improvises: an unaligned or non-appending write, a
+  growth past the format, or a write touching more indirect groups than
+  APPEND_MAX_OLD can hold all return 0 and fall through. A fast path that
+  half-handles a case is worse than one that hands it back.
+
+  12c. THE BENCHMARK, AFTER — AND A MEASUREMENT THAT COULD NOT FAIL
+  ------------------------------------------------------------------
+
+  The first "after" run reported numbers IDENTICAL to the before: 133,678 gets,
+  1249x growth. Not a failed optimisation — a failed measurement. The benchmark
+  called vfs_write_at_locked directly and so measured the general path on both
+  sides of the change. That is the "test that cannot fail" this tree keeps
+  warning about, aimed at an instrument instead of an assertion. There is now
+  ONE dispatch, vfs_write_at_dispatch_locked, used by both the syscall path and
+  the benchmark, so they cannot measure different things again.
+
+  With the benchmark fixed, same 256-chunk workload, same host:
+
+                          before        after       change
+      wall time         62,330 ms    19,970 ms      3.1x faster
+      cas_get total       133,678          666      200x fewer
+      cas_put total         1,007          671      1.5x fewer
+      last append     1,249 gets      3 gets        416x fewer
+      growth last/first     1249x           3x      flat
+
+  The 3x is a CONSTANT, not growth: the first append lands in the direct array
+  (1 put, 1 get) while later ones patch one ind2 group (top + L1 get; L1, top
+  and chunk put). It does not change with file size, which is what O(write)
+  means. Wall time improves less than operations do because the remaining 20 s
+  is dominated by one journal commit per append — 255 real dirent writes to
+  disk — which is per-WRITE work and was never the quadratic term.
+
+  12d. THE BOUNDARY TESTS
+  ------------------------
+
+  Twelve checks in `validate`, at exactly the transition: a file built to 4,176
+  chunks must leave ind3 UNUSED and chunk 4,176 unresolvable; one more chunk
+  must bring ind3 into use, resolve chunk 4,176 to the block written, leave
+  chunk 4,175 resolving through ind2 UNCHANGED, and return nothing for 4,177.
+  An off-by-one here does not corrupt loudly — it returns a hash of 0 for a
+  chunk that exists, which reads as end-of-data, so the file would simply
+  appear to stop at 2,138,112 bytes.
+
+  The crossing chunk is given distinctive content so its hash cannot collide
+  with the repeated filler, which is what makes "resolves to the right block"
+  mean something.
+
+  BUILT WITH THE FAST PATH, which is what makes it affordable at all: the
+  general path costs 62 s for 256 chunks, so 4,176 chunks that way would have
+  added many minutes to every tier of every gate run.
+
+  AND THE FILE IS UNLINKED AGAIN — but that is NOT where the cost was, and the
+  measurement says so. Three gate runs, same host:
+
+      Phase 4, no boundary tests          465 / 400 / 430 / 440 s
+      boundary tests, file left behind    630 / 565 / 595 / 600 s   (+165)
+      boundary tests, file unlinked       605 / 550 / 570 / 580 s   (+140)
+
+  So unlinking recovered ~25 s per tier, not the 165. The remaining ~140 s is
+  the boundary file's CONSTRUCTION: 4,176 cas_put calls at roughly 33 ms each,
+  because every put hashes 512 bytes and then searches the content index, which
+  reads index blocks off the volume. The chunks all dedup to 64 real blocks —
+  the volume is not storing 2 MB — but the put CALLS are unavoidable, because a
+  4,176-chunk file is 4,176 chunks however cheaply each one stores.
+
+  THAT IS A REAL AND PERMANENT TAX: about 9.3 minutes across a four-tier gate,
+  on every run, forever. It is being paid deliberately, because this is the
+  only test anywhere of the ind3 region and a test that is not in the gate is a
+  test that does not run. It is recorded here rather than buried so that the
+  next person can weigh it and reverse it if the trade stops being worth it.
+  The unlink stays regardless: it is 25 s, and it exercises the release side of
+  the boundary — the ind3 blocks have to come back, and the suite asserts that
+  blocks were freed and that g_cas_ref_underflow is still zero.
+
+  12e. VERIFIED
+  --------------
+
+    make apps-test           16/16 PASS (ASan/UBSan, -Wall -Wextra -Werror)
+    make desktop-media-test  24/24, full 1024x768 capture, image md5
+                             7956ee601833f504566d44a4601b6d0e
+    make desktop-test        58/58, 19,187 frames composited
+    make gate GATE_CAP=2400  gate-selftest 17/17, then on the REGRESSION image
+                             md5 005646b5f85ad7dbe90e497df1d4c050:
+
+      uniprocessor    OK   suites=46  passed=593  failed=0  ranks=0  (605 s)
+      smp2-bios       OK   suites=46  passed=607  failed=0  ranks=0  (550 s)
+      smp4-bios       OK   suites=46  passed=613  failed=0  ranks=0  (570 s)
+      smp4-iommu      OK   suites=48  passed=638  failed=0  ranks=0  (580 s)
+
+      FRESH-IMAGE MATRIX: PASS
+      2,451 assertions, 0 failed, 0 lock-rank violations, across 4 boots.
+
+  2,451 against section 11's 2,391 is +60, and it reconciles exactly: 15 new
+  `validate` checks on four tiers. Twelve are the boundary itself and three are
+  the unlink and its reference accounting. An arithmetic that did not close
+  would mean a suite had started or stopped reporting unnoticed.
+
+  The strongest evidence that the incremental REFERENCE handling is correct is
+  not one of my own assertions: the pre-existing `vfsstrs` suite passed with
+  0 underflows and with its exact-baseline reclamation checks intact —
+
+      cas-contend: allocated-but-unreferenced blocks return to EXACTLY their
+      pre-soak value
+      a full create-and-unlink cycle returns the unreferenced-block count to
+      its EXACT pre-workload baseline
+
+  Those compare derived reference counts against live ones. A fast path that
+  retained or released one block too few would show up there before it showed
+  up anywhere else.
+
+  12f. NOT COVERED
+  -----------------
+
+  - The fast path is exercised at 512-byte and 32 KiB appends (validate,
+    vfsappend) and at 64 KiB (the desktop capture). Appends wider than
+    4 * VFS_IND_PER_BLK chunks are DECLINED by design and fall to the general
+    path; nothing tests that they still produce the right file, beyond the
+    general path's own pre-existing coverage.
+  - Nothing tests the ind3 region FULL — a file of 8,272 chunks — because
+    VFS_MAX_FILE_BYTES forbids it at 5,120.
+  - The benchmark is one workload on one host, uniprocessor, with the volume
+    warm. It is an instrument for comparing two builds, not a throughput
+    figure for the filesystem.
+  - No concurrent writer test: the fast path runs under g_vfs_lock exactly as
+    the general path does, so the argument is the lock's, not a measurement's.
