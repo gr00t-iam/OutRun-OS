@@ -10,7 +10,11 @@ D=/tmp/dev-$TAG
 CF="-ffreestanding -O2 -Wall -Wextra -std=c11 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -msoft-float -mcmodel=kernel -fno-pic -fstack-protector-strong -fno-builtin -mstack-protector-guard=tls -mstack-protector-guard-reg=gs -mstack-protector-guard-offset=80"
 rm -rf $D; mkdir -p $D/iso/boot/grub
 nasm -f elf64 boot/boot.asm -o $D/boot.o
-gcc $CF -Ibuild -c kernel/kernel64.c -o $D/kernel64.o
+# DEVBOOT_EXTRA passes -D flags through to this one-off kernel, the way
+# EXTRA does for the Makefile. The object lives under $D, so it can never
+# be mistaken for the tree's build/kernel64.o -- which is the stale-object
+# trap EXTRA has in the Makefile.
+gcc $CF ${DEVBOOT_EXTRA:-} -Ibuild -c kernel/kernel64.c -o $D/kernel64.o
 ld -n -T linker.ld -z max-page-size=0x1000 $D/boot.o build/isr.o build/usermode.o build/switch.o $D/kernel64.o build/cap_engine.o build/ipc_ring.o build/scrypt.o -o $D/outrun-kernel.elf
 cp -r iso/boot/* $D/iso/boot/
 cp $D/outrun-kernel.elf $D/iso/boot/outrun-kernel.elf
