@@ -1067,3 +1067,190 @@ what evidence, and — deliberately — what is not.
     figure for the filesystem.
   - No concurrent writer test: the fast path runs under g_vfs_lock exactly as
     the general path does, so the argument is the lock's, not a measurement's.
+
+13. PHASE 6 — DEFERRED JOURNALLING AND THE MAP-PATCH RACE — 2026-09-10
+----------------------------------------------------------------------
+
+  13a. THE PREMISE WAS WRONG AGAIN, AND THE MEASUREMENT SAYS SO
+  --------------------------------------------------------------
+
+  Phase 6 was set up on the reading that the 19,970 ms remaining after Phase 5
+  was "entirely bound by disk I/O from 256 synchronous journal commits". That
+  was a reasonable inference — the CAS work had fallen to 666 gets and the
+  journal was the obvious remaining suspect — and it is not what the numbers
+  say. Deferred journalling was implemented, it works, and it cut journal disk
+  writes by 16x:
+
+      journal commits        256  ->   16
+      journal disk blocks    512  ->   32
+      wall time         19,970 ms  ->  18,700 ms      (6%)
+
+  Sixteen times fewer synchronous disk writes bought six percent. So the
+  journal was NOT the bottleneck either. What is left is the content itself:
+  256 distinct 512-byte chunks, each a real virtio-blk write, plus the content
+  index reads behind every cas_put. 128 KiB of new data under TCG is the floor,
+  and the append path is now within a few percent of it.
+
+  THIS IS THE THIRD PHASE RUNNING IN WHICH THE BOTTLENECK WAS SOMEWHERE OTHER
+  THAN WHERE THE PLAN PUT IT. Phase 4 blamed the chunk map and it was the
+  identity hash. Phase 5 blamed the indirect rebuild and it was the map walks.
+  Phase 6 blamed the journal and it is the content writes. The counters added
+  in Phase 5 (g_cas_puts / g_cas_gets) and here (journal commits and blocks)
+  exist so the next such question is settled by reading a number.
+
+  13b. WHAT DEFERRED JOURNALLING ACTUALLY CHANGES
+  ------------------------------------------------
+
+  A commit is two disk writes: the dirty directory block into its shadow slot,
+  then the header that makes the transaction PENDING. Every append of one file
+  dirties the SAME directory block, and only its last state is worth writing.
+  vfs_journal_commit_lazy marks the dirent and returns having done no I/O; the
+  writes happen at a flush point.
+
+  FLUSH POINTS, and there is no background flusher:
+    - SYS_VFS_SYNC, via vfs_journal_apply
+    - SYS_CLOSE of any descriptor
+    - VJ_LAZY_MAX (32) dirents pending
+    - VJ_LAZY_TICKS (100 = 1 s) since the oldest became dirty, CHECKED ON THE
+      NEXT APPEND. A deferred append with no VFS activity after it stays
+      deferred until a sync or a close. Calling that a "timed flush" without
+      this sentence would overstate it.
+    - any EAGER commit, which stages the deferred dirents into its own
+      transaction before publishing. Without that, a header naming only its own
+      block would leave the directory current for one dirent and stale for
+      another after a crash.
+
+  In the 256-append benchmark all 16 flushes were epoch-forced: only one dirent
+  was ever dirty, so the count threshold was never reached, and the file was
+  built over ~18.7 s, which is ~16 one-second epochs. The mechanism and the
+  arithmetic agree.
+
+  WHAT IT COSTS A CRASH. An append that has not been flushed is lost, which is
+  the POSIX bargain — data written without fsync may not survive a crash. What
+  does NOT change is CONSISTENCY: content chunks reach the CAS before the
+  dirent naming them is committed, so a dirent that reverts to an older length
+  describes a shorter file and the chunks past its end are unreferenced and
+  reclaimed. There is no state in which the directory names a chunk that is not
+  there. ONLY the append fast path defers; whole-file writes, truncate, rename
+  and unlink still commit eagerly, which is why the cross-reboot journal probe
+  — which writes a file and halts WITHOUT syncing — still finds its transaction
+  pending on the next boot.
+
+  13c. THE CHECKS, AND THE CONTROL
+  ---------------------------------
+
+  Seven checks in `validate`. Two things have to be true and they pull in
+  opposite directions: the appends must NOT each write the journal, or the
+  optimisation does nothing; and after a flush the file must still be entirely
+  there, or the optimisation lost data. Asserting only the first would pass for
+  a filesystem that silently dropped writes. The disk-BLOCK counter is what
+  makes the first half checkable — "deferred" means measurably fewer real
+  virtio-blk writes, not a flag someone set.
+
+  NEGATIVE CONTROL: with vfs_journal_commit_lazy routed straight to the eager
+  commit, the boot reported
+
+      FAIL  VFS deferring the appends wrote no journal blocks
+      FAIL  VFS a flush is pending after the appends
+      PASS  VFS the deferred file reads back byte-exact after the flush
+
+  — the data checks still passing and only the deferral checks failing, which
+  is the right discrimination.
+
+  13d. THE MAP-PATCH RACE, AND TWO DEFECTS IT FOUND IN ITSELF
+  ------------------------------------------------------------
+
+  vfs_append_locked patches the map in place, so unlike the rebuild it replaced
+  there ARE intermediate states in which the map is partly old and partly new.
+  The only thing making them unobservable is that every reader and writer holds
+  g_vfs_lock. `smprace` attacks that: four workers, two appending and two
+  reading one file, with every reader verifying every chunk it can see against
+  a pattern derived from the CHUNK INDEX — so any reader can check any chunk
+  without knowing who wrote it.
+
+  Result at -smp 4: 47 appends, 48 verified reads, 8/8 checks.
+
+  IT FAILED TWICE FIRST, AND BOTH FAILURES WERE IN THE TEST:
+
+  1. DRIVEN FROM THE AP IDLE LOOP IT DEADLOCKED THE BOOT. An AP took
+     g_vfs_lock, issued a virtio-blk read, and waited for a completion it could
+     not be woken for from that context — lock still held, every other core
+     queued behind it. The boot managed one cas_put and then sat until the
+     900 s harness timeout. cas_direct_burst runs in that context safely
+     because it only touches the in-memory index and never blocks on the
+     device; anything that can wait for the disk may not run there. Moved to
+     BSP kernel threads, which is the vehicle the tree already uses for
+     blocking VFS work (worker_fn), and which genuinely interleaves inside
+     g_vfs_lock because klock tracks rank per THREAD precisely so a holder can
+     park on a vblk wait.
+
+  2. THE READER TOOK g_vfs_lock AND THEN CALLED vfs_read_file, WHICH TAKES IT
+     TOO. A recursive acquisition of a rank-2 klock: the rank checker reported
+     it and the readers made no progress. It was caught because the suite
+     asserts the WORKLOAD HAPPENED before it asserts anything about the
+     workload — 0 verified reads failed the first check rather than letting the
+     other four pass vacuously on an empty run.
+
+  13e. THE GATE CAUGHT A REGRESSION, AND IT WAS THE CLOSE FLUSH
+  --------------------------------------------------------------
+
+  The first gate run after this work FAILED. smp4-bios came back with 29
+  failures — cas-contend, ofilestrs, appsstrs and posixstrs, every one of them
+  a ring-3 worker missing its deadline or not reaching a terminal state. The
+  other three tiers passed.
+
+  Nothing was broken. Everything was QUEUED. SYS_CLOSE had been made to take
+  g_vfs_lock unconditionally so a closed file would be durable, and almost
+  every close has nothing deferred — so one of the hottest syscalls in the
+  system had acquired a rank-2 lock it did not need, behind any thread holding
+  that lock across disk I/O.
+
+  The fix is to read g_vj_lazy_n WITHOUT the lock and take it only when there
+  is something to publish. Being wrong is safe in exactly one direction and it
+  is this one: a stale zero means this close skips a flush another core is
+  arranging, and that core's own flush point — or the next close, sync or epoch
+  — publishes it anyway. A stale non-zero costs one needless acquisition. The
+  deferred set itself is only ever mutated under the lock.
+
+  Worth recording as a shape, not just an incident: an optimisation whose whole
+  purpose was to REMOVE disk writes from a hot path nearly shipped having ADDED
+  a lock acquisition to a hotter one. The measurement that justified the change
+  (journal blocks) was not the measurement that would have caught the cost.
+
+  13f. VERIFIED
+  --------------
+
+    make apps-test           16/16 PASS (ASan/UBSan, -Wall -Wextra -Werror)
+    make desktop-media-test  24/24, full 1024x768 capture on a live volume
+    make desktop-test        58/58, 18,518 frames composited
+    make gate GATE_CAP=2400  on the REGRESSION image
+                             md5 3ab5ac07e1499cf54804e1f758b0afbe:
+
+      uniprocessor    OK   suites=47  passed=608  failed=0  ranks=0  (640 s)
+      smp2-bios       OK   suites=47  passed=622  failed=0  ranks=0  (585 s)
+      smp4-bios       OK   suites=47  passed=628  failed=0  ranks=0  (610 s)
+      smp4-iommu      OK   suites=49  passed=653  failed=0  ranks=0  (615 s)
+
+      FRESH-IMAGE MATRIX: PASS
+      2,511 assertions, 0 failed, 0 lock-rank violations, across 4 boots.
+
+  2,511 against Phase 5's 2,451 is +60, and it reconciles: 15 new checks on
+  four tiers — seven for deferred journalling, eight for the race. The suite
+  count moved 46 -> 47 (49 on iommu), which is `smprace` itself.
+
+  13g. NOT COVERED
+  -----------------
+
+  - NO CRASH TEST OF THE DEFERRED PATH. The consistency argument in 13b is from
+    the code and the ordering, not from a power-cut experiment: nothing boots a
+    volume whose last appends were deferred and unflushed. `cascrashwrite`
+    exercises the EAGER path, which is unchanged. This is the largest gap here.
+  - The race is BSP kernel threads, not two cores in the map at once. Since
+    g_vfs_lock serialises map mutation by construction, what a two-core version
+    would test is the lock rather than the patching — but that is an argument,
+    not a measurement, and it is recorded as one.
+  - The epoch is checked on the next append only. A single deferred append
+    followed by silence stays unflushed until a sync or close; no test covers
+    how long that window can be in practice.
+  - The benchmark is one workload, one host, uniprocessor, warm volume. It
+    compares two builds; it is not a throughput figure.
