@@ -7452,7 +7452,20 @@ static volatile uint64_t g_cjp_fired = 0;
 /* bitmap claim, the shared staging sectors (g_blk/g_idxbuf) and the SB       */
 /* counters were all shared mutable state that two cores previously raced.    */
 /* The lock IS held across the disk waits inside; see the klock rank rules.   */
+/* v1.2: HOW MANY CAS OPERATIONS A WRITE ACTUALLY COSTS.
+ *
+ * The complexity of the VFS write path is an argument about how many times it
+ * touches the store, and until now that argument was made from reading the
+ * code. These two counters make it a measurement: `vfsappend` reports the
+ * delta across a known workload, so a claim that a path is linear can be
+ * checked rather than believed. Both are incremented on every call, in a
+ * shipping build, and printed by `vfsappend` and `sched` -- a counter nothing
+ * emits is not instrumentation, and one that only exists under a debug flag is
+ * not evidence about the build anyone runs. */
+static volatile uint64_t g_cas_puts = 0, g_cas_gets = 0;
+
 static uint64_t cas_put(const void *data, uint32_t len) {
+    __sync_fetch_and_add(&g_cas_puts, 1);
     uint64_t h = rust_cas_hash((uint64_t)data, len);       /* <-- Rust CAS hash */
     klock_acquire(&g_cas_lock);
     SB->put_count++;
@@ -7718,6 +7731,7 @@ static int cas_free(uint64_t hash) {
 
 /* fetch content by hash -> length, copies into out (up to max).              */
 static int64_t cas_get(uint64_t hash, void *out, uint32_t max) {
+    __sync_fetch_and_add(&g_cas_gets, 1);
     uint32_t len;
     klock_acquire(&g_cas_lock);                /* g_idxbuf + g_blk are shared   */
     int64_t b = cas_index_find(hash, &len);
@@ -9445,6 +9459,191 @@ static int vfs_write_by_dirent(int di, const void *data, uint32_t len) {
  * Called with g_vfs_lock HELD. */
 static uint64_t g_wa_ch[VFS_MAX_FILE_BYTES / 512];   /* under g_vfs_lock */
 
+/* v1.2: THE APPEND FAST PATH — a write whose cost is its own size.
+ *
+ * MEASURED FIRST, THEN WRITTEN. `vfsappend 256` on the general path built a
+ * 256-chunk file in 62.3 s and 133,678 cas_get calls, with the last append
+ * costing 1,249 gets against the first append's 1. That 1249x is the whole
+ * problem stated as a number: every write was proportional to the FILE, so
+ * building a file of N writes cost O(N^2). Note where it was NOT: the last
+ * append issued 6 puts. The indirect-block rebuild was never the expensive
+ * part; resolving chunks through the map was.
+ *
+ * THREE O(file) WALKS RAN ON EVERY WRITE, and all three are avoidable when the
+ * write only ADDS bytes:
+ *
+ *   1. the rebuild loop re-resolved every existing chunk through the indirect
+ *      map (~2 cas_get each) purely to hand the array back to a builder that
+ *      would rewrite the same blocks;
+ *   2. vfs_retain_map_locked walked all N chunks of the new map;
+ *   3. vfs_release_map_locked walked all N of the old one.
+ *
+ * (2) and (3) cancel exactly for a chunk present in both maps, which on an
+ * append is every chunk the file already had. So this path retains only the
+ * NEW chunks, releases only the REPLACED indirect blocks, and leaves the
+ * untouched prefix's references exactly as they were.
+ *
+ * (1) goes away by PATCHING the map instead of rebuilding it: a new chunk
+ * lands in the direct array, or in ind1, or in one 64-entry group of ind2 or
+ * ind3, and only the blocks on that path are re-stored.
+ *
+ * ROLLBACK IS WHY THE ORDER IS WHAT IT IS. Every cas_put happens BEFORE any
+ * cas_free: a release that ran first would return the old indirect blocks to
+ * the free pool, and a later failure would restore a dirent whose map points
+ * into reclaimed storage. The blocks to release are collected and freed only
+ * once the whole patch has succeeded.
+ *
+ * Returns 1 if it handled the write, 0 to fall back to the general path. It
+ * declines rather than improvises whenever anything is not simple: an
+ * unaligned or non-appending write, a growth past the format, or a write wide
+ * enough to touch more indirect groups than APPEND_MAX_OLD can hold. A fast
+ * path that half-handles a case is worse than one that hands it back. */
+#define APPEND_MAX_OLD 24            /* replaced indirect blocks held for release */
+
+/* Read one indirect block, or produce zeroes if it does not exist yet. */
+static void vfs_ind_load(uint64_t h, uint64_t *blk) {
+    for (uint32_t k = 0; k < VFS_IND_PER_BLK; k++) blk[k] = 0;
+    if (h) cas_get(h, blk, VFS_IND_PER_BLK * 8);
+}
+
+/* Patch the new chunks that land in ONE double-indirect block, rewriting only
+ * the 64-entry groups they touch and then the top block once. */
+static uint64_t vfs_dblock_patch(uint64_t top_hash, const uint64_t *ch,
+                                 uint32_t base, uint32_t from, uint32_t to,
+                                 uint64_t *old, int *nold, int *ok) {
+    uint64_t top[VFS_IND_PER_BLK], l1[VFS_IND_PER_BLK];
+    vfs_ind_load(top_hash, top);
+    uint32_t g0 = (from - base) / VFS_IND_PER_BLK;
+    uint32_t g1 = (to - 1 - base) / VFS_IND_PER_BLK;
+    for (uint32_t g = g0; g <= g1; g++) {
+        uint32_t lo = base + g * VFS_IND_PER_BLK;
+        uint32_t hi = lo + VFS_IND_PER_BLK;
+        vfs_ind_load(top[g], l1);
+        for (uint32_t i = (from > lo ? from : lo); i < (to < hi ? to : hi); i++)
+            l1[i - lo] = ch[i];
+        uint64_t nh = cas_put(l1, sizeof l1);
+        if (!nh) { *ok = 0; return top_hash; }
+        if (top[g] && top[g] != nh) {
+            if (*nold >= APPEND_MAX_OLD) { *ok = 0; return top_hash; }
+            old[(*nold)++] = top[g];
+        }
+        if (top[g] != nh) vfs_map_ref_one(nh, VFS_MAP_RETAIN);
+        top[g] = nh;
+    }
+    uint64_t nt = cas_put(top, sizeof top);
+    if (!nt) { *ok = 0; return top_hash; }
+    if (top_hash && top_hash != nt) {
+        if (*nold >= APPEND_MAX_OLD) { *ok = 0; return top_hash; }
+        old[(*nold)++] = top_hash;
+    }
+    if (top_hash != nt) vfs_map_ref_one(nt, VFS_MAP_RETAIN);
+    return nt;
+}
+
+static int vfs_append_locked(int di, uint64_t off, const void *data, uint32_t len) {
+    struct dirent *d = &DENTS[di];
+    uint32_t oldlen = d->len;
+    uint64_t end = off + (uint64_t)len;
+
+    /* THE PRECONDITIONS. Each one is a case this path would have to guess at. */
+    if (!d->used || !len) return 0;
+    if (off != (uint64_t)oldlen) return 0;          /* not an append           */
+    if (oldlen % 512u) return 0;                    /* old tail is partial     */
+    if (end > (uint64_t)VFS_MAX_FILE_BYTES) return 0;
+    uint32_t newlen = (uint32_t)end;
+    uint32_t nch = (newlen + 511) / 512, oldnch = oldlen / 512;
+    if (nch > VFS_CHUNKS_MAX) return 0;
+    /* At most a handful of indirect groups, or hand it back: see APPEND_MAX_OLD. */
+    if (nch - oldnch > 4u * VFS_IND_PER_BLK) return 0;
+
+    struct dirent prev = *d;
+    const uint8_t *src = (const uint8_t *)data;
+    uint8_t blk[512];
+    uint64_t old[APPEND_MAX_OLD];
+    int nold = 0, ok = 1;
+
+    /* (1) THE NEW CHUNKS ONLY. Nothing the file already had is read, resolved
+     * or re-stored — that is the whole difference from the general path. */
+    for (uint32_t i = oldnch; i < nch && ok; i++) {
+        uint64_t cstart = (uint64_t)i * 512;
+        uint32_t clen = (newlen - (uint32_t)cstart) < 512 ? (newlen - (uint32_t)cstart) : 512;
+        for (uint32_t k = 0; k < 512; k++) blk[k] = 0;
+        uint64_t s = off > cstart ? off : cstart;
+        uint64_t e = end < cstart + 512 ? end : cstart + 512;
+        for (uint64_t b = s; b < e; b++) blk[b - cstart] = src[b - off];
+        g_wa_ch[i] = cas_put(blk, clen);
+        if (!g_wa_ch[i]) ok = 0;
+    }
+
+    /* (2) PATCH THE MAP. Puts only; nothing is freed until the end. */
+    if (ok && oldnch < VFS_MAX_CHUNKS) {
+        uint32_t to = nch < VFS_MAX_CHUNKS ? nch : VFS_MAX_CHUNKS;
+        for (uint32_t i = oldnch; i < to; i++) d->chunk_hash[i] = g_wa_ch[i];
+    }
+    if (ok && nch > VFS_MAX_CHUNKS && oldnch < VFS_CHUNKS_L1) {
+        uint64_t b1[VFS_IND_PER_BLK];
+        vfs_ind_load(d->ind1_hash, b1);
+        uint32_t from = oldnch > VFS_MAX_CHUNKS ? oldnch : VFS_MAX_CHUNKS;
+        uint32_t to = nch < VFS_CHUNKS_L1 ? nch : VFS_CHUNKS_L1;
+        for (uint32_t i = from; i < to; i++) b1[i - VFS_MAX_CHUNKS] = g_wa_ch[i];
+        uint64_t nh = cas_put(b1, sizeof b1);
+        if (!nh) ok = 0;
+        else {
+            if (d->ind1_hash && d->ind1_hash != nh && nold < APPEND_MAX_OLD)
+                old[nold++] = d->ind1_hash;
+            if (d->ind1_hash != nh) vfs_map_ref_one(nh, VFS_MAP_RETAIN);
+            d->ind1_hash = nh;
+        }
+    }
+    if (ok && nch > VFS_CHUNKS_L1 && oldnch < VFS_CHUNKS_L2) {
+        uint32_t from = oldnch > VFS_CHUNKS_L1 ? oldnch : VFS_CHUNKS_L1;
+        uint32_t to = nch < VFS_CHUNKS_L2 ? nch : VFS_CHUNKS_L2;
+        d->ind2_hash = vfs_dblock_patch(d->ind2_hash, g_wa_ch, VFS_CHUNKS_L1,
+                                        from, to, old, &nold, &ok);
+    }
+    if (ok && nch > VFS_CHUNKS_L2) {
+        uint32_t from = oldnch > VFS_CHUNKS_L2 ? oldnch : VFS_CHUNKS_L2;
+        uint32_t to = nch;
+        vfs_ind3_set(d, vfs_dblock_patch(vfs_ind3_get(d), g_wa_ch, VFS_CHUNKS_L2,
+                                         from, to, old, &nold, &ok));
+    }
+
+    if (!ok) {
+        /* Nothing has been freed, so restoring the snapshot is enough. The
+         * blocks put along the way are unreferenced and the next refs rebuild
+         * reclaims them; a half-patched map is the outcome this avoids. */
+        *d = prev;
+        return -1;
+    }
+
+    /* (3) REFERENCES: the new chunks, and only those. Every chunk the file
+     * already had appears in both maps, so a retain and a release would cancel;
+     * doing neither is the same answer without the two O(file) walks. */
+    for (uint32_t i = oldnch; i < nch; i++) vfs_map_ref_one(g_wa_ch[i], VFS_MAP_RETAIN);
+
+    d->len = newlen; d->nchunks = nch;
+
+    /* (4) THE IDENTITY, continued rather than recomputed — the same argument
+     * the general path makes, and here it is unconditional because this
+     * function only ever runs on an aligned append. */
+    uint64_t h = oldlen ? prev.file_hash : FNV1A_SEED;
+    for (uint32_t i = oldnch; i < nch; i++) {
+        uint32_t clen = (newlen - i * 512) < 512 ? (newlen - i * 512) : 512;
+        for (uint32_t k = 0; k < 512; k++) blk[k] = 0;
+        if (g_wa_ch[i]) cas_get(g_wa_ch[i], blk, 512);
+        h = rust_cas_hash_cont(h, (uint64_t)blk, clen);
+    }
+    d->file_hash = newlen ? h : 0;
+    d->mtime = vfs_now();
+    if (!d->atime) d->atime = d->mtime;
+
+    /* (5) ONLY NOW are the replaced indirect blocks released. */
+    for (int i = 0; i < nold; i++) vfs_map_ref_one(old[i], VFS_MAP_RELEASE);
+
+    vfs_journal_commit_idx(di);
+    return 1;
+}
+
 static int vfs_write_at_locked(int di, uint64_t off, const void *data, uint32_t len) {
     struct dirent *d = &DENTS[di];
     if (!d->used) return -1;
@@ -9570,6 +9769,22 @@ static int vfs_write_at_locked(int di, uint64_t off, const void *data, uint32_t 
     if (prev.used) vfs_release_map_locked(&prev);
     vfs_journal_commit_idx(di);
     return (int)len;
+}
+
+/* v1.2: THE ONE PLACE THAT CHOOSES BETWEEN THE TWO WRITE PATHS.
+ *
+ * A helper rather than a few lines inside vfs_write_at, because the append
+ * benchmark needs to make the same choice a real write makes. The first
+ * version of that benchmark called vfs_write_at_locked directly and measured
+ * the general path on both sides of the optimisation -- reporting an identical
+ * 133,678 cas_get before and after, which is precisely the "test that cannot
+ * fail" this tree keeps warning about, only aimed at a measurement. Callers
+ * hold g_vfs_lock. */
+static int64_t vfs_write_at_dispatch_locked(int di, uint64_t off, const void *data, uint32_t len) {
+    int fast = vfs_append_locked(di, off, data, len);
+    if (fast > 0) return (int64_t)len;
+    if (fast < 0) return (int64_t)-1;
+    return (int64_t)vfs_write_at_locked(di, off, data, len);
 }
 
 /* v0.84: SET A FILE'S LENGTH — the operation ftruncate() names, and the last
@@ -19714,7 +19929,7 @@ static int64_t vfs_write_at(int di, uint64_t off, const void *data, uint32_t len
      * held, and the caller has already released g_ofile_lock (rank 1), so
      * nothing is nested. */
     klock_acquire(&g_vfs_lock);
-    int64_t r = (int64_t)vfs_write_at_locked(di, off, data, len);
+    int64_t r = vfs_write_at_dispatch_locked(di, off, data, len);
     klock_release(&g_vfs_lock);
     return r;
 }
@@ -26533,6 +26748,83 @@ static void cmd_timebench(void) {
             }
         }
     }
+    kputs("-- done --\n");
+}
+
+/* v1.2: THE APPEND BENCHMARK — what a file built by N sequential writes costs.
+ *
+ * `vfsappend [chunks]` builds one file by appending 512 bytes at a time onto a
+ * chunk boundary, which is the shape every real writer has: OUTRUN SNAP, the
+ * compiler emitting an object, anything streaming output. It reports the CAS
+ * operations and the ticks the whole build took, and — the number that decides
+ * the complexity question — the operations attributable to the LAST write
+ * against those of the FIRST.
+ *
+ * A path that is O(write) has a flat last-versus-first ratio. A path that is
+ * O(file) per write has a ratio that grows with the file, and summing it is
+ * where the O(N^2) comes from. Reading the code can suggest which; only this
+ * can say.
+ *
+ * NOT part of the suite battery. It is an instrument, run by hand and by the
+ * milestone that changes the write path, because a benchmark in the gate is a
+ * boot-time cost paid on every tier forever to answer a question nobody asked
+ * on that boot. */
+static void cmd_vfs_append_bench(int argc, char **argv) {
+    if (!g_cas_mounted) { kputs("[vfsapp ] CAS not mounted\n"); return; }
+    uint32_t want = 512;                       /* chunks, default */
+    if (argc >= 2) {
+        uint32_t v = 0;
+        for (char *q = argv[1]; *q >= '0' && *q <= '9'; q++) v = v * 10u + (uint32_t)(*q - '0');
+        if (v) want = v;
+    }
+    if (want > VFS_MAX_FILE_BYTES / 512u) want = VFS_MAX_FILE_BYTES / 512u;
+
+    static uint8_t pat[512];
+    const char *name = "vfsappend-target";
+    int q0 = g_quiet; g_quiet = 1;             /* cas_put narrates every block */
+
+    /* Chunk 0 as a whole-file write, so the appends below all land on a
+     * boundary and every one of them takes the same path. */
+    for (uint32_t k = 0; k < 512; k++) pat[k] = (uint8_t)(k * 7u + 1u);
+    vfs_write_file(name, pat, 512);
+    int di = vfs_find(name);
+    if (di < 0) { g_quiet = q0; kputs("[vfsapp ] could not create the target\n"); return; }
+
+    uint64_t t0 = g_ticks;
+    uint64_t p0 = g_cas_puts, g0 = g_cas_gets;
+    uint64_t first_p = 0, first_g = 0, last_p = 0, last_g = 0;
+    uint32_t built = 1;
+    int failed = 0;
+
+    for (uint32_t i = 1; i < want; i++) {
+        uint64_t bp = g_cas_puts, bg = g_cas_gets;
+        for (uint32_t k = 0; k < 512; k++) pat[k] = (uint8_t)(k * 7u + (uint8_t)i);
+        klock_acquire(&g_vfs_lock);
+        int64_t r = vfs_write_at_dispatch_locked(di, (uint64_t)i * 512, pat, 512);
+        klock_release(&g_vfs_lock);
+        if (r != 512) { failed = 1; break; }
+        built++;
+        if (i == 1) { first_p = g_cas_puts - bp; first_g = g_cas_gets - bg; }
+        last_p = g_cas_puts - bp; last_g = g_cas_gets - bg;
+    }
+    uint64_t ticks = g_ticks - t0;
+    uint64_t tot_p = g_cas_puts - p0, tot_g = g_cas_gets - g0;
+    g_quiet = q0;
+
+    kprintf("[vfsapp ] built %u chunks by sequential append%s in %u ticks (%u ms)\n",
+            (uint64_t)built, failed ? " (STOPPED EARLY)" : "", ticks, ticks * 10u);
+    kprintf("[vfsapp ] cas ops total: %u put, %u get\n", tot_p, tot_g);
+    kprintf("[vfsapp ] first append: %u put, %u get\n", first_p, first_g);
+    kprintf("[vfsapp ] last  append: %u put, %u get\n", last_p, last_g);
+    /* The verdict, stated rather than left to the reader: a per-write cost that
+     * grows with the file is what makes the whole build quadratic. */
+    kprintf("[vfsapp ] per-write growth: last/first = %u.%ux put, %u.%ux get "
+            "(1.0x means O(write); growth means O(file))\n",
+            first_p ? last_p / first_p : 0, first_p ? (last_p * 10u / first_p) % 10u : 0,
+            first_g ? last_g / first_g : 0, first_g ? (last_g * 10u / first_g) % 10u : 0);
+    kprintf("[vfsapp ] file: %u bytes, %u chunks, ind3 %s\n",
+            (uint64_t)DENTS[di].len, (uint64_t)DENTS[di].nchunks,
+            vfs_ind3_get(&DENTS[di]) ? "IN USE" : "unused");
     kputs("-- done --\n");
 }
 
@@ -36843,6 +37135,90 @@ static void cmd_validate(void) {
         int seqmatch = (sn == (int64_t)sizeof seq);
         for (int i = 0; i < 7 * 512 && seqmatch; i++) if (seqrb[i] != seq[i]) seqmatch = 0;
         vcheck("VFS append-built file reads back byte-exact", seqmatch);
+
+        /* v1.2: THE ind2 -> ind3 BOUNDARY, at 4,176 and 4,177 chunks.
+         *
+         * This is the one transition in the chunk map where a file stops being
+         * addressable by the structure that has held every file this system
+         * has ever stored, and starts needing the second double-indirect block
+         * v1.2 added. An off-by-one here does not corrupt loudly: it returns a
+         * hash of 0 for a chunk that exists, which reads as end-of-data, so a
+         * file would simply appear to stop at 2,138,112 bytes.
+         *
+         * BUILT WITH THE APPEND FAST PATH, which is what makes it affordable
+         * to run on every boot of every tier. The general path costs O(file)
+         * per write -- measured at 62 s for a 256-chunk file -- so building
+         * 4,176 chunks that way would have added minutes to the gate. The
+         * pattern repeats every 32 KiB on purpose: the chunks dedup, so the
+         * volume stores 64 real blocks rather than 4,176, and what is being
+         * tested is the MAP rather than the store's capacity. */
+        static uint8_t bpat[32 * 1024];
+        const uint32_t CPB = (uint32_t)(sizeof bpat / 512);
+        for (uint32_t i = 0; i < sizeof bpat; i++) bpat[i] = (uint8_t)(i * 13u + 7u);
+        vfs_write_file("vbnd", bpat, sizeof bpat);
+        int bi = vfs_find("vbnd");
+        int bok = (bi >= 0);
+        while (bok && DENTS[bi].nchunks < VFS_CHUNKS_L2) {
+            uint32_t have = DENTS[bi].nchunks;
+            uint32_t want = VFS_CHUNKS_L2 - have;
+            if (want > CPB) want = CPB;
+            klock_acquire(&g_vfs_lock);
+            int rr = vfs_append_locked(bi, (uint64_t)have * 512, bpat, want * 512);
+            klock_release(&g_vfs_lock);
+            if (rr != 1) bok = 0;
+        }
+        vcheck("VFS boundary file built to exactly 4176 chunks",
+               bok && DENTS[bi].nchunks == VFS_CHUNKS_L2);
+        vcheck("VFS at 4176 chunks the second double-indirect is UNUSED",
+               bok && vfs_ind3_get(&DENTS[bi]) == 0);
+        vcheck("VFS at 4176 chunks the first double-indirect IS used",
+               bok && DENTS[bi].ind2_hash != 0);
+        uint64_t hlast2 = bok ? vfs_chunk_hash_at(&DENTS[bi], VFS_CHUNKS_L2 - 1) : 0;
+        vcheck("VFS chunk 4175 (last in ind2) resolves", hlast2 != 0);
+        vcheck("VFS chunk 4176 does not exist yet",
+               bok && vfs_chunk_hash_at(&DENTS[bi], VFS_CHUNKS_L2) == 0);
+
+        /* ONE MORE CHUNK, and it must land in ind3 with content that is its
+         * own -- a distinctive block, so its hash cannot collide with any of
+         * the 64 repeated ones above and "the right hash" means something. */
+        static uint8_t bx[512];
+        for (uint32_t i = 0; i < sizeof bx; i++) bx[i] = (uint8_t)(i ^ 0xA5u);
+        uint64_t hx = cas_put(bx, sizeof bx);
+        int rx = 0;
+        if (bok) {
+            klock_acquire(&g_vfs_lock);
+            rx = vfs_append_locked(bi, (uint64_t)VFS_CHUNKS_L2 * 512, bx, sizeof bx);
+            klock_release(&g_vfs_lock);
+        }
+        vcheck("VFS the write that crosses 4176 is accepted", rx == 1);
+        vcheck("VFS the file is now 4177 chunks",
+               rx == 1 && DENTS[bi].nchunks == VFS_CHUNKS_L2 + 1);
+        vcheck("VFS crossing 4176 brings the second double-indirect into use",
+               rx == 1 && vfs_ind3_get(&DENTS[bi]) != 0);
+        vcheck("VFS chunk 4176 resolves through ind3 to the block written",
+               rx == 1 && hx && vfs_chunk_hash_at(&DENTS[bi], VFS_CHUNKS_L2) == hx);
+        /* The crossing must not disturb the block on the other side of it. */
+        vcheck("VFS chunk 4175 still resolves through ind2, unchanged",
+               rx == 1 && vfs_chunk_hash_at(&DENTS[bi], VFS_CHUNKS_L2 - 1) == hlast2);
+        vcheck("VFS chunk 4177 is past the end and resolves to nothing",
+               rx == 1 && vfs_chunk_hash_at(&DENTS[bi], VFS_CHUNKS_L2 + 1) == 0);
+        /* And the identity still follows the content across the boundary. */
+        vcheck("VFS the boundary file's hash changed when it crossed",
+               rx == 1 && DENTS[bi].file_hash != 0);
+
+        /* REMOVED AGAIN, and this is not tidiness — it is the difference
+         * between a test that costs what it costs and one that taxes every
+         * suite after it. A 4,177-chunk file left in the directory is walked
+         * by cas_refs_rebuild and by every later map tally, so leaving it
+         * behind put ~165 s per tier onto the gate for work none of those
+         * suites were trying to do. Unlinking it also exercises the release
+         * side of the boundary: the ind3 blocks have to come back. */
+        uint64_t freed0 = g_cas_blocks_freed;
+        vcheck("VFS the boundary file unlinks", bok && vfs_unlink("vbnd") >= 0);
+        vcheck("VFS unlinking it released blocks (ind3 map walked on release)",
+               g_cas_blocks_freed > freed0);
+        vcheck("VFS refcount underflow never occurred across the boundary work",
+               g_cas_ref_underflow == 0);
     }
 
     kprintf("[valid  ] RESULT: %d passed, %d failed\n", g_vpass, g_vfail);
@@ -38043,6 +38419,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "vfiostress")) cmd_vfio_stress();
     else if (!kstrcmp(argv[0], "vfsstress")) cmd_vfs_stress();
     else if (!kstrcmp(argv[0], "vfsbench")) cmd_vfs_bench();
+    else if (!kstrcmp(argv[0], "vfsappend")) cmd_vfs_append_bench(argc, argv);
     else if (!kstrcmp(argv[0], "timebench")) cmd_timebench();
     else if (!kstrcmp(argv[0], "gpustress")) cmd_gpu_stress();
     else if (!kstrcmp(argv[0], "audiostress")) cmd_audio_stress();
@@ -38384,6 +38761,14 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
     cmd_net();
     cmd_timestream();
     cmd_validate();
+#ifdef VFSAPPEND_BENCH
+    /* make EXTRA=-DVFSAPPEND_BENCH : run the append benchmark on this boot
+     * and halt. An instrument, never in a shipping build — the suite
+     * battery below would otherwise pay for it on every tier of every
+     * gate run to answer a question nobody asked on that boot. */
+    { char *bargv[2] = { (char *)"vfsappend", (char *)VFSAPPEND_BENCH };
+      cmd_vfs_append_bench(2, bargv); }
+#endif
     cmd_invariants();
     usermode_init();        /* user GDT segments + TSS + SYSCALL MSRs (needed for ring 3) */
     smp_init();             /* v0.35: boot every core (needs the kernel GDT above) */
