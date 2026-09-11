@@ -6871,13 +6871,77 @@ static inline void vfs_ind3_set(struct dirent *d, uint64_t h) {
 static uint8_t g_dir[VFS_MAXFILES * 256] __attribute__((aligned(512)));
 #define DENTS ((struct dirent *)g_dir)
 
-static void bm_set(uint64_t b) { g_bitmap[b >> 3] |= (uint8_t)(1u << (b & 7)); }
+/* v1.5: DIRTY BITMAP RANGE.
+ *
+ * cas_flush_meta() rewrote every bitmap block on the volume on every call, so
+ * its cost was SB->bitmap_blocks + 1 regardless of how little had changed --
+ * and a single put dirties exactly ONE bitmap block. MEASURED on the 4 MB
+ * volume (bitmap_blocks 2): 1,082 calls, 3,246 block writes, 31% of all writes
+ * in the append benchmark's window. On a 64 MB volume (bitmap_blocks 32) the
+ * same call count would cost ~34,000 writes, which is the case this matters
+ * for; the 4 MB number is the floor, not the headline.
+ *
+ * WHY A RANGE AND NOT A PER-BLOCK BITMASK. The dirty set is almost always one
+ * block, occasionally two adjacent (bm_alloc walks upward), so a [min,max]
+ * pair captures it exactly while costing two words and no allocation. A
+ * scattered set would degrade to the old behaviour, which is the correct
+ * failure mode: it writes MORE than necessary, never less.
+ *
+ * CORRECTNESS. cas_mount() re-reads every bitmap block from disk (see the read
+ * loop beside cas_journal_recover), so a block dirtied in RAM and never
+ * written is silently LOST across a reboot -- it would come back claiming
+ * blocks are free that the index still names. The tracker is therefore exact
+ * by construction: bm_set() and bm_free() are the ONLY two writers of
+ * g_bitmap in the entire kernel (cas_format's cmemset and cas_mount's read
+ * loop are the other two references, and both are followed by a full flush).
+ * Any future mutator MUST mark its block, which is why marking lives inside
+ * those two functions rather than at their call sites. */
+static uint64_t g_bm_dirty_lo = (uint64_t)-1, g_bm_dirty_hi = 0;
+
+static inline void bm_mark_dirty(uint64_t b) {
+    uint64_t blk = (b >> 3) / CAS_BS;              /* byte offset -> bitmap block */
+    if (blk < g_bm_dirty_lo) g_bm_dirty_lo = blk;
+    if (blk > g_bm_dirty_hi) g_bm_dirty_hi = blk;
+}
+/* Force the next flush to write the whole bitmap. Used where the in-memory
+ * bitmap is replaced wholesale rather than edited bit by bit. */
+static inline void bm_mark_all_dirty(void) { g_bm_dirty_lo = 0; g_bm_dirty_hi = (uint64_t)-1; }
+
+static void bm_set(uint64_t b) { g_bitmap[b >> 3] |= (uint8_t)(1u << (b & 7)); bm_mark_dirty(b); }
 static int  bm_get(uint64_t b) { return (g_bitmap[b >> 3] >> (b & 7)) & 1; }
 
+/* MEASUREMENT, not instrumentation for its own sake. The Phase 7b proposal is
+ * to scope this function to the bitmap blocks that are actually dirty, and the
+ * size of that win is entirely a function of SB->bitmap_blocks -- which is 2 on
+ * the 4 MB volume every suite runs against, and 32 on a 64 MB one. Counting the
+ * CALLS and the BLOCKS separately is what distinguishes those cases: a estimate
+ * derived from an assumed bitmap size is how a 19% saving gets sold as 97%.
+ * Both counters are live in a shipping build, so they gate a claim rather than
+ * decorate one. g_cfm_saved is the same measurement after the fact: the blocks
+ * this scoping did NOT write, so the claim stays checkable in every boot. */
+static volatile uint64_t g_cfm_calls = 0, g_cfm_blocks = 0, g_cfm_saved = 0;
+
 static void cas_flush_meta(void) {
+    uint64_t nb = SB->bitmap_blocks;
+    uint64_t lo = g_bm_dirty_lo, hi = g_bm_dirty_hi;
+    if (hi >= nb) hi = nb ? nb - 1 : 0;            /* clamp the mark-all sentinel */
+
+    /* The superblock always moves: used_blocks, put_count and dedup_hits change
+     * on paths that dirty no bitmap bit at all, and a stale superblock is what
+     * makes used_blocks disagree with the bitmap popcount that cio audits. */
+    __sync_fetch_and_add(&g_cfm_calls, 1);
     virtio_write_block(0, g_sbblk);
-    for (uint64_t i = 0; i < SB->bitmap_blocks; i++)
+
+    if (lo > hi) {                                  /* nothing dirtied since the last flush */
+        __sync_fetch_and_add(&g_cfm_blocks, 1);
+        __sync_fetch_and_add(&g_cfm_saved, nb);
+        return;
+    }
+    for (uint64_t i = lo; i <= hi; i++)
         virtio_write_block(SB->bitmap_start + i, g_bitmap + i * CAS_BS);
+    __sync_fetch_and_add(&g_cfm_blocks, 1 + (hi - lo + 1));
+    __sync_fetch_and_add(&g_cfm_saved, nb - (hi - lo + 1));
+    g_bm_dirty_lo = (uint64_t)-1; g_bm_dirty_hi = 0;   /* clean again */
 }
 
 static int64_t bm_alloc(void) {
@@ -6891,6 +6955,7 @@ static int64_t bm_alloc(void) {
 static void bm_free(uint64_t b) {
     if (!bm_get(b)) return;
     g_bitmap[b >> 3] &= (uint8_t)~(1u << (b & 7));
+    bm_mark_dirty(b);
     if (SB->used_blocks) SB->used_blocks--;
 }
 
@@ -7812,6 +7877,9 @@ static void cas_format(void) {
     SB->data_start    = SB->scratch_start + SB->scratch_blocks;
     SB->used_blocks   = SB->data_start;
     cmemset(g_bitmap, 0, sizeof g_bitmap);
+    /* The bitmap was replaced wholesale, not edited: every block must reach
+     * disk regardless of what the dirty range happened to hold. */
+    bm_mark_all_dirty();
     for (uint64_t b = 0; b < SB->data_start; b++) bm_set(b);
     cmemset(g_idxbuf, 0, CAS_BS);
     for (uint64_t i = 0; i < SB->index_blocks; i++) virtio_write_block(SB->index_start + i, g_idxbuf);
@@ -7874,6 +7942,10 @@ static int cas_mount(void) {
     virtio_read_block(0, g_sbblk);          /* recovery may have rewritten the superblock */
     for (uint64_t i = 0; i < SB->bitmap_blocks; i++)
         virtio_read_block(SB->bitmap_start + i, g_bitmap + i * CAS_BS);
+    /* g_bitmap now MATCHES disk exactly, so nothing is dirty. Clearing the
+     * range here is not an optimisation: a stale mark from before the mount
+     * would make the next flush write blocks this volume never dirtied. */
+    g_bm_dirty_lo = (uint64_t)-1; g_bm_dirty_hi = 0;
     vfs_journal_apply();                    /* replay any pending directory commit before load */
     for (uint64_t i = 0; i < SB->dir_blocks && i < VFS_DIR_BLOCKS; i++)
         virtio_read_block(SB->dir_start + i, g_dir + i * CAS_BS);
@@ -25029,6 +25101,44 @@ static void cmd_cio(void) {
     kprintf("[cio    ] allocation bitmap: %d bits set, superblock used_blocks %d\n", popcnt, used);
     ciocheck("used_blocks == popcount(bitmap) (no double-allocated or leaked block)", popcnt == used);
 
+    /* v1.5: THE BITMAP ON DISK MATCHES THE BITMAP IN RAM.
+     *
+     * cas_flush_meta() now writes only the bitmap blocks the dirty range says
+     * changed, so a mutator that edits g_bitmap WITHOUT marking its block would
+     * leave that block unwritten — and cas_mount() re-reads every block from
+     * disk, so the edit would vanish at the next boot, bringing back a bitmap
+     * that calls blocks free while the index still names them.
+     *
+     * The audit above CANNOT see that: it compares the in-memory bitmap with
+     * the superblock, and both are in RAM. Verified by negative control — a
+     * build with bm_free()'s mark deliberately removed passes every assertion
+     * in this suite, including the popcount one, on a fresh boot. Only a
+     * reboot, or this check, exposes it.
+     *
+     * So compare against the DISK. Any mismatch is a missing bm_mark_dirty(). */
+    uint64_t bmbad = 0, bmblks = 0;
+    klock_acquire(&g_cas_lock);
+    {
+        static uint8_t ondisk[CAS_BS];
+        /* Flush FIRST, so a legitimately-pending dirty block is not read as a
+         * defect. What survives this flush is only an edit the tracker never
+         * heard about — which is exactly the bug being hunted, because the
+         * flush cannot write a block the dirty range does not name. */
+        cas_flush_meta();
+        bmblks = SB->bitmap_blocks;
+        for (uint64_t i = 0; i < bmblks; i++) {
+            virtio_read_block(SB->bitmap_start + i, ondisk);
+            for (uint64_t k = 0; k < CAS_BS; k++)
+                if (ondisk[k] != g_bitmap[i * CAS_BS + k]) { bmbad++; break; }
+        }
+    }
+    klock_release(&g_cas_lock);
+    kprintf("[cio    ] bitmap durability: %d of %d block(s) differ between RAM and disk\n",
+            bmbad, bmblks);
+    ciocheck("every bitmap block in RAM is identical on disk (no mutation escaped the "
+             "dirty-range tracker — an unmarked edit is silently lost at the next mount)",
+             bmbad == 0);
+
     int fds_leaked = 0;
     klock_acquire(&g_ofile_lock);
     for (int fd = 0; fd < OFILE_MAX; fd++) if (g_ofiles[fd].used) fds_leaked++;
@@ -27160,6 +27270,14 @@ static void cmd_vfs_append_bench(int argc, char **argv) {
      * map work it was ALL of it. Counted here so the two can be compared. */
     uint64_t c0 = g_vj_commits, b0 = g_vj_blocks_written;
     uint64_t vr0 = g_vblk_reads, vw0 = g_vblk_writes;
+    /* Phase 7b sizing. The split between DEDUP and STORED puts decides what
+     * scoping cas_flush_meta() can be worth: a dedup put changes no bitmap bit
+     * at all and so could skip the bitmap entirely, while a stored put dirties
+     * exactly one block. Taken from the superblock's own persistent counters as
+     * a delta over this window, rather than from a second set of counters that
+     * could drift away from the ones the volume actually keeps. */
+    uint64_t pc0 = SB->put_count, dh0 = SB->dedup_hits;
+    uint64_t cfc0 = g_cfm_calls, cfb0 = g_cfm_blocks, cfs0 = g_cfm_saved;
     uint64_t d0 = g_vj_lazy_deferred, f0 = g_vj_lazy_flushes, x0 = g_vj_lazy_forced;
     uint64_t first_p = 0, first_g = 0, last_p = 0, last_g = 0;
     uint32_t built = 1;
@@ -27201,6 +27319,28 @@ static void cmd_vfs_append_bench(int argc, char **argv) {
             (g_vblk_writes - vw0) + (g_vblk_reads - vr0));
     kprintf("[vfsapp ] deferred %u append commit(s), %u flush(es), %u forced\n",
             g_vj_lazy_deferred - d0, g_vj_lazy_flushes - f0, g_vj_lazy_forced - x0);
+    /* Phase 7b sizing, printed so the estimate is read off the machine rather
+     * than off an assumption about bitmap geometry. `scoped` is what the same
+     * workload would cost if the flush wrote the superblock plus only the ONE
+     * bitmap block a stored put dirties, and nothing but the superblock on a
+     * dedup hit -- the upper bound on the proposed refactor, before deciding
+     * whether it is worth the correctness surface. */
+    {
+        uint64_t puts = SB->put_count - pc0, dedup = SB->dedup_hits - dh0;
+        uint64_t stored = puts > dedup ? puts - dedup : 0;
+        uint64_t cfc = g_cfm_calls - cfc0, cfb = g_cfm_blocks - cfb0;
+        uint64_t cfs = g_cfm_saved - cfs0;
+        uint64_t tot = g_vblk_writes - vw0;
+        kprintf("[vfsapp ] cas puts: %u total = %u dedup + %u stored (bitmap_blocks %u)\n",
+                puts, dedup, stored, SB->bitmap_blocks);
+        kprintf("[vfsapp ] cas_flush_meta: %u call(s), %u block write(s) = %u%% of %u write(s)\n",
+                cfc, cfb, tot ? cfb * 100u / tot : 0, tot);
+        /* v1.5: what the dirty-range scoping actually removed, counted rather
+         * than predicted. A saving that is not measured in the build that
+         * ships it is a belief. */
+        kprintf("[vfsapp ] cas_flush_meta dirty-scoped: %u block write(s) AVOIDED (unscoped would be %u)\n",
+                cfs, cfb + cfs);
+    }
     kprintf("[vfsapp ] file: %u bytes, %u chunks, ind3 %s\n",
             (uint64_t)DENTS[di].len, (uint64_t)DENTS[di].nchunks,
             vfs_ind3_get(&DENTS[di]) ? "IN USE" : "unused");
