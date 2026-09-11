@@ -43,7 +43,20 @@ ISO=${1:?usage: gate-dirty.sh <iso> [boots] [extra-qemu-args] [workdir]}
 BOOTS=${2:-3}
 EXTRA=${3:-}
 WORK=${4:-build/gate-dirty}
-CAP=${GATE_DIRTY_CAP:-480}
+# v1.4: 480 -> 900. This is the deadline for boot 1 to REACH THE PROMPT before
+# the harness types into it, and 480 stopped being enough: the v1.2 ind2/ind3
+# boundary test builds a 4,176-chunk file in `validate` and costs ~140 s, which
+# took a boot that reached the prompt in ~470 s to ~610 s. The fresh gate was
+# green throughout, because `make gate` never types anything and so never waits
+# for a prompt.
+#
+# THE FAILURE WAS SILENT IN THE WORST WAY. Missing the window does not report
+# "too slow": boot 1 never runs cascrashwrite, so no cross-boot artefact is
+# created, and boots 2 and 3 then find no marker and correctly assert NOTHING.
+# The gate only caught it because it separately checks that the artefacts were
+# created at all -- the check that exists precisely because this class of
+# failure looks like a pass.
+CAP=${GATE_DIRTY_CAP:-900}
 
 [ -r "$ISO" ] || { echo "gate-dirty: cannot read ISO '$ISO'"; exit 2; }
 command -v qemu-system-x86_64 >/dev/null || { echo "gate-dirty: qemu-system-x86_64 not found"; exit 2; }

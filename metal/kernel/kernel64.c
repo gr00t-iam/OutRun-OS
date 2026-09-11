@@ -5722,8 +5722,22 @@ static int virtio_blk_request(uint32_t type, uint64_t sector, void *buffer) {
     }
 }
 
-int virtio_read_block(uint64_t sector, void *buffer)        { return virtio_blk_request(VIRTIO_BLK_T_IN,  sector, buffer); }
-int virtio_write_block(uint64_t sector, const void *buffer) { return virtio_blk_request(VIRTIO_BLK_T_OUT, sector, (void *)buffer); }
+/* v1.4: DISK TRANSACTIONS, COUNTED. Three phases in a row have been planned
+ * against a guess about where the time goes and three have been wrong -- the
+ * chunk map, the indirect rebuild, the journal. Every one of them was settled
+ * by a counter after the fact. These two count the thing that is actually slow
+ * under TCG, a virtqueue round trip, so the next question about the I/O floor
+ * is answered before the work rather than after it. Live in a shipping build
+ * and printed by `vfsappend`. */
+static volatile uint64_t g_vblk_reads = 0, g_vblk_writes = 0;
+int virtio_read_block(uint64_t sector, void *buffer) {
+    __sync_fetch_and_add(&g_vblk_reads, 1);
+    return virtio_blk_request(VIRTIO_BLK_T_IN,  sector, buffer);
+}
+int virtio_write_block(uint64_t sector, const void *buffer) {
+    __sync_fetch_and_add(&g_vblk_writes, 1);
+    return virtio_blk_request(VIRTIO_BLK_T_OUT, sector, (void *)buffer);
+}
 
 /* ===========================================================================
  * VIRTIO-NET DRIVER + ASYNC IRQ ROUTING  (Phase 3)
@@ -27011,6 +27025,26 @@ static void smpr_thread(void *arg) {
     __sync_fetch_and_sub(&g_smpr_left, 1);
 }
 
+/* v1.4: THE DEFERRED-FLUSH CRASH MARKER.
+ *
+ * Phase 6 made an append mark its dirent dirty and return without touching the
+ * disk, and argued that a crash before the flush leaves the filesystem
+ * CONSISTENT even though it may not leave it CURRENT. That was an argument
+ * from the code and the ordering. It is now an experiment: `cascrashwrite`
+ * leaves a file whose base is durable and whose appends are deferred, then
+ * halts; a completely separate QEMU process, booting the same volume, judges
+ * what survived.
+ *
+ * Both halves derive the content from the CHUNK INDEX through this one
+ * function, so the writing boot and the judging boot cannot disagree about
+ * what the bytes should have been. */
+#define LZC_NAME  "vlazy-crash"
+#define LZC_BASE  1                    /* chunks made durable before the halt  */
+#define LZC_APPEND 7                   /* chunks appended and left DEFERRED    */
+static uint8_t lzc_byte(uint32_t chunk, uint32_t off) {
+    return (uint8_t)(chunk * 23u + off * 7u + 1u);
+}
+
 static void cmd_smp_vfs_race(void) {
     kputs("-- SMP VFS RACE: concurrent map patching and reads on one file --\n");
     if (!g_cas_mounted) { kputs("[smprace] CAS not mounted\n-- done --\n"); return; }
@@ -27125,6 +27159,7 @@ static void cmd_vfs_append_bench(int argc, char **argv) {
     /* v1.3: the journal is the other half of the cost, and after the Phase 5
      * map work it was ALL of it. Counted here so the two can be compared. */
     uint64_t c0 = g_vj_commits, b0 = g_vj_blocks_written;
+    uint64_t vr0 = g_vblk_reads, vw0 = g_vblk_writes;
     uint64_t d0 = g_vj_lazy_deferred, f0 = g_vj_lazy_flushes, x0 = g_vj_lazy_forced;
     uint64_t first_p = 0, first_g = 0, last_p = 0, last_g = 0;
     uint32_t built = 1;
@@ -27158,6 +27193,12 @@ static void cmd_vfs_append_bench(int argc, char **argv) {
             first_p ? last_p / first_p : 0, first_p ? (last_p * 10u / first_p) % 10u : 0,
             first_g ? last_g / first_g : 0, first_g ? (last_g * 10u / first_g) % 10u : 0);
     kprintf("[vfsapp ] journal: %u commits, %u disk blocks written\n", jc, jb);
+    /* THE FLOOR, ITEMISED. Every one of these is a virtqueue round trip, and
+     * under TCG a round trip is the unit of cost -- so this is the number any
+     * further optimisation of this path has to move. */
+    kprintf("[vfsapp ] virtio-blk: %u write(s), %u read(s) = %u transactions\n",
+            g_vblk_writes - vw0, g_vblk_reads - vr0,
+            (g_vblk_writes - vw0) + (g_vblk_reads - vr0));
     kprintf("[vfsapp ] deferred %u append commit(s), %u flush(es), %u forced\n",
             g_vj_lazy_deferred - d0, g_vj_lazy_flushes - f0, g_vj_lazy_forced - x0);
     kprintf("[vfsapp ] file: %u bytes, %u chunks, ind3 %s\n",
@@ -29488,6 +29529,92 @@ static void cmd_vfs_stress(void) {
                      "SUPERBLOCK shadow was replayed too and not only the bitmap block",
                      SB->used_blocks == crpop);
             kputs("[vfsstrs] cas cross-reboot: VERIFIED\n");
+        }
+    }
+
+    /* ===== v1.4: CROSS-REBOOT RECOVERY OF A DEFERRED FLUSH ==================
+     *
+     * Phase 6 made an append mark its dirent and return without touching the
+     * disk, and argued that a crash before the flush leaves the filesystem
+     * CONSISTENT even if it does not leave it CURRENT. That was reasoning from
+     * the ordering. This is the experiment: a prior boot ran `cascrashwrite`,
+     * which made LZC_BASE chunks durable, appended LZC_APPEND more and left
+     * them DEFERRED, and halted. This boot judges what survived.
+     *
+     * WHAT IS AND IS NOT ASSERTED. The recovered length is NOT required to be
+     * any particular value -- that is the whole point of a deferred flush, and
+     * demanding the appends came back would be asserting the opposite of the
+     * design. It IS required to be one of the states the design permits:
+     *
+     *   1. a whole number of chunks, between the durable base and everything
+     *      that was staged. A length outside that range means recovery
+     *      invented or lost something nobody wrote.
+     *   2. EVERY chunk the dirent still names must resolve AND read back with
+     *      the bytes that chunk index was written with. This is the real
+     *      assertion: a directory that names a chunk the store cannot produce
+     *      is a dangling reference, and it is exactly what a torn map patch or
+     *      a half-published journal would leave.
+     *   3. volume-wide index/bitmap agreement, so the recovery did not repair
+     *      this file by breaking the store.
+     *
+     * ON A FRESH VOLUME THIS ASSERTS NOTHING and says so, exactly as the CAS
+     * phase above does: the four fresh-image gate tiers have no prior boot, so
+     * their assertion counts are unchanged and the dirty gate is where this
+     * has teeth. ==================================================== */
+    {
+        static uint8_t lz_want[CAS_BS], lz_got[CAS_BS];
+        int lzi = vfs_find(LZC_NAME);
+        if (lzi < 0) {
+            kprintf("[vfsstrs] lazy cross-reboot: '%s' NOT on this volume — no prior boot ran "
+                    "`cascrashwrite`. Nothing asserted\n", LZC_NAME);
+        } else {
+            uint32_t lzlen = DENTS[lzi].len;
+            uint32_t lznch = lzlen / 512u;
+            int whole  = (lzlen % 512u) == 0;
+            int inrange = lznch >= LZC_BASE && lznch <= (uint32_t)(LZC_BASE + LZC_APPEND);
+            /* Every chunk it still names must be THERE and be RIGHT. */
+            int resolved = 1, exact = 1;
+            uint32_t firstbad = 0;
+            for (uint32_t c = 0; c < lznch && resolved && exact; c++) {
+                klock_acquire(&g_vfs_lock);
+                uint64_t ch = vfs_chunk_hash_at(&DENTS[lzi], c);
+                klock_release(&g_vfs_lock);
+                if (!ch) { resolved = 0; firstbad = c; break; }
+                int64_t got = cas_get(ch, lz_got, sizeof lz_got);
+                if (got != (int64_t)CAS_BS) { resolved = 0; firstbad = c; break; }
+                for (uint32_t i = 0; i < CAS_BS; i++) lz_want[i] = lzc_byte(c, i);
+                for (uint32_t i = 0; i < CAS_BS; i++)
+                    if (lz_got[i] != lz_want[i]) { exact = 0; firstbad = c; break; }
+            }
+            uint64_t lzlive, lzdang;
+            klock_acquire(&g_cas_lock);
+            cas_index_verify_locked(&lzlive, &lzdang);
+            klock_release(&g_cas_lock);
+
+            kprintf("[vfsstrs] lazy cross-reboot: '%s' came back %u byte(s) = %u chunk(s) "
+                    "(base %u, staged %u); every named chunk %s, bytes %s, dangling %u\n",
+                    LZC_NAME, (uint64_t)lzlen, (uint64_t)lznch, (uint64_t)LZC_BASE,
+                    (uint64_t)(LZC_BASE + LZC_APPEND),
+                    resolved ? "RESOLVED" : "*** MISSING ***",
+                    exact ? "EXACT" : "*** WRONG ***", lzdang);
+            if (!resolved || !exact)
+                kprintf("[vfsstrs] lazy cross-reboot: first bad chunk index %u\n",
+                        (uint64_t)firstbad);
+
+            vfscheck("lazy cross-reboot: the recovered length is a whole number of chunks "
+                     "(a partial chunk would mean the dirent outran its map)", whole);
+            vfscheck("lazy cross-reboot: the recovered length is between the durable base and "
+                     "everything staged — recovery neither invented nor lost a chunk nobody "
+                     "wrote", inrange);
+            vfscheck("lazy cross-reboot: EVERY chunk the dirent still names resolves through the "
+                     "map and the store can produce it (no dangling reference from a half-"
+                     "published journal or a torn map patch)", resolved);
+            vfscheck("lazy cross-reboot: every chunk that survived reads back with the bytes its "
+                     "index was written with (a file that comes back describing content it "
+                     "cannot produce is worse than one that lost the appends)", exact);
+            vfscheck("lazy cross-reboot: volume-wide index/bitmap agreement holds (dangling == 0 "
+                     "— the deferred appends left no orphaned reference behind)", lzdang == 0);
+            kputs("[vfsstrs] lazy cross-reboot: VERIFIED\n");
         }
     }
 
@@ -38872,6 +38999,22 @@ static void shell_exec(char *line) {
          * this instead; vfscrashwrite is kept for interactive use and because
          * a fixture that has been green for forty milestones is not something to
          * delete on the way past. */
+        /* v1.4: THE DEFERRED-APPEND ARM, staged FIRST and appended LAST.
+         *
+         * The ORDER of these two statements against the rest of this command
+         * is the whole experiment, and it is dictated by Phase 6's own design:
+         * an EAGER commit stages every deferred dirent into its own
+         * transaction before publishing. So the base has to be made durable
+         * before the eager writes below, and the appends have to happen AFTER
+         * them -- otherwise the vfs-reboot-test commit would carry the
+         * appends to disk and there would be nothing deferred left to crash. */
+        static uint8_t lzc[512];
+        for (uint32_t i = 0; i < sizeof lzc; i++) lzc[i] = lzc_byte(0, i);
+        vfs_write_file(LZC_NAME, lzc, sizeof lzc);
+        klock_acquire(&g_vfs_lock);
+        vfs_journal_apply();               /* the BASE is now home, journal clean */
+        klock_release(&g_vfs_lock);
+
         static const uint8_t crashpat3[24] = "CROSS-REBOOT-JOURNAL-OK";
         vfs_write_file("vfs-reboot-test", crashpat3, sizeof crashpat3);
         int64_t cb = cas_crash_stage();
@@ -38881,6 +39024,26 @@ static void shell_exec(char *line) {
         else
             kprintf("[cas    ] cascrashwrite: staged an INTERRUPTED put of block %d — cjournal "
                     "PENDING, home bitmap and superblock NOT flushed\n", (uint64_t)cb);
+        /* NOW the deferred appends, after every eager commit above. */
+        int lzi = vfs_find(LZC_NAME);
+        uint32_t staged = 0;
+        for (uint32_t c = 1; c <= LZC_APPEND && lzi >= 0; c++) {
+            for (uint32_t i = 0; i < sizeof lzc; i++) lzc[i] = lzc_byte(c, i);
+            klock_acquire(&g_vfs_lock);
+            int rr = vfs_append_locked(lzi, (uint64_t)c * 512, lzc, sizeof lzc);
+            klock_release(&g_vfs_lock);
+            if (rr == 1) staged++;
+        }
+        /* THE PREMISE, PRINTED. If nothing is pending at the halt the next boot
+         * has nothing to judge, and a run that asserted anyway would be
+         * asserting about a crash that did not happen. */
+        kprintf("[vfs    ] cascrashwrite: '%s' base %u chunk(s) DURABLE, %u append(s) "
+                "staged, %u dirent(s) pending an unflushed journal epoch\n",
+                LZC_NAME, (uint64_t)LZC_BASE, (uint64_t)staged, (uint64_t)g_vj_lazy_n);
+        if (!g_vj_lazy_n)
+            kputs("[vfs    ] cascrashwrite: WARNING nothing is deferred — the epoch "
+                  "fired during staging and the next boot will assert nothing\n");
+
         kputs("[vfs    ] cascrashwrite: journal-committed 'vfs-reboot-test', halting WITHOUT sync (simulated power loss)\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
