@@ -126,9 +126,31 @@ class Qmp:
         self.cmd("input-send-event",
                  events=[{"type": "key", "data": {"down": True,
                           "key": {"type": "qcode", "data": name}}},
-                         {"type": "key", "data": {"down": False,
+                        {"type": "key", "data": {"down": False,
                           "key": {"type": "qcode", "data": name}}}])
         time.sleep(0.3)
+
+    def chord(self, modifier, name):
+        """Hold `modifier`, press and release `name`, then release `modifier`.
+
+        Sent as ONE input-send-event so QEMU delivers the four scancodes in
+        order without another event interleaving. A chord assembled from two
+        separate key() calls would release Ctrl before the letter arrived and
+        the guest would see a plain keystroke -- which is indistinguishable
+        from a driver that ignores Ctrl entirely, and would let this test pass
+        against the very bug it exists to catch.
+        """
+        self.cmd("input-send-event", events=[
+            {"type": "key", "data": {"down": True,
+             "key": {"type": "qcode", "data": modifier}}},
+            {"type": "key", "data": {"down": True,
+             "key": {"type": "qcode", "data": name}}},
+            {"type": "key", "data": {"down": False,
+             "key": {"type": "qcode", "data": name}}},
+            {"type": "key", "data": {"down": False,
+             "key": {"type": "qcode", "data": modifier}}},
+        ])
+        time.sleep(0.5)
 
     def screenshot(self, path):
         """What the screen actually shows, as a PPM the caller can inspect.
@@ -198,6 +220,40 @@ def main():
         check("the editor is launched at boot", wait_for("launched 'VAULT PAD'", STEP_DEADLINE))
         check("a frame is composited with a window on it",
               wait_for("window(s), 1 launched, 0 launch failure", STEP_DEADLINE))
+
+        # CTRL CHORDS, END TO END: QMP scancodes -> PS/2 IRQ -> kbd_ring ->
+        # wimp_input_step -> the focused window's event queue.
+        #
+        # This exists because the two halves of the shortcut path were wired
+        # independently and never met. vault_pad decoded 19/15/26/25 as
+        # save/open/undo/redo from the day it was written, but keyboard_irq()
+        # tracked only Shift, so scancode 0x1D became an ordinary character and
+        # NO chord could ever be produced. Both halves looked complete in
+        # isolation; only a test that presses the real key crosses the gap.
+        #
+        # VAULT PAD is launched at boot and holds focus here, so the chord is
+        # delivered to a real window rather than to the desktop.
+        #
+        # The assertion reads the kernel's routing line rather than the screen:
+        # a chord is CONSUMED by the application, so unlike a printable key it
+        # leaves nothing visible to photograph. Asserting on the code (19) and
+        # not merely on "some control character" is what stops a driver that
+        # mapped Ctrl+S to the wrong letter from passing.
+        mark = size_of(LOG)
+        qmp.chord("ctrl", "s")
+        check("Ctrl+S reaches the focused window as code 19 (^S)",
+              wait_for("ctrl chord ^S (code 19)", STEP_DEADLINE, mark))
+        mark = size_of(LOG)
+        qmp.chord("ctrl", "o")
+        check("Ctrl+O reaches the focused window as code 15 (^O)",
+              wait_for("ctrl chord ^O (code 15)", STEP_DEADLINE, mark))
+        # A letter with no modifier must NOT be promoted to a control code --
+        # the chord path has to be gated on Ctrl actually being held, not on
+        # the letter alone.
+        mark = size_of(LOG)
+        qmp.key("s")
+        check("a bare 's' is not mistaken for a chord",
+              not wait_for("ctrl chord", 6, mark))
 
         # New apps must exercise their actual launcher, input, publication and
         # teardown paths before the original four-window tests. Reuse slot 1

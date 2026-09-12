@@ -32380,6 +32380,20 @@ static void wimp_input_step(void) {
          * wanted is delivered to the application. */
         if (wimp_key(ch)) continue;
         g_desk_last_key = ch; g_desk_key_tick = g_ticks; g_desk_key_repeats = 0;
+        /* v1.6: name the CONTROL characters on their way to a window.
+         *
+         * Ctrl chords are the one class of key whose arrival cannot be
+         * observed from outside: a printable key shows up in the document, but
+         * ^S is consumed by the application and leaves nothing on screen. With
+         * nothing logged, a guest test could only assert that the desktop did
+         * not crash -- which is exactly the "counter nothing prints" trap this
+         * tree has been caught by before.
+         *
+         * Printable keys are deliberately NOT logged: they arrive by the
+         * hundred during the soak and would bury the serial log. */
+        if (ch > 0 && ch < 32 && ch != '\n' && ch != '\r' && ch != '\t')
+            kprintf("[desktop] ctrl chord ^%c (code %u) -> window %d\n",
+                    (uint64_t)('A' + ch - 1), (uint64_t)ch, (uint64_t)g_wm_focus);
         klock_acquire(&g_wm_lock);
         if (g_wm_focus >= 0 && g_wmwin[g_wm_focus].used)
             wm_queue_event(g_wm_focus, 2 /*key*/, 0, 0, ch);
