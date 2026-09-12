@@ -12,15 +12,54 @@ struct vp_editor {
      * withdraws it. */
     char clip[VP_CLIP_CAP+1], origin[VP_NAME_CAP+1];
     int len, cursor, dirty, top, left, name_len, name_cursor, focus, command, confirm;
+    char undo_text[VP_CAP+1];
+    int undo_len,undo_cursor,undo_valid,redo,menu;
+    /* The content this buffer last agreed with on disk (or the empty document
+     * it started as). `dirty` is derived from this on undo/redo, so stepping
+     * back onto saved content correctly reports SAVED rather than MODIFIED. */
+    char clean_text[VP_CAP+1];
+    int clean_len;
     const char *status;
 };
 static void vp_init(struct vp_editor *e) {
     e->text[0]=0; e->len=e->cursor=e->dirty=e->top=e->left=0;
     e->focus=e->command=e->confirm=0; e->status="READY";
     e->clip[0]=0; e->origin[0]=0;
+    e->undo_valid=e->redo=e->menu=0;
+    e->clean_text[0]=0; e->clean_len=0;
     const char *s="notes.txt"; int i=0;
     do { e->filename[i]=s[i]; } while(s[i++]);
     e->name_len=e->name_cursor=i-1;
+}
+static void vp_checkpoint(struct vp_editor *e) {
+    for(int i=0;i<=e->len;i++) e->undo_text[i]=e->text[i];
+    e->undo_len=e->len; e->undo_cursor=e->cursor; e->undo_valid=1; e->redo=0;
+}
+/* Record the buffer as agreeing with disk. Called wherever `dirty` is cleared:
+ * init, open and save. */
+static void vp_mark_clean(struct vp_editor *e) {
+    for(int i=0;i<=e->len;i++) e->clean_text[i]=e->text[i];
+    e->clean_len=e->len; e->dirty=0;
+}
+static int vp_matches_clean(const struct vp_editor *e) {
+    if(e->len!=e->clean_len) return 0;
+    for(int i=0;i<e->len;i++) if(e->text[i]!=e->clean_text[i]) return 0;
+    return 1;
+}
+static void vp_undo(struct vp_editor *e,int redo) {
+    if(!e->undo_valid || e->redo!=redo) { e->status="NOTHING TO UNDO / REDO"; return; }
+    int max=e->len>e->undo_len?e->len:e->undo_len;
+    for(int i=0;i<=max;i++) { char c=e->text[i]; e->text[i]=e->undo_text[i]; e->undo_text[i]=c; }
+    int n=e->len; e->len=e->undo_len; e->undo_len=n;
+    n=e->cursor; e->cursor=e->undo_cursor; e->undo_cursor=n;
+    /* Undo is not inherently a modification: stepping back onto the content
+     * this buffer was last opened or saved with leaves the file and the buffer
+     * in agreement, so reporting "* MODIFIED" there would send the user to save
+     * a document identical to the one on disk. Compare against the clean
+     * baseline rather than assuming any edit dirties the buffer. */
+    e->redo=!redo;
+    e->dirty = !vp_matches_clean(e);
+    e->status=redo?"REDONE":"UNDONE";
 }
 static int vp_insert(struct vp_editor *e, int c) {
     if(e->len>=VP_CAP) { e->status="BUFFER FULL"; return 0; }
@@ -134,7 +173,7 @@ static int vp_open(struct vp_editor *e,vp_io_fn io) {
     if(!ok) { e->status="READ FAILED OR FILE TOO LARGE"; return 0; }
     for(int i=0;i<n;i++) e->text[i]=vp_staging[i];
     e->text[n]=0; e->len=n; e->cursor=e->top=e->left=0;
-    e->dirty=0; e->status="OPENED"; vp_adopt(e); return 1;
+    e->undo_valid=0; vp_mark_clean(e); e->status="OPENED"; vp_adopt(e); return 1;
 }
 static int vp_save(struct vp_editor *e,vp_io_fn io) {
     if(!e->filename[0]) { e->confirm=0; e->status="FILENAME REQUIRED"; return 0; }
@@ -162,12 +201,45 @@ static int vp_save(struct vp_editor *e,vp_io_fn io) {
     if(io(8,fd,0,0)<0) ok=0;
     if(ok && io(22,0,0,0)<0) ok=0;
     if(!ok) { e->status="SAVE FAILED: DISK MAY BE PARTIAL"; return 0; }
-    e->dirty=0; e->status="SAVED"; vp_adopt(e); return 1;
+    vp_mark_clean(e); e->status="SAVED"; vp_adopt(e); return 1;
 }
 enum { VP_NONE, VP_OPEN, VP_SAVE };
 /* The shipping PS/2 map emits ASCII only, not arrows or Ctrl chords.
  * Escape toggles a documented command mode, usable on the actual keyboard. */
 static int vp_key(struct vp_editor *e,int c) {
+    if(c==19) return VP_SAVE;
+    if(c==15) return VP_OPEN;
+    /* Undo/redo withdraw a pending overwrite question like any other key. These
+     * return early, so they must do it themselves -- the general withdrawal
+     * below is downstream of here and would never be reached. Leaving `confirm`
+     * set would mean the NEXT save silently overwrote a file the user was still
+     * being asked about, after they had changed the buffer underneath it. */
+    if(c==26 || c==25) { e->confirm=0; vp_undo(e,c==25); return VP_NONE; }
+    if(e->command && (c=='z' || c=='Z')) { e->confirm=0; vp_undo(e,c=='Z'); return VP_NONE; }
+    /* Checkpoint only for a key that will ACTUALLY change the buffer.
+     *
+     * This used to checkpoint for every editing key, including ones that turn
+     * out to be no-ops: a backspace at the start of the buffer, or a forward
+     * delete at the end, returns from vp_delete() having changed nothing, but
+     * the undo slot had already been overwritten with the current (identical)
+     * text. The visible effect is that a stray backspace at column 0 silently
+     * DISCARDS the user's undo history -- the edit they actually wanted back is
+     * gone, replaced by a snapshot of the unchanged buffer.
+     *
+     * A paste is the same story when the clipboard is empty, which is why
+     * 'p' is tested here too rather than assumed to be a mutation. */
+    int mutating = 0;
+    if(!e->focus) {
+        if(!e->command) {
+            if(c==8)        mutating = e->cursor > 0;          /* backspace: not at BOL */
+            else if(c==127) mutating = e->cursor < e->len;     /* delete: not at EOF   */
+            else if(c==10 || c==13 || (c>=32 && c<=126)) mutating = 1;
+        } else {
+            if(c=='x' || c=='D') mutating = 1;
+            else if(c=='p')      mutating = e->clip[0] != 0;   /* empty paste changes nothing */
+        }
+    }
+    if(mutating) vp_checkpoint(e);
     /* Every key but a repeated save withdraws a pending overwrite question. */
     if(!(e->command && c=='s')) e->confirm=0;
     if(c==27) { e->command=!e->command; return VP_NONE; }
@@ -221,6 +293,44 @@ static int vp_key(struct vp_editor *e,int c) {
 }
 static int vp_click(struct vp_editor *e,int x,int y,int w,int h) {
     if(x<0 || y<0 || x>=w || y>=h) return VP_NONE;
+    /* A click is user interaction, so it withdraws a pending overwrite question
+     * exactly as a keystroke does. Placed AFTER the bounds check: a click that
+     * missed the window is not an answer to anything. The save button itself is
+     * the one action that must survive this, and it re-arms `confirm` on its
+     * own path -- the withdrawal here only clears the question, it never
+     * answers it, so a second deliberate save is still required to overwrite. */
+    e->confirm=0;
+    if(y>=34 && y<54 && x<192) { e->menu=e->menu==x/64+1?0:x/64+1; return VP_NONE; }
+    if(e->menu) {
+        int menu=e->menu,item=(y-56)/24; e->menu=0;
+        if(x<(menu-1)*64 || x>=(menu-1)*64+192 || y<56 || item>=4) return VP_NONE;
+        if(menu==1) {
+            /* File > New. The old buffer's undo history belongs to the OLD
+             * document: carrying it into the new one lets a single undo resurrect
+             * the previous file's text into a buffer the user believes is empty,
+             * and then a save writes it to the new filename. Start a distinct
+             * history instead, and mark the empty buffer clean so it is not
+             * reported as unsaved work before a single key is pressed. */
+            if(item==0) { if(e->dirty) e->status="UNSAVED: SAVE BEFORE NEW"; else { e->text[0]=0; e->len=e->cursor=e->top=e->left=0; e->origin[0]=0; e->undo_valid=e->redo=0; vp_mark_clean(e); e->status="NEW DOCUMENT"; } }
+            if(item==1) return VP_OPEN;
+            if(item==2) return VP_SAVE;
+            /* Save as: the point is to TYPE a filename, so leave command mode as
+             * well as focusing the field. Without clearing it, the very next
+             * keystroke is read as a command ('x' cuts, 'p' pastes) instead of
+             * a character of the name the user was just asked for. */
+            if(item==3) { e->focus=1; e->command=0; e->name_cursor=e->name_len; e->status="EDIT FILENAME THEN SAVE"; }
+        } else if(menu==2) {
+            if(item==0) vp_undo(e,e->redo);
+            if(item==1) vp_yank(e);
+            if(item==2) { vp_checkpoint(e); vp_cut(e); }
+            if(item==3) { vp_checkpoint(e); vp_paste(e); }
+        } else {
+            if(item<2) for(int i=0;i<(h-104)/16;i++) vp_move(e,item==0?VP_UP:VP_DOWN);
+            if(item==2) e->cursor=0;
+            if(item==3) e->cursor=e->len;
+        }
+        return VP_NONE;
+    }
     if(y>=8 && y<32) {
         if(x>=w-144 && x<w-80) return VP_OPEN;
         if(x>=w-72 && x<w-8) return VP_SAVE;
@@ -259,7 +369,8 @@ static void vp_paint(struct vp_editor *e,int w,int h,vp_draw_fn draw,void *ctx) 
     draw(ctx,w-144,8,64,24,0x28495d,0); draw(ctx,w-72,8,64,24,0x533a63,0);
     vp_label(draw,ctx,w-136,12,"OPEN",0xffffff,6);
     vp_label(draw,ctx,w-64,12,"SAVE",0xffffff,6);
-    vp_label(draw,ctx,8,36,"ESC cmd: hjkl 0/$ g/G move | x del | y/D/p copy/cut/paste line | s/o save/open",0x8ba4bc,cols);
+    vp_label(draw,ctx,8,36,"File    Edit    View",0xe6f2ff,cols);
+    vp_label(draw,ctx,208,36,"Esc: commands | z/Z undo/redo",0x8ba4bc,cols-26);
     int row=0,col=0;
     for(int i=0;i<e->len && row<e->top+rows;i++) {
         unsigned char c=(unsigned char)e->text[i];
@@ -277,7 +388,13 @@ static void vp_paint(struct vp_editor *e,int w,int h,vp_draw_fn draw,void *ctx) 
     vp_label(draw,ctx,192,h-44,"LN",0xb8c8df,2); vp_number(draw,ctx,216,h-44,row+1);
     vp_label(draw,ctx,280,h-44,"COL",0xb8c8df,3); vp_number(draw,ctx,312,h-44,col+1);
     vp_label(draw,ctx,8,h-24,e->status,0xb8c8df,cols);
-    vp_label(draw,ctx,w-176,h-24,"TAB: filename / text",0x8ba4bc,21);
+    vp_label(draw,ctx,w-176,h-24,"BYTES",0x8ba4bc,5); vp_number(draw,ctx,w-128,h-24,e->len);
+    if(e->menu) {
+        static const char *items[3][4]={{"New (saved buffer)","Open    Ctrl+O","Save    Ctrl+S","Save as: filename"},{"Undo / Redo  z/Z","Copy line","Cut line","Paste line"},{"Page up","Page down","Document start","Document end"}};
+        int x=(e->menu-1)*64;
+        draw(ctx,x,56,192,96,0x344255,0);
+        for(int i=0;i<4;i++) vp_label(draw,ctx,x+8,64+i*24,items[e->menu-1][i],0xe6f2ff,22);
+    }
 }
 #endif
 
