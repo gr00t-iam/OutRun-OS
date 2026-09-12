@@ -42,7 +42,7 @@ application's own SAVED line rather than by a guess.
 """
 import hashlib, json, os, re, socket, struct, subprocess, sys, time
 
-ISO = sys.argv[1] if len(sys.argv) > 1 else "build/outrun-desktop-1.0.0.iso"
+ISO = sys.argv[1] if len(sys.argv) > 1 else "build/outrun-desktop-1.1.0.iso"
 LOG = sys.argv[2] if len(sys.argv) > 2 else "/tmp/desktop-media.log"
 IMG = LOG + ".vblk.img"
 QMP, W, H = "/tmp/outrun-media.qmp", 1024, 768

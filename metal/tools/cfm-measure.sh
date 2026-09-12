@@ -19,7 +19,7 @@ dd if=/dev/zero of=build/cfm2.img bs=1M count=4 2>/dev/null
   done
   sleep 3
 } | timeout 1800 qemu-system-x86_64 \
-      -cdrom build/outrun-os-1.0.0.iso -m 512M -nographic -no-reboot \
+      -cdrom build/outrun-os-1.1.0.iso -m 512M -nographic -no-reboot \
       -vga none -device virtio-vga \
       -drive file=build/cfm2.img,if=none,format=raw,id=vd0 \
       -device virtio-blk-pci,drive=vd0,disable-legacy=on,disable-modern=off \

@@ -25,7 +25,7 @@ OBJS := $(BUILD)/boot.o $(BUILD)/isr.o $(BUILD)/usermode.o $(BUILD)/switch.o $(B
 # artefact by its filename alone. At release time it becomes plain X.Y.Z and
 # KERNEL_VERSION becomes X.Y.Z-metal. release-version-check cross-checks all
 # three strings (this one, KERNEL_VERSION, and the grub menuentry).
-VERSION := 1.0.0
+VERSION := 1.1.0
 ISO  := $(BUILD)/outrun-os-$(VERSION).iso
 
 .PHONY: all qemu qemu-vga qemu-audio qemu-usb qemu-iommu qemu-nvme install-img clean

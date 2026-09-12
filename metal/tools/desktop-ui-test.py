@@ -13,7 +13,7 @@ naming its window count and launch tally.
 """
 import hashlib, json, os, re, socket, subprocess, sys, time
 
-ISO = sys.argv[1] if len(sys.argv) > 1 else "build/outrun-desktop-1.0.0.iso"
+ISO = sys.argv[1] if len(sys.argv) > 1 else "build/outrun-desktop-1.1.0.iso"
 LOG = sys.argv[2] if len(sys.argv) > 2 else "/tmp/desktop-ui.log"
 # Extra QEMU arguments, so one test can cover more than one machine shape.
 # `make desktop-test DESKTOP_QEMU="-smp 4"` is the -smp 4 desktop: the compositor

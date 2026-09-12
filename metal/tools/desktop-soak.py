@@ -41,7 +41,7 @@ _spec = importlib.util.spec_from_file_location(
 _ui = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_ui)
 
-ISO = sys.argv[1] if len(sys.argv) > 1 else "build/outrun-desktop-1.0.0.iso"
+ISO = sys.argv[1] if len(sys.argv) > 1 else "build/outrun-desktop-1.1.0.iso"
 LOG = sys.argv[2] if len(sys.argv) > 2 else "/tmp/desktop-soak.log"
 TARGET = int(sys.argv[3]) if len(sys.argv) > 3 else 50000
 EXTRA_QEMU = os.environ.get("SOAK_QEMU", "").split()
