@@ -558,6 +558,21 @@ static const char sc_map_shift[128] = {
 static volatile char kbd_ring[64];
 static volatile uint32_t kbd_w = 0, kbd_r = 0;
 static bool shift_down = false;
+/* v1.6: CONTROL, tracked the same way Shift already was.
+ *
+ * Every text application in this tree already DECODES control characters --
+ * vault_pad has taken 19/15/26/25 for save/open/undo/redo since it was written,
+ * and outrun_term routes ^A/^E/^U/^P/^N through term_key. Nothing could ever
+ * produce them: this handler tracked Shift alone, so scancode 0x1D fell through
+ * to sc_map and was delivered as an ordinary character. The shortcuts were
+ * unreachable code that looked implemented, which is the same shape as the
+ * launcher chips that were painted but never hit-tested.
+ *
+ * Ctrl+<letter> maps to 1..26 (the ASCII control block), which is the encoding
+ * those call sites already expect. Ctrl with a non-letter is DROPPED rather
+ * than delivered as its unmodified character: passing Ctrl+1 through as '1'
+ * would type into the document a user who is reaching for a shortcut. */
+static bool ctrl_down = false;
 #include "key_state.h"
 static volatile unsigned char g_key_held[128];
 
@@ -565,8 +580,11 @@ static void keyboard_irq(void) {
     uint8_t sc = inb(0x60);
     if (sc == 0x2A || sc == 0x36) { shift_down = true;  return; }
     if (sc == 0xAA || sc == 0xB6) { shift_down = false; return; }
+    if (sc == 0x1D)               { ctrl_down  = true;  return; }
+    if (sc == 0x9D)               { ctrl_down  = false; return; }
     if (sc & 0x80) { key_state_update(g_key_held, sc, 0); return; }
     char c = shift_down ? sc_map_shift[sc & 0x7F] : sc_map[sc & 0x7F];
+    if (ctrl_down) c = (char)key_ctrl_char((unsigned char)sc_map[sc & 0x7F]);
     key_state_update(g_key_held, sc, (unsigned char)c);
     if (c && ((kbd_w - kbd_r) < 64))
         kbd_ring[kbd_w++ % 64] = c;
