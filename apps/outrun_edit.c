@@ -116,6 +116,7 @@ static int code_replace(struct code_editor *e,const char *pattern,const char *re
     if(v->len-from>VP_CAP-n) { v->status="REPLACE WOULD EXCEED CAPACITY"; return -1; }
     while(from<v->len) vp_staging[n++]=v->text[from++];
     if(count) {
+        vp_checkpoint(v);
         for(int i=0;i<n;i++) v->text[i]=vp_staging[i];
         v->text[n]=0; v->len=n; v->cursor=0; v->dirty=1;
     }

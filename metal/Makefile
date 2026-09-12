@@ -127,10 +127,59 @@ $(BUILD)/user_init.elf: $(BUILD)/user_init.o user/user.ld
 # kernel64.c), so adding a program here is the whole of adding a program. They
 # share apps/gui.c and are held to the same -Wall -Wextra the kernel is: ring 3
 # being the quieter half is exactly how v0.77 hid three real defects.
-APPS      := vault_pad calc task_mgr settings outrun_term outrun_edit outrun_disks pci_view sys_trace net_deck outrun_snap outrun_media
+APPS      := vault_pad calc task_mgr settings outrun_term outrun_edit outrun_disks pci_view sys_trace net_deck outrun_snap outrun_media outrun_web
 APP_ELFS  := $(APPS:%=$(BUILD)/apps/%.elf)
 APP_SRC   := ../apps
 APP_DEPS  := $(APP_SRC)/gui.h $(APP_SRC)/font.h $(APP_SRC)/build_task.h ../include/outrun_abi.h $(APP_SRC)/bmp.h
+
+# ---- OutRun Web: the one application with a third-party dependency ----------
+# It needs Mbed TLS, which is vendored UNMODIFIED under apps/vendor/mbedtls and
+# must stay that way: the security value of a maintained TLS stack is precisely
+# that it is the upstream one. It therefore gets its own compile and link rules
+# rather than the generic single-object pattern above.
+#
+# Three things here are load-bearing:
+#
+#  * -Wno-error on the VENDORED sources only. Upstream is held to upstream's
+#    warning policy, not ours; our own code keeps -Werror. Applying our flags to
+#    a dependency would make every upstream bump a tree-wide build break, which
+#    is how a project ends up pinned to an old TLS library.
+#  * The CA trust store is GENERATED (tools/mk-ca-roots.py) into a header. The
+#    browser is a boot module with no path to a system trust store, so the roots
+#    it verifies against have to be in the binary and visible in the diff that
+#    changes them.
+#  * MBEDTLS_CONFIG_FILE selects the freestanding profile in
+#    apps/web_mbedtls_config.h -- no filesystem, no POSIX sockets, no time(2).
+WEB_SRC   := $(APP_SRC)/outrun_web.c
+WEB_VENDOR := $(APP_SRC)/vendor/mbedtls
+WEB_CA    := $(APP_SRC)/web_ca_roots.h
+WEB_LIB_SRC := $(wildcard $(WEB_VENDOR)/library/*.c)
+WEB_LIB_OBJ := $(patsubst $(WEB_VENDOR)/library/%.c,$(BUILD)/apps/mbedtls/%.o,$(WEB_LIB_SRC))
+WEB_CFLAGS := $(UCFLAGS) -I$(APP_SRC) -I$(WEB_VENDOR)/include \
+              -DMBEDTLS_CONFIG_FILE='"web_mbedtls_config.h"'
+
+$(WEB_CA): $(APP_SRC)/vendor/cacert.pem tools/mk-ca-roots.py
+	python3 tools/mk-ca-roots.py $< $@
+
+$(BUILD)/apps/mbedtls:
+	mkdir -p $@
+
+$(BUILD)/apps/mbedtls/%.o: $(WEB_VENDOR)/library/%.c | $(BUILD)/apps/mbedtls
+	$(CC) $(WEB_CFLAGS) -Wno-error -c $< -o $@
+
+$(BUILD)/apps/outrun_web.o: $(WEB_SRC) $(APP_DEPS) $(WEB_CA) | $(BUILD)/apps
+	$(CC) $(WEB_CFLAGS) -Werror $(UEXTRA) -c $< -o $@
+
+# The libc subset Mbed TLS expects from a hosted platform. See web_libc.c for
+# why this exists rather than a patch to the vendored tree.
+$(BUILD)/apps/web_libc.o: $(APP_SRC)/web_libc.c | $(BUILD)/apps
+	$(CC) $(WEB_CFLAGS) -Werror -c $< -o $@
+
+$(BUILD)/apps/outrun_web.elf: $(BUILD)/apps/outrun_web.o $(BUILD)/apps/gui.o \
+                              $(BUILD)/apps/web_libc.o $(WEB_LIB_OBJ) user/user.ld
+	$(LD) -n -T user/user.ld $< $(BUILD)/apps/gui.o $(BUILD)/apps/web_libc.o \
+	      $(WEB_LIB_OBJ) -o $@
+	@echo "  app linked: $@ (with vendored Mbed TLS)"
 
 $(BUILD)/apps:
 	mkdir -p $@

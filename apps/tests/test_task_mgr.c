@@ -121,6 +121,16 @@ static void test_graph_scale_peak_at_wrap(void) {
     assert(h[HISTORY - 1] == 50);  /* slot 2, newest: the peak */
 }
 int main(void) {
+    struct monitor_state paused = {0};
+    struct outrun_desktop_info snap = {.wall_ns=1,.frames_total=100,.frames_used=10};
+    monitor_sample(&paused,&snap);
+    monitor_control(&paused,'p'); snap.wall_ns=2; snap.frames_used=90;
+    monitor_sample(&paused,&snap); assert(paused.ram==10 && paused.count==1);
+    monitor_control(&paused,'p'); monitor_sample(&paused,&snap);
+    assert(paused.ram==90 && paused.cpu==0);
+    monitor_control(&paused,'c'); assert(paused.sort==SORT_CPU);
+    monitor_control(&paused,'i'); assert(paused.sort==SORT_PID);
+    monitor_control(&paused,'g'); assert(paused.fixed_scale);
     test_measured_deltas();
     test_sort_by_pid_ascending();
     test_sort_by_cpu_descending_is_stable();

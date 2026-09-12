@@ -19,6 +19,17 @@
 #define SYS_IPC_RECV 19
 #define SYS_VFS_SYNC 22
 #define SYS_VFS_UNLINK 23
+#define SYS_SOCKET 35
+#define SYS_BIND 36
+#define SYS_CONNECT 37
+#define SYS_SEND 38
+#define SYS_RECV 39
+#define OUTRUN_AF_INET 2
+#define OUTRUN_SOCK_STREAM 1
+#define OUTRUN_SOCK_DGRAM 2
+#define OUTRUN_SOCK_NONBLOCK 0x800
+/* IPv4 and port passed as host-order integers, not sockaddr pointers. */
+#define SYS_CLOCK_GETTIME 104
 #define SYS_WIN_CREATE 40
 #define SYS_WIN_DAMAGE 41
 #define SYS_WIN_POLL 42

@@ -32,6 +32,20 @@ int main(void) {
         for (int x = 0; x < 8; ++x)
             different |= glyphs[y*16+x] != glyphs[y*16+x+8];
     assert(different); /* an editor must display the actual letter case */
+    assert(app_text_width("iii") < app_text_width("WWW"));
+    assert(app_text_width("") == 0);
+    u32 aa_pixels[64*16]={0};
+    struct app_win aa={.cw=64,.ch=16,.surf=aa_pixels};
+    app_text(&aa,0,0,"Window",0xffffff);
+    int intermediate=0;
+    for(unsigned i=0;i<64*16;i++) if(aa_pixels[i] && aa_pixels[i]!=0xffffff) intermediate=1;
+    assert(intermediate && "UI font must contain antialiased coverage");
+    app_text(&text,-3,-2,"Wide",0xffffff);
+    app_button(&text,0,0,16,8,"OK",1);
+    assert(app_hit(2,3,0,0,4,4) && !app_hit(4,3,0,0,4,4));
+    assert(app_scroll_to(99,100,20)==80);
+    assert(app_scroll_to(-2,100,20)==0);
+    assert(app_scroll_to(5,10,20)==0);
     assert(sizeof(struct outrun_event) == 16);
     assert(sizeof(struct outrun_process) == 48);
     assert(sizeof(struct outrun_desktop_info) == 640);

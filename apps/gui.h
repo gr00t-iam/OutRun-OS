@@ -21,6 +21,12 @@ void app_fill(struct app_win *w, u32 c);
 void app_rect(struct app_win *w, int x, int y, int width, int height, u32 c);
 void app_char(struct app_win *w, int x, int y, char ch, u32 c);
 void app_str(struct app_win *w, int x, int y, const char *s, u32 c);
+/* Proportional UI typography; app_char/app_str remain the 8px text grid. */
+int app_text_width(const char *s);
+void app_text(struct app_win *w,int x,int y,const char *s,u32 color);
+void app_button(struct app_win *w,int x,int y,int width,int height,const char *label,int active);
+int app_hit(int px,int py,int x,int y,int width,int height);
+int app_scroll_to(int requested,int total,int visible);
 void app_u32(struct app_win *w, int x, int y, u32 value, u32 c);
 int app_poll(struct app_win *w, struct outrun_event *event);
 void app_title(struct app_win *w, const char *title);

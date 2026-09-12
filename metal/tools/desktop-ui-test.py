@@ -2,7 +2,7 @@
 """Drive the desktop image with real input events and check what it does.
 
 This is a UI test, so it uses the machine's actual input path: QMP
-`input-send-event` delivers absolute pointer moves and button presses to the
+`input-send-event` delivers relative pointer moves and button presses to the
 emulated PS/2 devices, exactly as a person at the keyboard would. Nothing here
 calls into the kernel's own routing helpers -- a test that drove wimp_pointer()
 directly would be verifying its own copy of the click path and not the one a
@@ -271,6 +271,25 @@ def main():
             ("NET DECK",    9, 430),
             ("SNAPSHOT",   10, 430),
             ("MEDIA",      11, 430),
+            # OutRun Web is tile 12 and the only app carrying PCAP_NETWORK. It
+            # is exercised here for the same reason as the rest: a launcher tile
+            # whose module is missing prints "no boot module" and otherwise
+            # looks exactly like a tile nobody clicked.
+            #
+            # The width MUST be the size the kernel actually grants, not the one
+            # the app asked for: SYS_WIN_CREATE clamps to WIN_MAX_W (600), and a
+            # width of 800 here put the close-box click 200 px past the real box,
+            # onto bare desktop. The window then never closed and every later
+            # check failed in a cascade that looked like a compositor fault.
+            #
+            # THE 44 BELOW IS ONLY VALID AT H=768. desk_tile_h() DERIVES the
+            # tile height from the available rail space, and 44 is merely its
+            # DESK_TILE_MAX clamp -- which this test happens to hit because it
+            # runs at 1024x768. At H=600 the real height is 41 and this click
+            # would land on tile 13; at scale 2 (384) it is 25 and lands on 21.
+            # If this test ever runs at another resolution, the coordinate must
+            # be derived the way the kernel derives it, not re-tuned by hand.
+            ("OUTRUN WEB", 12, 600),
         ]
         new_resting = []
         for label, tile, width in new_apps:

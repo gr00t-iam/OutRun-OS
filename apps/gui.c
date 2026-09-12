@@ -1,5 +1,6 @@
 #include "gui.h"
 #include "font.h"
+#include "ui_font.h"
 
 static void pixel(struct app_win *w, int x, int y, u32 c) {
     if ((unsigned)x < (unsigned)w->cw && (unsigned)y < (unsigned)w->ch)
@@ -27,6 +28,52 @@ void app_char(struct app_win *w, int x, int y, char ch, u32 c) {
 }
 void app_str(struct app_win *w, int x, int y, const char *s, u32 c) {
     for (; *s && x < w->cw; ++s, x += 8) app_char(w, x, y, *s, c);
+}
+/* UI labels use a baked antialiased proportional font. app_char/app_str keep
+ * their existing cell geometry for terminal output and editable source text. */
+int app_text_width(const char *s) {
+    int width=0;
+    for(;*s;s++) {
+        unsigned c=(u8)*s; if(c<32 || c>126) c='?';
+        int n=ui_font_advance[c-32];
+        if(width>2147483647-n) return 2147483647;
+        width+=n;
+    }
+    return width;
+}
+void app_text(struct app_win *w,int x,int y,const char *s,u32 color) {
+    i64 pen=x;
+    for(;*s && pen<w->cw;s++) {
+        unsigned c=(u8)*s; if(c<32 || c>126) c='?';
+        const u8 *glyph=ui_font_coverage[c-32];
+        for(int r=0;r<UI_FONT_H;r++) for(int col=0;col<UI_FONT_W;col++) {
+            i64 xx=pen+col, yy=(i64)y+r;
+            unsigned a=glyph[r*UI_FONT_W+col];
+            if(!a || xx<0 || yy<0 || xx>=w->cw || yy>=w->ch) continue;
+            u32 bg=w->surf[yy*w->cw+xx], out=0;
+            for(int shift=0;shift<=16;shift+=8)
+                out|=((((color>>shift)&255)*a+((bg>>shift)&255)*(255-a)+127)/255)<<shift;
+            w->surf[yy*w->cw+xx]=out;
+        }
+        pen+=ui_font_advance[c-32];
+    }
+}
+int app_hit(int px,int py,int x,int y,int width,int height) {
+    return width>0 && height>0 && (i64)px>=x && (i64)py>=y &&
+        (i64)px<(i64)x+width && (i64)py<(i64)y+height;
+}
+int app_scroll_to(int requested,int total,int visible) {
+    if(visible<1) visible=1;
+    int max=total>visible?total-visible:0;
+    return requested<0?0:requested>max?max:requested;
+}
+void app_button(struct app_win *w,int x,int y,int width,int height,const char *label,int active) {
+    if(width<2 || height<2) return;
+    app_rect(w,x,y,width,height,active?0x43687b:0x344255);
+    app_rect(w,x+1,y+1,width-2,height-2,active?0x28495d:0x1c2636);
+    int tx=x+(width-app_text_width(label))/2;
+    /* Only draw labels that fit; never leak into a neighbouring control. */
+    if(tx>=x+2 && height>=UI_FONT_H+2) app_text(w,tx,y+(height-UI_FONT_H)/2,label,active?0x9deaff:0xeaf2f7);
 }
 void app_u32(struct app_win *w, int x, int y, u32 value, u32 c) {
     char digits[10]; int n = 0;

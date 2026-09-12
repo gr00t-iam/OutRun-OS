@@ -14599,6 +14599,8 @@ struct wmwin {
     int      x, y, w, h;                 /* screen-space chrome rect (incl. title bar) */
     int      z;                          /* stacking order: higher = nearer the front  */
     int      minimized, focused;
+    int      maximized, restore_x, restore_y, restore_w, restore_h;
+    int      hover_control, pressed_control; /* snapshot-safe chrome feedback */
     uint32_t accent;
     char     title[16];
     int      cw, ch;                     /* content surface dimensions (pixels)        */
@@ -14705,6 +14707,15 @@ static struct klock g_wm_lock = { 0, "wm", 12, 0, 0, 0, 0, 0 KLOCK_RW_INIT KLOCK
 static int g_wm_focus = -1;              /* window index with keyboard focus, or -1     */
 static int g_wm_znext = 1;               /* monotonically increasing z stamp            */
 static int g_wm_drag = -1, g_wm_drag_dx = 0, g_wm_drag_dy = 0;   /* window being dragged */
+/* WM_XP_STATE_BEGIN */
+/* Capture is invalidated by wm_destroy, so a recycled slot cannot receive a
+ * release from its predecessor. All of this state is protected by wm lock. */
+static int g_wm_capture = -1, g_wm_control, g_wm_resize;
+static int g_wm_down_x, g_wm_down_y, g_wm_start_x, g_wm_start_y;
+static int g_wm_start_w, g_wm_start_h, g_wm_moved;
+static int g_wm_click_win = -1, g_wm_click_x, g_wm_click_y;
+static uint64_t g_wm_click_tick;
+/* WM_XP_STATE_END */
 static volatile uint64_t g_wm_composes = 0, g_wm_damage = 0;     /* stats               */
 static volatile uint64_t g_wm_created = 0;   /* v0.54: monotonic count of windows ever created */
 /* v0.96: DESKTOP SETTINGS. Live state, read by the compositor and the input
@@ -14754,9 +14765,17 @@ static void wm_raise(int idx) {
 }
 /* Give keyboard focus to `idx` (or -1). Caller holds g_wm_lock. */
 static void wm_focus(int idx) {
+    if (idx < 0 || idx >= NWMWIN || !g_wmwin[idx].used || g_wmwin[idx].minimized) idx = -1;
     for (int i = 0; i < NWMWIN; i++) g_wmwin[i].focused = 0;
     g_wm_focus = idx;
-    if (idx >= 0 && idx < NWMWIN && g_wmwin[idx].used) g_wmwin[idx].focused = 1;
+    if (idx >= 0) g_wmwin[idx].focused = 1;
+}
+static void wm_focus_next(void) {
+    int best = -1;
+    for (int i = 0; i < NWMWIN; i++)
+        if (g_wmwin[i].used && !g_wmwin[i].minimized &&
+            (best < 0 || g_wmwin[i].z > g_wmwin[best].z)) best = i;
+    wm_focus(best);
 }
 /* Queue an input event onto a window's owner event ring. Caller holds g_wm_lock. */
 static void wm_queue_event(int idx, int32_t type, int32_t x, int32_t y, int32_t code) {
@@ -14777,11 +14796,15 @@ static void wm_destroy(int idx) {
      * exactly like the user stack. Nothing to revoke here; just drop refs. */
     if (g_wm_focus == idx) g_wm_focus = -1;
     if (g_wm_drag == idx) g_wm_drag = -1;
+    if (g_wm_capture == idx) { g_wm_capture = -1; g_wm_control = g_wm_resize = 0; }
+    if (g_wm_click_win == idx) g_wm_click_win = -1;
+    W->maximized = W->hover_control = W->pressed_control = 0;
     W->used = 0; W->owner = -1; W->surf_vaddr = 0; W->ppage = 0;
     W->cw = W->ch = 0; W->cpages = 0;
     W->paired = 0; W->front = 0; W->ppage_b = 0;
     W->focused = 0; W->minimized = 0; W->qw = W->qr = 0;
     W->focus_wg = -1;                    /* v0.71 */
+    if (g_wm_focus < 0) wm_focus_next();
 }
 
 /* Called from every kproc exit path (clean AND fault): destroy every window the
@@ -31667,7 +31690,7 @@ static void compositor_frame(int frame) {
 #define DESK_TILE_MAX 44
 #define DESK_TILE_MIN 20
 #define DESK_TILE_GAP  6
-#define DESK_NLAUNCH  12
+#define DESK_NLAUNCH  13
 struct launch_tile { const char *label, *module; uint32_t tint; };
 /* Labels are at most 12 characters: the rail is DESK_RAIL_W wide, the text
  * starts 12 pixels in, and the font is 8 pixels per glyph. A longer label does
@@ -31685,6 +31708,7 @@ static const struct launch_tile g_launch[DESK_NLAUNCH] = {
     { "NET DECK",    "net_deck",     C_MINT  },
     { "SNAPSHOT",    "outrun_snap",  C_MAGE  },
     { "MEDIA",       "outrun_media", C_MAGE  },
+    { "OUTRUN WEB",  "outrun_web",   C_CYAN  },
 };
 /* THE TILE HEIGHT IS DERIVED, NOT FIXED.
  *
@@ -31746,10 +31770,98 @@ static int desk_chip_at(int sx, int sy) {
     return -1;
 }
 
-/* v0.54: blit a window's full-resolution ARGB content surface 1:1 into its
- * on-screen content rectangle (no scaling — the surface is allocated to exactly
- * this size at SYS_WIN_CREATE), clipped to whichever is smaller. A window with
- * no surface (seeded by the stress suite's WM-logic tests) paints flat. */
+/* WM_XP_HELPERS_BEGIN */
+/* One geometry definition for painting, hit testing, and host/QMP tests.
+ * Controls from right to left: close=1, maximize/restore=2, minimize=3.
+ * Surface ABI is UNCHANGED: cw/ch, page grants and WIN_INFO stay fixed;
+ * display resize uses nearest-neighbor sampling and inverse input mapping. */
+static int wm_control_x(const struct wmwin *W, int control) {
+    return W->w - 3 - WIMP_CLOSE_W - (control - 1) * (WIMP_CLOSE_W + 3);
+}
+static int wm_control_at(const struct wmwin *W, int sx, int sy) {
+    int x = sx - W->x, y = sy - W->y;
+    if (y < 3 || y >= WIN_TITLE_H - 3) return 0;
+    for (int c = 1; c <= 3; c++)
+        if (x >= wm_control_x(W, c) && x < wm_control_x(W, c) + WIMP_CLOSE_W) return c;
+    return 0;
+}
+static int wm_clamp(int v, int lo, int hi) {
+    if (hi < lo) hi = lo;
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+static void wm_log_action(const char *action, int id) {
+    struct wmwin *W = &g_wmwin[id];
+    kprintf("[wm] %s id=%d x=%d y=%d w=%d h=%d\n", action,
+            (uint64_t)id, (uint64_t)W->x, (uint64_t)W->y,
+            (uint64_t)W->w, (uint64_t)W->h);
+}
+static void wm_toggle_maximize(int id) {
+    struct wmwin *W = &g_wmwin[id];
+    if (!W->maximized) {
+        W->restore_x = W->x; W->restore_y = W->y;
+        W->restore_w = W->w; W->restore_h = W->h;
+        W->x = DESK_RAIL_W; W->y = 0;
+        W->w = desk_w() - DESK_RAIL_W; W->h = desk_h() - WIN_TASKBAR_H;
+        W->maximized = 1;
+    } else {
+        W->w = W->restore_w; W->h = W->restore_h;
+        W->x = wm_clamp(W->restore_x, 0, desk_w() - W->w);
+        W->y = wm_clamp(W->restore_y, 0, desk_h() - WIN_TASKBAR_H - WIN_TITLE_H);
+        W->maximized = 0;
+    }
+    wm_log_action(W->maximized ? "maximize" : "restore", id);
+}
+/* Edges: left=1 right=2 top=4 bottom=8. Keep title buttons higher
+ * priority than the resize zone; corners have a wider diagonal target. */
+static int wm_edge_at(const struct wmwin *W, int sx, int sy) {
+    if (W->maximized) return 0;
+    int x = sx - W->x, y = sy - W->y, edge = 0;
+    if (x < 0 || y < 0 || x >= W->w || y >= W->h) return 0;
+    int corner = (y < 6 || y >= W->h - 6) ? 6 : 2;
+    if (x < corner) edge |= 1;
+    if (x >= W->w - corner) edge |= 2;
+    if (y < 2) edge |= 4;
+    if (y >= W->h - 2) edge |= 8;
+    return edge;
+}
+static int wm_content_point(const struct wmwin *W, int sx, int sy, int *cx, int *cy) {
+    int x = sx - W->x - 2, y = sy - W->y - WIN_TITLE_H - 1;
+    int dw = W->w - 4, dh = W->h - WIN_TITLE_H - 3;
+    if (dw <= 0 || dh <= 0 || x < 0 || y < 0 || x >= dw || y >= dh) return 0;
+    /* Surface-less stress windows use their display size. */
+    *cx = (int)((int64_t)x * (W->cw > 0 ? W->cw : dw) / dw);
+    *cy = (int)((int64_t)y * (W->ch > 0 ? W->ch : dh) / dh);
+    return 1;
+}
+/* Called under the lock for motion AND release, so the final packet's delta
+ * is never lost. Movement threshold also disqualifies a title double click. */
+static void wm_pointer_motion(int sx, int sy) {
+    int hit = wm_topmost_at(sx, sy);
+    for (int i = 0; i < NWMWIN; i++)
+        g_wmwin[i].hover_control = i == hit ? wm_control_at(&g_wmwin[i], sx, sy) : 0;
+    int id = g_wm_capture;
+    if (id < 0 || !g_wmwin[id].used) return;
+    struct wmwin *W = &g_wmwin[id];
+    int dx = sx - g_wm_down_x, dy = sy - g_wm_down_y;
+    if (dx > 3 || dx < -3 || dy > 3 || dy < -3) g_wm_moved = 1;
+    if (g_wm_resize) {
+        int l = g_wm_start_x, t = g_wm_start_y;
+        int r = l + g_wm_start_w, b = t + g_wm_start_h;
+        if (g_wm_resize & 1) l = wm_clamp(l + dx, 0, r - WIN_MIN_W);
+        if (g_wm_resize & 2) r = wm_clamp(r + dx, l + WIN_MIN_W, desk_w());
+        if (g_wm_resize & 4) t = wm_clamp(t + dy, 0, b - WIN_MIN_H);
+        if (g_wm_resize & 8) b = wm_clamp(b + dy, t + WIN_MIN_H, desk_h() - WIN_TASKBAR_H);
+        W->x = l; W->y = t; W->w = r - l; W->h = b - t;
+    } else if (g_wm_drag == id && g_wm_moved && !W->maximized) {
+        W->x = wm_clamp(sx - g_wm_drag_dx, 0, desk_w() - W->w);
+        W->y = wm_clamp(sy - g_wm_drag_dy, 0, desk_h() - WIN_TASKBAR_H - WIN_TITLE_H);
+    }
+}
+/* WM_XP_HELPERS_END */
+
+/* Resample the published surface into the display rectangle. Surface grants
+ * remain fixed for ABI-v1 applications; pointer coordinates use the inverse
+ * mapping in wm_content_point. Surface-less stress windows paint flat. */
 static void wimp_draw_content(struct wmwin *W, int cx, int cy, int cw, int ch) {
     if (cw <= 0 || ch <= 0) return;
     /* v0.96: a paired window is read from whichever set it last PUBLISHED, so
@@ -31758,39 +31870,91 @@ static void wimp_draw_content(struct wmwin *W, int cx, int cy, int cw, int ch) {
     int sw = W->cw, sh = W->ch;
     uint64_t npg = W->cpages;
     for (int j = 0; j < ch; j++) {
+        int sy = sh > 0 ? (int)((uint64_t)j * (unsigned)sh / (unsigned)ch) : 0;
         for (int i = 0; i < cw; i++) {
-            uint32_t c = 0;
-            if (pt && i < sw && j < sh) {
+            uint32_t c = C_OBS2;
+            if (pt && sw > 0 && sh > 0) {
+                int sx = (int)((uint64_t)i * (unsigned)sw / (unsigned)cw);
                 /* pixel -> byte offset -> (page, index) in the scattered surface */
-                uint64_t off = ((uint64_t)j * sw + i) * 4u;
+                uint64_t off = ((uint64_t)sy * (unsigned)sw + (unsigned)sx) * 4u;
                 uint64_t pg = off >> 12;
                 if (pg < npg && pt[pg])
                     c = ((volatile uint32_t *)pt[pg])[(off & 0xFFF) >> 2] & 0xFFFFFF;
             }
-            px(cx + i, cy + j, c ? c : C_OBS2);
+            px(cx + i, cy + j, c);
         }
     }
 }
 
 /* Draw one window's chrome + content. `focused` brightens the border/title. */
+#include "../../apps/ui_font.h"
+static void wm_ui_text(int x, int y, const char *text, uint32_t color, int right) {
+    for (int i = 0; text[i]; i++) {
+        unsigned c = (unsigned char)text[i];
+        if (c < 32 || c > 126) c = '?';
+        if (x + UI_FONT_W > right) break;
+        const unsigned char *glyph = ui_font_coverage[c - 32];
+        for (int row = 0; row < UI_FONT_H; row++)
+            for (int col = 0; col < UI_FONT_W; col++) {
+                int alpha = glyph[row * UI_FONT_W + col];
+                if (alpha) blend(x + col, y + row, color, alpha);
+            }
+        x += ui_font_advance[c - 32];
+    }
+}
+static uint32_t wm_color_mix(uint32_t a, uint32_t b, int n, int d) {
+    uint32_t r = (((a >> 16) & 255) * (d-n) + ((b >> 16) & 255) * n) / d;
+    uint32_t g = (((a >> 8) & 255) * (d-n) + ((b >> 8) & 255) * n) / d;
+    uint32_t bl = ((a & 255) * (d-n) + (b & 255) * n) / d;
+    return (r << 16) | (g << 8) | bl;
+}
+static void wimp_draw_control(struct wmwin *W, int control, int focused) {
+    int x = W->x + wm_control_x(W, control), y = W->y + 3;
+    int w = WIMP_CLOSE_W, h = WIN_TITLE_H - 6;
+    int hot = W->hover_control == control;
+    int down = hot && W->pressed_control == control;
+    uint32_t top = control == 1 ? 0xF16C56 : (focused ? 0x8FB6FF : 0xA8B5CF);
+    uint32_t bot = control == 1 ? 0xC52C16 : (focused ? 0x2459CD : 0x697FAD);
+    if (hot) { top = wm_color_mix(top, 0xFFFFFF, 1, 4); bot = wm_color_mix(bot, 0xFFFFFF, 1, 5); }
+    if (down) { top = wm_color_mix(bot, 0x000000, 1, 4); bot = top; }
+    for (int j = 0; j < h; j++) hline(x, y+j, w, wm_color_mix(top, bot, j, h-1));
+    hline(x+1, y, w-2, 0xFFFFFF); vline(x, y+1, h-2, 0xFFFFFF);
+    hline(x+1, y+h-1, w-2, 0x173D84); vline(x+w-1, y+1, h-2, 0x173D84);
+    int d = down ? 1 : 0;
+    int gx = x + 4 + d, gy = y + 4 + d;
+    if (control == 1) {
+        for (int k = 0; k < 6; k++) {
+            px(gx+k, gy+k, 0xFFFFFF); px(gx+5-k, gy+k, 0xFFFFFF);
+            px(gx+k-1, gy+k, 0xFFFFFF); px(gx+6-k, gy+k, 0xFFFFFF);
+        }
+    } else if (control == 3) rect(gx-1, gy+4, 7, 2, 0xFFFFFF);
+    else {
+        if (W->maximized) {
+            hline(gx+1, gy-1, 6, 0xFFFFFF); vline(gx+6, gy-1, 5, 0xFFFFFF);
+            hline(gx+2, gy+3, 5, 0xFFFFFF);
+        }
+        hline(gx-1, gy, 7, 0xFFFFFF); hline(gx-1, gy+1, 7, 0xFFFFFF);
+        vline(gx-1, gy, 6, 0xFFFFFF); vline(gx+5, gy, 6, 0xFFFFFF);
+        hline(gx-1, gy+5, 7, 0xFFFFFF);
+    }
+}
 static void wimp_draw_window(struct wmwin *W, int focused) {
     int x = W->x, y = W->y, w = W->w, h = W->h;
-    uint32_t border = focused ? W->accent : C_HAIR;
-    rect(x, y, w, h, C_OBS1);                             /* body */
-    hline(x, y, w, border); hline(x, y + h - 1, w, border);
-    vline(x, y, h, border); vline(x + w - 1, y, h, border);
-    rect(x, y, w, WIN_TITLE_H, focused ? C_OBS2 : C_OBS1);   /* title bar */
-    hline(x, y + WIN_TITLE_H, w, border);
-    draw_str(x + 6, y + 6, W->title, focused ? C_TEXT : C_MUTE);
-    /* close box (right) + minimize box (left of it) */
-    int clx = x + w - WIMP_CLOSE_W - 3, cly = y + 3;
-    rect(clx, cly, WIMP_CLOSE_W, WIN_TITLE_H - 6, C_MAGE);
-    hline(clx + 3, cly + 6, WIMP_CLOSE_W - 6, C_TEXT);
-    int mnx = clx - WIMP_MIN_W - 3;
-    rect(mnx, cly, WIMP_MIN_W, WIN_TITLE_H - 6, C_AMBER);
-    hline(mnx + 3, cly + (WIN_TITLE_H - 6) - 3, WIMP_MIN_W - 6, C_OBS0);
-    /* content region below the title bar */
-    wimp_draw_content(W, x + 2, y + WIN_TITLE_H + 1, w - 4, h - WIN_TITLE_H - 3);
+    uint32_t border = focused ? 0x164CB5 : 0x6A80AA;
+    rect(x, y, w, h, border);
+    uint32_t top = focused ? 0x4B91FA : 0xA6B8D5;
+    uint32_t bottom = focused ? 0x0752D5 : 0x718BB9;
+    for (int j = 1; j < WIN_TITLE_H; j++)
+        hline(x+1, y+j, w-2, wm_color_mix(top, bottom, j-1, WIN_TITLE_H-2));
+    hline(x+2, y, w-4, focused ? 0xA3C5FF : 0xC8D4E8);
+    vline(x, y+2, h-4, border); vline(x+w-1, y+2, h-4, 0x10377D);
+    hline(x+1, y+h-1, w-2, 0x10377D);
+    /* Clip the title before the shared control geometry, never overpaint X. */
+    int end = wm_control_x(W, 3) - 4;
+    if (focused) wm_ui_text(x+7, y+5, W->title, 0x143A82, x+end);
+    wm_ui_text(x+6, y+4, W->title, 0xFFFFFF, x+end);
+    for (int c = 3; c >= 1; c--) wimp_draw_control(W, c, focused);
+    wimp_draw_content(W, x+2, y+WIN_TITLE_H+1, w-4, h-WIN_TITLE_H-3);
 }
 
 static void wimp_draw_cursor(void) {
@@ -31947,80 +32111,100 @@ static void wimp_compose(void) {
 static int wimp_pointer(int sx, int sy, int down) {
     int hit = -1;
     klock_acquire(&g_wm_lock);
-    if (down) {
-        /* v0.96: the shell gets first refusal, and only where no window is.
-         * A window dragged over the rail must still be clickable — the desktop
-         * furniture is BEHIND the windows, so it is consulted only when the
-         * hit-test finds nothing there. */
-        if (wm_topmost_at(sx, sy) < 0) {
-            int chip = desk_chip_at(sx, sy);
-            if (chip >= 0) {
-                /* One chip, two jobs: restore a minimized window, or raise and
-                 * focus a visible one. */
-                g_wmwin[chip].minimized = 0;
-                wm_raise(chip); wm_focus(chip);
-                klock_release(&g_wm_lock);
-                return chip;
-            }
-            int tile = desk_launch_at(sx, sy);
-            if (tile >= 0) {
-                klock_release(&g_wm_lock);
-                desk_launch(tile);          /* spawns; never runs the app inline */
-                return -1;
+    if (!down) {
+        wm_pointer_motion(sx, sy);
+        hit = g_wm_capture;
+        if (hit >= 0 && g_wmwin[hit].used) {
+            struct wmwin *W = &g_wmwin[hit];
+            int control = g_wm_control;
+            W->pressed_control = 0;
+            if (control && wm_topmost_at(sx, sy) == hit && wm_control_at(W, sx, sy) == control) {
+                if (control == 1) { wm_log_action("close", hit); wm_destroy(hit); }
+                else if (control == 2) wm_toggle_maximize(hit);
+                else { W->minimized = 1; wm_focus_next(); wm_log_action("minimize", hit); }
+                g_wm_click_win = -1;
+            } else if (g_wm_resize) {
+                wm_log_action("resize", hit); g_wm_click_win = -1;
+            } else if (g_wm_drag == hit) {
+                if (g_wm_moved) { wm_log_action("drag", hit); g_wm_click_win = -1; }
+                else {
+                    g_wm_click_win = hit; g_wm_click_tick = g_ticks;
+                    g_wm_click_x = sx; g_wm_click_y = sy;
+                }
             }
         }
-        hit = wm_topmost_at(sx, sy);
-        if (hit >= 0) {
-            struct wmwin *W = &g_wmwin[hit];
-            int lx = sx - W->x, ly = sy - W->y;
-            int clx = W->w - WIMP_CLOSE_W - 3, mnx = clx - WIMP_MIN_W - 3;
-            if (ly < WIN_TITLE_H) {                       /* title-bar region */
-                if (lx >= clx && lx < clx + WIMP_CLOSE_W) {           /* close box */
-                    wm_destroy(hit); klock_release(&g_wm_lock); return hit;
-                } else if (lx >= mnx && lx < mnx + WIMP_MIN_W) {      /* minimize */
-                    W->minimized = !W->minimized; wm_raise(hit); wm_focus(hit);
-                } else {                                              /* drag */
-                    wm_raise(hit); wm_focus(hit);
-                    g_wm_drag = hit; g_wm_drag_dx = lx; g_wm_drag_dy = ly;
-                }
-            } else {                                      /* content: focus + route click */
-                wm_raise(hit); wm_focus(hit);
-                int cx = lx, cy = ly - WIN_TITLE_H;
-                /* v0.70: a widget under the pointer CONSUMES the click and
-                 * reports itself by id. The raw click is not also delivered —
-                 * an application that had to ignore clicks its own buttons
-                 * already handled would be doing the toolkit's job. */
-                int wg = -1;
-                for (int k = 0; k < NWIDGET; k++) {
-                    struct widget *g = &g_wg[k];
-                    if (!g->used || g->win != hit || !g->enabled) continue;
-                    if (g->kind == WG_LABEL || g->kind == WG_PROGRESS) continue;  /* not interactive */
-                    if (cx >= g->x && cx < g->x + g->w && cy >= g->y && cy < g->y + g->h) { wg = k; break; }
-                }
-                if (wg >= 0) {
-                    if (g_wg[wg].kind == WG_CHECK) g_wg[wg].value = !g_wg[wg].value;
-                    /* v0.71: clicking a control also gives it keyboard focus,
-                     * which is what makes a text field typeable by clicking
-                     * into it. */
-                    W->focus_wg = wg;
-                    __sync_fetch_and_add(&g_wg_clicks, 1);
-                    wm_queue_event(hit, 3 /*widget*/, cx, cy, wg);
-                } else {
-                    /* v0.71: a click on bare content takes focus OFF whatever
-                     * held it. Otherwise a text field would keep swallowing
-                     * keystrokes after the user had visibly clicked away. */
-                    W->focus_wg = -1;
-                    wm_queue_event(hit, 1 /*click*/, cx, cy, 0);
-                }
-            }
+        g_wm_capture = g_wm_drag = -1;
+        g_wm_control = g_wm_resize = 0;
+        klock_release(&g_wm_lock);
+        return hit;
+    }
+    /* A duplicate make never starts another action while captured. */
+    if (g_wm_capture >= 0) { klock_release(&g_wm_lock); return g_wm_capture; }
+    hit = wm_topmost_at(sx, sy);
+    if (hit < 0) {
+        g_wm_click_win = -1;
+        int chip = desk_chip_at(sx, sy);
+        if (chip >= 0) {
+            g_wmwin[chip].minimized = 0;
+            wm_raise(chip); wm_focus(chip); wm_log_action("restore", chip);
+            klock_release(&g_wm_lock); return chip;
+        }
+        int tile = desk_launch_at(sx, sy);
+        klock_release(&g_wm_lock);
+        if (tile >= 0) desk_launch(tile);
+        return -1;
+    }
+    struct wmwin *W = &g_wmwin[hit];
+    wm_raise(hit); wm_focus(hit);
+    g_wm_down_x = sx; g_wm_down_y = sy; g_wm_moved = 0;
+    g_wm_start_x = W->x; g_wm_start_y = W->y;
+    g_wm_start_w = W->w; g_wm_start_h = W->h;
+    int control = wm_control_at(W, sx, sy);
+    int edge = control ? 0 : wm_edge_at(W, sx, sy);
+    if (control) {
+        g_wm_capture = hit; g_wm_control = control;
+        W->pressed_control = W->hover_control = control; g_wm_click_win = -1;
+    } else if (edge) {
+        g_wm_capture = hit; g_wm_resize = edge; g_wm_click_win = -1;
+    } else if (sy - W->y < WIN_TITLE_H) {
+        int dx = sx - g_wm_click_x, dy = sy - g_wm_click_y;
+        if (g_wm_click_win == hit && g_ticks - g_wm_click_tick <= 40 &&
+            dx >= -3 && dx <= 3 && dy >= -3 && dy <= 3) {
+            wm_toggle_maximize(hit); g_wm_click_win = -1;
+            /* Swallow this release; do not seed a third click. */
+            g_wm_capture = hit;
+        } else {
+            g_wm_capture = g_wm_drag = hit;
+            g_wm_drag_dx = sx - W->x; g_wm_drag_dy = sy - W->y;
         }
     } else {
-        g_wm_drag = -1;                                   /* release */
+        g_wm_click_win = -1;
+        int cx, cy;
+        if (wm_content_point(W, sx, sy, &cx, &cy)) {
+            int wg = -1;
+            for (int k = 0; k < NWIDGET; k++) {
+                struct widget *g = &g_wg[k];
+                if (!g->used || g->win != hit || !g->enabled) continue;
+                if (g->kind == WG_LABEL || g->kind == WG_PROGRESS) continue;
+                if (cx >= g->x && cx < g->x + g->w && cy >= g->y && cy < g->y + g->h) { wg = k; break; }
+            }
+            if (wg >= 0) {
+                if (g_wg[wg].kind == WG_CHECK) g_wg[wg].value = !g_wg[wg].value;
+                W->focus_wg = wg;
+                __sync_fetch_and_add(&g_wg_clicks, 1);
+                wm_queue_event(hit, 3, cx, cy, wg);
+            } else {
+                W->focus_wg = -1;
+                /* ABI v1 includes the two-pixel left border and one-pixel
+                 * content separator; app_poll removes them. Resample before
+                 * restoring those offsets, never change existing clients. */
+                wm_queue_event(hit, 1, cx + 2, cy + 1, 0);
+            }
+        }
     }
     klock_release(&g_wm_lock);
     return hit;
 }
-
 /* v0.71: offer one keystroke to the focused window's focused WIDGET. Returns 1
  * if a widget consumed it, 0 if it should be delivered to the application as an
  * ordinary key event.
@@ -32108,6 +32292,7 @@ static int desk_launch(int t) {
     }
     uint64_t save = current_proc_idx;
     uint64_t caps = PCAP_WIMP | PCAP_FILESYSTEM;
+    if (!kstrcmp(g_launch[t].module, "outrun_web")) caps |= PCAP_NETWORK;
     if (!kstrcmp(g_launch[t].module, "outrun_term") || !kstrcmp(g_launch[t].module, "outrun_edit")) caps |= PCAP_IPC;
     /* The PCI explorer is the only application that CLAIMS a device.
      * SYS_PCI_CFG_READ serves a claimed device only — configuration
@@ -32161,16 +32346,12 @@ static void wimp_input_step(void) {
     uint8_t btn = g_mouse_btn & 1;
     if (btn && !prevbtn) wimp_pointer(g_cur_x, g_cur_y, 1);
     else if (!btn && prevbtn) wimp_pointer(g_cur_x, g_cur_y, 0);
-    else if (btn && g_wm_drag >= 0) {                     /* dragging */
+    else {
+        /* Hover, live resize, and drag share the same capture path. Running
+         * it on motion only during a title drag left hover and edge resizing
+         * invisible until release. */
         klock_acquire(&g_wm_lock);
-        if (g_wm_drag >= 0 && g_wmwin[g_wm_drag].used) {
-            int nx = g_cur_x - g_wm_drag_dx, ny = g_cur_y - g_wm_drag_dy;
-            if (nx < 0) nx = 0;
-            if (ny < 0) ny = 0;
-            if (nx > desk_w() - 40)  nx = desk_w() - 40;
-            if (ny > desk_h() - WIN_TITLE_H) ny = desk_h() - WIN_TITLE_H;
-            g_wmwin[g_wm_drag].x = nx; g_wmwin[g_wm_drag].y = ny;
-        }
+        wm_pointer_motion(g_cur_x, g_cur_y);
         klock_release(&g_wm_lock);
     }
     prevbtn = btn;
@@ -33528,10 +33709,20 @@ widgets_done: ;
     wimpcheck("title-bar drag moves the window and release ends the drag",
               moved && g_wm_drag == -1);
 
-    /* minimize c via its minimize box, then confirm it drops out of hit-testing */
+    /* minimize c via its minimize box, then confirm it drops out of hit-testing.
+     *
+     * The click point comes from wm_control_x(), the SAME function the titlebar
+     * is painted from and that wm_control_at() hit-tests against. It used to be
+     * open-coded here as "close box, minus one box to its left", which was true
+     * of the two-control titlebar and silently became a click on MAXIMIZE when a
+     * third control (maximize/restore) was inserted between them: local x 208
+     * landed in maximize's [206,220) instead of minimize's [189,203). The window
+     * was faithfully maximized, `minimized` stayed 0, and the assertion failed
+     * while looking like flakiness. A second copy of a hit box is the launcher
+     * version of the role-number trap — there is one geometry, and tests use it. */
     klock_acquire(&g_wm_lock);
-    int cclx = g_wmwin[c].w - WIMP_CLOSE_W - 3, cmnx = cclx - WIMP_MIN_W - 3;
-    int cminx = g_wmwin[c].x + cmnx + 2, cminy = g_wmwin[c].y + 3;
+    int cminx = g_wmwin[c].x + wm_control_x(&g_wmwin[c], 3) + WIMP_CLOSE_W / 2;
+    int cminy = g_wmwin[c].y + 3;
     klock_release(&g_wm_lock);
     wimp_pointer(cminx, cminy, 1); wimp_pointer(cminx, cminy, 0);
     klock_acquire(&g_wm_lock); int c_min = g_wmwin[c].minimized; klock_release(&g_wm_lock);

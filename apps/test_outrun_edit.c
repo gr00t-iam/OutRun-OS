@@ -17,6 +17,14 @@ static void draw(void *ctx,int x,int y,int w,int h,unsigned color,int ch) {
     if(ch) glyphs++;
 }
 int main(void) {
+    code_init(&e);
+    struct vp_editor *undo=&e.buffers[0];
+    vp_key(undo,'a'); vp_key(undo,'b'); vp_key(undo,26);
+    assert(!strcmp(undo->text,"a"));
+    vp_key(undo,25); assert(!strcmp(undo->text,"ab"));
+    vp_click(undo,20,40,600,400);
+    assert(undo->menu==1);
+    assert(vp_click(undo,20,90,600,400)==VP_OPEN);
     code_init(&e); set_text("int main() { return 42; }\n// hello\n");
     code_highlight(&e,CODE_C);
     assert(e.style[0]==CODE_KEYWORD && e.style[20]==CODE_NUMBER);

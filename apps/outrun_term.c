@@ -14,9 +14,10 @@ struct term_tab {
     int head,history,row,col,view,fg,bg,saved_row,saved_col;
     int parser,param[8],nparam,bad;
     int anchor,end,selected;
-    char cmd[96]; int cmdlen;
+    char cmd[96],commands[16][96],draft[96];
+    int cmdlen,cmdpos,command_count,command_view;
 };
-struct term_session { struct term_tab tabs[TERM_TABS]; int active,command; };
+struct term_session { struct term_tab tabs[TERM_TABS]; int active,command,menu; };
 typedef long long (*term_run_fn)(const char *,char *,unsigned);
 static struct term_cell *term_cell(struct term_tab *t,int row,int col) {
     return &t->cells[(t->head+row)%TERM_LINES][col];
@@ -146,18 +147,49 @@ static int term_tab_switch(struct term_session *s,int index) {
     if(index<0 || index>=TERM_TABS) return 0;
     s->active=index; return 1;
 }
+static void term_recall(struct term_tab *t,int older) {
+    if(!t->command_view) for(int i=0;i<=t->cmdlen;i++) t->draft[i]=t->cmd[i];
+    if(older && t->command_view<t->command_count) t->command_view++;
+    if(!older && t->command_view) t->command_view--;
+    const char *s=t->command_view?t->commands[t->command_count-t->command_view]:t->draft;
+    int i=0; do { t->cmd[i]=s[i]; } while(s[i++]);
+    t->cmdpos=t->cmdlen=i-1;
+}
 static void term_key(struct term_session *s,int c,term_run_fn run) {
     struct term_tab *t=&s->tabs[s->active];
     if(c==27) { s->command=!s->command; return; }
+    if(c==1) { t->cmdpos=0; return; }
+    if(c==5) { t->cmdpos=t->cmdlen; return; }
+    if(c==16 || c==14) { term_recall(t,c==16); return; }
+    if(c==21) { t->cmdlen=t->cmdpos=0; t->cmd[0]=0; return; }
     if(s->command) {
         if(c>='1' && c<='4') term_tab_switch(s,c-'1');
+        if(c=='h' && t->cmdpos) t->cmdpos--;
+        if(c=='l' && t->cmdpos<t->cmdlen) t->cmdpos++;
+        if(c=='0') t->cmdpos=0;
+        if(c=='$') t->cmdpos=t->cmdlen;
+        if(c=='k' || c=='j') term_recall(t,c=='k');
         if(c=='u') term_scroll(t,TERM_ROWS);
         if(c=='d') term_scroll(t,-TERM_ROWS);
         s->command=0; return;
     }
-    if(c==8) { if(t->cmdlen) t->cmd[--t->cmdlen]=0; return; }
+    if(c==8 || c==127) {
+        if(c==8) { if(!t->cmdpos) return; t->cmdpos--; }
+        else if(t->cmdpos==t->cmdlen) return;
+        for(int i=t->cmdpos;i<t->cmdlen;i++) t->cmd[i]=t->cmd[i+1];
+        t->cmdlen--; return;
+    }
     if(c==13 || c==10) {
         char out[4096];
+        if(t->cmdlen) {
+            if(t->command_count==16) {
+                for(int j=1;j<16;j++) for(int i=0;i<96;i++) t->commands[j-1][i]=t->commands[j][i];
+                t->command_count--;
+            }
+            for(int i=0;i<=t->cmdlen;i++) t->commands[t->command_count][i]=t->cmd[i];
+            t->command_count++;
+        }
+        t->command_view=0; t->draft[0]=0;
         t->view=0; t->selected=0;
         term_feed(t,t->cmd,(unsigned)t->cmdlen); term_feed(t,"\r\n",2);
         long long n=run(t->cmd,out,sizeof out);
@@ -174,9 +206,36 @@ static void term_key(struct term_session *s,int c,term_run_fn run) {
                 term_feed(t,limit,sizeof limit-1);
             }
         }
-        t->cmdlen=0; t->cmd[0]=0; return;
+        t->cmdlen=t->cmdpos=0; t->cmd[0]=0; return;
     }
-    if(c>=32 && c<=126 && t->cmdlen<95) { t->cmd[t->cmdlen++]=(char)c; t->cmd[t->cmdlen]=0; }
+    if(c>=32 && c<=126 && t->cmdlen<95) {
+        for(int i=t->cmdlen;i>=t->cmdpos;i--) t->cmd[i+1]=t->cmd[i];
+        t->cmd[t->cmdpos++]=(char)c; t->cmdlen++;
+    }
+}
+static void term_menu_action(struct term_session *s,int menu,int item,
+                             char *copy,unsigned cap,term_run_fn run) {
+    struct term_tab *t=&s->tabs[s->active];
+    s->command=0; s->menu=0;
+    if(menu==1) {
+        if(item==1) term_tab_switch(s,(s->active+TERM_TABS-1)%TERM_TABS);
+        if(item==2) term_tab_switch(s,(s->active+1)%TERM_TABS);
+        if(item==3) term_key(s,13,run);
+    } else if(menu==2) {
+        if(item==1) term_copy(t,copy,cap);
+        if(item==2) for(unsigned i=0;i<cap && copy[i];i++)
+            if(copy[i]>=32 && copy[i]<=126) term_key(s,copy[i],run);
+        if(item==3) term_key(s,21,run);
+    } else if(menu==3) {
+        if(item==1) term_scroll(t,TERM_ROWS);
+        if(item==2) term_scroll(t,-TERM_ROWS);
+        if(item==3) {
+            t->head=t->history=t->row=t->col=t->view=t->selected=0;
+            t->parser=t->nparam=t->bad=t->saved_row=t->saved_col=0;
+            t->fg=7; t->bg=0;
+            for(int r=0;r<TERM_ROWS;r++) term_clear_line(t,r,0,TERM_COLS);
+        }
+    }
 }
 #ifndef APP_HOST_TEST
 #include "gui.h"
@@ -190,24 +249,34 @@ static void term_render(struct app_win *w) {
     static const u32 colors[8]={0x0a0d14,0xff6b81,0x3df5c4,0xffcc66,0x77aaff,0xc4a6ff,0x22e4ff,0xeaf2f7};
     struct term_tab *t=&session.tabs[session.active];
     app_fill(w,w->bg);
+    static const char *menus[]={"File","Edit","View"};
+    for(int m=0;m<3;m++) app_button(w,8+m*60,2,56,20,menus[m],session.menu==m+1);
     for(int k=0;k<TERM_TABS;k++) {
-        app_rect(w,8+k*96,4,88,22,k==session.active?0x28495d:0x1c2636);
-        app_str(w,16+k*96,12,"TAB",w->fg); app_u32(w,48+k*96,12,(u32)k+1,w->fg);
+        app_rect(w,8+k*96,26,88,22,k==session.active?0x28495d:0x1c2636);
+        app_text(w,16+k*96,34,"Tab",w->fg); app_u32(w,48+k*96,34,(u32)k+1,w->fg);
     }
     int a=t->anchor,b=t->end; if(a>b) { int tmp=a; a=b; b=tmp; }
     for(int row=0;row<TERM_ROWS;row++) for(int col=0;col<TERM_COLS;col++) {
         int r=(t->head+TERM_LINES-t->view+row)%TERM_LINES;
         struct term_cell cell=t->cells[r][col]; int p=row*TERM_COLS+col;
-        app_rect(w,8+col*8,32+row*12,8,12,t->selected==2 && p>=a && p<b?0x435a76:colors[cell.bg]);
-        app_char(w,8+col*8,32+row*12,(char)cell.ch,colors[cell.fg]);
+        app_rect(w,8+col*8,52+row*12,8,12,t->selected==2 && p>=a && p<b?0x435a76:colors[cell.bg]);
+        app_char(w,8+col*8,52+row*12,(char)cell.ch,colors[cell.fg]);
     }
-    app_str(w,8,328,">",0x3df5c4);
-    int left=t->cmdlen>68?t->cmdlen-68:0;
-    app_str(w,24,328,t->cmd+left,w->fg);
-    app_str(w,8,352,session.command?"NAV: 1-4 tabs | u/d history":"ESC then 1-4 tabs, u/d history | click twice: select",0xffcc66);
-    app_str(w,8,368,"COPY",0x22e4ff); app_str(w,72,368,"PASTE",0x22e4ff);
-    app_str(w,144,368,"HISTORY",w->fg); app_u32(w,216,368,(u32)t->view,w->fg);
-    app_str(w,8,388,"Shell capture: 4095 bytes/command; no streaming PTY",0x7c8ca0);
+    app_str(w,8,348,">",0x3df5c4);
+    int left=t->cmdpos>68?t->cmdpos-68:0;
+    app_str(w,24,348,t->cmd+left,w->fg);
+    app_rect(w,24+(t->cmdpos-left)*8,358,7,2,0x3df5c4);
+    app_text(w,8,366,session.command?"NAV: h/l 0/$ cursor | k/j commands | u/d scroll":"Esc then: k/j recall | h/l cursor | 1-4 tabs",0xffcc66);
+    app_button(w,8,380,56,20,"Copy",0); app_button(w,72,380,56,20,"Paste",0);
+    app_text(w,144,386,"Scrollback",w->fg); app_u32(w,216,386,(u32)t->view,w->fg);
+    app_text(w,8,406,"Shell capture: 4095 bytes/command; no streaming PTY",0x7c8ca0);
+    if(session.menu) {
+        static const char *items[3][3]={{"Previous tab","Next tab","Run command"},
+            {"Copy selection","Paste text","Clear command"},{"Page up","Page down","Clear output"}};
+        int mx=8+(session.menu-1)*60;
+        app_rect(w,mx,22,164,78,0x344255);
+        for(int i=0;i<3;i++) app_button(w,mx+2,24+i*24,160,24,items[session.menu-1][i],0);
+    }
     app_present(w);
 }
 void _start(void) {
@@ -224,25 +293,32 @@ void _start(void) {
             if(build_command(&msg,command)==0) {
                 /* Keep the user's pending command while the task prints output. */
                 struct term_tab *t=&session.tabs[session.active];
-                char pending[96]; int n=t->cmdlen;
+                char pending[96]; int n=t->cmdlen,pos=t->cmdpos;
                 for(int i=0;i<=n;i++) pending[i]=t->cmd[i];
                 t->cmdlen=0;
                 for(int i=0;command[i];i++) t->cmd[t->cmdlen++]=command[i];
-                t->cmd[t->cmdlen]=0;
+                t->cmd[t->cmdlen]=0; t->cmdpos=t->cmdlen;
                 int mode=session.command; session.command=0;
                 term_key(&session,13,term_native_run); session.command=mode;
                 for(int i=0;i<=n;i++) t->cmd[i]=pending[i];
-                t->cmdlen=n;
+                t->cmdlen=n; t->cmdpos=pos;
                 term_render(&w);
             }
         }
         if(!rc) { app_idle(); continue; }
-        if(e.type==EVENT_KEY_PRESS) term_key(&session,e.code,term_native_run);
+        if(e.type==EVENT_KEY_PRESS) { session.menu=0; term_key(&session,e.code,term_native_run); }
         if(e.type==EVENT_MOUSE_DOWN) {
             struct term_tab *t=&session.tabs[session.active];
-            if(e.y>=4 && e.y<26 && e.x>=8) term_tab_switch(&session,(e.x-8)/96);
-            else if(e.y>=32 && e.y<320 && e.x>=8) term_select(t,(e.x-8)/8,(e.y-32)/12);
-            else if(e.y>=364 && e.y<384) {
+            if(app_hit(e.x,e.y,8,2,180,20)) {
+                int m=(e.x-8)/60+1; session.menu=session.menu==m?0:m;
+            } else if(session.menu) {
+                int mx=8+(session.menu-1)*60;
+                if(app_hit(e.x,e.y,mx,24,164,72))
+                    term_menu_action(&session,session.menu,(e.y-24)/24+1,clipboard,sizeof clipboard,term_native_run);
+                session.menu=0;
+            } else if(e.y>=26 && e.y<48 && e.x>=8) term_tab_switch(&session,(e.x-8)/96);
+            else if(e.y>=52 && e.y<340 && e.x>=8) term_select(t,(e.x-8)/8,(e.y-52)/12);
+            else if(e.y>=380 && e.y<400) {
                 if(e.x>=8 && e.x<64) term_copy(t,clipboard,sizeof clipboard);
                 if(e.x>=72 && e.x<136) for(unsigned i=0;clipboard[i];i++)
                     if(clipboard[i]>=32 && clipboard[i]<=126) term_key(&session,clipboard[i],term_native_run);

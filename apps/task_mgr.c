@@ -7,12 +7,21 @@ enum { SORT_PID = 0, SORT_CPU = 1 };
 struct monitor_state {
     struct outrun_desktop_info previous;
     u32 cpu, ram, count;
+    int paused,sort,fixed_scale,menu;
     /* Per-row cpu_ns delta from the last sample, matched by pid; 0 when the
      * row is new or the pid was recycled. This is what SORT_CPU orders by. */
     u64 delta[12];
     u8 cpu_history[HISTORY], ram_history[HISTORY];
 };
+static void monitor_control(struct monitor_state *m,int key) {
+    if(key=='p' || key==' ') { m->paused=!m->paused; if(!m->paused) m->previous.wall_ns=0; }
+    if(key=='c') m->sort=SORT_CPU;
+    if(key=='i') m->sort=SORT_PID;
+    if(key=='g') m->fixed_scale=!m->fixed_scale;
+    m->menu=0;
+}
 static void monitor_sample(struct monitor_state *m, const struct outrun_desktop_info *s) {
+    if(m->paused) return;
     u64 delta = 0, elapsed = s->wall_ns - m->previous.wall_ns;
     m->cpu = 0;
     for (u32 i = 0; i < 12; ++i) m->delta[i] = 0;
@@ -72,11 +81,12 @@ static void graph_heights(const u8 *values, u32 count, int *out, int plot) {
         out[i] = (int)((u32)values[(first + i) % HISTORY] * (u32)plot / peak);
 }
 #ifndef APP_HOST_TEST
-static void graph(struct app_win *w, const u8 *values, u32 count, int y, u32 color) {
+static void graph(struct app_win *w, const u8 *values, u32 count, int y, u32 color,int fixed) {
     int heights[HISTORY];
     app_rect(w, 8, y, HISTORY * 4, 54, 0x121722);
     u32 n = count < HISTORY ? count : HISTORY;
     graph_heights(values, count, heights, 50);
+    if(fixed) for(u32 i=0;i<n;i++) heights[i]=(int)values[(count-n+i)%HISTORY]/2;
     for (u32 i = 0; i < n; ++i)
         app_rect(w, 8 + (int)i * 4, y + 51 - heights[i], 3, heights[i] + 1, color);
 }
@@ -86,16 +96,16 @@ static void monitor_render(struct app_win *w, struct monitor_state *m, const u32
                            int sort, u64 selected, const char *status) {
     struct outrun_desktop_info *s = &m->previous;
     app_fill(w, w->bg);
-    app_str(w, 8, 8, "SYS-DIAG  /  MEASURED APP CPU", 0x22e4ff);
-    app_u32(w, 320, 8, m->cpu, w->fg); app_str(w, 352, 8, "%", w->fg);
-    graph(w, m->cpu_history, m->count, 22, 0x22e4ff);
-    app_str(w, 8, 84, "ALLOCATOR RAM", 0x3df5c4);
-    app_u32(w, 160, 84, m->ram, w->fg); app_str(w, 192, 84, "%", w->fg);
-    graph(w, m->ram_history, m->count, 98, 0x3df5c4);
-    app_str(w, 8, 160, "PID", sort == SORT_PID ? 0x22e4ff : 0x7c8ca0);
-    app_str(w, 80, 160, "PROCESS", 0x7c8ca0);
-    app_str(w, 232, 160, "CPU", sort == SORT_CPU ? 0x22e4ff : 0x7c8ca0);
-    app_str(w, 300, 160, "STATE", 0x7c8ca0);
+    app_text(w, 8, 8, "SYS-DIAG  /  MEASURED APP CPU", 0x22e4ff);
+    app_u32(w, 320, 8, m->cpu, w->fg); app_text(w, 352, 8, "%", w->fg);
+    graph(w, m->cpu_history, m->count, 22, 0x22e4ff,m->fixed_scale);
+    app_text(w, 8, 84, "ALLOCATOR RAM", 0x3df5c4);
+    app_u32(w, 160, 84, m->ram, w->fg); app_text(w, 192, 84, "%", w->fg);
+    graph(w, m->ram_history, m->count, 98, 0x3df5c4,m->fixed_scale);
+    app_text(w, 8, 160, "PID", sort == SORT_PID ? 0x22e4ff : 0x7c8ca0);
+    app_text(w, 80, 160, "PROCESS", 0x7c8ca0);
+    app_text(w, 232, 160, "CPU", sort == SORT_CPU ? 0x22e4ff : 0x7c8ca0);
+    app_text(w, 300, 160, "STATE", 0x7c8ca0);
     u64 total = 0;
     for (u32 i = 0; i < 12; ++i) total += m->delta[i];
     for (u32 i = 0; i < s->nproc && i < 12; ++i) {
@@ -103,15 +113,21 @@ static void monitor_render(struct app_win *w, struct monitor_state *m, const u32
         struct outrun_process *p = &s->proc[order[i]];
         if (p->pid == selected) app_rect(w, 4, y-2, w->cw-8, 14, 0x25374b);
         app_u32(w, 8, y, (u32)p->pid, w->fg);
-        app_str(w, 80, y, p->name, w->fg);
+        app_text(w, 80, y, p->name, w->fg);
         /* This row's share of the measured app CPU, as a whole percentage. */
         app_u32(w, 232, y, total ? (u32)(m->delta[order[i]] * 100 / total) : 0, w->fg);
-        app_str(w, 300, y, p->flags ? "EXITED" : "LIVE", 0x3df5c4);
+        app_text(w, 300, y, p->flags ? "EXITED" : "LIVE", 0x3df5c4);
     }
-    app_rect(w, 8, 350, 144, 24, 0x7b2345);
-    app_str(w, 16, 358, "TERMINATE", w->fg);
-    app_str(w, 8, 383, status, 0xffb020);
-    app_str(w, 8, 397, "CLICK PID/CPU TO SORT  GRAPH SCALES TO PEAK", 0x7c8ca0);
+    app_button(w,8,350,144,24,"Terminate",0);
+    app_text(w, 8, 383, status, 0xffb020);
+    app_text(w, 8, 397, m->fixed_scale?"Graph: 0-100% | CPU column: share of measured apps":"Graph: auto peak | CPU column: share of measured apps", 0x7c8ca0);
+    app_button(w,260,78,72,20,m->paused?"Resume":"Pause",m->paused);
+    app_button(w,340,78,68,20,"View",m->menu);
+    if(m->menu) {
+        static const char *items[]={"Pause / resume [P]","Sort by CPU [C]","Sort by PID [I]","Graph scale [G]"};
+        app_rect(w,232,100,180,96,0x344255);
+        for(int i=0;i<4;i++) app_text(w,240,108+i*24,items[i],w->fg);
+    }
     app_present(w);
 }
 void _start(void) {
@@ -119,7 +135,7 @@ void _start(void) {
     static struct monitor_state m;
     static struct outrun_desktop_info info;
     u32 order[12];
-    int sort = SORT_PID;
+
     u64 selected = 0, armed = 0, last = 0;
     const char *status = "SELECT PID THEN TERMINATE TWICE";
     if (app_create(&w, 430, 440, 0x22e4ff)) app_exit(1);
@@ -133,14 +149,21 @@ void _start(void) {
         }
         struct outrun_event e;
         while ((rc = app_poll(&w, &e)) > 0) {
+            if(e.type==EVENT_KEY_PRESS) { monitor_control(&m,e.code); armed=0; dirty=1; continue; }
             if (e.type != EVENT_MOUSE_DOWN) continue;
+            if(app_hit(e.x,e.y,340,78,68,20)) { m.menu=!m.menu; dirty=1; continue; }
+            if(app_hit(e.x,e.y,260,78,72,20)) { monitor_control(&m,'p'); armed=0; dirty=1; continue; }
+            if(m.menu) {
+                if(app_hit(e.x,e.y,232,100,180,96)) { static const char actions[]={'p','c','i','g'}; monitor_control(&m,actions[(e.y-100)/24]); }
+                m.menu=0; armed=0; dirty=1; continue;
+            }
             if (e.y >= 158 && e.y < 173) {
-                if (e.x >= 8 && e.x < 72) { sort = SORT_PID; dirty = 1; }
-                if (e.x >= 232 && e.x < 296) { sort = SORT_CPU; dirty = 1; }
+                if (e.x >= 8 && e.x < 72) { m.sort = SORT_PID; dirty = 1; }
+                if (e.x >= 232 && e.x < 296) { m.sort = SORT_CPU; dirty = 1; }
             } else if (e.y >= 173 && e.y < 343) {
                 u32 row = (u32)(e.y - 173) / 14;
                 if (row < m.previous.nproc && row < 12) {
-                    monitor_order(&m, sort, order);
+                    monitor_order(&m, m.sort, order);
                     selected = m.previous.proc[order[row]].pid; armed = 0; dirty = 1;
                     status = "CLICK TERMINATE TO ARM";
                 }
@@ -157,8 +180,8 @@ void _start(void) {
         }
         if (rc < 0) app_exit(0);
         if (dirty) {
-            monitor_order(&m, sort, order);
-            monitor_render(&w, &m, order, sort, selected, status);
+            monitor_order(&m, m.sort, order);
+            monitor_render(&w, &m, order, m.sort, selected, m.paused?"PAUSED: DISPLAY IS A FROZEN SNAPSHOT":status);
         }
         app_idle();
     }

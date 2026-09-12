@@ -168,7 +168,24 @@ static void overwrite_confirmation(void) {
     assert(vp_save(&e,host_io) && !e.dirty);
     unlink("/tmp/vault_pad_ow.txt"); unlink("/tmp/vault_pad_ow2.txt");
 }
+static void undo_noop(void) {
+    struct vp_editor e; vp_init(&e);
+    vp_key(&e,'a'); e.cursor=0; vp_key(&e,8);
+    vp_key(&e,27); vp_key(&e,'z');
+    assert(e.len==0 && "no-op backspace must not consume undo");
+    assert(!e.dirty && "undo to initial buffer restores clean state");
+    vp_key(&e,'p'); vp_key(&e,'Z');
+    assert(!strcmp(e.text,"a") && "empty paste preserves redo");
+    e.confirm=1; vp_key(&e,'z'); assert(!e.confirm);
+    e.confirm=1; vp_click(&e,80,40,720,480); assert(!e.confirm);
+    vp_click(&e,80,40,720,480);
+    e.dirty=0; vp_click(&e,8,40,720,480); vp_click(&e,8,60,720,480);
+    assert(e.undo_valid==0 && !e.origin[0] && "New starts a distinct undo history");
+    e.command=1; vp_click(&e,8,40,720,480); vp_click(&e,8,140,720,480);
+    assert(e.focus && !e.command && "Save as must enter filename insertion");
+}
 int main(void) {
+    undo_noop();
     insertion(); navigation(); file_io(); interaction(); rendering();
     document_jumps(); line_clipboard(); overwrite_confirmation();
     puts("vault_pad: all core tests PASS");

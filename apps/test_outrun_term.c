@@ -14,6 +14,15 @@ static long long command(const char *cmd, char *out, unsigned cap) {
 }
 int main(void) {
     term_init(&s);
+    term_key(&s,'a',failure); term_key(&s,'c',failure);
+    term_key(&s,27,failure); term_key(&s,'h',failure); term_key(&s,'b',failure);
+    assert(!strcmp(s.tabs[0].cmd,"abc"));
+    term_key(&s,13,failure);
+    term_key(&s,'x',failure); term_key(&s,27,failure); term_key(&s,'k',failure);
+    assert(!strcmp(s.tabs[0].cmd,"abc"));
+    term_key(&s,27,failure); term_key(&s,'j',failure);
+    assert(!strcmp(s.tabs[0].cmd,"x"));
+    term_init(&s);
     struct term_tab *t=&s.tabs[0];
     term_feed(t,"abc\rZ",5);
     assert(term_cell(t,0,0)->ch=='Z' && term_cell(t,0,1)->ch=='b');
@@ -35,7 +44,13 @@ int main(void) {
     assert(term_copy(t,copy,3)==2 && !strcmp(copy,"he"));
     assert(term_tab_switch(&s,1)==1 && s.active==1);
     assert(s.tabs[1].history==0 && s.tabs[0].history==1000);
+    term_menu_action(&s,1,2,copy,sizeof copy,failure); assert(s.active==2);
+    term_menu_action(&s,2,3,copy,sizeof copy,failure); assert(s.tabs[2].cmdlen==0);
+    term_feed(&s.tabs[2],"test",4);
+    term_menu_action(&s,3,3,copy,sizeof copy,failure);
+    assert(s.tabs[2].row==0 && s.tabs[2].history==0 && term_cell(&s.tabs[2],0,0)->ch==' ');
     assert(!term_tab_switch(&s,TERM_TABS));
+    assert(term_tab_switch(&s,1)); /* restore the command-routing test's tab */
     for(const char *p="help";*p;p++) term_key(&s,*p,command);
     term_key(&s,13,command);
     assert(calls==1 && s.tabs[1].cmdlen==0);
