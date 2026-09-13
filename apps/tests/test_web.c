@@ -20,7 +20,7 @@ int main(void) {
     static struct web_doc d;
     web_html(&d,"<h1>Hello &amp; world</h1><script>bad()</script><a href='/next'>Next</a><img src='/x.bmp' alt='Pic'>");
     assert(d.count && d.nlinks == 1 && d.nimages == 1);
-    assert(!strcmp(d.links[0],"/next"));
+    assert(!strcmp(web_link(&d,0),"/next"));
     assert(!strcmp(d.images[0].src,"/x.bmp"));
     for (int i=0;i<d.count;i++) assert(!strstr(d.items[i].text,"bad"));
     puts("web: URL resolution and bounded HTML PASS");
@@ -105,7 +105,7 @@ int main(void) {
     {
         int found=-1;
         for (int i=0;i<d.count;i++) if (!strcmp(d.items[i].text,"link")) found=d.items[i].link;
-        assert(found>=0 && !strcmp(d.links[found],"/deep"));
+        assert(found>=0 && !strcmp(web_link(&d,found),"/deep"));
     }
 
     /* Line wrapping still happens inside a block, and wrapped continuation
@@ -227,6 +227,98 @@ int main(void) {
     web_html(&d,"<p>plain</p>");
     assert(web_pool_used(&d)==0);
     puts("web: image pool, cap lift, aliasing and exhaustion PASS");
+
+    /* ---- Slice A part 3: link arena and inline CSS ------------------------
+     * links[64][WEB_URL] was a 32 KB fixed block, and raising the count
+     * multiplies it -- 256 links would be 128 KB for storage that is almost
+     * entirely padding, because a real href is tens of bytes, not 512. Hrefs
+     * now pack into a shared character arena, so the link CAP and the bytes
+     * spent on links stop being the same number. */
+    assert(WEB_LINKS >= 256);
+    {
+        static char lots[65536]; lots[0]=0;
+        for (int i=0;i<200;i++) strcat(lots,"<a href='/p'>x</a> ");
+        web_html(&d,lots);
+        assert(d.nlinks==200);
+        for (int i=0;i<d.nlinks;i++) assert(!strcmp(web_link(&d,i),"/p"));
+        for (int i=0;i<d.count;i++)
+            assert(d.items[i].link>=-1 && d.items[i].link<d.nlinks);
+    }
+    /* Arena exhaustion drops the LINK, not the document: text still renders,
+     * and the anchor degrades to plain text rather than pointing somewhere
+     * arbitrary. Out-of-range indices return empty, never past the arena. */
+    assert(!web_link(&d,-1)[0]);
+    assert(!web_link(&d,d.nlinks)[0]);
+    assert(!web_link(&d,999999)[0]);
+    {
+        /* Long hrefs consume real arena space; when it runs out the parser
+         * must keep going. */
+        static char big[65536]; big[0]=0;
+        for (int i=0;i<400;i++) {
+            strcat(big,"<a href='/");
+            for (int k=0;k<60;k++) strcat(big,"z");
+            strcat(big,"'>t</a> ");
+        }
+        web_html(&d,big);
+        assert(d.nlinks>0 && d.nlinks<=WEB_LINKS);
+        for (int i=0;i<d.nlinks;i++) assert(strlen(web_link(&d,i))<WEB_URL);
+        for (int i=0;i<d.count;i++) assert(d.items[i].link<d.nlinks);
+    }
+
+    /* Inline CSS: color and font-size on a style attribute reach the item.
+     * background-color is PARSED and applied to the item so the renderer can
+     * fill behind the text. */
+    web_html(&d,"<p style='color:#ff8800'>tinted</p>");
+    assert(d.count==1 && d.items[0].color==0xff8800u);
+    web_html(&d,"<span style='color: rgb(18, 52, 86)'>rgbform</span>");
+    assert(d.count==1 && d.items[0].color==0x123456u);
+    web_html(&d,"<p style='color:#f80'>short</p>");
+    assert(d.count==1 && d.items[0].color==0xff8800u);
+    /* A named colour the table knows, and one it does not: unknown must fall
+     * back to the default rather than to black-on-black or garbage. */
+    web_html(&d,"<p style='color:red'>named</p>");
+    assert(d.count==1 && d.items[0].color==0xff0000u);
+    web_html(&d,"<p style='color:chartreuse'>unknown</p>");
+    assert(d.count==1 && d.items[0].color==0xdce6efu);
+    /* Malformed values must not corrupt the item or run off the attribute. */
+    web_html(&d,"<p style='color:#zz'>bad</p>");
+    assert(d.count==1 && d.items[0].color==0xdce6efu);
+    web_html(&d,"<p style='color:'>empty</p>");
+    assert(d.count==1 && d.items[0].color==0xdce6efu);
+    /* font-size selects a bounded size class, and an absurd value clamps
+     * rather than producing a line height that breaks layout arithmetic. */
+    web_html(&d,"<p style='font-size:24px'>big</p>");
+    assert(d.count==1 && d.items[0].size>WEB_SIZE_NORMAL);
+    web_html(&d,"<p style='font-size:9999px'>huge</p>");
+    assert(d.count==1 && d.items[0].size<=WEB_SIZE_MAX);
+    web_html(&d,"<p style='font-size:1px'>tiny</p>");
+    assert(d.count==1 && d.items[0].size>=WEB_SIZE_MIN);
+    /* background-color reaches the item and defaults to transparent. */
+    web_html(&d,"<p style='background-color:#202020'>bg</p>");
+    assert(d.count==1 && d.items[0].bg==0x202020u);
+    web_html(&d,"<p>nobg</p>");
+    assert(d.count==1 && d.items[0].bg==WEB_BG_NONE);
+    /* Style is INHERITED by nested inline content and restored on close --
+     * the same stack discipline the link and heading context already use. */
+    web_html(&d,"<p style='color:#00ff00'>out <span>in</span> out2</p>");
+    assert(d.count==3);
+    for (int i=0;i<d.count;i++) assert(d.items[i].color==0x00ff00u);
+    web_html(&d,"<p><span style='color:#ff0000'>red</span> plain</p>");
+    {
+        unsigned red=0,plain=0;
+        for (int i=0;i<d.count;i++) {
+            if (!strcmp(d.items[i].text,"red"))   red=d.items[i].color;
+            if (!strcmp(d.items[i].text,"plain")) plain=d.items[i].color;
+        }
+        assert(red==0xff0000u && plain==0xdce6efu);   /* restored after </span> */
+    }
+    /* A link keeps its link colour unless the page overrides it explicitly. */
+    web_html(&d,"<a href='/x'>plain link</a>");
+    assert(d.count==2 && d.items[0].color==0x7dd3fcu);
+    web_html(&d,"<a href='/x' style='color:#ff00ff'>styled link</a>");
+    assert(d.count==2 && d.items[0].color==0xff00ffu);
+    puts("web: link arena, inline CSS colour/size/background PASS");
+
 
 
     struct web_response r;

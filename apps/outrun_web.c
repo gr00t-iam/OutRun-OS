@@ -88,14 +88,22 @@ static int web_resolve(const char *base, const char *ref, char *out) {
     if(!web_add(origin,sizeof origin,norm)||!web_url_parse(origin,&check)) return 0;
     return web_copy(out,WEB_URL,origin);
 }
+/* Text size classes. A bounded set rather than free pixel sizes: the glyph
+ * renderer draws one 8x16 face, so a "size" scales line height and is a hint
+ * the layout can honour, not an arbitrary font metric it would have to lie
+ * about. Clamped at both ends -- a page asking for 9999px must not produce a
+ * line height that overflows the layout arithmetic. */
+enum { WEB_SIZE_MIN = 0, WEB_SIZE_SMALL = 0, WEB_SIZE_NORMAL = 1,
+       WEB_SIZE_LARGE = 2, WEB_SIZE_XL = 3, WEB_SIZE_MAX = 3 };
+#define WEB_BG_NONE 0xFFFFFFFFu     /* sentinel: no background-color set */
 /* Item kinds. A rule is not an empty text run: the renderer has to be able to
  * tell "draw a horizontal line here" from "a word that happens to be blank",
  * and a flat display list of text-only items cannot express <hr> at all. */
 enum { WEB_ITEM_TEXT = 0, WEB_ITEM_RULE = 1 };
 struct web_item {
     short x,y,link,image;
-    unsigned color;
-    unsigned char kind, heading;   /* heading: 0 = body text, 1..6 = <h1>..<h6> */
+    unsigned color, bg;
+    unsigned char kind, heading, size;
     char text[72];
 };
 /* ---- Images: metadata in the document, pixels in a shared pool -----------
@@ -118,6 +126,8 @@ struct web_item {
  * needs yet. */
 #define WEB_IMAGES     48          /* image REFERENCES a document may hold   */
 #define WEB_POOL_SLOTS 16          /* images DECODED into pixels at once     */
+#define WEB_LINKS      256         /* link REFERENCES a document may hold    */
+#define WEB_LINKBUF    16384       /* shared characters for all those hrefs  */
 #define WEB_IMG_W 96
 #define WEB_IMG_H 64
 struct web_image {
@@ -126,13 +136,28 @@ struct web_image {
     int slot;                      /* pool index, or -1 when nothing is held  */
 };
 struct web_doc {
-    struct web_item items[WEB_ITEMS]; char links[64][WEB_URL];
+    struct web_item items[WEB_ITEMS];
+    /* Link hrefs pack into a shared arena. links[WEB_LINKS][WEB_URL] would be
+     * 128 KB at 256 links, almost all of it padding: a real href is tens of
+     * bytes, not 512. Offsets into a 16 KB arena decouple the link CAP from
+     * the bytes links cost. */
+    unsigned short linkat[WEB_LINKS];
+    char linkbuf[WEB_LINKBUF];
+    int linkused;
     struct web_image images[WEB_IMAGES];
     int count,nlinks,nimages,height,truncated;
     /* Which pool slots THIS document owns. Kept here rather than in the pool
      * so a document can release exactly its own slots without scanning. */
     unsigned char owns[WEB_POOL_SLOTS];
 };
+/* Always returns a readable C string. An out-of-range index yields "" rather
+ * than indexing the arena, so a stale item->link can never produce a pointer
+ * into unrelated bytes. */
+static const char *web_link(const struct web_doc *d,int i) {
+    static const char empty[] = "";
+    if (i < 0 || i >= d->nlinks || d->linkat[i] >= WEB_LINKBUF) return empty;
+    return d->linkbuf + d->linkat[i];
+}
 /* The pool itself is process-global and never appears in a snapshot: a
  * snapshot stores slot indices, and a restore re-points at live slots or
  * marks the image undecoded. Copying 1.5 MB of pixels into a snapshot is
@@ -231,6 +256,107 @@ static const struct web_element *web_element_find(const char *name) {
         if (!strcmp(web_elements[i].name,name)) return &web_elements[i];
     return 0;   /* unknown: caller treats as inline, deliberately */
 }
+/* ---- Inline CSS: the three properties the brief asks for ------------------
+ * A style ATTRIBUTE parser, not a stylesheet engine: no selectors, no
+ * cascade, no specificity. Declaring that boundary matters, because "supports
+ * CSS" would be a false claim -- what is supported is color, background-color
+ * and font-size on a style="" attribute, inherited down the open-element
+ * stack and restored on close, exactly as link and heading context already
+ * are. Anything else in the attribute is ignored, not misread. */
+static int web_hex1(int c) {
+    c = web_lower(c);
+    if (c>='0'&&c<='9') return c-'0';
+    if (c>='a'&&c<='f') return c-'a'+10;
+    return -1;
+}
+struct web_named_color { const char *name; unsigned rgb; };
+static const struct web_named_color web_named_colors[] = {
+    {"black",0x000000},{"white",0xffffff},{"red",0xff0000},{"lime",0x00ff00},
+    {"green",0x008000},{"blue",0x0000ff},{"yellow",0xffff00},{"cyan",0x00ffff},
+    {"aqua",0x00ffff},{"magenta",0xff00ff},{"fuchsia",0xff00ff},{"gray",0x808080},
+    {"grey",0x808080},{"silver",0xc0c0c0},{"maroon",0x800000},{"olive",0x808000},
+    {"navy",0x000080},{"teal",0x008080},{"purple",0x800080},{"orange",0xffa500},
+};
+/* Returns 1 and sets *out on success. An unrecognised or malformed value
+ * leaves *out untouched so the caller keeps its inherited colour -- a page
+ * asking for a colour we cannot parse must not get black-on-black. */
+static int web_css_color(const char *v,unsigned *out) {
+    while (web_space(*v)) ++v;
+    if (*v=='#') {
+        ++v; int n=0; while (web_hex1(v[n])>=0) ++n;
+        if (n==3) {
+            int r=web_hex1(v[0]),g=web_hex1(v[1]),b=web_hex1(v[2]);
+            *out=(unsigned)((r*17)<<16 | (g*17)<<8 | (b*17)); return 1;
+        }
+        if (n>=6) {
+            unsigned c=0;
+            for (int i=0;i<6;i++) c=(c<<4)|(unsigned)web_hex1(v[i]);
+            *out=c; return 1;
+        }
+        return 0;
+    }
+    if (!strncmp(v,"rgb(",4)) {
+        v+=4; unsigned part[3]={0,0,0};
+        for (int i=0;i<3;i++) {
+            while (web_space(*v)) ++v;
+            if (*v<'0'||*v>'9') return 0;
+            unsigned n=0,digits=0;
+            while (*v>='0'&&*v<='9') { n=n*10+(unsigned)(*v++-'0'); if(++digits>3) return 0; }
+            if (n>255) n=255;
+            part[i]=n;
+            while (web_space(*v)) ++v;
+            if (i<2) { if (*v!=',') return 0; ++v; }
+        }
+        while (web_space(*v)) ++v;
+        if (*v!=')') return 0;
+        *out=(part[0]<<16)|(part[1]<<8)|part[2]; return 1;
+    }
+    char name[24]; unsigned n=0;
+    while (v[n] && !web_space(v[n]) && n<sizeof name-1) { name[n]=(char)web_lower(v[n]); ++n; }
+    name[n]=0;
+    for (unsigned i=0;i<sizeof web_named_colors/sizeof *web_named_colors;i++)
+        if (!strcmp(web_named_colors[i].name,name)) { *out=web_named_colors[i].rgb; return 1; }
+    return 0;
+}
+/* Map a CSS length onto one of the bounded size classes. The renderer has a
+ * single 8x16 face, so a size is a line-height hint, not a font metric we
+ * could honour precisely -- clamping is the honest behaviour rather than
+ * pretending 9999px is representable. */
+static int web_css_size(const char *v,unsigned char *out) {
+    while (web_space(*v)) ++v;
+    if (*v<'0'||*v>'9') return 0;
+    unsigned px=0,digits=0;
+    while (*v>='0'&&*v<='9') { px=px*10+(unsigned)(*v++-'0'); if(++digits>5) break; }
+    unsigned char s = px<12 ? WEB_SIZE_SMALL : px<17 ? WEB_SIZE_NORMAL
+                    : px<25 ? WEB_SIZE_LARGE : WEB_SIZE_XL;
+    /* The ternary already yields a value in [WEB_SIZE_MIN, WEB_SIZE_MAX], so
+     * there is no clamp here: an `s < WEB_SIZE_MIN` test on an unsigned char
+     * against 0 is always false, which -Wtype-limits correctly rejects as a
+     * check that cannot fire. The bound is enforced by construction. */
+    *out=s; return 1;
+}
+/* Walk "prop: value; prop: value" and apply the three we honour. */
+static void web_css_apply(const char *style,unsigned *color,unsigned *bg,unsigned char *size) {
+    const char *p=style;
+    while (*p) {
+        while (web_space(*p)||*p==';') ++p;
+        if (!*p) break;
+        char prop[24]; unsigned n=0;
+        while (*p && *p!=':' && *p!=';' && n<sizeof prop-1) {
+            if (!web_space(*p)) prop[n++]=(char)web_lower(*p);
+            ++p;
+        }
+        prop[n]=0;
+        if (*p!=':') { while (*p && *p!=';') ++p; continue; }
+        ++p;
+        char val[64]; unsigned m=0;
+        while (*p && *p!=';' && m<sizeof val-1) val[m++]=*p++;
+        val[m]=0;
+        if (!strcmp(prop,"color")) web_css_color(val,color);
+        else if (!strcmp(prop,"background-color")) web_css_color(val,bg);
+        else if (!strcmp(prop,"font-size")) web_css_size(val,size);
+    }
+}
 /* Open-element stack. Bounded and non-recursive: a page with 4000 unclosed
  * divs must degrade, not smash the stack. Overflow keeps parsing at the
  * deepest tracked level rather than dropping content. */
@@ -242,7 +368,11 @@ struct web_layout {
     int link;                 /* enclosing <a>, or -1                        */
     int heading;              /* enclosing <h1..6> level, or 0               */
     int skip;                 /* inside <script>/<style>/<head>              */
-    struct { char name[32]; unsigned char display, heading; int link; } open[WEB_DEPTH];
+    unsigned color, bg;       /* inherited inline style                      */
+    unsigned char size;
+    int styled;               /* page set a colour explicitly on this run    */
+    struct { char name[32]; unsigned char display, heading, size, styled; int link;
+             unsigned color, bg; } open[WEB_DEPTH];
     int depth;
 };
 static void web_line_break(struct web_layout *L) {
@@ -254,13 +384,22 @@ static void web_word(struct web_layout *L,const char *s) {
     int len=(int)strlen(s); if(!len) return;
     struct web_doc *d=L->d;
     int h = L->heading ? 22 : 18;
+    /* Larger inline sizes get more line height. The face is fixed at 8x16, so
+     * this is leading, not glyph scaling -- the honest effect of a size class
+     * on a single-face renderer. */
+    if (L->size == WEB_SIZE_LARGE && h < 22) h = 22;
+    if (L->size == WEB_SIZE_XL) h = 26;
     if (L->x + len*8 > 552) { L->y += L->line_h; L->x = 8; L->line_h = h; }
     if (h > L->line_h) L->line_h = h;
     if (d->count >= WEB_ITEMS) { d->truncated = 1; return; }
     struct web_item *it=&d->items[d->count++];
     it->x=(short)L->x; it->y=(short)L->y; it->link=(short)L->link; it->image=-1;
     it->kind=WEB_ITEM_TEXT; it->heading=(unsigned char)L->heading;
-    it->color = L->link>=0 ? 0x7dd3fcu : L->heading ? 0x67e8f9u : 0xdce6efu;
+    it->size=L->size; it->bg=L->bg;
+    /* An explicit page colour wins; otherwise a link is link-coloured, a
+     * heading heading-coloured, and body text takes the default. */
+    it->color = L->styled ? L->color
+              : L->link>=0 ? 0x7dd3fcu : L->heading ? 0x67e8f9u : 0xdce6efu;
     web_copy(it->text,sizeof it->text,s);
     L->x += len*8 + 8;
 }
@@ -271,7 +410,7 @@ static void web_rule(struct web_layout *L) {
     struct web_item *it=&d->items[d->count++];
     it->x=8; it->y=(short)L->y; it->link=-1; it->image=-1;
     it->kind=WEB_ITEM_RULE; it->heading=0; it->color=0x35506e;
-    it->text[0]=0;
+    it->size=WEB_SIZE_NORMAL; it->bg=WEB_BG_NONE; it->text[0]=0;
     L->y += 12; L->x = 8; L->line_h = 18;
 }
 static void web_html(struct web_doc *d,const char *html) {
@@ -284,6 +423,7 @@ static void web_html(struct web_doc *d,const char *html) {
     struct web_layout L;
     memset(&L,0,sizeof L);
     L.d=d; L.x=8; L.y=0; L.line_h=18; L.link=-1;
+    L.color=0xdce6efu; L.bg=WEB_BG_NONE; L.size=WEB_SIZE_NORMAL; L.styled=0;
     const char *p=html; char word[72]; int n=0;
     while(*p) {
         if(*p=='<'||web_space(*p)) {
@@ -322,9 +462,14 @@ static void web_html(struct web_doc *d,const char *html) {
                     L.depth = at;
                     /* Restore the enclosing context from what remains open. */
                     L.link = -1; L.heading = 0;
+                    L.color = 0xdce6efu; L.bg = WEB_BG_NONE;
+                    L.size = WEB_SIZE_NORMAL; L.styled = 0;
                     for (int i=0;i<L.depth;i++) {
                         if (L.open[i].link >= 0) L.link = L.open[i].link;
                         if (L.open[i].heading)   L.heading = L.open[i].heading;
+                        if (L.open[i].styled) { L.color = L.open[i].color; L.styled = 1; }
+                        if (L.open[i].bg != WEB_BG_NONE) L.bg = L.open[i].bg;
+                        if (L.open[i].size != WEB_SIZE_NORMAL) L.size = L.open[i].size;
                     }
                     if (was_block) web_line_break(&L);
                 } else if (disp == WEB_DISP_BLOCK) web_line_break(&L);
@@ -338,9 +483,20 @@ static void web_html(struct web_doc *d,const char *html) {
             }
 
             int link_here = -1;
-            if (!strcmp(name,"a") && d->nlinks < 64) {
-                web_attr(tag,"href",d->links[d->nlinks],WEB_URL);
-                if (d->links[d->nlinks][0]) { link_here = d->nlinks++; L.link = link_here; }
+            if (!strcmp(name,"a") && d->nlinks < WEB_LINKS) {
+                /* Parse the href into a scratch buffer, then pack it into the
+                 * arena. A link that does not fit is DROPPED -- the anchor
+                 * degrades to plain text rather than pointing at a truncated
+                 * or arbitrary URL, and the document keeps parsing. */
+                char href[WEB_URL];
+                web_attr(tag,"href",href,sizeof href);
+                size_t hn = strlen(href);
+                if (hn && d->linkused + (int)hn + 1 <= WEB_LINKBUF) {
+                    d->linkat[d->nlinks] = (unsigned short)d->linkused;
+                    memcpy(d->linkbuf + d->linkused, href, hn + 1);
+                    d->linkused += (int)hn + 1;
+                    link_here = d->nlinks++; L.link = link_here;
+                }
             }
             if (!strcmp(name,"img") && d->nimages < WEB_IMAGES && d->count < WEB_ITEMS) {
                 int z=d->nimages; struct web_image *im=&d->images[z];
@@ -355,6 +511,19 @@ static void web_html(struct web_doc *d,const char *html) {
                 }
             }
             if (el && el->heading) L.heading = el->heading;
+            /* style="" on this element, inherited by everything inside it. */
+            {
+                char style[256];
+                web_attr(tag,"style",style,sizeof style);
+                if (style[0]) {
+                    unsigned c=L.color, b=L.bg; unsigned char z=L.size;
+                    int had=L.styled;
+                    web_css_apply(style,&c,&b,&z);
+                    if (c!=L.color) { L.color=c; L.styled=1; }
+                    else L.styled=had;
+                    L.bg=b; L.size=z;
+                }
+            }
 
             /* Void and self-closed elements never go on the stack: pushing
              * <br> or <img> would leave them open forever and every later
@@ -365,6 +534,8 @@ static void web_html(struct web_doc *d,const char *html) {
                 L.open[i].display=disp;
                 L.open[i].heading=el?el->heading:0;
                 L.open[i].link=link_here;
+                L.open[i].color=L.color; L.open[i].bg=L.bg;
+                L.open[i].size=L.size; L.open[i].styled=(unsigned char)L.styled;
             }
             continue;
         }
@@ -1024,7 +1195,15 @@ static int web_snapshot_valid(const struct web_snapshot *s) {
         !memchr(s->url, 0, WEB_URL)) return 0;
     for (int i=0;i<s->hcount;i++) if (!memchr(s->history[i],0,WEB_URL)) return 0;
     for (int i=0;i<s->nmarks;i++) if (!memchr(s->marks[i],0,WEB_URL)) return 0;
-    for (int i=0;i<s->doc.nlinks;i++) if (!memchr(s->doc.links[i],0,WEB_URL)) return 0;
+    if (s->doc.linkused < 0 || s->doc.linkused > WEB_LINKBUF) return 0;
+    for (int i=0;i<s->doc.nlinks;i++) {
+        /* Every offset must land inside the used part of the arena AND its
+         * string must terminate before the arena ends, or a restored snapshot
+         * hands the navigator a pointer that runs off the buffer. */
+        if (s->doc.linkat[i] >= s->doc.linkused) return 0;
+        if (!memchr(s->doc.linkbuf + s->doc.linkat[i], 0,
+                    (size_t)(WEB_LINKBUF - s->doc.linkat[i]))) return 0;
+    }
     for (int i=0;i<s->doc.nimages;i++)
         if (!memchr(s->doc.images[i].src,0,WEB_URL) || !memchr(s->doc.images[i].alt,0,72)) return 0;
     for (int i=0;i<s->doc.count;i++) {
@@ -1151,7 +1330,7 @@ static void web_click(int x, int y) {
         int bx,by,bw,bh;
         if (!web_item_box(it,t->scroll,&bx,&by,&bw,&bh) || !app_hit(x,y,bx,by,bw,bh)) continue;
         char dest[WEB_URL];
-        if (web_resolve(t->url, t->doc.links[it->link], dest)) web_navigate(web_active, dest, 1);
+        if (web_resolve(t->url, web_link(&t->doc, it->link), dest)) web_navigate(web_active, dest, 1);
         return;
     }
 }
@@ -1300,6 +1479,11 @@ static void web_draw_document(struct app_win *w, const struct web_doc *doc, int 
             app_rect(w, it->x + 4, y + WEB_LINE / 2, WEB_W - 40, 1, it->color);
             continue;
         }
+        /* Background fill first: a page that sets background-color expects it
+         * behind the text, not instead of it. WEB_BG_NONE means transparent,
+         * which is the overwhelmingly common case. */
+        if (it->bg != WEB_BG_NONE)
+            app_rect(w, it->x + 4, y, app_text_width(it->text), WEB_LINE, it->bg);
         app_text(w, it->x + 4, y, it->text, it->link >= 0 ? 0x77aaff : it->color);
     }
 }
