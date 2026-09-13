@@ -11,6 +11,16 @@
 #define MBEDTLS_HAVE_TIME
 #define MBEDTLS_HAVE_TIME_DATE
 #define MBEDTLS_MEMORY_BUFFER_ALLOC_C
+/* The browser supplies its own TLS heap (web_tls_heap, 8-byte aligned) to
+ * mbedtls_memory_buffer_alloc_init, so the allocator's internal chunk-header
+ * arithmetic -- not malloc -- decides the alignment of every struct it hands
+ * back. Left at the default it produced addresses 4 mod 8, which UBSan caught
+ * as misaligned struct mbedtls_x509_crt accesses during certificate chain
+ * parsing (x509_crt.c:1358 and :3250-3261). x86-64 tolerates unaligned scalar
+ * loads so the guest never faulted; the host test with -fsanitize=undefined is
+ * what exposed it. This is the knob for that case: it makes the allocator's
+ * multiple match the heap's alignment. */
+#define MBEDTLS_MEMORY_ALIGN_MULTIPLE 8
 #define MBEDTLS_AES_C
 #define MBEDTLS_ASN1_PARSE_C
 #define MBEDTLS_ASN1_WRITE_C

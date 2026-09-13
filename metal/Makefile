@@ -203,8 +203,88 @@ $(BUILD)/apps/outrun_edit.o: $(APP_SRC)/vault_pad.c
 # a boot: a defect in the calculator's overflow guard is far cheaper to see here
 # than in a serial log 300 s into an emulated boot.
 .PHONY: apps apps-test
-apps-test:
+apps-test: kernel-test web-test
 	bash ../apps/tests/run.sh
+
+# The KERNEL's host-testable logic. These cover code that lives in kernel64.c
+# and its headers, so they are not app tests and run.sh is the wrong place for
+# them -- but they need no image either, and until now nothing ran them at all.
+#
+# test-wm-host.py and test-spatial-host.py were both reachable only by typing
+# their path by hand, which is the harness version of a counter nothing prints:
+# the assertions existed, passed, and gated nothing. test-spatial-host.py was in
+# fact BROKEN (it redeclared bx/by into test-wm-host.py's main() and failed
+# -Werror), and that went unnoticed precisely because no target invoked it.
+.PHONY: kernel-test
+kernel-test:
+	python3 tools/test-wm-host.py
+	python3 tools/test-spatial-host.py
+
+# The BROWSER's host tests. Same story as kernel-test, one step worse: these
+# three files existed, contained real assertions, and NOTHING RAN THEM. run.sh
+# iterates a fixed app list plus apps/test_*.c, and all three browser tests
+# live in apps/tests/, which no glob covers -- so `make apps-test` reported
+# "all host tests passed" while grep for "web" in its output returned nothing.
+#
+# They cannot join run.sh's generic loop because the browser is the one app
+# with a third-party dependency: they need the Mbed TLS include path, the
+# freestanding config, the GENERATED CA trust store, and host builds of the
+# vendored library to link against. The ring-3 objects above cannot be reused
+# for that -- they are freestanding and -mcmodel=large -- so this target builds
+# a host copy, but derives every flag from the same variables.
+WEB_TEST_CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+                   -I$(APP_SRC) -I$(WEB_VENDOR)/include \
+                   -DMBEDTLS_CONFIG_FILE='"web_mbedtls_config.h"'
+WEB_HOST_OBJ := $(patsubst $(WEB_VENDOR)/library/%.c,$(BUILD)/webtest/mbedtls/%.o,$(WEB_LIB_SRC))
+$(BUILD)/webtest/mbedtls:
+	mkdir -p $@
+$(BUILD)/webtest/mbedtls/%.o: $(WEB_VENDOR)/library/%.c | $(BUILD)/webtest/mbedtls
+	$(CC) $(WEB_TEST_CFLAGS) -Wno-error -c $< -o $@
+# gui.c needs APP_HOST_TEST on the command line (it has no #define of its own);
+# the test sources define it themselves, so passing -D globally would redefine
+# it under -Werror. Compile the toolkit separately and link the object.
+$(BUILD)/webtest/gui.o: $(APP_SRC)/gui.c | $(BUILD)/webtest/mbedtls
+	$(CC) $(WEB_TEST_CFLAGS) -DAPP_HOST_TEST -c $< -o $@
+.PHONY: web-test
+web-test: $(WEB_CA) $(WEB_HOST_OBJ) $(BUILD)/webtest/gui.o
+	@mkdir -p $(BUILD)/webtest
+# test_web defines WEB_CORE_TEST, which compiles the ENTIRE TLS section out of
+# outrun_web.c -- including its mbedtls_platform_gmtime_r definition. Linking
+# the library into it therefore fails on a symbol that build deliberately does
+# not have, so the core test is built WITHOUT the vendored objects and the two
+# network tests with them.
+	gcc $(WEB_TEST_CFLAGS) $(APP_SRC)/tests/test_web.c -o $(BUILD)/webtest/test_web
+	$(BUILD)/webtest/test_web
+# test_web_ui exercises the real renderer, so it links the GUI toolkit and
+# supplies its own sysc() stub. test_web_network drives POSIX sockets and never
+# touches a window, so it links neither -- giving it gui.o would demand a sysc()
+# it has no reason to have.
+	gcc $(WEB_TEST_CFLAGS) $(APP_SRC)/tests/test_web_ui.c $(BUILD)/webtest/gui.o \
+	    $(WEB_HOST_OBJ) -o $(BUILD)/webtest/test_web_ui
+	$(BUILD)/webtest/test_web_ui
+# test_web_network drives the TRANSPORT state machine only -- no parsing, no
+# history, no image decode -- so those functions are genuinely unreferenced in
+# that translation unit. They are live code reached by the other two tests and
+# by the shipping ELF, so the honest flag is to stop treating unused-function
+# as an error for this one binary rather than to delete or fake a caller.
+# Sanitizers stay FULLY on, alignment included: the misaligned x509_crt accesses
+# UBSan found here were fixed at the root with MBEDTLS_MEMORY_ALIGN_MULTIPLE 8
+# in web_mbedtls_config.h, not suppressed.
+	gcc $(WEB_TEST_CFLAGS) \
+	    -Wno-error=unused-function -Wno-unused-function \
+	    $(APP_SRC)/tests/test_web_network.c $(WEB_HOST_OBJ) \
+	    -o $(BUILD)/webtest/test_web_network
+# test_web_network is DRIVEN, not standalone: run-web-network.py takes the
+# binary as argv[1] and stands up real loopback HTTP/TLS servers with ephemeral
+# certificates and ports around it. Running the binary bare exits non-zero
+# because there is nothing listening -- which is correct behaviour, not a
+# failure. It needs python3-cryptography; when that is missing the harness is
+# SKIPPED with a message rather than silently counted as a pass.
+	@if python3 -c 'import cryptography' 2>/dev/null; then \
+	  python3 $(APP_SRC)/tests/run-web-network.py $(BUILD)/webtest/test_web_network || exit 1; \
+	else \
+	  echo "web network: SKIPPED (python3-cryptography not installed)"; \
+	fi
 
 # The desktop's own acceptance test: boots the desktop image, drives the REAL
 # input path over QMP, and fails unless every launcher tile starts its program

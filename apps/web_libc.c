@@ -45,6 +45,16 @@ int memcmp(const void *x, const void *y, size_t n) {
     for (; n--; a++, b++) if (*a != *b) return *a < *b ? -1 : 1;
     return 0;
 }
+/* Mbed TLS does not need this, but outrun_web.c's snapshot validator does:
+ * it uses memchr to prove every fixed-size string field in a restored
+ * snapshot is NUL-terminated before anything reads it as a C string. GCC
+ * also synthesises calls to it from open-coded scan loops, so a freestanding
+ * link needs a real definition even where the source never names it. */
+void *memchr(const void *s, int c, size_t n) {
+    const unsigned char *p = s;
+    for (; n--; p++) if (*p == (unsigned char)c) return (void *)p;
+    return 0;
+}
 size_t strlen(const char *s) { const char *p = s; while (*p) p++; return (size_t)(p - s); }
 int strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }

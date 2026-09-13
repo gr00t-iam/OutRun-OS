@@ -362,7 +362,15 @@ struct web_job {
 static mbedtls_x509_crt web_roots;
 static mbedtls_ssl_config web_tls_config;
 static mbedtls_ctr_drbg_context web_rng;
-static unsigned char web_tls_heap[3*1024*1024];
+/* 8-byte aligned deliberately. mbedtls_memory_buffer_alloc_init carves every
+ * TLS allocation out of this array, so the array's own alignment becomes the
+ * alignment of every struct inside it -- and an unsigned char[] only promises
+ * 1. UBSan caught real misaligned mbedtls_x509_crt accesses through this heap
+ * during certificate chain parsing. x86-64 tolerates unaligned scalar loads, so
+ * the guest never faulted and the defect was invisible until the host test ran
+ * with -fsanitize=undefined; on a stricter target it is a crash, and here it
+ * silently costs split loads on every certificate field. */
+static unsigned char web_tls_heap[3*1024*1024] __attribute__((aligned(8)));
 static int web_tls_ready,web_have_roots;
 static uint64_t web_clock(int realtime) {
 #ifdef WEB_HOST_NETWORK
@@ -465,7 +473,20 @@ static int web_runtime_init(const unsigned char *roots,size_t len) {
     mbedtls_memory_buffer_alloc_init(web_tls_heap,sizeof web_tls_heap);
     mbedtls_x509_crt_init(&web_roots); mbedtls_ssl_config_init(&web_tls_config); mbedtls_ctr_drbg_init(&web_rng);
     mbedtls_platform_set_time(web_time);
-    web_have_roots=mbedtls_x509_crt_parse(&web_roots,roots,len)==0;
+    /* mbedtls_x509_crt_parse returns 0 when EVERY certificate parsed, a NEGATIVE
+     * error when it could not use the input at all, and a POSITIVE count of how
+     * many individual certificates it skipped while parsing the rest. Demanding
+     * ==0 therefore rejects a whole trust store because of one certificate this
+     * build's trimmed algorithm set cannot represent -- which is exactly what
+     * the real 189 KB cacert.pem does, leaving web_have_roots at 0 and failing
+     * every HTTPS request closed as if the network were down.
+     *
+     * Accept a partial parse, but only if it actually yielded a chain: rc<0 or
+     * an empty list still fails, so an empty or garbage store can never be read
+     * as success. That distinction is the whole point -- verifying against zero
+     * roots would accept anything. */
+    int rc=mbedtls_x509_crt_parse(&web_roots,roots,len);
+    web_have_roots = rc>=0 && web_roots.version!=0;
     return web_have_roots;
 }
 static int web_tls_init(void) {
@@ -598,6 +619,7 @@ static void web_step(struct web_job *j) {
     }
 }
 
+#if !defined(WEB_HOST_NETWORK) || defined(WEB_UI_TEST)
 /* ===========================================================================
  * BROWSER UI — toolbar, tab strip, address bar, viewport, status bar
  * ===========================================================================
@@ -640,6 +662,9 @@ static void web_step(struct web_job *j) {
 #define WEB_LINE      14
 
 static struct web_tab web_tabs[WEB_TABS];
+/* One scratch snapshot slot, saved with S and restored with R. version==0
+ * means "nothing saved yet" -- web_snapshot_save stamps it. */
+static struct web_snapshot web_saved_page;
 static struct web_job web_current;
 static char web_address[WEB_URL];
 static char web_marks[WEB_MARKS][WEB_URL];
@@ -760,6 +785,73 @@ static void web_bookmark(const char *url) {
     web_copy(web_marks[web_nmarks++], WEB_URL, url);
 }
 
+/* Application-assisted snapshots, NOT process checkpoints. No DOM is retained:
+ * the document is a bounded display list with decoded thumbnail pixels. Never
+ * copy web_job, TLS contexts, fd values, pending requests or authentication.
+ * Version/size are checked even for these process-local, non-persistent cards.
+ * No private-tab isolation claim: all cards share this browser's address space. */
+#define WEB_SNAPSHOT_VERSION 1u
+struct web_snapshot {
+    uint32_t version, bytes;
+    char url[WEB_URL], history[WEB_HIST][WEB_URL], marks[WEB_MARKS][WEB_URL];
+    struct web_doc doc;
+    int hcount, hpos, nmarks, scroll;
+};
+static int web_snapshot_valid(const struct web_snapshot *s) {
+    if (s->version != WEB_SNAPSHOT_VERSION || s->bytes != sizeof *s ||
+        s->hcount < 0 || s->hcount > WEB_HIST || s->hpos < 0 ||
+        (s->hcount ? s->hpos >= s->hcount : s->hpos != 0) ||
+        s->nmarks < 0 || s->nmarks > WEB_MARKS || s->scroll < 0 ||
+        s->doc.count < 0 || s->doc.count > WEB_ITEMS ||
+        s->doc.nlinks < 0 || s->doc.nlinks > 64 ||
+        s->doc.nimages < 0 || s->doc.nimages > 8 ||
+        s->doc.height < 0 || s->doc.height > 65536 ||
+        !memchr(s->url, 0, WEB_URL)) return 0;
+    for (int i=0;i<s->hcount;i++) if (!memchr(s->history[i],0,WEB_URL)) return 0;
+    for (int i=0;i<s->nmarks;i++) if (!memchr(s->marks[i],0,WEB_URL)) return 0;
+    for (int i=0;i<s->doc.nlinks;i++) if (!memchr(s->doc.links[i],0,WEB_URL)) return 0;
+    for (int i=0;i<s->doc.nimages;i++)
+        if (!memchr(s->doc.images[i].src,0,WEB_URL) || !memchr(s->doc.images[i].alt,0,72)) return 0;
+    for (int i=0;i<s->doc.count;i++) {
+        const struct web_item *it=&s->doc.items[i];
+        if (!memchr(it->text,0,sizeof it->text) || it->link < -1 ||
+            it->link >= s->doc.nlinks || it->image < -1 || it->image >= s->doc.nimages) return 0;
+    }
+    return 1;
+}
+static int web_snapshot_save(struct web_snapshot *s) {
+    const struct web_tab *t=&web_tabs[web_active];
+    memset(s,0,sizeof *s); s->version=WEB_SNAPSHOT_VERSION; s->bytes=sizeof *s;
+    memcpy(s->url,t->url,sizeof s->url); memcpy(s->history,t->history,sizeof s->history);
+    memcpy(s->marks,web_marks,sizeof s->marks); s->doc=t->doc;
+    s->hcount=t->hcount; s->hpos=t->hpos; s->nmarks=web_nmarks; s->scroll=t->scroll;
+    return web_snapshot_valid(s);
+}
+static int web_snapshot_restore(const struct web_snapshot *s) {
+    if (!web_snapshot_valid(s) || !web_new_tab()) return 0;
+    struct web_tab *t=&web_tabs[web_active];
+    memcpy(t->url,s->url,sizeof t->url); memcpy(t->history,s->history,sizeof t->history);
+    memcpy(web_marks,s->marks,sizeof web_marks); web_nmarks=s->nmarks;
+    t->doc=s->doc; t->hcount=s->hcount; t->hpos=s->hpos; web_scroll(s->scroll);
+    web_copy(web_address,sizeof web_address,t->url);
+    /* New tab was zeroed: no automatic document OR missing-image request.
+     * User reload/navigation starts fresh transport; secure badge stays off. */
+    web_status(t,"Snapshot restored offline - R reloads; navigation reconnects");
+    return 1;
+}
+
+/* Use the exact rendered item geometry for hit-testing laid-out links and
+ * images. */
+static int web_item_box(const struct web_item *it,int scroll,int *x,int *y,int *w,int *h) {
+    *x=it->x+4; *y=WEB_CHROME_H+it->y-scroll;
+    *w=it->image>=0?96:app_text_width(it->text); *h=it->image>=0?64:WEB_LINE;
+    if (*y<WEB_CHROME_H) { *h-=WEB_CHROME_H-*y; *y=WEB_CHROME_H; }
+    if (*y+*h>WEB_H-WEB_STATUS_H) *h=WEB_H-WEB_STATUS_H-*y;
+    if (*x<0) { *w+=*x; *x=0; }
+    if (*x+*w>WEB_W) *w=WEB_W-*x;
+    return *w>0 && *h>0;
+}
+
 static void web_press(int button) {
     struct web_tab *t = &web_tabs[web_active];
     if (button == WEB_BTN_BACK)   { web_back(-1); return; }
@@ -822,13 +914,11 @@ static void web_click(int x, int y) {
     if (y >= WEB_H - WEB_STATUS_H) return;
     /* Viewport: resolve the click to a laid-out item and follow its link. */
     struct web_tab *t = &web_tabs[web_active];
-    int doc_y = y - WEB_CHROME_H + t->scroll;
     for (int i = 0; i < t->doc.count; i++) {
         struct web_item *it = &t->doc.items[i];
         if (it->link < 0 || it->link >= t->doc.nlinks) continue;
-        if (doc_y < it->y || doc_y >= it->y + WEB_LINE) continue;
-        int w = app_text_width(it->text);
-        if (x < it->x + 4 || x >= it->x + 4 + w) continue;
+        int bx,by,bw,bh;
+        if (!web_item_box(it,t->scroll,&bx,&by,&bw,&bh) || !app_hit(x,y,bx,by,bw,bh)) continue;
         char dest[WEB_URL];
         if (web_resolve(t->url, t->doc.links[it->link], dest)) web_navigate(web_active, dest, 1);
         return;
@@ -853,6 +943,25 @@ static void web_event(struct outrun_event *e) {
         case 'k': web_scroll(web_tabs[web_active].scroll - WEB_LINE); break;
         case ' ': web_scroll(web_tabs[web_active].scroll + WEB_VIEW_H - WEB_LINE); break;
         case 'g': web_scroll(0); break;
+        /* Offline snapshot of the active tab, and restore into a new tab.
+         * ONE slot, deliberately: this is a scratch "hold this page while I go
+         * look at something" facility, not a session manager. The snapshot is
+         * a typed, versioned, bounded copy of document + scroll + history --
+         * it holds no socket and no TLS session, so a restored tab is offline
+         * until the user navigates or reloads, and its secure badge stays off
+         * because nothing about the restored bytes was re-verified. */
+        case 'S':
+            web_status(&web_tabs[web_active],
+                       web_snapshot_save(&web_saved_page)
+                           ? "Page snapshotted - press R to restore into a new tab"
+                           : "Snapshot failed: document too large or no free tab");
+            break;
+        case 'R':
+            if (!web_saved_page.version)
+                web_status(&web_tabs[web_active], "No snapshot saved - press S first");
+            else if (!web_snapshot_restore(&web_saved_page))
+                web_status(&web_tabs[web_active], "Restore failed: no free tab or snapshot rejected");
+            break;
         default: break;
     }
 }
@@ -928,7 +1037,32 @@ static void web_pump(void) {
     web_fetch_next_image(t);
 }
 
-#ifndef WEB_UI_TEST
+static void web_draw_document(struct app_win *w, const struct web_doc *doc, int scroll) {
+    /* Document. Only the lines inside the viewport are drawn. */
+    for (int i = 0; i < doc->count; i++) {
+        const struct web_item *it = &doc->items[i];
+        int y = WEB_CHROME_H + it->y - scroll;
+        if (y < WEB_CHROME_H - WEB_LINE || y >= WEB_H - WEB_STATUS_H) continue;
+        if (it->image >= 0 && it->image < doc->nimages) {
+            const struct web_image *im = &doc->images[it->image];
+            if (im->loaded > 0) {
+                /* Blit the decoded 96x64 thumbnail, clipped to the viewport. */
+                for (int r = 0; r < 64; r++) {
+                    int py = y + r;
+                    if (py < WEB_CHROME_H || py >= WEB_H - WEB_STATUS_H) continue;
+                    for (int c = 0; c < 96; c++)
+                        app_rect(w, it->x + 4 + c, py, 1, 1, im->pixels[r * 96 + c]);
+                }
+            } else {
+                app_rect(w, it->x + 4, y, 96, 64, 0x1d2534);
+                app_text(w, it->x + 8, y + 26, im->alt[0] ? im->alt : "[image]", 0x8fa3bf);
+            }
+            continue;
+        }
+        app_text(w, it->x + 4, y, it->text, it->link >= 0 ? 0x77aaff : it->color);
+    }
+}
+
 static void web_draw(struct app_win *w) {
     struct web_tab *t = &web_tabs[web_active];
     app_fill(w, 0x0a0d14);
@@ -965,29 +1099,7 @@ static void web_draw(struct app_win *w) {
     app_text(w, WEB_ADDR_X + 16, WEB_TABBAR_H + 7,
              web_editing ? web_address : (t->url[0] ? t->url : "Type a URL, or press L"),
              web_editing ? 0xeaf2f7 : 0xc4d2e2);
-    /* Document. Only the lines inside the viewport are drawn. */
-    for (int i = 0; i < t->doc.count; i++) {
-        struct web_item *it = &t->doc.items[i];
-        int y = WEB_CHROME_H + it->y - t->scroll;
-        if (y < WEB_CHROME_H - WEB_LINE || y >= WEB_H - WEB_STATUS_H) continue;
-        if (it->image >= 0 && it->image < t->doc.nimages) {
-            struct web_image *im = &t->doc.images[it->image];
-            if (im->loaded > 0) {
-                /* Blit the decoded 96x64 thumbnail, clipped to the viewport. */
-                for (int r = 0; r < 64; r++) {
-                    int py = y + r;
-                    if (py < WEB_CHROME_H || py >= WEB_H - WEB_STATUS_H) continue;
-                    for (int c = 0; c < 96; c++)
-                        app_rect(w, it->x + 4 + c, py, 1, 1, im->pixels[r * 96 + c]);
-                }
-            } else {
-                app_rect(w, it->x + 4, y, 96, 64, 0x1d2534);
-                app_text(w, it->x + 8, y + 26, im->alt[0] ? im->alt : "[image]", 0x8fa3bf);
-            }
-            continue;
-        }
-        app_text(w, it->x + 4, y, it->text, it->link >= 0 ? 0x77aaff : it->color);
-    }
+    web_draw_document(w, &t->doc, t->scroll);
     if (web_menu && web_nmarks) {
         int h = web_nmarks * WEB_LINE + 6;
         app_rect(w, 140, WEB_CHROME_H, 420, h, 0x22e4ff);
@@ -1005,7 +1117,13 @@ static void web_draw(struct app_win *w) {
 /* Ring-3 entry. Applications here are _start, not main: user.ld names _start as
  * ENTRY and there is no C runtime to call main for us. Linking with main()
  * produced a working ELF whose entry point the linker had to guess, which boots
- * into whatever happens to sit at the default address. */
+ * into whatever happens to sit at the default address.
+ *
+ * Compiled out for WEB_UI_TEST: that build deliberately omits the 200 KB CA
+ * roots header (an included-but-unused array trips -Wunused-const-variable),
+ * so the one reference to web_ca_roots below cannot resolve there. The host UI
+ * test supplies its own main(). */
+#ifndef WEB_UI_TEST
 void _start(void) {
     struct app_win w;
     /* app_create returns NEGATIVE on failure, not zero -- see vault_pad. */
@@ -1028,5 +1146,6 @@ void _start(void) {
         app_idle();
     }
 }
-#endif /* !WEB_UI_TEST */
+#endif /* !WEB_UI_TEST: host UI test supplies its own main() */
+#endif /* UI section */
 #endif /* !WEB_CORE_TEST */

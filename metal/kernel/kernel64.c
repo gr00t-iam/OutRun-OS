@@ -14619,6 +14619,9 @@ struct wmwin {
     int      minimized, focused;
     int      maximized, restore_x, restore_y, restore_w, restore_h;
     int      hover_control, pressed_control; /* snapshot-safe chrome feedback */
+    int sp_tx, sp_ty, sp_vx, sp_vy, sp_mass, sp_drag;
+    uint64_t sp_cpu, sp_sample, sp_pid, sp_caps;
+    uint32_t sp_load, sp_threads, sp_grants;
     uint32_t accent;
     char     title[16];
     int      cw, ch;                     /* content surface dimensions (pixels)        */
@@ -14726,6 +14729,45 @@ static int g_wm_focus = -1;              /* window index with keyboard focus, or
 static int g_wm_znext = 1;               /* monotonically increasing z stamp            */
 static int g_wm_drag = -1, g_wm_drag_dx = 0, g_wm_drag_dy = 0;   /* window being dragged */
 /* WM_XP_STATE_BEGIN */
+/* WM_SPATIAL_MATH_BEGIN */
+/* Camera coordinates are signed world pixels; zoom is Q10. All products
+ * widen before multiplication. Finite integer range, not an allocation per tile. */
+static int sp_project(int p, int camera, int zoom) {
+    return (int)(((int64_t)p - camera) * zoom / 1024);
+}
+static int sp_unproject(int p, int camera, int zoom) {
+    return camera + (int)((int64_t)p * 1024 / zoom);
+}
+static int sp_lod(int old, int zoom) { return old ? zoom < 410 : zoom < 359; }
+static void sp_spring(int *p, int *v, int target, int mass, int reduced) {
+    if (reduced) { *p = target; *v = 0; return; }
+    if (mass < 1) mass = 1;
+    if (mass > 16) mass = 16;
+    int64_t dv = ((int64_t)target - *p) / (8 * mass);
+    int64_t next = ((int64_t)*v + dv) * 3 / 4;
+    if (next > 8192) next = 8192;
+    if (next < -8192) next = -8192;
+    *v = (int)next;
+    *p += *v;
+    if ((int64_t)target - *p < 16 && (int64_t)target - *p > -16 && *v < 16 && *v > -16) {
+        *p = target; *v = 0;
+    }
+}
+/* WM_SPATIAL_MATH_END */
+static int g_sp_enabled, g_sp_x, g_sp_y, g_sp_zoom = 1024, g_sp_glyph, g_sp_reduced;
+/* Draw and hit test both project via this function. Chrome stays legible;
+ * content scales independently through the existing surface inverse mapping. */
+static struct wmwin wm_screen_rect(const struct wmwin *W) {
+    struct wmwin R = *W;
+    if (!g_sp_enabled || W->maximized) return R;
+    R.x = sp_project(W->x, g_sp_x, g_sp_zoom);
+    R.y = sp_project(W->y, g_sp_y, g_sp_zoom);
+    R.w = g_sp_glyph ? 148 : sp_project(W->w, 0, g_sp_zoom);
+    R.h = g_sp_glyph ? 76 : sp_project(W->h, 0, g_sp_zoom);
+    if (R.w < 120) R.w = 120;
+    if (R.h < 64) R.h = 64;
+    return R;
+}
 /* Capture is invalidated by wm_destroy, so a recycled slot cannot receive a
  * release from its predecessor. All of this state is protected by wm lock. */
 static int g_wm_capture = -1, g_wm_control, g_wm_resize;
@@ -14770,7 +14812,8 @@ static int wm_topmost_at(int sx, int sy) {
     for (int i = 0; i < NWMWIN; i++) {
         struct wmwin *W = &g_wmwin[i];
         if (!W->used || W->minimized) continue;
-        if (sx >= W->x && sx < W->x + W->w && sy >= W->y && sy < W->y + W->h && W->z > bestz) {
+        struct wmwin R = wm_screen_rect(W);
+        if (sx >= R.x && sx < R.x + R.w && sy >= R.y && sy < R.y + R.h && W->z > bestz) {
             best = i; bestz = W->z;
         }
     }
@@ -31797,6 +31840,7 @@ static int wm_control_x(const struct wmwin *W, int control) {
     return W->w - 3 - WIMP_CLOSE_W - (control - 1) * (WIMP_CLOSE_W + 3);
 }
 static int wm_control_at(const struct wmwin *W, int sx, int sy) {
+    struct wmwin R = wm_screen_rect(W); W = &R;
     int x = sx - W->x, y = sy - W->y;
     if (y < 3 || y >= WIN_TITLE_H - 3) return 0;
     for (int c = 1; c <= 3; c++)
@@ -31832,6 +31876,8 @@ static void wm_toggle_maximize(int id) {
 /* Edges: left=1 right=2 top=4 bottom=8. Keep title buttons higher
  * priority than the resize zone; corners have a wider diagonal target. */
 static int wm_edge_at(const struct wmwin *W, int sx, int sy) {
+    if (g_sp_enabled && g_sp_glyph) return 0;
+    struct wmwin R = wm_screen_rect(W); W = &R;
     if (W->maximized) return 0;
     int x = sx - W->x, y = sy - W->y, edge = 0;
     if (x < 0 || y < 0 || x >= W->w || y >= W->h) return 0;
@@ -31843,6 +31889,7 @@ static int wm_edge_at(const struct wmwin *W, int sx, int sy) {
     return edge;
 }
 static int wm_content_point(const struct wmwin *W, int sx, int sy, int *cx, int *cy) {
+    struct wmwin R = wm_screen_rect(W); W = &R;
     int x = sx - W->x - 2, y = sy - W->y - WIN_TITLE_H - 1;
     int dw = W->w - 4, dh = W->h - WIN_TITLE_H - 3;
     if (dw <= 0 || dh <= 0 || x < 0 || y < 0 || x >= dw || y >= dh) return 0;
@@ -31861,6 +31908,9 @@ static void wm_pointer_motion(int sx, int sy) {
     if (id < 0 || !g_wmwin[id].used) return;
     struct wmwin *W = &g_wmwin[id];
     int dx = sx - g_wm_down_x, dy = sy - g_wm_down_y;
+    if (g_sp_enabled && !W->maximized) {
+        dx = sp_unproject(dx, 0, g_sp_zoom); dy = sp_unproject(dy, 0, g_sp_zoom);
+    }
     if (dx > 3 || dx < -3 || dy > 3 || dy < -3) g_wm_moved = 1;
     if (g_wm_resize) {
         int l = g_wm_start_x, t = g_wm_start_y;
@@ -31871,8 +31921,15 @@ static void wm_pointer_motion(int sx, int sy) {
         if (g_wm_resize & 8) b = wm_clamp(b + dy, t + WIN_MIN_H, desk_h() - WIN_TASKBAR_H);
         W->x = l; W->y = t; W->w = r - l; W->h = b - t;
     } else if (g_wm_drag == id && g_wm_moved && !W->maximized) {
-        W->x = wm_clamp(sx - g_wm_drag_dx, 0, desk_w() - W->w);
-        W->y = wm_clamp(sy - g_wm_drag_dy, 0, desk_h() - WIN_TASKBAR_H - WIN_TITLE_H);
+        if (g_sp_enabled) {
+            W->sp_tx = wm_clamp(g_wm_start_x + dx, -1000000, 1000000);
+            W->sp_ty = wm_clamp(g_wm_start_y + dy, -1000000, 1000000);
+            W->sp_drag = 1;
+            if (g_sp_reduced) { W->x = W->sp_tx; W->y = W->sp_ty; }
+        } else {
+            W->x = wm_clamp(sx - g_wm_drag_dx, 0, desk_w() - W->w);
+            W->y = wm_clamp(sy - g_wm_drag_dy, 0, desk_h() - WIN_TASKBAR_H - WIN_TITLE_H);
+        }
     }
 }
 /* WM_XP_HELPERS_END */
@@ -32052,7 +32109,97 @@ static void wimp_draw_widgets(const struct wmwin *W, int wi) {
     }
 }
 
+/* Advisory telemetry only: atomic scalar samples, no allocator/net locks under
+ * WM. No per-process traffic accounting exists; never infer activity from caps.
+ * Buddy availability is explicitly a pool measure, NOT process RSS. */
+static uint64_t g_sp_available;
+static int g_sp_pressure;
+static uint32_t g_sp_glass[512];
+static void wm_spatial_sample(const struct wmwin *R) {
+    if (g_sp_pressure) return;
+    for (int i=0;i<512;i++) {
+        int x=wm_clamp(R->x+i*4,0,desk_w()-1);
+        int y=wm_clamp(R->y+WIN_TITLE_H/2,0,desk_h()-1);
+        int xx=wm_clamp(x+3,0,desk_w()-1), yy=wm_clamp(y+3,0,desk_h()-1);
+        g_sp_glass[i]=wm_color_mix(wm_color_mix(g_bb[y*g_stride+x],g_bb[y*g_stride+xx],1,2),
+            wm_color_mix(g_bb[yy*g_stride+x],g_bb[yy*g_stride+xx],1,2),1,2);
+    }
+}
+static void wm_spatial_tick(void) {
+    static uint64_t last;
+    if (!g_sp_enabled) return;
+    uint64_t now = g_ticks, elapsed = now - last;
+    if (!elapsed) return;
+    last = now;
+    unsigned steps = elapsed > 4 ? 4 : (unsigned)elapsed; /* 100 Hz, bounded catch-up */
+    g_sp_available = __atomic_load_n(&g_zone.nr_free, __ATOMIC_RELAXED) * 4096;
+    g_sp_pressure = g_sp_available < 16ull * 1024 * 1024;
+    klock_acquire(&g_wm_lock);
+    for (int i = 0; i < NWMWIN; i++) {
+        struct wmwin *W = &g_wmwin[i];
+        if (!W->used || (unsigned)W->owner >= MAX_KPROC) continue;
+        int p = W->owner;
+        if (!kprocs[p].used || kprocs[p].exited) continue;
+        uint64_t pid = kprocs[p].pid;
+        if (W->sp_pid != pid) {
+            W->sp_pid = pid; W->sp_sample = 0; W->sp_drag = 0;
+            W->sp_vx = W->sp_vy = 0;
+        }
+        if (!W->sp_sample || now - W->sp_sample >= 25) {
+            uint64_t cpu = proc_cpu_live(p), dt = now - W->sp_sample;
+            W->sp_load = W->sp_sample && cpu >= W->sp_cpu && dt ?
+                (uint32_t)((cpu - W->sp_cpu) / (dt * 100000)) : 0;
+            if (W->sp_load > 100) W->sp_load = 100; /* one-core saturation */
+            W->sp_cpu = cpu; W->sp_sample = now; W->sp_threads = 0;
+            int leader = tg_of(p);
+            for (int t = 0; t < MAX_KPROC; t++)
+                if (kprocs[t].used && !kprocs[t].exited && tg_of(t) == leader) W->sp_threads++;
+            W->sp_caps = kprocs[leader].caps;
+            W->sp_grants = kprocs[leader].dma_grant_count;
+            W->sp_mass = 1 + W->sp_load / 20 + W->sp_threads / 2 +
+                         (W->cpages * (W->paired ? 2 : 1)) / 256;
+            if (W->sp_mass > 16) W->sp_mass = 16;
+        }
+        if (!W->sp_drag || W->maximized) continue;
+        for (unsigned n = 0; n < steps; n++) {
+            sp_spring(&W->x, &W->sp_vx, W->sp_tx, W->sp_mass, g_sp_reduced);
+            sp_spring(&W->y, &W->sp_vy, W->sp_ty, W->sp_mass, g_sp_reduced);
+        }
+        if (W->x == W->sp_tx && W->y == W->sp_ty) W->sp_drag = 0;
+    }
+    klock_release(&g_wm_lock);
+}
+/* Software glass: at most four background samples per 4x4 tile, title strip
+ * only. Sample first, then tint; no GPU shader or unbounded framebuffer blur. */
+static void wm_spatial_glass(const struct wmwin *R) {
+    int x0 = wm_clamp(R->x + 2, 0, desk_w()), x1 = wm_clamp(R->x + R->w - 2, 0, desk_w());
+    int y0 = wm_clamp(R->y + 1, 0, desk_h()), y1 = wm_clamp(R->y + WIN_TITLE_H, 0, desk_h());
+    for (int y = y0; y < y1; y += 4) for (int x = x0; x < x1; x += 4) {
+        uint32_t c = 0x17283C;
+        if (!g_sp_pressure) {
+            c = g_sp_glass[wm_clamp((x-R->x)/4,0,511)];
+            c = wm_color_mix(c, R->sp_load > 50 ? 0xB56036 : 0x245878, 3,4);
+        }
+        rect(x,y,x+4<x1?4:x1-x,y+4<y1?4:y1-y,c);
+    }
+    wm_ui_text(R->x+6,R->y+4,R->title,0xFFFFFF,R->x+wm_control_x(R,3)-4);
+    for(int c=3;c>=1;c--) wimp_draw_control((struct wmwin *)R,c,R->focused);
+}
+static void wm_spatial_badges(const struct wmwin *R) {
+    /* Bottom strip is reserved for telemetry only in glyph LOD, so normal
+     * application controls/content are never covered by badges. */
+    if (!g_sp_glyph || R->maximized) return;
+    int y = R->y + R->h - 32;
+    rect(R->x+2,y,R->w-4,30,0x14202C);
+    wm_ui_text(R->x+5,y,"ALLOW",R->sp_caps?0x7CD7F0:0x75828A,R->x+48);
+    wm_ui_text(R->x+51,y,"DMA",R->sp_grants?0xF9CA75:0x75828A,R->x+83);
+    wm_ui_text(R->x+89,y,"CPU",R->sp_load?0x8AF4AD:0x75828A,R->x+R->w-4);
+    rect(R->x+5,y+17,(R->w-10)*R->sp_load/100,3,0x8AF4AD);
+    for (unsigned t=0;t<R->sp_threads && t<16;t++) rect(R->x+5+t*7,y+23,4,3,0x7CD7F0);
+}
 static void wimp_compose(void) {
+    g_sp_enabled = g_boot_desktop;
+    wm_spatial_tick();
     int W = desk_w(), H = desk_h();
     if (!g_bb) return;
     /* v0.96: only the LOGICAL desktop is cleared. At scale 2 the rest of the
@@ -32061,7 +32208,8 @@ static void wimp_compose(void) {
     for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) g_bb[y * (int)g_stride + x] = C_OBS0;
     for (int gx = 0; gx < W; gx += 48) vline(gx, 0, H - WIN_TASKBAR_H, C_GRID);
     for (int gy = 0; gy < H - WIN_TASKBAR_H; gy += 48) hline(0, gy, W, C_GRID);
-    draw_str(DESK_RAIL_W + 12, 8, "OUTRUN NODE // GRID ONLINE", g_desk_accent);
+    draw_str(DESK_RAIL_W + 12, 8, g_sp_enabled ? "RMB drag: pan | RMB +/-: zoom | RMB 0: home | RMB M: motion" : "OUTRUN NODE // GRID ONLINE", g_desk_accent);
+    if (g_sp_enabled) draw_str(DESK_RAIL_W+12,20,g_sp_pressure ? "BUDDY FREE <16MiB: low-cost glass" : "BUDDY FREE >=16MiB | ALLOW=caps DMA=grants CPU=activity dots=threads", C_MUTE);
 
     /* v0.96: THE LAUNCHER IS A CONTROL NOW, not decoration. Every tile here is
      * hit-tested by wimp_pointer against this exact geometry — the two are
@@ -32096,8 +32244,12 @@ static void wimp_compose(void) {
     }
     for (int a = 0; a < nord; a++) {
         int wi = order[a];
-        wimp_draw_window(&snap[wi], snap[wi].focused);
-        wimp_draw_widgets(&snap[wi], wi);      /* v0.70: painted BY the system */
+        struct wmwin R = wm_screen_rect(&snap[wi]);
+        if (R.x >= W || R.y >= H || R.x+R.w <= 0 || R.y+R.h <= 0) continue;
+        if (g_sp_enabled) wm_spatial_sample(&R);
+        wimp_draw_window(&R, R.focused);
+        if (g_sp_enabled) { wm_spatial_glass(&R); wm_spatial_badges(&R); }
+        if (!g_sp_enabled || (!g_sp_glyph && g_sp_zoom == 1024)) wimp_draw_widgets(&R, wi);      /* v0.70: painted BY the system */
     }
 
     /* taskbar across the bottom: one chip per used window */
@@ -32184,7 +32336,7 @@ static int wimp_pointer(int sx, int sy, int down) {
         W->pressed_control = W->hover_control = control; g_wm_click_win = -1;
     } else if (edge) {
         g_wm_capture = hit; g_wm_resize = edge; g_wm_click_win = -1;
-    } else if (sy - W->y < WIN_TITLE_H) {
+    } else if (sy - wm_screen_rect(W).y < WIN_TITLE_H || (g_sp_enabled && g_sp_glyph)) {
         int dx = sx - g_wm_click_x, dy = sy - g_wm_click_y;
         if (g_wm_click_win == hit && g_ticks - g_wm_click_tick <= 40 &&
             dx >= -3 && dx <= 3 && dy >= -3 && dy <= 3) {
@@ -32361,6 +32513,10 @@ static void wimp_input_step(void) {
     if (g_cur_y < 0) g_cur_y = 0;
     if (g_cur_y >= desk_h()) g_cur_y = desk_h() - 1;
 
+    if (g_sp_enabled && (g_mouse_btn & 2) && g_wm_capture < 0) {
+        g_sp_x = wm_clamp(g_sp_x-sp_unproject(dx,0,g_sp_zoom),-1000000,1000000);
+        g_sp_y = wm_clamp(g_sp_y-sp_unproject(dy,0,g_sp_zoom),-1000000,1000000);
+    }
     uint8_t btn = g_mouse_btn & 1;
     if (btn && !prevbtn) wimp_pointer(g_cur_x, g_cur_y, 1);
     else if (!btn && prevbtn) wimp_pointer(g_cur_x, g_cur_y, 0);
@@ -32376,6 +32532,21 @@ static void wimp_input_step(void) {
 
     int ch;
     while ((ch = kbd_getc_nonblock()) >= 0) {             /* route keys to focus */
+        if (g_sp_enabled && (g_mouse_btn & 2) && g_wm_capture < 0 &&
+            (ch == '-' || ch == '+' || ch == '=' || ch == '0' || ch == 'm' || ch == 'M')) {
+            int wx=sp_unproject(g_cur_x,g_sp_x,g_sp_zoom), wy=sp_unproject(g_cur_y,g_sp_y,g_sp_zoom);
+            if(ch=='m'||ch=='M') g_sp_reduced=!g_sp_reduced;
+            else if(ch=='0') {g_sp_zoom=1024;g_sp_x=g_sp_y=0;}
+            else {
+                g_sp_zoom=wm_clamp(ch=='-'?g_sp_zoom*4/5:g_sp_zoom*5/4,128,2048);
+                g_sp_x=wm_clamp(wx-sp_unproject(g_cur_x,0,g_sp_zoom),-1000000,1000000);
+                g_sp_y=wm_clamp(wy-sp_unproject(g_cur_y,0,g_sp_zoom),-1000000,1000000);
+            }
+            g_sp_glyph=sp_lod(g_sp_glyph,g_sp_zoom);
+            g_desk_last_key=0;
+            kprintf("[spatial] zoom=%u glyph=%u reduced=%u buddy_free=%u\n",(uint64_t)g_sp_zoom,(uint64_t)g_sp_glyph,(uint64_t)g_sp_reduced,g_sp_available);
+            continue;
+        }
         /* v0.71: the focused WIDGET gets first refusal. Only a key no widget
          * wanted is delivered to the application. */
         if (wimp_key(ch)) continue;
