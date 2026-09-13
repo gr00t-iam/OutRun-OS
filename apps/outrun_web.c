@@ -88,12 +88,76 @@ static int web_resolve(const char *base, const char *ref, char *out) {
     if(!web_add(origin,sizeof origin,norm)||!web_url_parse(origin,&check)) return 0;
     return web_copy(out,WEB_URL,origin);
 }
-struct web_item { short x,y,link,image; unsigned color; char text[72]; };
-struct web_image { char src[WEB_URL],alt[72]; unsigned pixels[96*64]; int loaded; };
+/* Item kinds. A rule is not an empty text run: the renderer has to be able to
+ * tell "draw a horizontal line here" from "a word that happens to be blank",
+ * and a flat display list of text-only items cannot express <hr> at all. */
+enum { WEB_ITEM_TEXT = 0, WEB_ITEM_RULE = 1 };
+struct web_item {
+    short x,y,link,image;
+    unsigned color;
+    unsigned char kind, heading;   /* heading: 0 = body text, 1..6 = <h1>..<h6> */
+    char text[72];
+};
+/* ---- Images: metadata in the document, pixels in a shared pool -----------
+ * struct web_image used to embed `unsigned pixels[96*64]` -- 24 KB apiece.
+ * With 8 per document that was 201 KB of a 414 KB web_doc, and web_doc is
+ * instantiated per tab AND inside every snapshot, so ~983 KB of BSS was
+ * reserved for image pixels whether or not any page had an image. The 8-image
+ * cap was therefore not a policy about pages, it was a memory limit wearing a
+ * feature's clothing.
+ *
+ * Pixels now live in ONE pool. The document holds metadata plus a slot index,
+ * so the per-document image cap and the number of simultaneously DECODED
+ * images become independent numbers: a page may reference many images while
+ * only the ones actually fetched consume pixel storage.
+ *
+ * Pool lifetime is PER DOCUMENT and slots are owned by exactly one image.
+ * web_html releases the previous document's slots, so navigation cannot leak
+ * the pool one page at a time. A global cache would have to answer eviction,
+ * cross-origin reuse and stale-after-navigation questions that nothing here
+ * needs yet. */
+#define WEB_IMAGES     48          /* image REFERENCES a document may hold   */
+#define WEB_POOL_SLOTS 16          /* images DECODED into pixels at once     */
+#define WEB_IMG_W 96
+#define WEB_IMG_H 64
+struct web_image {
+    char src[WEB_URL], alt[72];
+    int loaded;                    /* 0 pending, 1 decoded, -1 failed/refused */
+    int slot;                      /* pool index, or -1 when nothing is held  */
+};
 struct web_doc {
     struct web_item items[WEB_ITEMS]; char links[64][WEB_URL];
-    struct web_image images[8]; int count,nlinks,nimages,height,truncated;
+    struct web_image images[WEB_IMAGES];
+    int count,nlinks,nimages,height,truncated;
+    /* Which pool slots THIS document owns. Kept here rather than in the pool
+     * so a document can release exactly its own slots without scanning. */
+    unsigned char owns[WEB_POOL_SLOTS];
 };
+/* The pool itself is process-global and never appears in a snapshot: a
+ * snapshot stores slot indices, and a restore re-points at live slots or
+ * marks the image undecoded. Copying 1.5 MB of pixels into a snapshot is
+ * exactly the cost this change exists to remove. */
+static unsigned web_pool[WEB_POOL_SLOTS][WEB_IMG_W*WEB_IMG_H];
+static unsigned char web_pool_taken[WEB_POOL_SLOTS];
+static const unsigned *web_pool_pixels(const struct web_doc *d,int slot) {
+    (void)d;
+    if (slot < 0 || slot >= WEB_POOL_SLOTS || !web_pool_taken[slot]) return 0;
+    return web_pool[slot];
+}
+static int web_pool_used(const struct web_doc *d) {
+    int n=0;
+    for (int i=0;i<WEB_POOL_SLOTS;i++) if (d->owns[i]) n++;
+    return n;
+}
+static int web_pool_claim(struct web_doc *d) {
+    for (int i=0;i<WEB_POOL_SLOTS;i++)
+        if (!web_pool_taken[i]) { web_pool_taken[i]=1; d->owns[i]=1; return i; }
+    return -1;                     /* exhausted: caller must fail closed */
+}
+static void web_pool_release(struct web_doc *d) {
+    for (int i=0;i<WEB_POOL_SLOTS;i++)
+        if (d->owns[i]) { web_pool_taken[i]=0; d->owns[i]=0; }
+}
 static int web_lower(int c) { return c>='A'&&c<='Z'?c+32:c; }
 static int web_equal(const char *a,const char *b) {
     while(*a&&*b) if(web_lower(*a++)!=web_lower(*b++)) return 0;
@@ -119,20 +183,111 @@ static void web_attr(const char *tag,const char *key,char *out,size_t cap) {
         if(match) { out[overflow?0:n]=0; return; }
     }
 }
-static void web_word(struct web_doc *d,const char *s,int *x,int *y,int link,unsigned color) {
-    int len=(int)strlen(s); if(!len)return;
-    if(*x+len*8>552) { *x=8; *y+=18; }
-    if(d->count>=WEB_ITEMS) { d->truncated=1; return; }
+/* ---- Element table + layout state ---------------------------------------
+ * The old parser had one rule: a tag in a hardcoded list emitted a line break,
+ * everything else did nothing. That cannot express <span> (inline, must NOT
+ * break) or <hr> (block, and not text), and it silently treated every unknown
+ * wrapper -- <section>, <main>, <nav>, which real pages are full of -- as a
+ * no-op while treating <em> the same way. This table replaces that guess with
+ * a declared display type per element, and the default for an UNKNOWN tag is
+ * inline: a wrapper we do not recognise must be transparent to layout rather
+ * than injecting a spurious break.
+ *
+ * There is no retained node tree. A tree would buy nothing here -- nothing
+ * re-lays-out, mutates or queries the document after parse -- and would cost a
+ * second bounded arena on top of the display list. What the parser keeps is
+ * the ONE thing a flat loop could not: an explicit open-element STACK, so
+ * nesting is tracked rather than flattened. That is what makes <a> inside
+ * <span> inside <p> resolve, and what makes an inner block's close return to
+ * the enclosing block instead of to the document. */
+enum { WEB_DISP_INLINE = 0, WEB_DISP_BLOCK = 1, WEB_DISP_RULE = 2, WEB_DISP_SKIP = 3 };
+struct web_element { const char *name; unsigned char display, heading; };
+static const struct web_element web_elements[] = {
+    { "script", WEB_DISP_SKIP,  0 }, { "style", WEB_DISP_SKIP,  0 },
+    { "head",   WEB_DISP_SKIP,  0 }, { "title", WEB_DISP_SKIP,  0 },
+    { "p",      WEB_DISP_BLOCK, 0 }, { "div",   WEB_DISP_BLOCK, 0 },
+    { "br",     WEB_DISP_BLOCK, 0 }, { "li",    WEB_DISP_BLOCK, 0 },
+    { "tr",     WEB_DISP_BLOCK, 0 }, { "ul",    WEB_DISP_BLOCK, 0 },
+    { "ol",     WEB_DISP_BLOCK, 0 }, { "table", WEB_DISP_BLOCK, 0 },
+    { "body",   WEB_DISP_BLOCK, 0 }, { "html",  WEB_DISP_BLOCK, 0 },
+    { "section",WEB_DISP_BLOCK, 0 }, { "article",WEB_DISP_BLOCK,0 },
+    { "header", WEB_DISP_BLOCK, 0 }, { "footer",WEB_DISP_BLOCK, 0 },
+    { "nav",    WEB_DISP_BLOCK, 0 }, { "main",  WEB_DISP_BLOCK, 0 },
+    { "blockquote", WEB_DISP_BLOCK, 0 }, { "pre", WEB_DISP_BLOCK, 0 },
+    { "hr",     WEB_DISP_RULE,  0 },
+    { "h1", WEB_DISP_BLOCK, 1 }, { "h2", WEB_DISP_BLOCK, 2 },
+    { "h3", WEB_DISP_BLOCK, 3 }, { "h4", WEB_DISP_BLOCK, 4 },
+    { "h5", WEB_DISP_BLOCK, 5 }, { "h6", WEB_DISP_BLOCK, 6 },
+    /* Explicitly inline. Listed rather than left to the default so the intent
+     * is visible: these are the ones whose breaking would be a visible bug. */
+    { "span", WEB_DISP_INLINE, 0 }, { "a",  WEB_DISP_INLINE, 0 },
+    { "em",   WEB_DISP_INLINE, 0 }, { "b",  WEB_DISP_INLINE, 0 },
+    { "i",    WEB_DISP_INLINE, 0 }, { "strong", WEB_DISP_INLINE, 0 },
+    { "code", WEB_DISP_INLINE, 0 }, { "small",  WEB_DISP_INLINE, 0 },
+    { "label",WEB_DISP_INLINE, 0 }, { "img",    WEB_DISP_INLINE, 0 },
+};
+static const struct web_element *web_element_find(const char *name) {
+    for (unsigned i=0;i<sizeof web_elements/sizeof *web_elements;i++)
+        if (!strcmp(web_elements[i].name,name)) return &web_elements[i];
+    return 0;   /* unknown: caller treats as inline, deliberately */
+}
+/* Open-element stack. Bounded and non-recursive: a page with 4000 unclosed
+ * divs must degrade, not smash the stack. Overflow keeps parsing at the
+ * deepest tracked level rather than dropping content. */
+#define WEB_DEPTH 32
+struct web_layout {
+    struct web_doc *d;
+    int x, y;                 /* pen position                                */
+    int line_h;               /* tallest thing on the current line           */
+    int link;                 /* enclosing <a>, or -1                        */
+    int heading;              /* enclosing <h1..6> level, or 0               */
+    int skip;                 /* inside <script>/<style>/<head>              */
+    struct { char name[32]; unsigned char display, heading; int link; } open[WEB_DEPTH];
+    int depth;
+};
+static void web_line_break(struct web_layout *L) {
+    /* Only advance if the line has content: consecutive block tags such as
+     * </div><div> must not stack up blank lines. <br> asks explicitly. */
+    if (L->x > 8) { L->y += L->line_h; L->x = 8; L->line_h = 18; }
+}
+static void web_word(struct web_layout *L,const char *s) {
+    int len=(int)strlen(s); if(!len) return;
+    struct web_doc *d=L->d;
+    int h = L->heading ? 22 : 18;
+    if (L->x + len*8 > 552) { L->y += L->line_h; L->x = 8; L->line_h = h; }
+    if (h > L->line_h) L->line_h = h;
+    if (d->count >= WEB_ITEMS) { d->truncated = 1; return; }
     struct web_item *it=&d->items[d->count++];
-    it->x=(short)*x; it->y=(short)*y; it->link=(short)link; it->image=-1; it->color=color;
-    web_copy(it->text,sizeof it->text,s); *x+=len*8+8;
+    it->x=(short)L->x; it->y=(short)L->y; it->link=(short)L->link; it->image=-1;
+    it->kind=WEB_ITEM_TEXT; it->heading=(unsigned char)L->heading;
+    it->color = L->link>=0 ? 0x7dd3fcu : L->heading ? 0x67e8f9u : 0xdce6efu;
+    web_copy(it->text,sizeof it->text,s);
+    L->x += len*8 + 8;
+}
+static void web_rule(struct web_layout *L) {
+    struct web_doc *d=L->d;
+    web_line_break(L);
+    if (d->count >= WEB_ITEMS) { d->truncated = 1; return; }
+    struct web_item *it=&d->items[d->count++];
+    it->x=8; it->y=(short)L->y; it->link=-1; it->image=-1;
+    it->kind=WEB_ITEM_RULE; it->heading=0; it->color=0x35506e;
+    it->text[0]=0;
+    L->y += 12; L->x = 8; L->line_h = 18;
 }
 static void web_html(struct web_doc *d,const char *html) {
-    memset(d,0,sizeof *d); int x=8,y=0,link=-1,skip=0; unsigned color=0xdce6efu;
+    /* Release the OUTGOING document's pool slots before zeroing it: memset
+     * would erase the ownership map and strand those slots taken forever,
+     * exhausting the pool after a handful of navigations. */
+    web_pool_release(d);
+    memset(d,0,sizeof *d);
+    for (int i=0;i<WEB_IMAGES;i++) d->images[i].slot = -1;
+    struct web_layout L;
+    memset(&L,0,sizeof L);
+    L.d=d; L.x=8; L.y=0; L.line_h=18; L.link=-1;
     const char *p=html; char word[72]; int n=0;
     while(*p) {
         if(*p=='<'||web_space(*p)) {
-            word[n]=0; if(!skip)web_word(d,word,&x,&y,link,color); n=0;
+            word[n]=0; if(!L.skip) web_word(&L,word); n=0;
             if(web_space(*p)) { ++p; continue; }
             if(!strncmp(p,"<!--",4)) { const char *e=strstr(p+4,"-->"); if(!e)break; p=e+3; continue; }
             ++p; char tag[1024]; int t=0; char q=0;
@@ -143,28 +298,73 @@ static void web_html(struct web_doc *d,const char *html) {
             if(*p)++p; tag[t]=0;
             char name[32]; int k=0; const char *a=tag; int close=*a=='/'; if(close)++a;
             while(*a&&!web_space(*a)&&*a!='/'&&k<31)name[k++]=(char)web_lower(*a++); name[k]=0;
-            if(!strcmp(name,"script")||!strcmp(name,"style")||!strcmp(name,"head")) { skip=close?0:1; continue; }
-            if(skip)continue;
-            if(!strcmp(name,"p")||!strcmp(name,"div")||!strcmp(name,"br")||!strcmp(name,"li")||!strcmp(name,"tr")||name[0]=='h') {
-                if(x!=8||!strcmp(name,"br"))y+=18; x=8;
-                color=(!close&&name[0]=='h')?0x67e8f9u:0xdce6efu;
+            if(!name[0]) continue;
+            /* Self-closing form <br/> -- the trailing slash is on the tag, not
+             * the name, so it must be read off the raw text. */
+            int selfclose = t>0 && tag[t-1]=='/';
+            const struct web_element *el = web_element_find(name);
+            unsigned char disp = el ? el->display : WEB_DISP_INLINE;
+
+            if (disp == WEB_DISP_SKIP) { L.skip = close ? 0 : 1; continue; }
+            if (L.skip) continue;
+
+            if (disp == WEB_DISP_RULE) { if(!close) web_rule(&L); continue; }
+
+            if (close) {
+                /* Unwind to the MATCHING open element, not just one level:
+                 * unbalanced markup is the norm, and popping blindly would
+                 * leave the stack describing elements that already closed. */
+                int at=-1;
+                for (int i=L.depth-1;i>=0;i--) if (!strcmp(L.open[i].name,name)) { at=i; break; }
+                if (at>=0) {
+                    int was_block = 0;
+                    for (int i=L.depth-1;i>=at;i--) if (L.open[i].display==WEB_DISP_BLOCK) was_block=1;
+                    L.depth = at;
+                    /* Restore the enclosing context from what remains open. */
+                    L.link = -1; L.heading = 0;
+                    for (int i=0;i<L.depth;i++) {
+                        if (L.open[i].link >= 0) L.link = L.open[i].link;
+                        if (L.open[i].heading)   L.heading = L.open[i].heading;
+                    }
+                    if (was_block) web_line_break(&L);
+                } else if (disp == WEB_DISP_BLOCK) web_line_break(&L);
+                continue;
             }
-            if(!strcmp(name,"a")) {
-                link=-1;
-                if(!close&&d->nlinks<64) {
-                    web_attr(tag,"href",d->links[d->nlinks],WEB_URL);
-                    if(d->links[d->nlinks][0])link=d->nlinks++;
-                }
+
+            if (disp == WEB_DISP_BLOCK) {
+                /* <br> is an explicit break even on an empty line. */
+                if (!strcmp(name,"br")) { L.y += L.line_h; L.x = 8; L.line_h = 18; }
+                else web_line_break(&L);
             }
-            if(!close&&!strcmp(name,"img")&&d->nimages<8&&d->count<WEB_ITEMS) {
+
+            int link_here = -1;
+            if (!strcmp(name,"a") && d->nlinks < 64) {
+                web_attr(tag,"href",d->links[d->nlinks],WEB_URL);
+                if (d->links[d->nlinks][0]) { link_here = d->nlinks++; L.link = link_here; }
+            }
+            if (!strcmp(name,"img") && d->nimages < WEB_IMAGES && d->count < WEB_ITEMS) {
                 int z=d->nimages; struct web_image *im=&d->images[z];
                 web_attr(tag,"src",im->src,sizeof im->src); web_attr(tag,"alt",im->alt,sizeof im->alt);
-                if(im->src[0]) {
-                    if(x!=8)y+=18;
+                if (im->src[0]) {
+                    if (L.x != 8) web_line_break(&L);
                     struct web_item *it=&d->items[d->count++];
-                    it->x=8; it->y=(short)y; it->link=(short)link; it->image=(short)z;
-                    ++d->nimages; y+=84; x=8;
+                    it->x=8; it->y=(short)L.y; it->link=(short)L.link; it->image=(short)z;
+                    it->kind=WEB_ITEM_TEXT; it->heading=0; it->color=0xdce6efu;
+                    it->text[0]=0;
+                    ++d->nimages; L.y += 84; L.x = 8; L.line_h = 18;
                 }
+            }
+            if (el && el->heading) L.heading = el->heading;
+
+            /* Void and self-closed elements never go on the stack: pushing
+             * <br> or <img> would leave them open forever and every later
+             * close would unwind through them. */
+            if (!selfclose && strcmp(name,"br") && strcmp(name,"img") && L.depth < WEB_DEPTH) {
+                int i=L.depth++;
+                web_copy(L.open[i].name,sizeof L.open[i].name,name);
+                L.open[i].display=disp;
+                L.open[i].heading=el?el->heading:0;
+                L.open[i].link=link_here;
             }
             continue;
         }
@@ -175,9 +375,10 @@ static void web_html(struct web_doc *d,const char *html) {
             for(unsigned j=0;j<6;j++) if(!strncmp(p,entity[j],strlen(entity[j]))) { c=value[j]; p+=strlen(entity[j]); break; }
         }
         if((unsigned char)c<32||(unsigned char)c>=127)c='?';
-        if(!skip) { word[n++]=c; if(n==68) { word[n]=0; web_word(d,word,&x,&y,link,color); n=0; } }
+        if(!L.skip) { word[n++]=c; if(n==68) { word[n]=0; web_word(&L,word); n=0; } }
     }
-    word[n]=0; if(!skip)web_word(d,word,&x,&y,link,color); d->height=y+20;
+    word[n]=0; if(!L.skip) web_word(&L,word);
+    d->height = L.y + L.line_h + 2;
 }
 struct web_response { size_t body,length; int status; char location[WEB_URL],type[80]; };
 /* Returns incomplete=0, complete=1, malformed/unsupported=-1. Only compacts
@@ -294,12 +495,23 @@ static int web_dns_answer(const unsigned char *p,size_t n,unsigned id,const char
 }
 
 /* Every image is decoded from received bytes. Unsupported formats remain alt
- * text, never a decorative stand-in claimed as a downloaded image. */
-static int web_decode_image(struct web_image *im,const unsigned char *b,size_t n) {
+ * text, never a decorative stand-in claimed as a downloaded image.
+ *
+ * The pool slot is claimed HERE, on a successful parse, not at <img> parse
+ * time: a page may reference WEB_IMAGES images while only the ones actually
+ * fetched hold pixels. Exhaustion marks the image failed (-1) rather than
+ * pending (0), because a pending image is one the fetch loop will keep
+ * retrying forever. */
+static int web_decode_image(struct web_doc *d,struct web_image *im,const unsigned char *b,size_t n) {
     int w,h; unsigned off;
     if(bmp_parse(b,n,&w,&h,&off)<0) { im->loaded=-1; return 0; }
-    for(int y=0;y<64;y++) for(int x=0;x<96;x++)
-        im->pixels[y*96+x]=bmp_pixel(b,off,w,h,x*w/96,y*h/64);
+    if(im->slot < 0) {
+        im->slot = web_pool_claim(d);
+        if(im->slot < 0) { im->loaded=-1; return 0; }   /* pool full: fail closed */
+    }
+    unsigned *px = web_pool[im->slot];
+    for(int y=0;y<WEB_IMG_H;y++) for(int x=0;x<WEB_IMG_W;x++)
+        px[y*WEB_IMG_W+x]=bmp_pixel(b,off,w,h,x*w/WEB_IMG_W,y*h/WEB_IMG_H);
     im->loaded=1; return 1;
 }
 struct web_tab {
@@ -762,6 +974,9 @@ static int web_new_tab(void) {
 static void web_close_tab(void) {
     struct web_tab *t = &web_tabs[web_active];
     if (web_job_tab == web_active) { web_close(&web_current); web_current.state = WEB_IDLE; web_job_tab = -1; }
+    /* Return this tab's pixel slots before the memset erases the ownership
+     * map -- otherwise closing tabs leaks the pool a document at a time. */
+    web_pool_release(&t->doc);
     memset(t, 0, sizeof *t);
     for (int i = 0; i < WEB_TABS; i++)
         if (web_tabs[i].used) { web_active = i; web_copy(web_address, sizeof web_address, web_tabs[i].url); return; }
@@ -804,7 +1019,7 @@ static int web_snapshot_valid(const struct web_snapshot *s) {
         s->nmarks < 0 || s->nmarks > WEB_MARKS || s->scroll < 0 ||
         s->doc.count < 0 || s->doc.count > WEB_ITEMS ||
         s->doc.nlinks < 0 || s->doc.nlinks > 64 ||
-        s->doc.nimages < 0 || s->doc.nimages > 8 ||
+        s->doc.nimages < 0 || s->doc.nimages > WEB_IMAGES ||
         s->doc.height < 0 || s->doc.height > 65536 ||
         !memchr(s->url, 0, WEB_URL)) return 0;
     for (int i=0;i<s->hcount;i++) if (!memchr(s->history[i],0,WEB_URL)) return 0;
@@ -816,6 +1031,10 @@ static int web_snapshot_valid(const struct web_snapshot *s) {
         const struct web_item *it=&s->doc.items[i];
         if (!memchr(it->text,0,sizeof it->text) || it->link < -1 ||
             it->link >= s->doc.nlinks || it->image < -1 || it->image >= s->doc.nimages) return 0;
+        /* New in slice A: both are switched on by the renderer, so a restored
+         * snapshot carrying an out-of-range value would select a branch that
+         * does not exist. Validate them like every other restored field. */
+        if (it->kind > WEB_ITEM_RULE || it->heading > 6) return 0;
     }
     return 1;
 }
@@ -824,6 +1043,13 @@ static int web_snapshot_save(struct web_snapshot *s) {
     memset(s,0,sizeof *s); s->version=WEB_SNAPSHOT_VERSION; s->bytes=sizeof *s;
     memcpy(s->url,t->url,sizeof s->url); memcpy(s->history,t->history,sizeof s->history);
     memcpy(s->marks,web_marks,sizeof s->marks); s->doc=t->doc;
+    /* A snapshot owns NO pool slots. Copying owns[] would make two documents
+     * claim the same pixels, and whichever released first would free them out
+     * from under the other. The snapshot keeps image METADATA and records the
+     * images as undecoded; a restored tab shows placeholders until the user
+     * reloads, which is the same honesty as its offline status line. */
+    memset(s->doc.owns,0,sizeof s->doc.owns);
+    for (int i=0;i<s->doc.nimages;i++) { s->doc.images[i].slot=-1; s->doc.images[i].loaded=0; }
     s->hcount=t->hcount; s->hpos=t->hpos; s->nmarks=web_nmarks; s->scroll=t->scroll;
     return web_snapshot_valid(s);
 }
@@ -832,7 +1058,12 @@ static int web_snapshot_restore(const struct web_snapshot *s) {
     struct web_tab *t=&web_tabs[web_active];
     memcpy(t->url,s->url,sizeof t->url); memcpy(t->history,s->history,sizeof t->history);
     memcpy(web_marks,s->marks,sizeof web_marks); web_nmarks=s->nmarks;
-    t->doc=s->doc; t->hcount=s->hcount; t->hpos=s->hpos; web_scroll(s->scroll);
+    t->doc=s->doc;
+    /* Belt and braces: the saved copy already holds no slots, but a restore
+     * must never be the thing that grants ownership. */
+    memset(t->doc.owns,0,sizeof t->doc.owns);
+    for (int i=0;i<t->doc.nimages;i++) { t->doc.images[i].slot=-1; t->doc.images[i].loaded=0; }
+    t->hcount=s->hcount; t->hpos=s->hpos; web_scroll(s->scroll);
     web_copy(web_address,sizeof web_address,t->url);
     /* New tab was zeroed: no automatic document OR missing-image request.
      * User reload/navigation starts fresh transport; secure badge stays off. */
@@ -1018,7 +1249,7 @@ static void web_pump(void) {
     if (t->image_next) {
         int slot = t->image_next - 1;
         if (slot >= 0 && slot < t->doc.nimages)
-            web_decode_image(&t->doc.images[slot],
+            web_decode_image(&t->doc, &t->doc.images[slot],
                              (const unsigned char *)web_current.buffer + web_current.response.body,
                              web_current.response.length);
         web_job_tab = -1;
@@ -1045,18 +1276,28 @@ static void web_draw_document(struct app_win *w, const struct web_doc *doc, int 
         if (y < WEB_CHROME_H - WEB_LINE || y >= WEB_H - WEB_STATUS_H) continue;
         if (it->image >= 0 && it->image < doc->nimages) {
             const struct web_image *im = &doc->images[it->image];
-            if (im->loaded > 0) {
-                /* Blit the decoded 96x64 thumbnail, clipped to the viewport. */
-                for (int r = 0; r < 64; r++) {
+            const unsigned *px = web_pool_pixels(doc, im->slot);
+            if (im->loaded > 0 && px) {
+                /* Blit the decoded thumbnail from the pool, clipped to the
+                 * viewport. px is NULL for any slot the document does not
+                 * hold, so a stale index draws the placeholder instead of
+                 * another document's pixels. */
+                for (int r = 0; r < WEB_IMG_H; r++) {
                     int py = y + r;
                     if (py < WEB_CHROME_H || py >= WEB_H - WEB_STATUS_H) continue;
-                    for (int c = 0; c < 96; c++)
-                        app_rect(w, it->x + 4 + c, py, 1, 1, im->pixels[r * 96 + c]);
+                    for (int c = 0; c < WEB_IMG_W; c++)
+                        app_rect(w, it->x + 4 + c, py, 1, 1, px[r * WEB_IMG_W + c]);
                 }
             } else {
-                app_rect(w, it->x + 4, y, 96, 64, 0x1d2534);
+                app_rect(w, it->x + 4, y, WEB_IMG_W, WEB_IMG_H, 0x1d2534);
                 app_text(w, it->x + 8, y + 26, im->alt[0] ? im->alt : "[image]", 0x8fa3bf);
             }
+            continue;
+        }
+        /* A rule is a drawn line, not text: without this branch <hr> parses
+         * correctly and renders as nothing at all. */
+        if (it->kind == WEB_ITEM_RULE) {
+            app_rect(w, it->x + 4, y + WEB_LINE / 2, WEB_W - 40, 1, it->color);
             continue;
         }
         app_text(w, it->x + 4, y, it->text, it->link >= 0 ? 0x77aaff : it->color);
@@ -1110,6 +1351,22 @@ static void web_draw(struct app_win *w) {
     /* Status bar. */
     app_rect(w, 0, WEB_H - WEB_STATUS_H, WEB_W, WEB_STATUS_H, 0x151b28);
     app_text(w, 6, WEB_H - WEB_STATUS_H + 3, t->status, 0x9deaff);
+    /* Pool pressure, shown only once the shared pixel pool is more than half
+     * spoken for. Images that could not claim a slot render as placeholders,
+     * and without this the user has no way to tell that apart from an image
+     * that simply failed to download. */
+    {
+        int used = web_pool_used(&t->doc), total = 0;
+        for (int i = 0; i < WEB_POOL_SLOTS; i++) if (web_pool_taken[i]) total++;
+        if (total * 2 > WEB_POOL_SLOTS) {
+            char note[40]; web_copy(note, sizeof note, "img ");
+            char n[12]; web_num(n, (unsigned)used); web_add(note, sizeof note, n);
+            web_add(note, sizeof note, "/");
+            web_num(n, (unsigned)WEB_POOL_SLOTS); web_add(note, sizeof note, n);
+            app_text(w, WEB_W - 260, WEB_H - WEB_STATUS_H + 3, note,
+                     total >= WEB_POOL_SLOTS ? 0xffcc66 : 0x8fa3bf);
+        }
+    }
     if (t->doc.truncated)
         app_text(w, WEB_W - 150, WEB_H - WEB_STATUS_H + 3, "document truncated", 0xffcc66);
 }
