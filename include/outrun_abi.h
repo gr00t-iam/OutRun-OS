@@ -214,6 +214,15 @@ struct outrun_net_info {
     unsigned long long tx_frames, loop_deliveries, accepts, eagain, sessions;
     struct outrun_netif iface[HW_MAX_NETIF];
     struct outrun_socket sock[HW_MAX_SOCK];
+    /* v1.2: the host's live layer-3 configuration, all in host byte order.
+     * OutRun Web hardcoded QEMU SLIRP's 10.0.2.3 as its resolver, which exists
+     * only under `-netdev user` and answers nothing on a real bridge. A ring-3
+     * program must be able to ASK what resolver this host was given rather than
+     * assume one. `configured` is 0 when no DHCP lease was applied and the
+     * built-in fallbacks are still in force, so a caller can tell a real lease
+     * from a default instead of having them look alike. gw == 0 means no route
+     * off-link exists. */
+    unsigned int cfg_ip, cfg_mask, cfg_gw, cfg_dns, cfg_configured;
 };
 
 /* ---- SYS_FB_CAPTURE(out, (x<<16)|y, (w<<16)|h) ---------------------------

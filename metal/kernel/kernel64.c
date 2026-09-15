@@ -5867,6 +5867,12 @@ static int udp_bind(uint16_t port, int tid) {
     return -1;
 }
 
+/* v1.2: fwd — defined with the socket layer, where SOCK_DGRAM_MAX and
+ * g_net_lock exist. Declared HERE, above net_route, because that is its only
+ * caller and an implicit declaration would silently give it the wrong type. */
+static void net_wire_udp_deliver(uint16_t dport, uint32_t saddr, uint16_t sport,
+                                 const uint8_t *data, uint16_t len);
+
 /* Parse Ethernet -> IPv4 -> UDP entirely in place (no memcpy). On a port-filter*/
 /* hit, hand the payload POINTER to the owning slot and wake it.               */
 static void net_route(const uint8_t *frame, uint32_t len) {
@@ -5887,6 +5893,22 @@ static void net_route(const uint8_t *frame, uint32_t len) {
         thread_wake(g_udp[i].owner_tid);
         return;
     }
+    /* v1.2: FALL THROUGH TO RING-3 SOCKETS.
+     * Before this the function ended at the loop above, so a datagram whose
+     * port matched no kernel demo slot was simply discarded. net_deliver_locked
+     * — the path that fills a ring-3 socket's receive queue — had exactly one
+     * caller, the LOOPBACK path, which meant no UDP datagram arriving on the
+     * wire could ever be read by a ring-3 program. OutRun Web's DNS reply was
+     * received by the NIC, counted, and dropped one layer short of the socket
+     * waiting for it.
+     *
+     * The delivery itself lives with the socket layer (net_wire_udp_deliver),
+     * because SOCK_DGRAM_MAX and g_net_lock are both declared thousands of
+     * lines below this point. */
+    uint32_t saddr = ((uint32_t)ip[12] << 24) | ((uint32_t)ip[13] << 16) |
+                     ((uint32_t)ip[14] << 8) | ip[15];
+    uint16_t sport = (uint16_t)((udp[0] << 8) | udp[1]);
+    net_wire_udp_deliver(dport, saddr, sport, payload, plen);
 }
 
 /* Per-frame dispatch: ARP -> the ARP waiter; IPv4 -> the UDP router.          */
@@ -5904,7 +5926,39 @@ static void net_route(const uint8_t *frame, uint32_t len) {
  * host that is asking for us is about to talk to us, so its mapping is the one
  * we are most likely to need next, and learning it from the request saves the
  * round trip we would otherwise make asking back. */
-#define NET_GUEST_IP    0x0A000210u    /* 10.0.2.16: our SLIRP-side address    */
+/* ===========================================================================
+ * v1.2: RUNTIME NETWORK CONFIGURATION — the address this host actually has
+ * ===========================================================================
+ * Until now NET_GUEST_IP was a #define, so every IPv4 header this kernel ever
+ * emitted claimed to come from 10.0.2.16 whatever network it was plugged into.
+ * That is correct for exactly one configuration — QEMU's `-netdev user` SLIRP
+ * — and wrong for every real bridge, where the reply cannot be routed back to
+ * an address that is not on the segment.
+ *
+ * The DEFAULTS BELOW ARE THE OLD CONSTANTS, deliberately. Every gate tier in
+ * this tree boots under SLIRP, every timing budget was calibrated there, and a
+ * configuration change that altered those boots would invalidate them all at
+ * once. Nothing here changes behaviour until dhcp_apply() supplies something
+ * different; `configured` is what distinguishes a lease from the fallback, so
+ * a boot that never got a lease can say so rather than silently looking alike.
+ *
+ * Kept as a MACRO spelled NET_GUEST_IP so the dozen existing use sites keep
+ * compiling untouched and this diff stays reviewable. */
+struct netcfg {
+    uint32_t ip;          /* our address, host byte order                     */
+    uint32_t mask;        /* netmask                                          */
+    uint32_t gw;          /* default next hop; 0 means "no route off-link"    */
+    uint32_t dns;         /* resolver, handed to ring 3 via HW_NET            */
+    uint32_t configured;  /* 0 = still on the built-in SLIRP defaults         */
+};
+static struct netcfg g_netcfg = {
+    0x0A000210u,          /* 10.0.2.16 — unchanged SLIRP guest address        */
+    0xFFFFFF00u,          /* /24                                              */
+    0x0A000202u,          /* 10.0.2.2  — SLIRP gateway                        */
+    0x0A000203u,          /* 10.0.2.3  — SLIRP DNS forwarder                  */
+    0
+};
+#define NET_GUEST_IP    (g_netcfg.ip)
 static volatile uint64_t g_net_tx_frames;   /* defined with the socket layer   */
 /* v1.0+: BYTES, not just frames. A frame count is not bandwidth — a link
  * carrying sixty 60-byte ARP frames and one carrying sixty 1514-byte segments
@@ -5913,6 +5967,14 @@ static volatile uint64_t g_net_tx_frames;   /* defined with the socket layer   *
  * counters are incremented at the single chokepoint of their direction. */
 static volatile uint64_t g_net_tx_bytes = 0, g_net_rx_bytes = 0;
 static void vnet_tx(const uint8_t *frame, uint32_t len);   /* fwd: v0.69 */
+/* v1.2: the ring-3 socket delivery path, defined with the socket layer far
+ * below. net_route only ever fed the g_udp[] DEMO slots, so an inbound UDP
+ * datagram from the wire could reach a kernel suite and could never reach a
+ * ring-3 socket — which is why OutRun Web's DNS reply was received by the NIC,
+ * counted by g_net_rx_frames, and then dropped on the floor. */
+static int net_deliver_locked(uint16_t dport, uint32_t saddr, uint16_t sport,
+                              const uint8_t *data, uint16_t len);
+static volatile uint64_t g_net_udp_wire_rx = 0, g_net_udp_wire_drop = 0;
 #define ARP_CACHE_N 8
 struct arpent { int used; uint32_t ip; uint8_t mac[6]; uint64_t seen; };
 static struct arpent g_arp[ARP_CACHE_N];
@@ -5976,6 +6038,60 @@ static void arp_request(uint32_t ip) {
     vnet_tx(f, n);
     g_net_tx_frames++;
     __sync_fetch_and_add(&g_arp_requests, 1);
+}
+
+/* ===========================================================================
+ * v1.2: NEXT-HOP SELECTION — the layer that was missing
+ * ===========================================================================
+ * Before this, both transmit paths ARPed for the FINAL DESTINATION. For an
+ * off-link address — any internet host — no station on the segment will ever
+ * answer that, so the lookup missed forever and every frame fell back to the
+ * broadcast MAC. SLIRP hides this completely (its emulated gateway answers ARP
+ * for everything and accepts broadcast), which is exactly why the defect could
+ * survive every gate tier in this tree: all of them boot under `-netdev user`.
+ *
+ * The rule is the standard one and it is one line: a destination inside our own
+ * subnet is reached directly; anything else is reached through the gateway. The
+ * ADDRESS WE ARP FOR is therefore not always the address we are sending to, and
+ * that distinction is the entire content of this function.
+ *
+ * gw == 0 means no route is configured. Falling back to `daddr` there keeps the
+ * pre-v1.2 behaviour for a host that genuinely has no gateway, rather than
+ * silently dropping the frame. */
+static uint32_t net_next_hop(uint32_t daddr) {
+#ifdef NETHOP_FALSIFY
+    /* Falsification build: the pre-v1.2 behaviour, restored deliberately so the
+     * off-link assertion in [nethop] can be shown to FAIL. A routing test that
+     * cannot fail has not passed. */
+    return daddr;
+#else
+    if ((daddr & g_netcfg.mask) == (g_netcfg.ip & g_netcfg.mask)) return daddr;
+    return g_netcfg.gw ? g_netcfg.gw : daddr;
+#endif
+}
+
+/* DETECTIONS, not just failures. hits counts frames that went out correctly
+ * addressed; arps counts the ones that had to fall back to broadcast while a
+ * request went out. A suite asserting only "no failures" is green on a workload
+ * that never resolved a next hop at all, so [nethop] asserts hits > 0. Both are
+ * live in the shipping build — a counter that can only be incremented by a
+ * #ifdef'd path is not evidence of anything. */
+static volatile uint64_t g_net_hop_hits = 0, g_net_hop_arps = 0;
+
+/* Resolve the destination MAC for `daddr` into `out`. Returns 1 when it came
+ * from the cache, 0 when it fell back to broadcast and fired a request so the
+ * NEXT frame is addressed properly. Dropping the frame instead would stall
+ * every new connection for a full round trip.
+ *
+ * ONE copy of this logic, called by both tcp_wire_build and net_tx_udp, so the
+ * two paths cannot drift apart the way they already had. */
+static int net_dst_mac(uint32_t daddr, uint8_t *out) {
+    uint32_t hop = net_next_hop(daddr);
+    if (arp_lookup(hop, out)) { __sync_fetch_and_add(&g_net_hop_hits, 1); return 1; }
+    for (int i = 0; i < 6; i++) out[i] = 0xFF;
+    arp_request(hop);
+    __sync_fetch_and_add(&g_net_hop_arps, 1);
+    return 0;
 }
 
 /* Handle an inbound ARP frame: learn the sender, and answer a request that is
@@ -6278,6 +6394,75 @@ static void net_wait_slot(int slot) {
 
 static volatile int g_dhcpd_done = 0;
 
+/* ===========================================================================
+ * v1.2: APPLY A DHCP LEASE TO THE LIVE NETWORK CONFIGURATION
+ * ===========================================================================
+ * dhcpd_fn has performed a real DHCP round trip since v0.42 and has always
+ * PRINTED the offer and discarded it. NET_GUEST_IP was a compile-time constant,
+ * so the lease could not be applied even in principle.
+ *
+ * Refusals, rather than clamps, on everything that cannot be trusted:
+ *   - a zero yiaddr is not an address;
+ *   - a mask with a zero host part or a non-contiguous prefix is not a mask,
+ *     and accepting one would make net_next_hop route by nonsense;
+ *   - a gateway outside the leased subnet cannot be reached to be a gateway.
+ * A refused field leaves the previous value standing, so a partial or hostile
+ * offer degrades to the built-in defaults instead of half-configuring the host.
+ *
+ * Returns 1 when the address was applied. Every branch says on the console what
+ * it did, because "DHCP answered" and "this host is configured" are different
+ * claims and the old code let them look alike. */
+static int dhcp_apply(const uint8_t *yi, const uint8_t *mask,
+                      const uint8_t *router, const uint8_t *dns) {
+    uint32_t ip = ((uint32_t)yi[0] << 24) | ((uint32_t)yi[1] << 16) |
+                  ((uint32_t)yi[2] << 8) | yi[3];
+    if (!ip) { kputs("[dhcpd  ] offer carried no address; keeping built-in defaults\n"); return 0; }
+
+    uint32_t nm = g_netcfg.mask;
+    if (mask) {
+        uint32_t m = ((uint32_t)mask[0] << 24) | ((uint32_t)mask[1] << 16) |
+                     ((uint32_t)mask[2] << 8) | mask[3];
+        /* A netmask is a run of 1s then a run of 0s. ~m + 1 is a power of two
+         * exactly when that holds, which rejects 255.0.255.0 and friends. */
+        uint32_t host = ~m;
+        if (m && (host & (host + 1)) == 0) nm = m;
+        else kprintf("[dhcpd  ] ignoring malformed netmask %d.%d.%d.%d\n",
+                     (uint64_t)mask[0], (uint64_t)mask[1], (uint64_t)mask[2], (uint64_t)mask[3]);
+    }
+
+    uint32_t gw = 0;
+    if (router) {
+        uint32_t g = ((uint32_t)router[0] << 24) | ((uint32_t)router[1] << 16) |
+                     ((uint32_t)router[2] << 8) | router[3];
+        /* An off-subnet gateway cannot be ARPed for, so it cannot forward. */
+        if (g && (g & nm) == (ip & nm)) gw = g;
+        else kprintf("[dhcpd  ] ignoring off-subnet gateway %d.%d.%d.%d\n",
+                     (uint64_t)router[0], (uint64_t)router[1], (uint64_t)router[2], (uint64_t)router[3]);
+    }
+
+    uint32_t rs = g_netcfg.dns;
+    if (dns) {
+        uint32_t r = ((uint32_t)dns[0] << 24) | ((uint32_t)dns[1] << 16) |
+                     ((uint32_t)dns[2] << 8) | dns[3];
+        if (r) rs = r;           /* a resolver MAY legitimately be off-subnet */
+    }
+
+    g_netcfg.ip = ip; g_netcfg.mask = nm; g_netcfg.gw = gw; g_netcfg.dns = rs;
+    g_netcfg.configured = 1;
+    kprintf("[dhcpd  ] applied: ip %d.%d.%d.%d mask %d.%d.%d.%d\n",
+            (uint64_t)(ip >> 24 & 0xFF), (uint64_t)(ip >> 16 & 0xFF),
+            (uint64_t)(ip >> 8 & 0xFF), (uint64_t)(ip & 0xFF),
+            (uint64_t)(nm >> 24 & 0xFF), (uint64_t)(nm >> 16 & 0xFF),
+            (uint64_t)(nm >> 8 & 0xFF), (uint64_t)(nm & 0xFF));
+    kprintf("[dhcpd  ] applied: gw %d.%d.%d.%d dns %d.%d.%d.%d\n",
+            (uint64_t)(gw >> 24 & 0xFF), (uint64_t)(gw >> 16 & 0xFF),
+            (uint64_t)(gw >> 8 & 0xFF), (uint64_t)(gw & 0xFF),
+            (uint64_t)(rs >> 24 & 0xFF), (uint64_t)(rs >> 16 & 0xFF),
+            (uint64_t)(rs >> 8 & 0xFF), (uint64_t)(rs & 0xFF));
+    if (!gw) kputs("[dhcpd  ] NO GATEWAY: off-link destinations are unreachable\n");
+    return 1;
+}
+
 static void dhcpd_fn(void *arg) {
     (void)arg;
     int slot = udp_bind(68, g_cur);                       /* filter: UDP dst port 68 */
@@ -6336,11 +6521,19 @@ static void dhcpd_fn(void *arg) {
     const uint8_t *d = (const uint8_t *)g_udp[slot].payload;
     const uint8_t *yi = d + 16;                           /* yiaddr             */
     int msg_type = 0; const uint8_t *srv = 0;
+    /* v1.2: options 1 (subnet mask), 3 (router) and 6 (DNS) are now READ AND
+     * APPLIED. Before this the offer was printed and thrown away, which meant
+     * a successful DHCP round trip and a total failure to configure the host
+     * looked identical on the console. */
+    const uint8_t *mask = 0, *router = 0, *dnsopt = 0;
     const uint8_t *o = d + 240;                           /* options after cookie */
     for (int i = 0; i < 300 && o[0] != 0xFF; ) {
         uint8_t code = o[0], ln = o[1];
         if (code == 53) msg_type = o[2];
         if (code == 54) srv = o + 2;
+        if (code ==  1 && ln >= 4) mask   = o + 2;
+        if (code ==  3 && ln >= 4) router = o + 2;
+        if (code ==  6 && ln >= 4) dnsopt = o + 2;
         o += 2 + ln; i += 2 + ln;
     }
     kprintf("[dhcpd  ] router delivered %d-byte UDP payload (zero-copy pointer)\n", (uint64_t)g_udp[slot].plen);
@@ -6349,6 +6542,7 @@ static void dhcpd_fn(void *arg) {
             (uint64_t)yi[0], (uint64_t)yi[1], (uint64_t)yi[2], (uint64_t)yi[3]);
     if (srv) kprintf(", server %d.%d.%d.%d", (uint64_t)srv[0], (uint64_t)srv[1], (uint64_t)srv[2], (uint64_t)srv[3]);
     kputs("\n");
+    dhcp_apply(yi, mask, router, dnsopt);
     g_dhcpd_done = 1;
 }
 
@@ -13940,6 +14134,24 @@ static int net_deliver_locked(uint16_t dport, uint32_t saddr, uint16_t sport,
     return -1;                                                /* nothing bound here */
 }
 
+/* v1.2: the wire's entry point into ring-3 socket delivery. Called from
+ * net_route, which runs in the virtio bottom half with NO ranked lock held, so
+ * taking g_net_lock (rank 11) here is an upward acquisition and legal.
+ *
+ * Counted as a DETECTION (rx) and a failure (drop) separately: a suite that
+ * asserts only "no drops" is green on a boot that never received a datagram at
+ * all, which is precisely the state this tree was in before this function
+ * existed. [nethop] asserts rx > 0. */
+static void net_wire_udp_deliver(uint16_t dport, uint32_t saddr, uint16_t sport,
+                                 const uint8_t *data, uint16_t len) {
+    if (len > SOCK_DGRAM_MAX) len = SOCK_DGRAM_MAX;
+    klock_acquire(&g_net_lock);
+    int d = net_deliver_locked(dport, saddr, sport, data, len);
+    klock_release(&g_net_lock);
+    if (d >= 0) __sync_fetch_and_add(&g_net_udp_wire_rx, 1);
+    else        __sync_fetch_and_add(&g_net_udp_wire_drop, 1);
+}
+
 /* ---- TCP: sequence arithmetic ---------------------------------------------
  * Sequence numbers wrap, so every comparison must be modular. Writing `a < b`
  * on raw uint32 works for 4 billion bytes and then silently inverts, which is
@@ -14400,7 +14612,12 @@ static void net_tx_udp(uint32_t daddr, uint16_t sport, uint16_t dport,
     if (plen > SOCK_DGRAM_MAX) plen = SOCK_DGRAM_MAX;
     uint8_t f[14 + 20 + 8 + SOCK_DGRAM_MAX];
     cmemset(f, 0, sizeof f);
-    for (int i = 0; i < 6; i++) f[i] = 0xFF;               /* dst MAC broadcast */
+    /* v1.2: the next-hop MAC, not an unconditional broadcast. Every DNS query
+     * this kernel ever sent went out to FF:FF:FF:FF:FF:FF — invisible under
+     * SLIRP, and on a real bridge the reason no resolver ever answered. */
+    uint8_t dmac[6];
+    net_dst_mac(daddr, dmac);
+    for (int i = 0; i < 6; i++) f[i] = dmac[i];
     for (int i = 0; i < 6; i++) f[6 + i] = g_vnet_mac[i];  /* src MAC */
     f[12] = 0x08; f[13] = 0x00;                            /* ethertype IPv4 */
     uint8_t *ip = f + 14;
@@ -14456,10 +14673,12 @@ static uint32_t tcp_wire_build(uint8_t *f, uint32_t saddr, uint32_t daddr,
     /* v0.69: the peer's real MAC when we know it. Broadcast is the fallback
      * for a first segment to an unresolved address, and it fires an ARP
      * request so the NEXT segment is addressed properly — dropping the segment
-     * instead would stall every new connection for a round trip. */
+     * instead would stall every new connection for a round trip.
+     * v1.2: resolve the NEXT HOP, not the destination. ARPing for an off-link
+     * address is answered by nobody on a real segment. */
     uint8_t dmac[6];
-    if (arp_lookup(daddr, dmac)) { for (int i = 0; i < 6; i++) f[i] = dmac[i]; }
-    else { for (int i = 0; i < 6; i++) f[i] = 0xFF; arp_request(daddr); }
+    net_dst_mac(daddr, dmac);
+    for (int i = 0; i < 6; i++) f[i] = dmac[i];
     for (int i = 0; i < 6; i++) f[6 + i] = g_vnet_mac[i];
     f[12] = 0x08; f[13] = 0x00;                               /* ethertype IPv4    */
     uint8_t *ip = f + 14;
@@ -22196,18 +22415,27 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
                 uint64_t tx_frames, loop_deliveries, accepts, eagain, sessions;
                 struct unetif iface[2];
                 struct usock sock[16];
+                /* v1.2: live layer-3 config — see include/outrun_abi.h, which
+                 * is the master copy this must move with. */
+                uint32_t cfg_ip, cfg_mask, cfg_gw, cfg_dns, cfg_configured;
             };
             /* The runtime size check below rejects a caller built against a
              * different header. This one rejects a KERNEL built against a
              * different header — a divergence the runtime check could only
              * ever report as every caller mysteriously getting -EINVAL. */
-            _Static_assert(sizeof(struct unet) == 856,
+            _Static_assert(sizeof(struct unet) == 880,
                            "HW_NET layout must match include/outrun_abi.h");
             if (usz != sizeof(struct unet)) return (uint64_t)-22;
             if (!access_ok(kprocs[hwme].cr3, ubuf, sizeof(struct unet), 1)) return (uint64_t)-14;
             static struct unet k;
             cmemset(&k, 0, sizeof k);
             k.version = 1; k.size = (uint32_t)sizeof k;
+            /* v1.2: the live layer-3 configuration, so a ring-3 program can ask
+             * what resolver this host was actually given instead of assuming
+             * QEMU SLIRP's. */
+            k.cfg_ip = g_netcfg.ip; k.cfg_mask = g_netcfg.mask;
+            k.cfg_gw = g_netcfg.gw; k.cfg_dns = g_netcfg.dns;
+            k.cfg_configured = g_netcfg.configured;
             k.tx_frames = g_net_tx_frames; k.loop_deliveries = g_net_loop_deliveries;
             k.accepts = g_net_accepts; k.eagain = g_net_eagain; k.sessions = g_net_sessions;
             if (g_vnet_ready) {
@@ -30541,6 +30769,94 @@ static void netcheck(const char *n, int c) {
     else   { g_netfail++; kprintf("[netstrs]  FAIL  %s\n", n); }
 }
 
+/* ===========================================================================
+ * v1.2: [nethop] — next-hop selection and wire-side UDP delivery
+ * ===========================================================================
+ * This suite calls net_next_hop() ITSELF rather than restating its rule, so it
+ * cannot pass while the shipping function does something else. Under
+ * -DNETHOP_FALSIFY that function returns the destination unconditionally (the
+ * pre-v1.2 behaviour) and the off-link assertion below MUST go red — that build
+ * is the standing proof this test is capable of failing.
+ *
+ * It also asserts the DETECTION counters, not merely the absence of failures.
+ * g_net_hop_hits == 0 would mean no frame was ever addressed from the ARP
+ * cache; g_net_udp_wire_rx == 0 would mean the wire->socket path never ran.
+ * Either is "green for the wrong reason", which is what this tree's evidence
+ * rules exist to prevent. */
+static int g_hoppass, g_hopfail;
+static void hopcheck(const char *n, int c) {
+    if (c) { g_hoppass++; kprintf("[nethop ]  PASS  %s\n", n); }
+    else   { g_hopfail++; kprintf("[nethop ]  FAIL  %s\n", n); }
+}
+
+static void cmd_net_hop(void) {
+    kputs("-- NEXT-HOP: on-link direct, off-link via gateway, wire UDP -> ring-3 socket --\n");
+    g_hoppass = g_hopfail = 0;
+
+    struct netcfg saved = g_netcfg;
+
+    /* A deterministic configuration, independent of whatever DHCP did, so the
+     * arithmetic below means the same thing on every host and every tier. */
+    g_netcfg.ip = 0xC0A80164u;      /* 192.168.1.100 */
+    g_netcfg.mask = 0xFFFFFF00u;    /* /24           */
+    g_netcfg.gw = 0xC0A80101u;      /* 192.168.1.1   */
+
+    hopcheck("an on-link destination is its own next hop",
+             net_next_hop(0xC0A801C8u) == 0xC0A801C8u);      /* 192.168.1.200 */
+    hopcheck("the gateway itself is on-link and routes directly",
+             net_next_hop(0xC0A80101u) == 0xC0A80101u);
+    /* THE ASSERTION THE FALSIFY BUILD BREAKS. 8.8.8.8 is off-link, so the frame
+     * must be addressed to the gateway. Pre-v1.2 this returned 8.8.8.8 and the
+     * stack ARPed for a host no segment would ever answer for. */
+    hopcheck("an off-link destination routes via the gateway",
+             net_next_hop(0x08080808u) == 0xC0A80101u);
+    hopcheck("a /16 mask widens what counts as on-link",
+             (g_netcfg.mask = 0xFFFF0000u, net_next_hop(0xC0A8FF01u) == 0xC0A8FF01u));
+    g_netcfg.mask = 0xFFFFFF00u;
+    /* No gateway means no route: fall back to the destination rather than
+     * silently discarding, which is what a host with no router must do. */
+    g_netcfg.gw = 0;
+    hopcheck("with no gateway configured an off-link destination is not rewritten",
+             net_next_hop(0x08080808u) == 0x08080808u);
+
+    g_netcfg = saved;
+
+    /* Drive the transmit path FROM THIS SUITE rather than relying on another
+     * suite's side effects. Depending on tcpstrs having happened to transmit is
+     * how a detection counter silently becomes a measure of suite ordering
+     * instead of a measure of the code under test.
+     *
+     * A datagram to an off-link address exercises exactly the repaired path:
+     * net_tx_udp -> net_dst_mac -> net_next_hop, which before v1.2 was an
+     * unconditional broadcast that never consulted ARP at all. */
+    uint64_t hits0 = g_net_hop_hits, arps0 = g_net_hop_arps;
+    if (g_vnet_ready) {
+        const uint8_t probe[4] = { 'h', 'o', 'p', 0 };
+        net_tx_udp(0x08080808u, 4242, 53, probe, sizeof probe);   /* off-link  */
+        net_tx_udp(g_netcfg.gw, 4242, 53, probe, sizeof probe);   /* on-link   */
+    }
+    uint64_t moved = (g_net_hop_hits - hits0) + (g_net_hop_arps - arps0);
+    hopcheck("transmitting consults the next-hop resolver (it is on the TX path)",
+             !g_vnet_ready || moved >= 2);
+
+    /* Detections. These are live counters in the shipping build. */
+    kprintf("[nethop ] hop hits %u, hop ARPs %u; wire UDP rx %u, dropped %u\n",
+            (uint64_t)g_net_hop_hits, (uint64_t)g_net_hop_arps,
+            (uint64_t)g_net_udp_wire_rx, (uint64_t)g_net_udp_wire_drop);
+    hopcheck("the next-hop path actually ran (hits + ARPs > 0)",
+             !g_vnet_ready || (g_net_hop_hits + g_net_hop_arps) > 0);
+    kprintf("[nethop ] netcfg: %s (ip %d.%d.%d.%d gw %d.%d.%d.%d dns %d.%d.%d.%d)\n",
+            g_netcfg.configured ? "DHCP lease applied" : "built-in defaults",
+            (uint64_t)(g_netcfg.ip >> 24 & 0xFF), (uint64_t)(g_netcfg.ip >> 16 & 0xFF),
+            (uint64_t)(g_netcfg.ip >> 8 & 0xFF), (uint64_t)(g_netcfg.ip & 0xFF),
+            (uint64_t)(g_netcfg.gw >> 24 & 0xFF), (uint64_t)(g_netcfg.gw >> 16 & 0xFF),
+            (uint64_t)(g_netcfg.gw >> 8 & 0xFF), (uint64_t)(g_netcfg.gw & 0xFF),
+            (uint64_t)(g_netcfg.dns >> 24 & 0xFF), (uint64_t)(g_netcfg.dns >> 16 & 0xFF),
+            (uint64_t)(g_netcfg.dns >> 8 & 0xFF), (uint64_t)(g_netcfg.dns & 0xFF));
+    kprintf("[nethop ] RESULT: %d passed, %d failed\n",
+            (uint64_t)g_hoppass, (uint64_t)g_hopfail);
+}
+
 static void cmd_net_stress(void) {
     kputs("-- NET STRESS: real ring-3 datagram-socket bind/connect/send/recv churn, incl. client faults --\n");
     g_netpass = g_netfail = 0;
@@ -31746,14 +32062,36 @@ static void compositor_frame(int frame) {
  * reproduce.
  *
  * The names are this system's own. */
-#define DESK_RAIL_W   112
-#define DESK_RAIL_Y   32
-#define DESK_TILE_MAX 44
-#define DESK_TILE_MIN 20
-#define DESK_TILE_GAP  6
 #define DESK_NLAUNCH  13
+/* ---- Hazard Launch button + industrial glass taskbar ---------------------
+ * The desktop used to be a 112px left RAIL of thirteen tiles. That rail cost
+ * a permanent column of desktop on every window, which is why maximize had to
+ * subtract DESK_RAIL_W, and it scaled badly: desk_tile_h() had to derive a
+ * tile height because thirteen fixed tiles overran the taskbar at scale 2.
+ *
+ * The apps now live in a POPUP menu behind one Launch button in the taskbar,
+ * so the desktop is background plus taskbar and a maximized window gets the
+ * full width. The tile-height derivation is gone with the rail; the menu
+ * scrolls instead, which is bounded by construction rather than by a clamp.
+ *
+ * There is no Launch button or menu before this change -- neither string
+ * appears anywhere in the tree -- so this builds them rather than restyling
+ * something that already existed. */
+#define DESK_LAUNCH_W  76          /* hazard button width inside the taskbar */
+#define DESK_MENU_W   168
+#define DESK_MENU_ROW  20
+#define DESK_MENU_VIS   8          /* rows visible before the menu scrolls   */
+#define HAZ_YELLOW 0xFFC800u
+#define HAZ_BLACK  0x202020u
+#define HAZ_RED    0xCC0000u
+#define HAZ_RED_HI 0xFF4040u
+/* Menu state. `open` and `scroll` are desktop state, not window state, so
+ * they live beside the other desktop globals and are read by BOTH the
+ * compositor and the pointer -- one source, so a row cannot be drawn where
+ * the hit test does not look for it. */
+static int g_desk_menu_open, g_desk_menu_scroll, g_desk_launch_hot;
 struct launch_tile { const char *label, *module; uint32_t tint; };
-/* Labels are at most 12 characters: the rail is DESK_RAIL_W wide, the text
+/* Labels are at most 12 characters: the menu is DESK_MENU_W wide, the text
  * starts 12 pixels in, and the font is 8 pixels per glyph. A longer label does
  * not wrap — it runs off the rail and over whatever window is beneath it. */
 static const struct launch_tile g_launch[DESK_NLAUNCH] = {
@@ -31771,40 +32109,92 @@ static const struct launch_tile g_launch[DESK_NLAUNCH] = {
     { "MEDIA",       "outrun_media", C_MAGE  },
     { "OUTRUN WEB",  "outrun_web",   C_CYAN  },
 };
-/* THE TILE HEIGHT IS DERIVED, NOT FIXED.
+/* desk_tile_h() and the DESK_TILE_* constants are GONE with the rail. They
+ * derived a tile height so thirteen tiles would fit above the taskbar at any
+ * scale; the menu scrolls instead, so there is no height to derive. Leaving
+ * them behind would be a geometry helper for a control that no longer exists,
+ * which is exactly how the next reader concludes the rail is still live. */
+/* ---- Taskbar clock + system indicators -----------------------------------
+ * The clock is cached and refreshed about once a second from g_ticks (100 Hz).
+ * Reading CMOS on every composite would mean a port round-trip 60 times a
+ * second for a value that changes once.
  *
- * A constant 44 fitted six tiles into any desktop this kernel can produce.
- * Twelve do not: at scale 2 the logical desktop is 512x384, and twelve fixed
- * tiles would run 176 pixels past the taskbar — the last several unreachable,
- * and unreachable in a way that looks exactly like a launcher that ignores
- * clicks. Deriving the height from the space actually available makes the rail
- * fit whatever the settings app has chosen, and the clamp at DESK_TILE_MIN
- * means a desktop too small for all twelve produces tiles that are too short
- * rather than tiles nothing can click.
- *
- * Both the compositor and the pointer call THIS function. That is the same
- * discipline the chip hit box already follows and for the same reason: a
- * second copy of the geometry is how a control becomes decoration. */
-static int desk_tile_h(void) {
-    int avail = desk_h() - WIN_TASKBAR_H - DESK_RAIL_Y;
-    if (avail <= 0) return DESK_TILE_MIN;
-    int h = avail / DESK_NLAUNCH;
-    if (h > DESK_TILE_MAX) h = DESK_TILE_MAX;
-    if (h < DESK_TILE_MIN) h = DESK_TILE_MIN;
-    return h;
+ * If the RTC never anchored, g_rtc_boot_epoch is 0 and there is no wall clock
+ * to show. This displays UPTIME in that case rather than a plausible-looking
+ * 00:00 -- rtc_init already refuses a flat-battery 1980 for the same reason,
+ * and a clock that invents a time is worse than one that admits it has none. */
+static int g_desk_clock_h = -1, g_desk_clock_m = -1;
+static uint64_t g_desk_clock_tick;
+static void desk_clock_refresh(void) {
+    if (g_desk_clock_h >= 0 && g_ticks - g_desk_clock_tick < 100) return;
+    g_desk_clock_tick = g_ticks;
+    struct rtc_time t;
+    if (g_rtc_boot_epoch && rtc_read_raw(&t)) {
+        g_desk_clock_h = t.hour; g_desk_clock_m = t.min;
+    } else {
+        g_desk_clock_h = -1; g_desk_clock_m = -1;
+    }
 }
-/* Which launcher tile contains a logical-desktop point, or -1. */
+/* Two digits, no snprintf in this path. */
+static void desk_two(char *dst, int v) {
+    if (v < 0) v = 0;
+    dst[0] = (char)('0' + (v / 10) % 10);
+    dst[1] = (char)('0' + v % 10);
+}
+/* Geometry helpers. Compositor and pointer both call these, which is the same
+ * discipline the chip hit box follows and for the same reason: a second copy
+ * of the geometry is how a control becomes decoration. */
+static int desk_launch_btn_at(int sx, int sy) {
+    return sy >= desk_h() - WIN_TASKBAR_H && sy < desk_h() &&
+           sx >= 0 && sx < DESK_LAUNCH_W;
+}
+/* Top edge of the popup, given how many rows it will show. */
+static int desk_menu_rows(void) {
+    int rows = DESK_NLAUNCH - g_desk_menu_scroll;
+    if (rows > DESK_MENU_VIS) rows = DESK_MENU_VIS;
+    if (rows < 1) rows = 1;
+    return rows;
+}
+static int desk_menu_top(void) {
+    return desk_h() - WIN_TASKBAR_H - desk_menu_rows() * DESK_MENU_ROW - 2;
+}
+/* Which launcher ENTRY a logical-desktop point selects, or -1. Only meaningful
+ * while the menu is open.
+ *
+ * The right DESK_MENU_SCROLL_W pixels are the scroll gutter, NOT rows: without
+ * that exclusion a click on the up/down arrow resolves to whatever entry sits
+ * on that line and launches it, which is the arrow-that-does-nothing trap in
+ * its worst form -- the affordance appears to work while doing something else
+ * entirely. */
+#define DESK_MENU_SCROLL_W 20
 static int desk_launch_at(int sx, int sy) {
-    if (sx < 6 || sx >= DESK_RAIL_W - 6) return -1;
-    if (sy < DESK_RAIL_Y) return -1;
-    int th = desk_tile_h();
-    /* A tile drawn under the taskbar is not clickable, and must not be
-     * reported as clicked either. */
-    if (sy >= desk_h() - WIN_TASKBAR_H) return -1;
-    int i = (sy - DESK_RAIL_Y) / th;
+    if (!g_desk_menu_open) return -1;
+    int top = desk_menu_top(), rows = desk_menu_rows();
+    if (sx < 0 || sx >= DESK_MENU_W - DESK_MENU_SCROLL_W) return -1;
+    if (sy < top || sy >= top + rows * DESK_MENU_ROW) return -1;
+    int i = g_desk_menu_scroll + (sy - top) / DESK_MENU_ROW;
     if (i < 0 || i >= DESK_NLAUNCH) return -1;
-    if ((sy - DESK_RAIL_Y) % th >= th - DESK_TILE_GAP) return -1;   /* the gap */
     return i;
+}
+/* Scroll gutter: -1 = up, +1 = down, 0 = not a scroll click. Returns 0 when
+ * that direction has nothing left to reveal, so the gutter is inert exactly
+ * when the arrow is not drawn. */
+static int desk_menu_scroll_at(int sx, int sy) {
+    if (!g_desk_menu_open) return 0;
+    int top = desk_menu_top(), rows = desk_menu_rows();
+    int mh = rows * DESK_MENU_ROW + 2;
+    if (sx < DESK_MENU_W - DESK_MENU_SCROLL_W || sx >= DESK_MENU_W) return 0;
+    if (sy < top || sy >= top + mh) return 0;
+    if (sy < top + mh / 2) return g_desk_menu_scroll > 0 ? -1 : 0;
+    return g_desk_menu_scroll + rows < DESK_NLAUNCH ? 1 : 0;
+}
+/* Is this point anywhere on the open menu? A click that misses the menu but
+ * is not on the Launch button dismisses it, so "outside" has to be a question
+ * the pointer can ask without duplicating the row arithmetic. */
+static int desk_menu_at(int sx, int sy) {
+    if (!g_desk_menu_open) return 0;
+    int top = desk_menu_top();
+    return sx >= 0 && sx < DESK_MENU_W && sy >= top && sy < desk_h() - WIN_TASKBAR_H;
 }
 /* Where window `id`'s taskbar chip sits, given the window table `snap`.
  * Returns 0 if it has no chip (which happens once the bar is full). One
@@ -31814,7 +32204,10 @@ static int desk_launch(int t);           /* defined with the scheduler helpers b
 static int desk_chip_slot(const struct wmwin *snap, int id, int *out_x, int *out_w) {
     int slot = 0;
     for (int i = 0; i < id; i++) if (snap[i].used) slot++;
-    int x = 8 + slot * (DESK_CHIP_W + 6);
+    /* Chips start AFTER the Launch button. Without this offset the first chip
+     * is drawn on top of it and the button's hit box wins the click, which
+     * looks exactly like a chip that ignores the pointer. */
+    int x = DESK_LAUNCH_W + 8 + slot * (DESK_CHIP_W + 6);
     if (x + DESK_CHIP_W > desk_w() - 8) return 0;
     *out_x = x; *out_w = DESK_CHIP_W;
     return 1;
@@ -31862,8 +32255,10 @@ static void wm_toggle_maximize(int id) {
     if (!W->maximized) {
         W->restore_x = W->x; W->restore_y = W->y;
         W->restore_w = W->w; W->restore_h = W->h;
-        W->x = DESK_RAIL_W; W->y = 0;
-        W->w = desk_w() - DESK_RAIL_W; W->h = desk_h() - WIN_TASKBAR_H;
+        /* The left rail is gone, so a maximized window gets the FULL width.
+         * This offset existed only to clear the launcher tiles. */
+        W->x = 0; W->y = 0;
+        W->w = desk_w(); W->h = desk_h() - WIN_TASKBAR_H;
         W->maximized = 1;
     } else {
         W->w = W->restore_w; W->h = W->restore_h;
@@ -31901,6 +32296,11 @@ static int wm_content_point(const struct wmwin *W, int sx, int sy, int *cx, int 
 /* Called under the lock for motion AND release, so the final packet's delta
  * is never lost. Movement threshold also disqualifies a title double click. */
 static void wm_pointer_motion(int sx, int sy) {
+    /* Launch button hover drives the highlight_red face. Set here rather than
+     * in the compositor so the state comes from real pointer motion -- a
+     * hover colour the compositor computes from its own guess is a colour
+     * nothing can be observed to change. */
+    g_desk_launch_hot = desk_launch_btn_at(sx, sy);
     int hit = wm_topmost_at(sx, sy);
     for (int i = 0; i < NWMWIN; i++)
         g_wmwin[i].hover_control = i == hit ? wm_control_at(&g_wmwin[i], sx, sy) : 0;
@@ -32208,23 +32608,8 @@ static void wimp_compose(void) {
     for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) g_bb[y * (int)g_stride + x] = C_OBS0;
     for (int gx = 0; gx < W; gx += 48) vline(gx, 0, H - WIN_TASKBAR_H, C_GRID);
     for (int gy = 0; gy < H - WIN_TASKBAR_H; gy += 48) hline(0, gy, W, C_GRID);
-    draw_str(DESK_RAIL_W + 12, 8, g_sp_enabled ? "RMB drag: pan | RMB +/-: zoom | RMB 0: home | RMB M: motion" : "OUTRUN NODE // GRID ONLINE", g_desk_accent);
-    if (g_sp_enabled) draw_str(DESK_RAIL_W+12,20,g_sp_pressure ? "BUDDY FREE <16MiB: low-cost glass" : "BUDDY FREE >=16MiB | ALLOW=caps DMA=grants CPU=activity dots=threads", C_MUTE);
-
-    /* v0.96: THE LAUNCHER IS A CONTROL NOW, not decoration. Every tile here is
-     * hit-tested by wimp_pointer against this exact geometry — the two are
-     * driven from one table (g_launch) so a tile cannot be drawn somewhere the
-     * pointer does not look for it. */
-    rect(0, 0, DESK_RAIL_W, H - WIN_TASKBAR_H, C_OBS1);
-    vline(DESK_RAIL_W - 1, 0, H - WIN_TASKBAR_H, C_HAIR);
-    int tile_h = desk_tile_h();
-    for (int i = 0; i < DESK_NLAUNCH; i++) {
-        int y = DESK_RAIL_Y + i * tile_h;
-        if (y + tile_h - DESK_TILE_GAP > H - WIN_TASKBAR_H) break;   /* see desk_tile_h */
-        rect(6, y, DESK_RAIL_W - 12, tile_h - DESK_TILE_GAP, C_OBS2);
-        hline(6, y, DESK_RAIL_W - 12, g_launch[i].tint);
-        draw_str(12, y + (tile_h - DESK_TILE_GAP - 8) / 2, g_launch[i].label, g_launch[i].tint);
-    }
+    draw_str(12, 8, g_sp_enabled ? "RMB drag: pan | RMB +/-: zoom | RMB 0: home | RMB M: motion" : "OUTRUN NODE // GRID ONLINE", g_desk_accent);
+    if (g_sp_enabled) draw_str(12,20,g_sp_pressure ? "BUDDY FREE <16MiB: low-cost glass" : "BUDDY FREE >=16MiB | ALLOW=caps DMA=grants CPU=activity dots=threads", C_MUTE);
 
     /* Snapshot the window table under the lock, then draw without holding it
      * (draw primitives can be slow and must never run under a klock). */
@@ -32252,9 +32637,50 @@ static void wimp_compose(void) {
         if (!g_sp_enabled || (!g_sp_glyph && g_sp_zoom == 1024)) wimp_draw_widgets(&R, wi);      /* v0.70: painted BY the system */
     }
 
-    /* taskbar across the bottom: one chip per used window */
-    rect(0, H - WIN_TASKBAR_H, W, WIN_TASKBAR_H, C_OBS1);
-    hline(0, H - WIN_TASKBAR_H, W, C_HAIR);
+    /* ---- Industrial glass taskbar ----------------------------------------
+     * A vertical gradient from rgba(0,0,0,160) at the top to rgba(0,0,0,96) at
+     * the bottom over whatever the desktop already drew, plus a 1px light grey
+     * highlight along the top edge. Blended per row rather than filled with a
+     * flat colour, so the wallpaper and any window edge behind it still read
+     * through -- that is what makes it glass rather than a dark bar. */
+    {
+        int bar_y = H - WIN_TASKBAR_H;
+        for (int y = 0; y < WIN_TASKBAR_H; y++) {
+            /* 160 -> 96 across the bar height. */
+            int a = 160 - (64 * y / (WIN_TASKBAR_H ? WIN_TASKBAR_H : 1));
+            for (int x = 0; x < W; x++) blend(x, bar_y + y, 0x000000u, a);
+        }
+        hline(0, bar_y, W, 0xB4B4B4u);   /* highlight line */
+    }
+    /* ---- Hazard Launch button --------------------------------------------
+     * Diagonal yellow/black bands, a red emergency-switch face, and a bevel
+     * that lightens the top edge and darkens the bottom. The bands are drawn
+     * by (x+y)/8 parity, which gives 8px diagonals without a rotation. */
+    {
+        int bx = 0, by = H - WIN_TASKBAR_H, bh = WIN_TASKBAR_H;
+        for (int y = 0; y < bh; y++)
+            for (int x = 0; x < DESK_LAUNCH_W; x++)
+                px(bx + x, by + y, (((x + y) / 8) & 1) ? HAZ_YELLOW : HAZ_BLACK);
+        /* Red face, inset so the hazard stripes frame it. */
+        int fx = bx + 8, fy = by + 4, fw = DESK_LAUNCH_W - 16, fh = bh - 8;
+        uint32_t face = g_desk_launch_hot ? HAZ_RED_HI : HAZ_RED;
+        rect(fx, fy, fw, fh, face);
+        /* Rounded corners: clip one pixel at each corner back to the stripes
+         * underneath, which reads as a radius at this size without a circle
+         * rasteriser. */
+        for (int c = 0; c < 2; c++) {
+            int cy = c ? fy + fh - 1 : fy;
+            px(fx, cy, (((fx + cy) / 8) & 1) ? HAZ_YELLOW : HAZ_BLACK);
+            px(fx + fw - 1, cy, (((fx + fw - 1 + cy) / 8) & 1) ? HAZ_YELLOW : HAZ_BLACK);
+        }
+        /* Bevel: ~10% lighter along the top, ~10% darker along the bottom.
+         * wm_color_mix is the existing tint helper; blend() would composite
+         * against the red we just wrote, which is the same thing at these
+         * weights but reads as an accident rather than a chosen ratio. */
+        hline(fx, fy, fw, wm_color_mix(face, 0xFFFFFFu, 1, 10));
+        hline(fx, fy + fh - 1, fw, wm_color_mix(face, 0x000000u, 1, 10));
+        draw_str(fx + (fw - 6 * 8) / 2, fy + (fh - 8) / 2, "LAUNCH", 0xFFFFFFu);
+    }
     /* v0.96: NAMED, CLICKABLE CHIPS. A minimized window had no way back before
      * this — the chips were painted but nothing hit-tested them, so minimizing
      * a window was one-way. desk_chip_at() decides both where a chip is drawn
@@ -32263,10 +32689,44 @@ static void wimp_compose(void) {
         int cx, cw2;
         if (!snap[i].used || !desk_chip_slot(snap, i, &cx, &cw2)) continue;
         uint32_t chip = snap[i].focused ? snap[i].accent : (snap[i].minimized ? C_MUTE : C_HAIR);
-        rect(cx, H - WIN_TASKBAR_H + 4, cw2, WIN_TASKBAR_H - 8, C_OBS2);
+        /* Chips sit on dark glass now: fill with a translucent lift rather than
+         * the old opaque panel colour, and brighten the label so a minimized
+         * title stays legible instead of grey-on-near-black. */
+        for (int y = 4; y < WIN_TASKBAR_H - 4; y++)
+            for (int x = 0; x < cw2; x++)
+                blend(cx + x, H - WIN_TASKBAR_H + y, 0xFFFFFFu, snap[i].focused ? 40 : 20);
         hline(cx, H - WIN_TASKBAR_H + 4, cw2, chip);
         draw_str(cx + 4, H - WIN_TASKBAR_H + 9, snap[i].title,
-                 snap[i].minimized ? C_MUTE : C_TEXT);
+                 snap[i].minimized ? 0x9A9A9Au : 0xF0F0F0u);
+    }
+    /* ---- Launch menu ------------------------------------------------------
+     * Drawn LAST so it is over every window and over the taskbar, matching the
+     * hit-test order in wimp_pointer. Scrolls when the app count exceeds
+     * DESK_MENU_VIS, so adding a fourteenth app needs no geometry change. */
+    if (g_desk_menu_open) {
+        int rows = desk_menu_rows(), top = desk_menu_top();
+        int mh = rows * DESK_MENU_ROW + 2;
+        for (int y = 0; y < mh; y++)
+            for (int x = 0; x < DESK_MENU_W && x < W; x++)
+                blend(x, top + y, 0x000000u, 205);
+        hline(0, top, DESK_MENU_W, 0xB4B4B4u);
+        vline(DESK_MENU_W - 1, top, mh, 0x6E6E6Eu);
+        for (int r = 0; r < rows; r++) {
+            int i = g_desk_menu_scroll + r;
+            if (i < 0 || i >= DESK_NLAUNCH) break;
+            int ry = top + 2 + r * DESK_MENU_ROW;
+            /* Icon: a tinted block standing in for per-app artwork. It is the
+             * app's own accent from g_launch, not a generic glyph, so entries
+             * are distinguishable. */
+            rect(6, ry + 4, 10, 10, g_launch[i].tint);
+            draw_str(24, ry + 6, g_launch[i].label, 0xF0F0F0u);
+        }
+        /* Scroll affordances, shown only when there is more to see -- an arrow
+         * that cannot do anything is the decoration trap again. */
+        if (g_desk_menu_scroll > 0)
+            draw_str(DESK_MENU_W - DESK_MENU_SCROLL_W + 6, top + 4, "^", HAZ_YELLOW);
+        if (g_desk_menu_scroll + rows < DESK_NLAUNCH)
+            draw_str(DESK_MENU_W - DESK_MENU_SCROLL_W + 6, top + mh - 12, "v", HAZ_YELLOW);
     }
 
     wimp_draw_cursor();
@@ -32310,6 +32770,46 @@ static int wimp_pointer(int sx, int sy, int down) {
     }
     /* A duplicate make never starts another action while captured. */
     if (g_wm_capture >= 0) { klock_release(&g_wm_lock); return g_wm_capture; }
+    /* The Launch button and its menu are drawn OVER every window, so they must
+     * be hit-tested before wm_topmost_at -- otherwise a window beneath the
+     * popup takes the click and the menu looks like it ignores the pointer.
+     * This is the same ordering rule the chips already rely on. */
+    if (desk_launch_btn_at(sx, sy)) {
+        g_desk_menu_open = !g_desk_menu_open;
+        if (!g_desk_menu_open) g_desk_menu_scroll = 0;
+        klock_release(&g_wm_lock);
+        return -1;
+    }
+    if (g_desk_menu_open) {
+        int entry = desk_launch_at(sx, sy);
+        int scroll = desk_menu_scroll_at(sx, sy);
+        int on_menu = desk_menu_at(sx, sy);
+        /* Scroll gutter first: it overlaps the row band horizontally, and a
+         * gutter click must never also be read as a row. */
+        if (scroll) {
+            g_desk_menu_scroll += scroll;
+            if (g_desk_menu_scroll < 0) g_desk_menu_scroll = 0;
+            if (g_desk_menu_scroll > DESK_NLAUNCH - 1) g_desk_menu_scroll = DESK_NLAUNCH - 1;
+            klock_release(&g_wm_lock);
+            return -1;
+        }
+        /* Selecting an entry launches and closes; clicking the menu but not a
+         * row keeps it open; clicking anywhere else dismisses it without
+         * disturbing the window underneath. */
+        if (entry >= 0) {
+            g_desk_menu_open = 0; g_desk_menu_scroll = 0;
+            klock_release(&g_wm_lock);
+            desk_launch(entry);
+            return -1;
+        }
+        if (!on_menu) {
+            g_desk_menu_open = 0; g_desk_menu_scroll = 0;
+            klock_release(&g_wm_lock);
+            return -1;
+        }
+        klock_release(&g_wm_lock);
+        return -1;
+    }
     hit = wm_topmost_at(sx, sy);
     if (hit < 0) {
         g_wm_click_win = -1;
@@ -32319,9 +32819,7 @@ static int wimp_pointer(int sx, int sy, int down) {
             wm_raise(chip); wm_focus(chip); wm_log_action("restore", chip);
             klock_release(&g_wm_lock); return chip;
         }
-        int tile = desk_launch_at(sx, sy);
         klock_release(&g_wm_lock);
-        if (tile >= 0) desk_launch(tile);
         return -1;
     }
     struct wmwin *W = &g_wmwin[hit];
@@ -39437,6 +39935,7 @@ static void shell_exec(char *line) {
     else if (!kstrcmp(argv[0], "sched")) cmd_sched();
     else if (!kstrcmp(argv[0], "vfs")) cmd_vfs();
     else if (!kstrcmp(argv[0], "net")) cmd_net();
+    else if (!kstrcmp(argv[0], "nethop")) cmd_net_hop();
     else if (!kstrcmp(argv[0], "gfx")) cmd_gfx();
     else if (!kstrcmp(argv[0], "stream")) { ts_print_timeline(); ts_query("the Q3 chart Sarah sent"); }
     else if (!kstrcmp(argv[0], "validate")) cmd_validate();
@@ -39999,6 +40498,12 @@ void __attribute__((no_stack_protector)) kernel_main(uint64_t mb_info) {
      * while both BIOS configurations stayed clean. Ordering is the fix: the
      * suite that needs silence goes first. */
     cmd_tcp_stress();       /* v0.68: TCP handshake, byte stream, FIN, and the wire codec */
+    /* v1.2: AFTER the network suites, deliberately. The detection counters this
+     * asserts (hop hits/ARPs, wire UDP rx) can only be non-zero once something
+     * has actually driven the wire — placing it before tcpstrs made it report
+     * zero and correctly fail, which is the "counter nothing increments" trap
+     * catching a suite ordered ahead of the work it measures. */
+    cmd_net_hop();          /* v1.2: next-hop routing + wire UDP delivery */
     mouse_init();
     fb_init();
     cmd_gfx();

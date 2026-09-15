@@ -924,7 +924,20 @@ static int web_start(struct web_job *j,const char *address) {
     j->dns_id=((unsigned)nonce[0]<<8)|nonce[1]; j->dns_len=web_dns_query(j->url.host,j->dns_id,j->dns);
     if(j->dns_len<0) { web_fail(j,"Invalid DNS name"); return 0; }
     j->fd=web_socket(1);
+    /* v1.2: ask the kernel what resolver this host was actually given. The old
+     * hardcoded 0x0a000203 is QEMU SLIRP's built-in forwarder — it exists only
+     * under `-netdev user` and answers nothing on a real bridge, which is why
+     * every lookup on a bridged VM sat in WEB_DNS_WAIT until its deadline. It
+     * survives ONLY as the last-resort fallback, so a SLIRP boot behaves as it
+     * always did. */
     unsigned resolver=0x0a000203u;
+#ifndef WEB_HOST_NETWORK
+    {
+        static struct outrun_net_info ni;
+        if((i64)sysc(SYS_HW_INFO,HW_NET,(u64)&ni,sizeof ni)>=0 && ni.cfg_dns)
+            resolver=ni.cfg_dns;
+    }
+#endif
 #ifdef WEB_HOST_NETWORK
     /* Tests supply a genuine UDP resolver, not an in-memory DNS answer. */
     const char *dns=getenv("WEB_DNS_IP"); if(dns&&!web_ipv4(dns,&resolver)) { web_fail(j,"Invalid test resolver"); return 0; }

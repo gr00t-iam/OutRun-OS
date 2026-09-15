@@ -2,6 +2,21 @@ metal/build/
 metal/iso/boot/outrun-kernel.elf
 metal/iso/boot/user_init.elf
 
+# v1.2: built ISOs must not be committed to the repo root.
+#
+# `outrun-launch-desktop-1.2.0-dev.iso` was uploaded here through the GitHub
+# web UI (c583409) as a 13.6 MB blob with no LFS filter behind it, joining four
+# older 12 MB images already in the root. Every one of them is permanent: a
+# blob in history is downloaded by every future clone whether or not the file
+# still exists at HEAD, so the repository only ever gets larger.
+#
+# It is also the wrong way to share a test image, because a committed artefact
+# carries no evidence. `make release-iso` emits the ISO with its MD5 and
+# SHA-256 beside it, which is what lets a later run prove which binary it
+# booted -- the discipline CLAUDE.md's release protocol exists to enforce.
+# Publish images as release assets, not as tracked files.
+/*.iso
+
 # v0.78: harness evidence. Gate runs write here rather than into metal/build/,
 # so `make clean` cannot destroy the logs that say what happened — which it has
 # now done to a reproduction and to an unexplained failure, in that order.
